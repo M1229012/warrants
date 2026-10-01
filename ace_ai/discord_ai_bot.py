@@ -4817,12 +4817,17 @@ class AceQueryEngine:
                 raise tools.ToolDataError(req['parse_error'])
             if not req.get('code') or not req.get('buy_date'):
                 return self._answer_general(question, context_key, on_queue, started, re.sub(r'\s+', '',question))
-            price = req.get('price') if req.get('price') is not None else trade_review.close_on_date(req['code'],req['buy_date'])
+            adjustment_note = ''
+            if req.get('price') is not None:
+                price, adjustment_note = trade_review.adjust_entry_price(req['code'], req['buy_date'], req['price'])
+            else:
+                price = trade_review.close_on_date(req['code'],req['buy_date'])
         except tools.ToolDataError as exc:
             return AnswerResult(text=str(exc),route='clarify',gemini_calls=0,elapsed=time.perf_counter()-started,as_text=True)
         estimated = req.get('price') is None
         note = (f"未提供成交價，以{req['buy_date']:%Y/%m/%d}收盤價{price:g}元估算成本，並非實際成交價。" if estimated else '')
-        effective = question+f"（成本{price:g}元{'為買進日收盤估算，並非實際成交價' if estimated else '為使用者提供'}；本題只分析目前行情。）"
+        note = ' '.join(x for x in [note,adjustment_note] if x)
+        effective = question+f"（成本{price:g}元{'為買進日收盤估算，並非實際成交價' if estimated else '為使用者提供'}；{adjustment_note}本題只分析目前行情。）"
         result = self._answer_general(effective,context_key,on_queue,started,re.sub(r'\s+', '',effective))
         if result.route not in CARD_ROUTES and result.route != 'answer_cache':
             return result
@@ -4896,7 +4901,7 @@ class AceQueryEngine:
         # 快取鍵值用「補完股票之後」的問題，避免 A 使用者的「那它的壓力在哪」拿到 B 使用者的答案；籌碼類型分開快取。
         # 族群追問（「那哪檔最強」）要帶族群名稱與模式，不同族群的同一句追問不能共用答案
         sector = parsed.sector or {}
-        key = "|".join(['解讀整合v2',compact, ",".join(c for c, _ in parsed.stocks), str(parsed.cost_price or ""), ",".join(parsed.branches),
+        key = "|".join(['解讀還原v3',compact, ",".join(c for c, _ in parsed.stocks), str(parsed.cost_price or ""), ",".join(parsed.branches),
                         "chip=" + parsed.chip,
                         "sector=" + str(sector.get("name") or sector.get("industry") or "") + ":" + str(sector.get("mode") or "")])
         key = self._access_cache_key(key)

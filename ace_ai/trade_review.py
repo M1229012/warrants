@@ -221,6 +221,16 @@ def close_on_date(code: str, day: date) -> float:
     return value
 
 
+def adjust_entry_price(code, day, price):
+    """已提供的歷史成交價換成圖表的最新股數基準，保留來源說明。"""
+    import price_adjustment
+    frame=tools.closed_frame(tools._load_price_bundle(code))
+    factor=price_adjustment.factor_on_date(frame,day)
+    value=float(price)*factor
+    note=(f'使用者提供{day:%Y/%m/%d}成交價{price:g}元，已依股數變動換算為{value:g}元，與還原K線使用同一基準。' if factor != 1 else '')
+    return value,note
+
+
 def _kd_cross_days_ago(part: pd.DataFrame, lookback: int = 3, down: bool = False) -> Optional[int]:
     """最近幾根內 K 穿過 D：down=False 由下往上（黃金交叉）、True 由上往下（死亡交叉）；
     0＝當天、1＝前一天…；沒有交叉回 None。"""
@@ -971,15 +981,18 @@ def build_review(req: Dict[str, Any], mapper=None) -> Dict[str, Any]:
         raise tools.ToolDataError('賣出日尚無可用行情，請提供實際賣出價或等行情更新後再試。')
     if sell_idx is not None and sell_idx < live_idx:
         raise tools.ToolDataError('賣出日早於買進日，請確認日期。')
-    buy_price = float(req.get("price") or df["Close"].iloc[idx])
+    import price_adjustment
+    buy_factor = price_adjustment.factor_on_date(df, req['buy_date'])
+    buy_price = float(req['price']) * buy_factor if req.get('price') is not None else float(df['Close'].iloc[idx])
     sell_price = None
     if sell_idx is not None:
         close_idx = _index_on_date(df, req['sell_date'])
         if req.get('sell_price') is None and close_idx is None:
             raise tools.ToolDataError('賣出日尚無收盤價，請補實際賣出價，或等收盤資料更新後再覆盤。')
-        sell_price = float(req.get("sell_price") or df["Close"].iloc[close_idx])
+        sell_price = float(req['sell_price']) * price_adjustment.factor_on_date(df, req['sell_date']) if req.get('sell_price') is not None else float(df['Close'].iloc[close_idx])
     snap = snapshot_at(df, idx)
     result = after_buy(live, live_idx, buy_price, sell_idx, sell_price)
+    result['adjustment_note'] = price_adjustment.basis_note(df)
     intraday = bundle.get("intraday") or {}
     result["price_basis"] = (f"盤中暫定（{intraday.get('time', '')}）" if intraday.get("is_live") and sell_idx is None
                              else "收盤")
@@ -1301,7 +1314,7 @@ def review_panel(payload: Dict[str, Any], review: Dict[str, Any], source: str) -
         "summary": review_summary(payload),
         "highlight_icons": highlight_icons(payload),
         "checks": checks,
-        "cost_basis": payload['after_buy'].get('drawdown_basis',''),
+        "cost_basis": '；'.join(x for x in [payload['after_buy'].get('adjustment_note',''),payload['after_buy'].get('drawdown_basis','')] if x),
     }}
 
 

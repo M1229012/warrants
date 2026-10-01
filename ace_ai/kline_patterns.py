@@ -75,7 +75,13 @@ def adjust(df: pd.DataFrame, events: Optional[Dict[str, Any]]) -> Tuple[pd.DataF
         if day > last or day <= first:
             continue
         kind = ev.get("kind", "")
-        if kind == "息" and ev.get("factor"):
+        applied = {e['date']: e for e in out.attrs.get('share_adjustments') or []}
+        if ev['date'] in applied:
+            flags['F1'] = True
+            if not applied[ev['date']].get('volume_factor'):
+                flags['F3_dates'].append(day)
+            continue
+        if kind in {"息", "除息"} and ev.get("factor"):
             mask = out.index < day
             out.loc[mask, ["Open", "High", "Low", "Close"]] *= float(ev["factor"])
             flags["F1"] = True

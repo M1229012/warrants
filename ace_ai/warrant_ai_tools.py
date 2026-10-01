@@ -1780,7 +1780,9 @@ def price_source_note(bundle: Dict[str, Any]) -> str:
     if gaps:
         shown = "、".join(gaps) if len(gaps) <= 3 else f"近期有 {len(gaps)} 個交易日"
         note += f"；{shown} 該股無交易資料（可能暫停交易、休市或無成交），均線以實際交易日計算"
-    return note
+    import price_adjustment
+    basis = price_adjustment.basis_note(closed_frame(bundle))
+    return note + ("；" + basis if basis else "")
 
 
 def _price_source_base(bundle: Dict[str, Any]) -> str:
@@ -2026,6 +2028,7 @@ def _load_index_bundle(code: str) -> Dict[str, Any]:
             return {"df": closed, "closed_df": closed, "market": "index", "intraday": {},
                     "daily_source": "指數日K收盤資料"}
         df = kf.calculate_indicators(merged)
+        df.attrs.update(merged.attrs)
         df["Close_prev"] = df["Close"].shift(1)
         # 指數盤中沒有量，均量沿用前一日，不讓今天這根把均量拉成 0。
         for column in ("MV5", "MV20"):
@@ -2338,19 +2341,30 @@ def _load_price_bundle(stock_code: str) -> Dict[str, Any]:
                 _ACCEPTED_GAPS[code] = (today, tuple(gaps))
                 shown = "、".join(gaps) if len(gaps) <= 3 else f"{gaps[0]} 等 {len(gaps)} 天"
                 print(f"⚠️ {code} 日K {shown} 已確認為休市、該股無成交或暫停交易，照常分析", flush=True)
+        # 底庫與日K快取保持原始價，只在分析入口還原一次。
+        import price_adjustment
+        raw_closed = daily_df.copy()
+        actions = get_corporate_actions(code)
+        try:
+            daily_df = price_adjustment.adjust_shares(daily_df, actions, as_of=merged.index[-1])
+            merged = price_adjustment.adjust_shares(merged, actions)
+        except ValueError as exc:
+            raise ToolDataError(str(exc)) from exc
         closed = kf.calculate_indicators(daily_df)
+        closed.attrs.update(daily_df.attrs)
         closed["Close_prev"] = closed["Close"].shift(1)
         if not intraday:
             return {"df": closed, "closed_df": closed, "market": market, "intraday": {}, "daily_source": daily_source,
-                    "data_gaps": list(gaps)}
+                    "data_gaps": list(gaps), "raw_closed_df": raw_closed, "corporate_actions": actions}
         df = kf.calculate_indicators(merged)
+        df.attrs.update(merged.attrs)
         df["Close_prev"] = df["Close"].shift(1)
         # 均量只用已收盤的日子：盤中累計量不算進 MV5／MV20（早盤會把均量拉低、量比失真）。
         for column in ("MV5", "MV20"):
             if column in df.columns and len(df) > 1:
                 df.iloc[-1, df.columns.get_loc(column)] = df[column].iloc[-2]
         return {"df": df, "closed_df": closed, "market": market, "intraday": intraday, "daily_source": daily_source,
-                "data_gaps": list(gaps)}
+                "data_gaps": list(gaps), "raw_closed_df": raw_closed, "corporate_actions": actions}
 
     ttl = TTL_INTRADAY_SECONDS if INTRADAY_ENABLE and intraday_session_now() else TTL_PRICE_SECONDS
     # 背景掃描的結果不含盤中 K 棒，另存一個 key，免得使用者接著問同一檔時
@@ -2697,7 +2711,7 @@ def _market_corp_rows(kf, dataset: str, start: str, today: str) -> List[Dict[str
 
 
 def get_corporate_actions(code: str) -> Dict[str, Any]:
-    """公司行動事件（一天查一次）：除權息（純現金「息」可還原）、分割、面額變更；減資資料源權限不足，列為未涵蓋。
+    """公司行動事件（一天查一次）：核對除權息、分割、反分割及面額變更參考價；減資未涵蓋。
     查詢失敗回 status=failed（型態模組會標「公司行動資料未核實」，不當成沒有事件）。"""
     today = taipei_now().strftime("%Y-%m-%d")
     cached = _CORP_CACHE.get(code)
@@ -2705,28 +2719,30 @@ def get_corporate_actions(code: str) -> Dict[str, Any]:
         return cached[1]
     kf = core()
     start = (taipei_now() - timedelta(days=400)).strftime("%Y-%m-%d")
+    import price_adjustment
     items: List[Dict[str, Any]] = []
+    coverage = ["減資資料未涵蓋（資料源權限不足）"]
+    successes = 0
     try:
         div = kf._finmind_get_data("TaiwanStockDividendResult", data_id=code, start_date=start, end_date=today, allow_empty=True)
         for r in (div.to_dict("records") if div is not None else []):
             kind = str(r.get("stock_or_cache_dividend") or "")
-            before, after = float(r.get("before_price") or 0), float(r.get("after_price") or 0)
-            items.append({"date": str(r.get("date"))[:10], "kind": kind,
-                          "factor": after / before if kind == "息" and before > 0 and 0 < after < before else None})
-        coverage = ["減資資料未涵蓋（資料源權限不足）"]
-        # 分割、面額變更：資料集不接受 data_id → 一天抓一次全市場再篩；抓不到只寫 Log，不影響除權息還原
-        for dataset, kind in (("TaiwanStockSplitPrice", "分割"), ("TaiwanStockParValueChange", "面額變更")):
-            try:
-                rows = _market_corp_rows(kf, dataset, start, today)
-                items += [{"date": str(r.get("date"))[:10], "kind": kind, "factor": None}
-                          for r in rows if str(r.get("stock_id")) == code]
-            except Exception as exc:
-                coverage.append(f"{kind}資料暫時無法取得（{type(exc).__name__}）")
-        result = {"status": "ok", "items": items, "coverage": coverage}
-        record_api_event("FinMindData", status=200)
+            items.append(price_adjustment.event_from_row(r, kind))
+        successes += 1
     except Exception as exc:
+        coverage.append(f"除權息資料暫時無法取得（{type(exc).__name__}）")
         print(f"⚠️ 公司行動資料查詢失敗｜{code}｜{err_text(exc)}", flush=True)
-        result = {"status": "failed", "items": []}
+    # 獨立查詢：除權息失敗不會阻斷分割／面額變更的核實資料。
+    for dataset, kind in (("TaiwanStockSplitPrice", "分割"), ("TaiwanStockParValueChange", "面額變更")):
+        try:
+            rows = _market_corp_rows(kf, dataset, start, today)
+            items += [price_adjustment.event_from_row(r, str(r.get('type') or kind))
+                      for r in rows if str(r.get("stock_id")) == code]
+            successes += 1
+        except Exception as exc:
+            coverage.append(f"{kind}資料暫時無法取得（{type(exc).__name__}）")
+    result = {"status": "ok" if successes else "failed", "items": items, "coverage": coverage}
+    record_api_event("FinMindData", status=200 if successes else 500)
     _CORP_CACHE[code] = (today, result)
     return result
 
@@ -5877,6 +5893,7 @@ def get_chart_panel(stock_code: str, branch_name: str = "", with_marks: bool = T
             marks = {"mode": str(mark_mode).lower(), "events": []}
     return {"stock_code": code, "stock_name": name, "bars": bars,
             "volume_profile": profile, "marks": marks, "intraday": bundle.get("intraday") or {},
+            "price_basis_note": price_source_note(bundle),
             "bollinger": analyze_bollinger(closed_frame(bundle)),
             "change_pct": float((df["Close"].iloc[-1] / previous - 1) * 100) if previous else None}
 

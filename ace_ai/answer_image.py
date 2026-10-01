@@ -1235,7 +1235,8 @@ def draw_chart(draw, y: int, panel: dict) -> None:
     # 成交量標題列：今日量＋均量線圖例（單位張，Volume 為股數）。
     legend = '價量分布｜紅：最大量區  /  橘：第二大量區  /  藍：其他價位' if profile_rectangles else '價量分布暫無有效資料'
     text_at(draw, (left, bottom + 40), legend + '  /  虛線：布林軌道', 17, MUTED)
-    state = '布林｜' + '；'.join((panel.get('bollinger') or {}).get('signals', ['資料不足'])[:3])
+    basis = panel.get('price_basis_note', '')
+    state = ('還原股價｜' if '已依核實參考價還原' in basis else '') + '布林｜' + '；'.join((panel.get('bollinger') or {}).get('signals', ['資料不足'])[:3])
     state, state_size = fit(state, 20, CONTENT - 80, False, 16)
     text_at(draw, (left, bottom + 66), state, state_size, INK)
     bottom += CAPTION_H
