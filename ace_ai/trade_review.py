@@ -936,6 +936,7 @@ def _current_facts(code: str, cost: float) -> Dict[str, Any]:
         "bollinger_signals": (tech.get("bollinger") or {}).get("signals"),
         "position_vs_two_zones": vp.get("position_vs_two_zones"),
         # 目前觀察只拿均線／量區當防守位；布林上軌是強勢時的「壓力／通道」，拿來當防守位不自然
+        "nearest_resistances": (levels.get("resistances") or [])[:2],
         "nearest_supports": [lv for lv in levels.get("supports") or []
                              if "上軌" not in str(lv.get("label", ""))][:2],
     }
@@ -1093,10 +1094,14 @@ HIGHLIGHT_FACETS = ("理由", "過程", "學習")     # 本次記住的三條固
 def ai_schema(mode: str) -> Dict[str, Any]:
     last = "lesson" if mode == "closed" else "watch"
     return {"type": "object",
-            "properties": {"headline": {"type": "string"}, "body": {"type": "string"},
+            "properties": {"response_focus": {"type": "string", "enum": ["holding", "improve", "reason", "general"],
+                                              "description": "依完整原問句判斷要回答持倉後續、防守與風險，交易改善，理由合理性，或一般回顧。日期只是持倉背景，不代表要檢討買進理由。"},
+                           "focus_answer": {"type": "string", "description": "直接回答這次真正的問題，不固定套理由核對結論。"},
+                           "improvements": {"type": "array", "items": {"type": "string"}, "description": "holding時寫1至2條具體觀察條件及其意義；改善題寫改善方法，無相關內容可留空。"},
+                           "headline": {"type": "string"}, "body": {"type": "string"},
                            "highlights": {"type": "array", "items": {"type": "string"}},
                            last: {"type": "string"}},
-            "required": ["headline", "body", "highlights", last]}
+            "required": ["response_focus", "focus_answer", "improvements", "headline", "body", "highlights", last]}
 
 
 REVIEW_PROMPT = """幫投資人把這筆交易寫成「自己的覆盤筆記」。review_data 是程式整理好的事實，你只負責讀懂、挑重點、用自然的話寫出來。
@@ -1151,7 +1156,12 @@ def _slim(value: Any) -> Any:
 
 
 def build_prompt(payload: Dict[str, Any]) -> str:
-    return REVIEW_PROMPT + '\n先直接回答 question 中的問題：改善題指出原理由的侷限與可執行的記錄方法，理由合理性題區分已核實、無法核實與不成立。❓無法核實不等於❌理由錯誤，也不代表使用者沒有客觀依據。未提供風險規劃只能說未提供，不可推斷當時沒做。不要只重述成立、回撤與目前支撐。\n' + '\n若未提供進場或出場理由，不可自行補造動機；依可核實走勢回顧，並說明未提供理由。\n' + json.dumps(_slim(payload), ensure_ascii=False, default=str)
+    semantic = """回答目的由你依完整question語意判斷，優先於前面的固定覆盤欄位風格及review_focus提示，不依題庫或關鍵字決定內容。
+response_focus：holding＝詢問目前持倉的後續、風險或防守；improve＝檢討交易可改善之處；reason＝核對買進理由；general＝一般回顧。持有日期只是背景，不能因此強迫理由檢討。
+focus_answer直接接住真正的問題。holding時body與highlights圍繞目前結構、風險與後續條件，不套理由／過程／學習三段；improvements寫1～2個可觀察條件與意義。防守位依current.nearest_supports，壓力依nearest_resistances；說明守住代表什麼、跌破時哪些依據變弱，不代替人決定買賣。不把布林上軌當防守位、不自行計算停損比例。資料不足的個別項目簡短略過，不讓缺買進理由阻止目前持倉分析。
+未提供理由、部位或計畫，只能說未提供，不能說當時未設定、沒有規劃、憑感覺或推測動機；沒有理由核對項目時不必反覆強調。買進價來源為買進日收盤价就明確稱成本估算，不能當實際成交價。不能用現在走勢證明當時買對。
+改善題與理由題也要依原問句現寫回應；❓未核實不等於❌錯誤。行情與歷史事實限制仍有效，全部數字照資料，不杜撰，不給個人買賣指令。"""
+    return REVIEW_PROMPT + '\n'+semantic+'\n'+json.dumps(_slim(payload),ensure_ascii=False,default=str)
 
 
 def review_focus(question):
@@ -1191,6 +1201,8 @@ def question_response(payload):
 
 
 def apply_question_response(payload,review):
+    if review.get('response_focus') in ('holding','improve','reason','general') and review.get('focus_answer'):
+        return review
     answer,steps=question_response(payload)
     return dict(review,focus_answer=answer,improvements=steps) if answer else review
 
@@ -1258,6 +1270,13 @@ def sanitize_review(data: Any, payload: Dict[str, Any], prune) -> Tuple[Dict[str
     def clean(text: Any, limit: int) -> str:
         pruned, removed = prune(str(text or ""), payload)
         pruned, hindsight = strip_hindsight(pruned)
+        if not payload.get('trade',{}).get('entry_reason_raw'):
+            kept=[]
+            for sentence in re.findall(r"[^。！？\n]+[。！？]?",pruned):
+                if re.search(r'(?:未設定|未設立|沒有設定|沒設定|未規劃|沒有規劃|未制定|沒有明確|未設明確|未設定明確|憑感覺|僅憑|只是憑|僅針對)',sentence) and re.search(r'理由|依據|計畫|規劃|布局|判斷|進場',sentence):
+                    hindsight.append(sentence)
+                else:kept.append(sentence)
+            pruned=''.join(kept)
         if any(c.get('status')=='❓' for c in payload.get('reason_checks') or []):
             kept=[]
             for sentence in re.findall(r"[^。！？\n]+[。！？]?",pruned):
@@ -1279,6 +1298,13 @@ def sanitize_review(data: Any, payload: Dict[str, Any], prune) -> Tuple[Dict[str
     raw += [""] * (3 - len(raw))
     review["highlights"] = [clean(h, HIGHLIGHT_MAX) or _clip(fb, HIGHLIGHT_MAX)
                             for h, fb in zip(raw, fallback["highlights"])]
+    focus=data.get('response_focus')
+    if focus in ('holding','improve','reason','general'):
+        answer=clean(data.get('focus_answer'),150)
+        if answer:
+            review['response_focus']=focus
+            review['focus_answer']=answer
+            review['improvements']=[t for t in (clean(x,200) for x in (data.get('improvements') or [])[:3]) if t]
     return apply_question_response(payload,review), removed_all
 
 
@@ -1352,6 +1378,11 @@ def review_panel(payload: Dict[str, Any], review: Dict[str, Any], source: str) -
         "title": title(payload), "headline": review["headline"], "body": review["body"],
         "highlights": review["highlights"],
         "focus_answer": review.get("focus_answer", ""), "improvements": review.get("improvements") or [],
+        "focus_label": "後續怎麼觀察？" if review.get('response_focus')=='holding' else '',
+        "right_label": "後續觀察條件" if review.get('response_focus')=='holding' else '',
+        "context_text": ('目前結構：'+str((payload.get('current') or {}).get('pattern_label') or '尚無可核實結構')+
+                         '\n成本來源：'+str(payload['trade'].get('buy_price_source') or '未提供'))
+                        if review.get('response_focus')=='holding' else '', 
         "last_label": "下次" if closed else "目前觀察",
         "last_text": review.get("lesson" if closed else "watch", ""),
         "source": source,

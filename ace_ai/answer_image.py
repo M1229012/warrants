@@ -2839,7 +2839,7 @@ def review_card(draw, y: float, data: dict, dry: bool) -> int:
     cy+=18
     focus=data.get('focus_answer') or data.get('headline') or ''
     if focus:
-        heading='這筆操作，哪裡可以更好？' if data.get('improvements') else '這筆交易的重點'
+        heading=data.get('focus_label') or ('這筆操作，哪裡可以更好？' if data.get('improvements') else '這筆交易的重點')
         h=_para(None,px+20,cy+12,heading,20,TRADE_COLOR,width-40,True)
         h+=_para(None,px+20,cy+12+h,focus,24,INK,width-40,True)+24
         if target is not None:
@@ -2850,14 +2850,14 @@ def review_card(draw, y: float, data: dict, dry: bool) -> int:
     col=(width-64)/2;right=px+col+64;top=cy
     def cp(x,yy,text,size=22,color=INK,bold=False,indent=0):
         return yy+_para(target,x+indent,yy,str(text or ''),size,color,col-indent,bold)
-    left=cp(px,top,'理由核對',25,bold=True)+12
-    left=cp(px,left,'你的理由：'+(data.get('reason_raw') or '未提供'),21,MUTED)+14
-    for check in data.get('checks') or []:
+    left=cp(px,top,'持倉背景' if data.get('context_text') else '理由核對',25,bold=True)+12
+    left=cp(px,left,data.get('context_text') or ('你的理由：'+(data.get('reason_raw') or '未提供')),21,MUTED)+14
+    for check in ([] if data.get('context_text') else data.get('checks') or []):
         if target is not None:_status_icon(target,px+10,left+15,str(check.get('status','❓')),r=9)
         left=cp(px,left,check.get('claim',''),22,bold=True,indent=30)
         left=cp(px,left,'｜'.join(str(check.get(k) or '') for k in ('status_text','evidence')).strip('｜'),20,MUTED,indent=30)+12
     items=data.get('improvements') or []
-    rr=cp(right,top,'下次可以補強' if items else '交易重點',25,bold=True)+14
+    rr=cp(right,top,data.get('right_label') or ('下次可以補強' if items else '交易重點'),25,bold=True)+14
     for n,item in enumerate(items or data.get('highlights') or [],1):
         if target is not None:text_at(target,(right,rr),f'{n:02d}',21,TRADE_COLOR,True)
         rr=cp(right,rr,item,22,indent=42)+14
