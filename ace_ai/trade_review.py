@@ -148,7 +148,7 @@ def parse_request(text: str) -> Dict[str, Any]:
         reason = re.sub(r'^(?:(?:今天|今日|昨天|昨日|前天|買在|買進|買入|賣在|賣出|賣掉|買|賣)[\s，,。]*)+','',reason).strip(' ，,。')
     reason = review_language.clean_reason(reason)
     sell_reason = review_language.clean_reason(sell_reason)
-    return {"code": code, "name": name, "buy_date": natural['buy_date'], "sell_date": natural['sell_date'],
+    return {"question": raw, "review_focus": review_focus(raw), "code": code, "name": name, "buy_date": natural['buy_date'], "sell_date": natural['sell_date'],
             "reason": reason, "sell_reason": sell_reason, "price": buy_price, "sell_price": sell_price,
             "lots": float(lots_hit.group(1)) if lots_hit else None,
             "need_warrant": bool(_WARRANT_RE.search(reason)), "need_inst": bool(_INST_RE.search(reason)),
@@ -458,7 +458,7 @@ def _segment(text: str) -> List[str]:
 def _split_claims(reason: str) -> List[str]:
     """理由拆成一條一條：先依標點／連接詞切，每段再去掉空白後依錨點自動斷詞。
     「KD 黃金交叉」（空白）仍是一條；「KD向上 突破布林」「KD黃金交叉外資買超」會拆成兩條。"""
-    parts = re.split(r"[，,、；;。\n/／|｜]|以及|並且|而且|加上|還有", str(reason or ""))
+    parts = re.split(r"[，,、；;。\n/／|｜]|以及|並且|而且|加上|還有", review_language.clean_reason(str(reason or "")))
     claims: List[str] = []
     for part in parts:
         compact = re.sub(r"\s+", "", part)
@@ -585,6 +585,8 @@ def check_claim(claim: str, snap: Dict[str, Any], inst: Optional[Dict[str, Any]]
                 warrant_events: Optional[Dict[str, Any]]) -> Dict[str, str]:
     close = snap.get("close")
     day = str(snap.get("date") or "")[5:]
+    if re.fullmatch(r'(?:覺得|感覺|預期|好像|以為|認為|看起來)?(?:會|要|快要|快|準備)?突破(?:了)?',claim):
+        return _result(claim, '❓', '未說明要突破哪個價位或區間，無法核對；不代表當時沒有依據')
     if re.search(_NOT_AUTO_RE, claim):                    # 「營收創新高」「W底」不能當成價格新高／均線來判
         return _result(claim, "❓", "屬於型態／基本面／消息面理由，系統不自動核對")
     concept = _check_concepts(claim, snap, day)          # 均線方向／糾結／交叉、布林壓縮、量縮、K 棒、MACD…
@@ -1053,6 +1055,7 @@ def build_review(req: Dict[str, Any], mapper=None) -> Dict[str, Any]:
             sell_checks = [check_claim(c, sell_snap, sell_inst, None) for c in _split_claims(req["sell_reason"])]
             sell_checks = remap_unmatched(sell_checks, mapper, sell_snap, sell_inst, None)
     payload = {
+        "question": req.get("question", ""), "review_focus": req.get("review_focus", "general"),
         "mode": "closed" if closed else "holding",
         "trade_id": f"{code}-{buy_day:%Y%m%d}-{int(time.time())}-{uuid.uuid4().hex[:6]}",   # 同秒建立也不撞號
         "stock": {"code": code, "name": req.get("name") or panel.get("stock_name", "")},
@@ -1148,7 +1151,48 @@ def _slim(value: Any) -> Any:
 
 
 def build_prompt(payload: Dict[str, Any]) -> str:
-    return REVIEW_PROMPT + '\n若未提供進場或出場理由，不可自行補造動機；依可核實走勢回顧，並說明未提供理由。\n' + json.dumps(_slim(payload), ensure_ascii=False, default=str)
+    return REVIEW_PROMPT + '\n先直接回答 question 中的問題：改善題指出原理由的侷限與可執行的記錄方法，理由合理性題區分已核實、無法核實與不成立。❓無法核實不等於❌理由錯誤，也不代表使用者沒有客觀依據。未提供風險規劃只能說未提供，不可推斷當時沒做。不要只重述成立、回撤與目前支撐。\n' + '\n若未提供進場或出場理由，不可自行補造動機；依可核實走勢回顧，並說明未提供理由。\n' + json.dumps(_slim(payload), ensure_ascii=False, default=str)
+
+
+def review_focus(question):
+    if re.search(r'改善|進步|更好|優缺點|哪裡.*(?:問題|錯)|檢討',str(question)):
+        return 'improve'
+    if re.search(r'合理|有沒有道理|對不對|理由.*(?:如何|怎麼看)|這個理由',str(question)):
+        return 'reason'
+    return 'general'
+
+
+def question_response(payload):
+    focus=payload.get('review_focus') or review_focus(payload.get('question',''))
+    if focus=='general':
+        return '',[]
+    checks=payload.get('reason_checks') or []
+    raw=payload.get('trade',{}).get('entry_reason_raw','')
+    unknown=[c for c in checks if c['status']=='❓']
+    bad=[c for c in checks if c['status'] in ('❌','⚠️')]
+    if not checks:
+        answer='未提供進場依據，目前無法評估理由是否合理；可以先把當時的判斷條件補齊。'
+    elif unknown:
+        answer='目前只能說這個理由尚無法核實，不能因此判定不合理，也不能推論你當時沒有依據。'
+    elif bad:
+        answer='進場理由與當日資料有不一致之處，改善重點是先釐清訊號定義與核對時點。'
+    else:
+        answer='進場條件有對到；可以改善的是把單一訊號補成完整的進場與風險紀錄，理由成立不等於整筆操作沒有改善空間。'
+    if re.search(r'突破',raw) and unknown:
+        steps=['把「要突破」說清楚：是哪個前高、整理區間或壓力位，以及當時是否已收盤越過。',
+               '把預期突破和已確認突破分開記錄，再補上當時觀察的量能；不要用後來上漲替當初理由背書。']
+    elif re.search(r'月線|MA20|20日',raw,re.I):
+        steps=['把「站上月線」定義清楚：觀察盤中穿越還是收盤站上，以及量能是否配合，分別記錄。',
+               '補上原先判斷失效的條件與部位規劃；這次未提供，不能推論你當時沒有做。']
+    else:
+        steps=['把進場依據寫成能核對的條件，保留當時看到的資料與判斷時點。',
+               '補上原先的風險條件與實際執行情況，再比較是否按照計畫；不要只用最後盈虧評分。']
+    return answer,steps
+
+
+def apply_question_response(payload,review):
+    answer,steps=question_response(payload)
+    return dict(review,focus_answer=answer,improvements=steps) if answer else review
 
 
 def _clip(text: str, limit: int) -> str:
@@ -1200,7 +1244,7 @@ def fallback_review(payload: Dict[str, Any]) -> Dict[str, Any]:
         review["watch"] = (f"能否守住{support['label']}（{support['price']:g}）" if support and support.get("price")
                            else f"目前{current.get('pattern_label') or '結構'}，觀察突破後結構是否能維持"
                            if current else "目前結構資料暫時取不到")
-    return review
+    return apply_question_response(payload,review)
 
 
 def sanitize_review(data: Any, payload: Dict[str, Any], prune) -> Tuple[Dict[str, Any], List[str]]:
@@ -1214,6 +1258,14 @@ def sanitize_review(data: Any, payload: Dict[str, Any], prune) -> Tuple[Dict[str
     def clean(text: Any, limit: int) -> str:
         pruned, removed = prune(str(text or ""), payload)
         pruned, hindsight = strip_hindsight(pruned)
+        if any(c.get('status')=='❓' for c in payload.get('reason_checks') or []):
+            kept=[]
+            for sentence in re.findall(r"[^。！？\n]+[。！？]?",pruned):
+                if re.search(r'(?:缺乏|沒有|缺少|僅憑|僅是|只是|憑感覺|主觀預期|理由不合理|理由不成立|不合理的理由)',sentence) and re.search(r'依據|支撐|感覺|判斷|主觀|理由',sentence):
+                    hindsight.append(sentence)
+                else:
+                    kept.append(sentence)
+            pruned=''.join(kept)
         removed_all.extend(removed + hindsight)
         return _clip(pruned, limit)
 
@@ -1227,7 +1279,7 @@ def sanitize_review(data: Any, payload: Dict[str, Any], prune) -> Tuple[Dict[str
     raw += [""] * (3 - len(raw))
     review["highlights"] = [clean(h, HIGHLIGHT_MAX) or _clip(fb, HIGHLIGHT_MAX)
                             for h, fb in zip(raw, fallback["highlights"])]
-    return review, removed_all
+    return apply_question_response(payload,review), removed_all
 
 
 def review_text(payload: Dict[str, Any], review: Dict[str, Any]) -> str:
@@ -1236,6 +1288,9 @@ def review_text(payload: Dict[str, Any], review: Dict[str, Any]) -> str:
     summary = "｜".join(text for text, _ in review_summary(payload))
     lines = [summary, "", f"我的理由｜{payload['trade'].get('entry_reason_raw', '')}"]
     lines += [f"{c['status']} {c['claim']}｜{c['evidence']}" for c in payload["reason_checks"]]
+    if review.get('focus_answer'):
+        lines += ['', '針對你的問題', review['focus_answer'], '可以改善的地方']
+        lines += ['• '+x for x in review.get('improvements') or []]
     lines += ["", review["headline"], review["body"], "", "交易心得"]
     lines += [f"• {h}" for h in review["highlights"]]
     lines += ["", f"{last_label}｜{review.get(last_key, '')}"]
@@ -1296,6 +1351,7 @@ def review_panel(payload: Dict[str, Any], review: Dict[str, Any], source: str) -
     return {"review": {
         "title": title(payload), "headline": review["headline"], "body": review["body"],
         "highlights": review["highlights"],
+        "focus_answer": review.get("focus_answer", ""), "improvements": review.get("improvements") or [],
         "last_label": "下次" if closed else "目前觀察",
         "last_text": review.get("lesson" if closed else "watch", ""),
         "source": source,

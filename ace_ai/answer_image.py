@@ -2769,6 +2769,21 @@ def _status_icon(draw, cx: float, cy: float, status: str, r: int = 12) -> None:
         draw.text((cx, cy), '?', font=font(16, True), fill='white', anchor='mm')
 
 
+def review_question_block(draw, px, cy, width, data):
+    if not data.get('focus_answer'):
+        return 0
+    start=cy
+    if draw is not None:text_at(draw,(px,cy),'針對你的問題',22,TRADE_COLOR,True)
+    cy+=36
+    cy+=_para(draw,px,cy,data['focus_answer'],24,INK,width,True)+12
+    if draw is not None:text_at(draw,(px,cy),'可以改善的地方',22,INK,True)
+    cy+=34
+    for item in data.get('improvements') or []:
+        if draw is not None:text_at(draw,(px,cy),'•',23,TRADE_COLOR,True)
+        cy+=_para(draw,px+24,cy,item,22,INK,width-24)+10
+    return cy-start+14
+
+
 def review_card(draw, y: float, data: dict, dry: bool) -> int:
     """交易覆盤卡（定案版，由上往下單欄）：
     標題 → 摘要 → 理由核對 → AI 覆盤 → 交易心得 → 目前觀察；完整文字換行並計算高度。"""
@@ -2791,6 +2806,7 @@ def review_card(draw, y: float, data: dict, dry: bool) -> int:
     h += 40 if summary else 0                                # 一行摘要
     h += 22 + 8 + max(1, len(reason_lines)) * 32 + 6          # 我的理由（完整換行）
     h += sum(len(cl) * 30 + len(ev) * 28 + 10 for _, cl, ev in checks) + 8   # 逐條核對（完整換行）
+    h += review_question_block(None,px,0,width,data)
     h += 18 + 40 + len(headline) * 34 + len(body) * 33 + 26  # AI 覆盤
     cost_h = _para(None,0,0,data.get('cost_basis',''),20,MUTED,width)+12 if data.get('cost_basis') else 0
     h += cost_h
@@ -2838,6 +2854,7 @@ def review_card(draw, y: float, data: dict, dry: bool) -> int:
         cy += len(claim_lines) * 30 + len(evidence_lines) * 28 + 10
     cy += 8
 
+    cy += review_question_block(draw,px,cy,width,data)
     cy += 18                                                  # AI 覆盤
     text_at(draw, (px, cy), 'AI 覆盤', 22, INK, True)
     cy += 40
