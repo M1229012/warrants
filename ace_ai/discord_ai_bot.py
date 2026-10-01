@@ -2551,6 +2551,8 @@ def build_final_prompt(payload: Dict[str, Any]) -> str:
         if review_language.intent(payload['question']) == 'review':
             sections.append('本題是資料不完整的交易回顧，不是一般型態問答：answer先說目前能回顧哪些交易依據、哪些無法核實；why圍繞使用者進場理由與交易規劃，提出可改善的記錄方法，未提供的理由或計畫不可捏造。目前行情只補充成本與風險，不能當成買進當天證據。scenarios可省略，不要硬湊兩種行情；不提供個人買賣指令。')
         sections.append('必須接住使用者原問句，不能每題只重複多頭排列、支撐壓力。玩笑或諧音直接在answer第一句順著原梗回應15～25字，再接客觀結論；例如問豁達就回應豁達，問套房就回應套房，不使用固定笑話模板。焦慮或虧損不嘲笑；沒有玩笑不硬加幽默。問能否持有時，先回答目前結構是否轉弱及風險有無升高，再說原因；成本估算必須稱為估算，不可說成實際成交價。')
+    if stock_banter.holding_question(payload['question']):
+        sections.append('使用者在問自己的持倉怎麼辦：直接回答這筆持倉目前的風險與下一步需要核對的條件，不只寫結構偏強弱。不重複堆砌成本數字。若虧損，說明原先理由是否仍有支持、哪些條件使風險升高；若獲利，說明回吐風險與結構是否維持。scenarios用「依據仍維持／依據轉弱」呈現具體可核對的條件，不把兩邊都叫轉強條件。未提供風險承受度、期限或部位，最多簡短指出一項需要補充，不自行替人訂停損比例或買賣決定。股票分割前後成本必須同一基準，未提供買進日無法確認成本基準時如實說明，不能擅自再除一次。')
     if stock_banter.humor_reply(payload['question']):
         sections.append('本題有明確玩笑：answer必須先用一句短句接住原梗，再給技術結論；此要求優先於一般格式的先寫結構。幽默不等於看多，禁止用梗保證漲跌。')
     payload_json = json.dumps(payload.get("tool_results") or {}, ensure_ascii=False, separators=(",", ":"), default=tools.json_safe)
@@ -4903,7 +4905,7 @@ class AceQueryEngine:
         # 快取鍵值用「補完股票之後」的問題，避免 A 使用者的「那它的壓力在哪」拿到 B 使用者的答案；籌碼類型分開快取。
         # 族群追問（「那哪檔最強」）要帶族群名稱與模式，不同族群的同一句追問不能共用答案
         sector = parsed.sector or {}
-        key = "|".join(['白話交易檢討v5',compact, ",".join(c for c, _ in parsed.stocks), str(parsed.cost_price or ""), ",".join(parsed.branches),
+        key = "|".join(['簡潔覆盤持倉回應v6',compact, ",".join(c for c, _ in parsed.stocks), str(parsed.cost_price or ""), ",".join(parsed.branches),
                         "chip=" + parsed.chip,
                         "sector=" + str(sector.get("name") or sector.get("industry") or "") + ":" + str(sector.get("mode") or "")])
         key = self._access_cache_key(key)
@@ -6506,6 +6508,8 @@ class AceQueryEngine:
         # 不再把圖上數字整段重打一次（圖片變很長、內容跟圖重複）
         brief = plan.route in CARD_ROUTES or plan.pattern
         rule_answer = brief_rule_answer(results) if brief else build_rule_based_answer(results)
+        holding_lead = stock_banter.holding_reply(question,results)
+        if holding_lead:rule_answer = holding_lead + '\n\n' + rule_answer
         if not plan.need_final_llm or not any(r.ok for r in results):
             return rule_answer, True
         payload = build_final_payload(question, results)
@@ -6540,7 +6544,13 @@ class AceQueryEngine:
             card["scenarios"] = [x for x in card["scenarios"] if x["text"]]
             if not card['answer']:
                 return 'AI文字未通過檢查，本次僅提供可核實的圖表與資料。\n\n'+rule_answer, False
+            card = stock_banter.integrate_holding_reply(question,card,results)
             card = stock_banter.ensure_inline_humor(question,card)
+            if stock_banter.holding_question(question):
+                card['scenario_title'] = '持倉觀察條件'
+                if len(card.get('scenarios') or []) == 2 and card['scenarios'][0]['title'] == card['scenarios'][1]['title']:
+                    card['scenarios'][0]['title'] = '情境 A'
+                    card['scenarios'][1]['title'] = '情境 B'
             pattern_names = [n for r in results if r.ok and r.name == "get_technical_analysis"
                              for n in ((r.data.get("kline_patterns") or {}).get("names") or [])]
             card_text = ai_card_text(card)

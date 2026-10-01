@@ -67,3 +67,38 @@ def ensure_inline_humor(question, card):
     if playful:
         return card
     return dict(card,answer=reply+answer)
+
+
+def holding_reply(question, results):
+    """以原始工具結果交代持倉處境，不猜日期、持有期間或使用者的計畫。"""
+    import math
+    if not _HOLDING.search(str(question)):
+        return ''
+    contexts=[r.data for r in results if r.ok and getattr(r,'name','')=='get_cost_position_context']
+    if len(contexts)!=1:
+        return ''
+    data=contexts[0]
+    try:
+        cost,close=float(data['cost_price']),float(data['close'])
+    except (KeyError,TypeError,ValueError):
+        return ''
+    if not all(math.isfinite(v) and v>0 for v in (cost,close)):
+        return ''
+    pnl=(close/cost-1)*100
+    situation=('帳面虧損' if pnl<0 else '帳面獲利' if pnl>0 else '接近成本')
+    lead=f'以你提供的成本 {cost:g} 元和本次行情 {close:g} 元計算，{situation}'
+    if pnl:lead+=f'約 {abs(pnl):.2f}%。'
+    else:lead+='。'
+    if pnl<0:
+        lead+='先核對持有理由是否失效、是否超出原先可承受的虧損；不能只等回本。'
+    elif pnl>0:
+        lead+='先核對持有理由是否仍成立，以及能承受多少獲利回吐；獲利不代表風險已消失。'
+    else:
+        lead+='接近成本不代表安全，仍要檢查持有理由和能承受的波動。'
+    return lead
+
+
+def integrate_holding_reply(question,card,results):
+    lead=holding_reply(question,results)
+    if not lead:return card
+    return dict(card,answer=lead+str(card.get('answer') or ''))

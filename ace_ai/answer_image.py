@@ -964,7 +964,8 @@ def _split_badges(x: float, numbers: list, **extra) -> list[dict]:
 def _dotted(draw, x, y_from, y_to, color):
     step = 5 if y_to >= y_from else -5
     for yy in range(int(y_from), int(y_to), step * 2):
-        draw.line((x, yy, x, yy + step), fill=color, width=1)
+        end = min(yy+step,y_to) if step>0 else max(yy+step,y_to)
+        draw.line((x, yy, x, end), fill=color, width=1)
 
 
 def draw_marks(draw, panel: dict, px, py, step: float, price_top: float, price_bottom: float) -> None:
@@ -995,6 +996,8 @@ def draw_marks(draw, panel: dict, px, py, step: float, price_top: float, price_b
         for badge in buy_badges:
             color = badge.get('color') or UP
             i = min(range(len(bars)), key=lambda k: abs(px(k) - badge['x']))
+            low = _finite(bars[i].get('Low'))
+            if low is not None:_dotted(draw,badge['x'],tri_bottom-half,py(low)+3,color)
             draw.polygon([(badge['x'], tri_bottom-half),(badge['x']-half,tri_bottom+half),(badge['x']+half,tri_bottom+half)], fill=color, outline='white')
             if str(badge.get('no', '')) != '':
                 cy = tri_bottom + half + 6 + MARK_BADGE_R + badge['row'] * MARK_BADGE_ROW
@@ -1002,6 +1005,8 @@ def draw_marks(draw, panel: dict, px, py, step: float, price_top: float, price_b
         for badge in sell_badges:
             color = badge.get('color') or DOWN
             i = min(range(len(bars)), key=lambda k: abs(px(k) - badge['x']))
+            high = _finite(bars[i].get('High'))
+            if high is not None:_dotted(draw,badge['x'],tri_top+half,py(high)-3,color)
             draw.polygon([(badge['x']-half,tri_top-half),(badge['x']+half,tri_top-half),(badge['x'],tri_top+half)], fill=color, outline='white')
             # 有編號＝A～E 事件（出清沿用買進編號）；沒編號＝小幅減碼／零星賣出。
             if str(badge.get('no', '')) != '':
@@ -1038,16 +1043,24 @@ def draw_marks(draw, panel: dict, px, py, step: float, price_top: float, price_b
     tri_bottom = price_bottom + 14
     for i in sorted(buy_days):
         x = px(i)
+        low = _finite(bars[i].get('Low'))
+        if low is not None:_dotted(draw,x,tri_bottom-half,py(low)+3,UP)
         draw.polygon([(x, tri_bottom-half),(x-half,tri_bottom+half),(x+half,tri_bottom+half)], fill=UP, outline='white')
     tri_top = price_top - 14
     for j in sorted(set(sell_days) | reduce_days):
         x = px(j)
+        high = _finite(bars[j].get('High'))
+        if high is not None:_dotted(draw,x,tri_top+half,py(high)-3,DOWN)
         draw.polygon([(x-half,tri_top-half),(x+half,tri_top-half),(x,tri_top+half)], fill=DOWN, outline='white')
     for badge in trade_buys:
         x = badge['x']
+        low = _finite(bars[badge['i']].get('Low'))
+        if low is not None:_dotted(draw,x,tri_bottom-half,py(low)+3,TRADE_COLOR)
         draw.polygon([(x, tri_bottom-half),(x-half,tri_bottom+half),(x+half,tri_bottom+half)], fill=TRADE_COLOR, outline='white')
     for badge in trade_sells:
         x = badge['x']
+        high = _finite(bars[badge['i']].get('High'))
+        if high is not None:_dotted(draw,x,tri_top+half,py(high)-3,TRADE_COLOR)
         draw.polygon([(x-half,tri_top-half),(x+half,tri_top-half),(x,tri_top+half)], fill=TRADE_COLOR, outline='white')
     for badge in buy_badges:
         cy = tri_bottom + half + 6 + MARK_BADGE_R + badge['row'] * MARK_BADGE_ROW
@@ -2785,114 +2798,71 @@ def review_question_block(draw, px, cy, width, data):
 
 
 def review_card(draw, y: float, data: dict, dry: bool) -> int:
-    """交易覆盤卡（定案版，由上往下單欄）：
-    標題 → 摘要 → 理由核對 → AI 覆盤 → 交易心得 → 目前觀察；完整文字換行並計算高度。"""
-    x0, x1 = MARGIN, WIDTH - MARGIN
-    px, width = x0 + REVIEW_PAD, CONTENT - REVIEW_PAD * 2
-    summary = [(str(t), str(c or INK)) for t, c in data.get('summary') or []]
-    checks = [(c, _capped_lines(str(c.get('claim', '')), 21, width - 60, 2, True),
-               _capped_lines(f"{c.get('status_text', '')}｜{c.get('evidence', '')}", 20, width - 60, 2))
-              for c in (data.get('checks') or [])[:4]]
-    reason_head = '我的理由｜'
-    reason_lines = _capped_lines(str(data.get('reason_raw', '')), 22, width - 16 - font(22, True).getlength(reason_head), 2, True)
-    headline = _capped_lines(data.get('headline', ''), 26, width - 40, 2, True)
-    body = _capped_lines(data.get('body', ''), 23, width - 40, 3)
-    icons = list(data.get('highlight_icons') or [])
-    highlights = [_capped_lines(h, 22, width - 56, 1) for h in (data.get('highlights') or [])[:3]]
-    label = str(data.get('last_label') or '目前觀察')
-    last = _capped_lines(data.get('last_text', ''), 22, width - 40 - font(22, True).getlength(f'{label}｜'), 1)
-
-    h = 24 + 50 + 12                                         # 標題列
-    h += 40 if summary else 0                                # 一行摘要
-    h += 22 + 8 + max(1, len(reason_lines)) * 32 + 6          # 我的理由（完整換行）
-    h += sum(len(cl) * 30 + len(ev) * 28 + 10 for _, cl, ev in checks) + 8   # 逐條核對（完整換行）
-    h += review_question_block(None,px,0,width,data)
-    h += 18 + 40 + len(headline) * 34 + len(body) * 33 + 26  # AI 覆盤
-    cost_h = _para(None,0,0,data.get('cost_basis',''),20,MUTED,width)+12 if data.get('cost_basis') else 0
-    h += cost_h
-    h += 18 + 38 + sum(len(lines)*32+6 for lines in highlights)                      # 本次記住
-    h += (18 + len(last)*32 + 20 + 6) if last else 0                            # 目前觀察
-    h += (26 if data.get('source') == 'fallback' else 0) + 22
-    if dry:
-        return int(h)
-
-    draw.rounded_rectangle((x0, y, x1, y + h), radius=20, fill='white', outline=LINE)
-    cy = y + 24
-    draw.ellipse((px, cy, px + 48, cy + 48), fill=TRADE_COLOR)
-    draw.text((px + 24, cy + 24), '覆', font=font(23, True), fill='white', anchor='mm')
-    draw.text((px + 62, cy + 24), str(data.get('title', '')), font=font(30, True), fill=INK, anchor='lm')
-    cy += 50 + 12
-
-    if summary:                                               # 09/11 買進 30.2｜現價 36.65（盤中）｜報酬 +21.36%｜…
-        size = 21                                             # 太長就整行一起縮字，不換行、不超出卡片
-        while size > 16 and sum(font(size, True).getlength(t) for t, _ in summary) + 30 * (len(summary) - 1) > width:
-            size -= 1
-        sx = px
-        for i, (text, color) in enumerate(summary):
-            if i:
-                draw.text((sx + 8, cy + 14), '｜', font=font(size), fill=LINE, anchor='lm')
-                sx += 30
-            draw.text((sx, cy + 14), text, font=font(size, True), fill=color, anchor='lm')
-            sx += font(size, True).getlength(text)
-        cy += 40
-
-    cy += 22                                                  # 我的理由＋逐條核對
-    draw.rectangle((px, cy + 4, px + 4, cy + 28), fill=TRADE_COLOR)
-    draw.text((px + 16, cy + 16), reason_head, font=font(22, True), fill=MUTED, anchor='lm')
-    for i, line in enumerate(reason_lines or ['']):
-        draw.text((px + 16 + font(22, True).getlength(reason_head), cy + 16 + i * 32), line, font=font(22, True),
-                  fill=INK, anchor='lm')
-    cy += 8 + max(1, len(reason_lines)) * 32 + 6
-    for c, claim_lines, evidence_lines in checks:
-        status = str(c.get('status', '❓'))
-        _status_icon(draw, px + 28, cy + 16, status, r=11)
-        for i, line in enumerate(claim_lines):
-            draw.text((px + 50, cy + 16 + i * 30), line, font=font(21, True), fill=INK, anchor='lm')
-        ey = cy + len(claim_lines) * 30 + 2
-        for i, line in enumerate(evidence_lines):
-            text_at(draw, (px + 50, ey + i * 28), line, 20, MUTED)
-        cy += len(claim_lines) * 30 + len(evidence_lines) * 28 + 10
-    cy += 8
-
-    cy += review_question_block(draw,px,cy,width,data)
-    cy += 18                                                  # AI 覆盤
-    text_at(draw, (px, cy), 'AI 覆盤', 22, INK, True)
-    cy += 40
-    if cost_h:
-        cy += _para(draw,px,cy,data['cost_basis'],20,MUTED,width)+12
-    box_h = len(headline) * 34 + len(body) * 33 + 26
-    draw.rounded_rectangle((px, cy, px + width, cy + box_h), radius=14, fill=NOTE_BG)
-    ty = cy + 13
-    for line in headline:
-        text_at(draw, (px + 20, ty), line, 26, NOTE_INK, True)
-        ty += 34
-    for line in body:
-        text_at(draw, (px + 20, ty), line, 23, INK)
-        ty += 33
-    cy += box_h
-
-    cy += 18                                                  # 交易心得：理由／過程／學習
-    text_at(draw, (px, cy), '交易心得', 22, INK, True)
-    cy += 38
-    for i, lines in enumerate(highlights):
-        _status_icon(draw, px + 14, cy + 15, icons[i] if i < len(icons) else '✅', r=11)
-        for line in lines:
-            text_at(draw, (px + 36, cy + 1), line, 22, INK)
-            cy += 32
-        cy += 6
-
-    if last:                                                  # 目前觀察（只講一件事）
-        cy += 18
-        watch_h=len(last)*32+20
-        draw.rounded_rectangle((px, cy, px + width, cy + watch_h), radius=12, fill=WATCH_BG)
-        draw.text((px + 18, cy + 23), f'{label}｜', font=font(22, True), fill=TRADE_COLOR, anchor='lm')
-        for i,line in enumerate(last):
-            draw.text((px + 18 + font(22, True).getlength(f'{label}｜'), cy + 23+i*32), line, font=font(22), fill=INK, anchor='lm')
-        cy += watch_h+6
-
-    if data.get('source') == 'fallback':
-        text_at(draw, (px, cy + 6), 'AI 摘要暫時無法使用，以上為系統整理的簡短版本', 18, MUTED)
-    return int(h)
+    """簡潔覆盤：結論、交易數據、理由核對、改善重點、目前觀察。"""
+    px, width = MARGIN + REVIEW_PAD, CONTENT - REVIEW_PAD * 2
+    if not dry:
+        height = review_card(None, y, data, True)
+        draw.rounded_rectangle((MARGIN,y,WIDTH-MARGIN,y+height),radius=20,fill='white',outline=LINE)
+    target = None if dry else draw
+    cy = y + 30
+    def para(text, size=23, color=INK, bold=False, indent=0):
+        nonlocal cy
+        cy += _para(target,px+indent,cy,str(text or ''),size,color,width-indent,bold)
+    def gap(n=18):
+        nonlocal cy
+        cy += n
+    def divider():
+        nonlocal cy
+        gap(16)
+        if target is not None:target.line((px,cy,px+width,cy),fill=LINE,width=1)
+        gap(24)
+    para(data.get('title','交易覆盤'),30,INK,True)
+    summary=[(str(t),c or INK) for t,c in data.get('summary') or []]
+    metrics=[(t,c) for t,c in summary if t.startswith(('報酬','實現報酬','最大浮盈','最大回撤'))]
+    meta=[t for t,c in summary if not t.startswith(('報酬','實現報酬','最大浮盈','最大回撤'))]
+    gap(10);para('  ·  '.join(meta),21,MUTED)
+    divider()
+    para('這筆操作，哪裡可以更好？' if data.get('improvements') else '這筆交易的重點',25,INK,True)
+    gap(12);para(data.get('focus_answer') or data.get('headline') or data.get('body'),25,INK,True)
+    if metrics:
+        gap(24)
+        col=(width-32)/3
+        for n,(text,color) in enumerate(metrics):
+            row=n//3;xx=px+(n%3)*(col+16);yy=cy+row*90
+            label,value=text.rsplit(' ',1) if ' ' in text else (text,'—')
+            if target is not None:
+                text_at(target,(xx,yy),label,20,MUTED)
+                text_at(target,(xx,yy+30),value,32,color,True)
+        gap(((len(metrics)+2)//3)*90)
+    divider()
+    para('買進理由核對',25,INK,True);gap(12)
+    para('你的理由：'+(data.get('reason_raw') or '未提供'),22,MUTED)
+    gap(14)
+    for check in data.get('checks') or []:
+        if target is not None:_status_icon(target,px+12,cy+15,str(check.get('status','❓')),r=10)
+        para(check.get('claim',''),22,INK,True,34)
+        para('｜'.join(str(check.get(k) or '') for k in ('status_text','evidence')).strip('｜'),21,MUTED,False,34)
+        gap(12)
+    divider()
+    items=data.get('improvements') or []
+    para('可以改善的地方' if items else '交易回顧',25,INK,True);gap(14)
+    if items:
+        for n,item in enumerate(items,1):
+            if target is not None:text_at(target,(px,cy),f'{n:02d}',22,TRADE_COLOR,True)
+            para(item,23,INK,False,50);gap(18)
+    else:
+        para(data.get('body',''),23)
+        # 綜合敘述已保留；不重複列出理由、過程及學習三段心得。
+    if data.get('last_text'):
+        divider()
+        para(data.get('last_label') or '目前觀察',24,INK,True);gap(10)
+        para(data['last_text'],23)
+    if data.get('cost_basis'):
+        gap(24);para(data['cost_basis'],18,MUTED)
+    if data.get('source')=='fallback':
+        gap(14);para('AI 摘要暫時無法使用，以上為系統整理。',18,MUTED)
+    gap(30)
+    return int(cy-y)
 
 
 def _is_article_panel(panel: dict) -> bool:
@@ -3081,8 +3051,11 @@ def render_answer(question: str, answer: str, panels: list[dict] | None = None,
         y += _sector_block(draw, y, panel, False) + 24
     for panel in article_panels:
         y += article_card(draw, y, panel['article'], False) + 24
+    protected_reviews = []
     for panel in review_panels:
-        y += review_card(draw, y, panel['review'], False) + 24
+        card_height = review_card(draw, y, panel['review'], False)
+        protected_reviews.append((MARGIN,y,WIDTH-MARGIN,y+card_height))
+        y += card_height + 24
     for panel in branch_panels:
         y += branch_card(draw, y, panel['branch_card'], False) + 24
     for panel in ai_panels:
@@ -3125,7 +3098,10 @@ def render_answer(question: str, answer: str, panels: list[dict] | None = None,
     if suffix:
         footer = f'{footer}｜{suffix}'
     text_at(draw, (MARGIN, height - 49), footer, 20, MUTED)
-    return add_center_watermarks(image)
+    preserved = [(rect,image.crop(rect)) for rect in protected_reviews]
+    image = add_center_watermarks(image)
+    for rect,crop in preserved:image.paste(crop,rect)
+    return image
 
 
 def encode_image(image: Image.Image, max_bytes: int = 7_500_000) -> tuple[bytes, str]:
