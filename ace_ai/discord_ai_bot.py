@@ -2093,6 +2093,10 @@ class GeminiGateway:
         if purpose not in ("planner", "intent") and not getattr(_AI_GATE, "allowed", True):
             _AI_GATE.blocked = True
             return GeminiResult(ok=False, error="user_ai_quota", purpose=purpose)
+        # 對所有使用者可見的AI文字套用共同原則；分類、OCR與純排版不混入寫作要求。
+        if purpose in ('final_answer','trade_review','sector_answer','weekly_pick','weekly_draft','weekly_draft_revision'):
+            if stock_banter.NATURAL_ANALYSIS_RULES not in prompt:
+                prompt += '\n\n'+stock_banter.NATURAL_ANALYSIS_RULES
         result = self._run_with_deadline(purpose, lambda deadline: self._generate(prompt, purpose, schema, temperature, deadline))
         if result.ok and purpose not in ("planner", "intent"):   # 判斷題意不算 AI 解讀次數
             _AI_GATE.used = True
@@ -2211,7 +2215,7 @@ FINAL_BASE_PROMPT = """你是「艾斯助手｜喬巴」。你的回答要像熟
 1. 只能依 tool_results 的事實與數字回答，不可自創資料。使用者自己提供的成本或假設價格必須明確標成「你的成本／假設價格」，不可當成現價。
 2. 保持客觀。可以直接說目前結構偏強、偏弱、轉強、承壓、支撐較明確等，但每個判斷都要緊接數據或型態依據；最重要的不利條件用條件式帶過（例「若跌破 34.79 才轉弱」），不可蓋過主要判斷。買超、高勝率都不是未來保證。
 3. 不給目標價或報酬保證，不替使用者做最後買賣決定。問滿足點／目標價時，一句說明不提供目標價，改說上方有哪些壓力（前高、缺口、布林上軌、大量區）與站上的條件。
-4. 回答以問題為中心：通常先用 1～2 句直接回答，再補 2～3 個最重要證據，最後視需要說後續最值得觀察什麼。不要固定套【回答】【觀察重點】；除非資訊很多，否則自然分段即可。
+4. 回答以問題為中心：先回答真正關心的事，依需要解釋支持判斷的證據與後續觀察，不設定每題相同的段落數或證據數。不要固定套【回答】【觀察重點】；除非資訊很多，否則自然分段即可。
 5. 圖片本身已顯示 K 線、均線、布林、大量區與分點標記，文字不要再逐項報數；只引用真正影響判斷的 1～3 個數據。沒有資料的欄位直接略過，不要在回答中列一串系統缺漏原因。
 6. 不要提資料供應商、Google Sheet、工作表或內部系統名稱。需要時說「日K資料」「權證分點統計」「歷史事件統計」。
 7. 問未來漲跌或機率時，不自行預測；改說目前有哪些偏多／偏空條件，以及哪個條件變化最值得追蹤。K 棒型態則依實體、影線、量能與所處位置說明是否符合常見定義，不斷言後續。
@@ -2285,10 +2289,10 @@ AI_CARD_SCHEMA = {
 }
 
 FINAL_CARD_FORMAT = """輸出格式（艾斯 AI 解讀）：只輸出符合 schema 的 JSON，不要 Markdown、不要星號或條列符號。你是在「解讀」，不是在整理資料：K 線、均線、評分卡與關鍵價位表已經在圖上，文字要說明這些訊號代表什麼。
-- answer：一句話直接回答使用者的問題（20～50 字），像分析師的判斷。**語氣方向跟著結構走**：多頭排列、量增、沿上軌這類偏強結構，就先寫偏強（例「多頭排列帶量上攻，結構強勢，34.79 是短線要守的位置」）；偏弱就先寫偏弱；多空訊號互相抵銷才寫中性。風險寫成條件（若跌破／若量縮…），不可讓風險蓋過主要判斷。不寫空泛警語：「風險不容忽視」「需謹慎」「宜保守」「而非追價」「不宜追高」「短期波動風險」這類沒有價位條件的提醒都不要。
-- why：「為什麼這樣看」2～4 句（60～180 字）。說明關鍵訊號代表什麼、彼此怎麼互相印證或矛盾；只引用 1～3 個真正影響判斷的數字，不要逐項重列均線、分數或價位。**有 kline_patterns 時，why 第一句必須用白話描述其中的型態或趨勢（例：近期在上升楔形後持續位於上緣之上、下方有未回補缺口），answer 也要提到型態**；均線最多一句、布林最多一句。kline_patterns 裡的「資料旗標」只限制跨事件日的解讀，不影響描述目前型態。
-- scenarios：接下來可能的兩種走法，通常固定 2 個：一個偏多（tone=good）、一個偏空或降溫（tone=warn）。title 是 12 字內短標，例如「情境 A｜強勢延續」「情境 B｜過熱修正」；text 用「若收盤…／若跌破…，代表…」的條件式，30～70 字，要有具體觀察價位。只陳述條件與意義，不預測漲跌、不給買賣指令；使用者問操作策略／進出場／停損時也一樣，不寫「建議買進／賣出／停損設在…」，改成要觀察的價位與條件。解讀重點依序：K 線型態（kline_patterns）→ 支撐壓力 → 量價 → 均線，布林最多一句；why 至少涵蓋三個不同面向，不要整段只講均線和布林。K 線型態名稱（箱型、三角收斂、上升／下降趨勢、缺口、紅三兵、吞噬、晨星、十字線、長上／下影線等）只能引用 kline_patterns 有列出的，不可自己判斷；突破狀態照原文的客觀事實描述（價格在上下緣的哪裡、突破後第幾天）；「○○ 起形成」是型態起點、「○○ 收盤向上突破」是突破日，兩個日期不可混用或互換，kline_patterns 有「創近 N 日新高／新低」「越過前高／跌破前低」「脫離近 N 日盤整區」時，answer 或 why 必須提到，用詞照原文（越過、脫離、創高），價位與日期照抄；不可自行下「突破成功／失敗」「假突破／假跌破」「型態失效」這類結論，也不可解讀成偏多或偏空；recent_bars_10（近 10 日 日期 開 高 低 收）與 ma_recent_3d 只用來描述近期走勢與均線方向。answer 第一句要直接回答使用者問的事。均線排列一定照資料寫：MA5<MA10<MA20<MA60 是空頭排列，不可說成多方架構強勢、多方掌控；反之亦然；單日紅K或帶量不等於結構轉多。情境要和目前結構一致：均線空頭排列時，偏多情境寫成「轉強條件」（例「若收盤站穩季線並突破布林上軌，才有機會扭轉空頭排列」），不可寫「多方續攻」「開啟新一波漲勢」這種已經轉多或預測漲勢的說法；均線多頭排列時，偏空情境同理寫成「轉弱條件」。新聞、三大法人或沒有可觀察價位的問題給空陣列。
-- summary：一句話總結（15～40 字），點出最重要的判斷，方向和 answer 一致（answer 偏強，summary 不可改成以風險收尾），可以用簡單比喻，但不可給買賣指令或保證。"""
+- answer：用1～3句直接回答原問句，從這題最重要的處境或訊號切入，不固定以結構偏強弱開頭；數字只引用真正必要的證據，不保證漲跌、不替人決定買賣。
+- why：按需要解釋關鍵證據如何支持答案；若answer已說清楚可留空。型態與趨勢只能引用kline_patterns，不重報評分或所有指標。
+- scenarios：依原問句選擇0～2個有必要的觀察條件，可留空，不強制多空各一個。title用短標直接點出本題要觀察的變化，不套固定情境名稱；text 用「若收盤…／若跌破…，代表…」的條件式，30～70 字，要有具體觀察價位。只陳述條件與意義，不預測漲跌、不給買賣指令；使用者問操作策略／進出場／停損時也一樣，不寫「建議買進／賣出／停損設在…」，改成要觀察的價位與條件。從K線型態、支撐壓力、量價、均線與布林中選擇能回答本題的證據，不固定順序；why只談真正影響本題答案的面向，不為了湊數羅列指標。K 線型態名稱（箱型、三角收斂、上升／下降趨勢、缺口、紅三兵、吞噬、晨星、十字線、長上／下影線等）只能引用 kline_patterns 有列出的，不可自己判斷；突破狀態照原文的客觀事實描述（價格在上下緣的哪裡、突破後第幾天）；「○○ 起形成」是型態起點、「○○ 收盤向上突破」是突破日，兩個日期不可混用或互換，kline_patterns 有「創近 N 日新高／新低」「越過前高／跌破前低」「脫離近 N 日盤整區」時，與本題相關才在answer或why解釋，用詞照原文（越過、脫離、創高），價位與日期照抄；不可自行下「突破成功／失敗」「假突破／假跌破」「型態失效」這類結論，也不可解讀成偏多或偏空；recent_bars_10（近 10 日 日期 開 高 低 收）與 ma_recent_3d 只用來描述近期走勢與均線方向。answer 第一句要直接回答使用者問的事。均線排列一定照資料寫：MA5<MA10<MA20<MA60 是空頭排列，不可說成多方架構強勢、多方掌控；反之亦然；單日紅K或帶量不等於結構轉多。情境要和目前結構一致：均線空頭排列時，偏多情境寫成「轉強條件」（例「若收盤站穩季線並突破布林上軌，才有機會扭轉空頭排列」），不可寫「多方續攻」「開啟新一波漲勢」這種已經轉多或預測漲勢的說法；均線多頭排列時，偏空情境同理寫成「轉弱條件」。新聞、三大法人或沒有可觀察價位的問題給空陣列。
+- summary：只有補充新的重點時才寫；若只是重複answer就留空，不強制每題一句話總結，不提供買賣指令或保證。"""
 
 
 def _is_empty_value(value: Any) -> bool:
@@ -2552,12 +2556,13 @@ def build_final_prompt(payload: Dict[str, Any]) -> str:
         sections.append(FINAL_PATTERN_RULES)
     sections.append(FINAL_CARD_FORMAT)
     if names & {'get_technical_analysis', 'get_pattern_scorecard', 'get_volume_profile'}:
-        sections.append("白話／持倉回答：先給目前技術結構偏強、偏弱、中性或資料不足的結論，再給1～2個最重要依據與後續觀察條件；不以成本高低決定股票好壞。問持有、賣出、回本時回答結構與風險，不替人做交易決定，不說續抱、值得持有、賣掉、加碼或保證回本。成本未提供就不計個人損益；日期未提供就不推測進場當天或持有時間；理由是用戶陳述，未核實不可當已知事實。這類問法why限40～80字，scenarios最多2條、每條20～40字，summary限20字，資料不足不硬湊。用戶要賣不等於已賣出。")
+        sections.append("白話／持倉回答：先回答這次原問句真正關心的事，再挑有必要的依據與觀察條件；不以成本高低決定股票好壞。問持有、賣出、回本時回答結構與風險，不替人做交易決定，不說續抱、值得持有、賣掉、加碼或保證回本。成本未提供就不計個人損益；日期未提供就不推測進場當天或持有時間；理由是用戶陳述，未核實不可當已知事實。欄位依資訊需要選擇，說清楚即可，資料不足不硬湊。用戶要賣不等於已賣出。")
         if review_language.intent(payload['question']) == 'review':
             sections.append('本題是資料不完整的交易回顧，不是一般型態問答：answer先說目前能回顧哪些交易依據、哪些無法核實；why圍繞使用者進場理由與交易規劃，提出可改善的記錄方法，未提供的理由或計畫不可捏造。目前行情只補充成本與風險，不能當成買進當天證據。scenarios可省略，不要硬湊兩種行情；不提供個人買賣指令。')
     if stock_banter.holding_question(payload['question']):
         sections.append('使用者在問自己的持倉怎麼辦：直接回答這筆持倉目前的風險與下一步需要核對的條件，不只寫結構偏強弱。不重複堆砌成本數字。若虧損，說明原先理由是否仍有支持、哪些條件使風險升高；若獲利，說明回吐風險與結構是否維持。scenarios用「依據仍維持／依據轉弱」呈現具體可核對的條件，不把兩邊都叫轉強條件。未提供風險承受度、期限或部位，最多簡短指出一項需要補充，不自行替人訂停損比例或買賣決定。股票分割前後成本必須同一基準，未提供買進日無法確認成本基準時如實說明，不能擅自再除一次。')
     sections.append(stock_banter.RESPONSE_LANGUAGE_RULES)
+    sections.append(stock_banter.NATURAL_ANALYSIS_RULES)
     sections.append('先判斷response_focus：holding是個人持倉、成本與風險需求，current是行情／型態，review是交易檢討；陳述句也可有隱含求助，不需問號。holding的answer先接住持倉處境，再解釋最重要風險與可觀察条件；不要只報均線或重述成本。')
     sections.append('回答重點：先接住問題而非一律報型態。問持倉後續／要注意什麼，先說最重要的風險與支撐／壓力觀察條件，說明守住或跌破的意義；缺買進理由不阻止目前分析。問改善才回顧交易規劃，問型態則分析目前型態。日期只是背景，不能一律變成覆盤。成本估算稱估算；未提供理由、計畫、日期不能推測當時沒有做。answer寫分析，humor_opening只放自然接話，不重複。')
     payload_json = json.dumps(payload.get("tool_results") or {}, ensure_ascii=False, separators=(",", ":"), default=tools.json_safe)
@@ -4910,7 +4915,7 @@ class AceQueryEngine:
         # 快取鍵值用「補完股票之後」的問題，避免 A 使用者的「那它的壓力在哪」拿到 B 使用者的答案；籌碼類型分開快取。
         # 族群追問（「那哪檔最強」）要帶族群名稱與模式，不同族群的同一句追問不能共用答案
         sector = parsed.sector or {}
-        key = "|".join(['陳述句持倉需求v12',compact, ",".join(c for c, _ in parsed.stocks), str(parsed.cost_price or ""), ",".join(parsed.branches),
+        key = "|".join(['原問句自然解讀v13',compact, ",".join(c for c, _ in parsed.stocks), str(parsed.cost_price or ""), ",".join(parsed.branches),
                         "chip=" + parsed.chip,
                         "sector=" + str(sector.get("name") or sector.get("industry") or "") + ":" + str(sector.get("mode") or "")])
         key = self._access_cache_key(key)
@@ -6549,7 +6554,6 @@ class AceQueryEngine:
             card["scenarios"] = [x for x in card["scenarios"] if x["text"]]
             if not card['answer']:
                 return 'AI文字未通過檢查，本次僅提供可核實的圖表與資料。\n\n'+rule_answer, False
-            card = stock_banter.integrate_holding_reply(question,card,results)
             if stock_banter.holding_question(question):
                 card['scenario_title'] = '持倉觀察條件'
                 if len(card.get('scenarios') or []) == 2 and card['scenarios'][0]['title'] == card['scenarios'][1]['title']:
@@ -6942,7 +6946,7 @@ def parse_ai_card(text: str) -> Optional[Dict[str, Any]]:
         scenarios.append({"title": _clean_card_text(item.get("title"), 24) or "情境",
                           "tone": tone if tone in ("good", "warn", "neutral") else "neutral",
                           "text": _clean_card_text(item.get("text"), 200)})
-    if not answer or not (why or summary):
+    if not answer:
         return None
     style = data.get("response_style", "serious")
     style = style if style in ("serious", "playful", "concerned") else "serious"

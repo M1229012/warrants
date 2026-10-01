@@ -3,8 +3,8 @@
 兩層分工：
   Python：事實（買賣價、報酬、持有日、MFE／MAE、原始理由、進場當日技術與法人、進場後走勢、目前結構）
           ＋ 理由核對（✅ 成立／⚠️ 部分成立／❌ 不成立／❓ 資料不足）
-  Gemini：讀事實、挑 2～4 個值得記錄的重點，寫成投資人自己的覆盤筆記，固定 JSON：
-          headline／body／highlights（2～3 條）／watch（持倉中）或 lesson（已賣出）
+  Gemini：讀事實、依問題挑值得記錄的重點，寫成投資人自己的覆盤筆記，固定 JSON：
+          headline／body／highlights（0～3 條）／watch（持倉中）或 lesson（已賣出）
           每欄都做數字核對、刪事後歸因句、限字數；Gemini 失敗就用程式版 fallback，同一個格式。
 
 原則：
@@ -1085,11 +1085,10 @@ def build_review(req: Dict[str, Any], mapper=None) -> Dict[str, Any]:
 
 
 # ============================================================
-# Gemini：讀結構化事實，挑 2～4 個值得記錄的重點，寫成投資人自己的覆盤筆記（固定 JSON 欄位）
+# Gemini：讀結構化事實，依問題挑值得記錄的重點，寫成投資人自己的覆盤筆記（固定 JSON 欄位）
 # ============================================================
 
 HEADLINE_MAX, BODY_MAX, HIGHLIGHT_MAX, WATCH_MAX = 32, 120, 34, 40
-HIGHLIGHT_FACETS = ("理由", "過程", "學習")     # 本次記住的三條固定分別講這三件事
 
 
 def ai_schema(mode: str) -> Dict[str, Any]:
@@ -1119,11 +1118,7 @@ REVIEW_PROMPT = """幫投資人把這筆交易寫成「自己的覆盤筆記」�
   講這筆交易的核心邏輯有沒有對到、進場後實際承受了什麼、最值得記住的一件事。
   統計列已有的數字最多只引用一個（通常是最大回撤），不要逐一列出日期、價格、報酬。
   好的例子：「這筆進場的核心是國票台南分點訊號，回頭核對確實有對到。進場後並不是一路上漲，中間最大回撤約 8%，之後才重新轉強。比較值得記的是，籌碼理由成立，但進場位置仍有不小的震盪空間。」
-- highlights：剛好 3 條、每條最多 30 字，順序固定、三條講不同的事，不要三條都在講結果：
-  1. 理由：原始進場邏輯是否成立（依 reason_checks）。
-  2. 過程：這筆交易進場後真正承受了什麼風險（例如回撤多深、震盪多久）。
-  3. 學習：下次同類型進場要注意或可沿用什麼。
-  不要把「目前報酬多少」當成一條重點。
+- highlights：依原問題選擇0～3個真正值得記錄的重點，可留空；不固定理由／過程／學習三條，不重複body。
 - watch（持倉中）：目前最值得觀察的「一件事」，最多 35 字，要具體、自然。
   若要提價位，只從 current.nearest_supports 挑最近的一個（例如「突破後能否守住 10 日線」）；
   不要拿布林上軌當防守位或風險條件，也不要列一串條件。
@@ -1164,7 +1159,7 @@ response_focus：holding＝詢問目前持倉的後續、風險或防守；impro
 focus_answer直接接住真正的問題。holding時body與highlights圍繞目前結構、風險與後續條件，不套理由／過程／學習三段；improvements寫1～2個可觀察條件與意義。防守位依current.nearest_supports，壓力依nearest_resistances；說明守住代表什麼、跌破時哪些依據變弱，不代替人決定買賣。不把布林上軌當防守位、不自行計算停損比例。資料不足的個別項目簡短略過，不讓缺買進理由阻止目前持倉分析。
 未提供理由、部位或計畫，只能說未提供，不能說當時未設定、沒有規劃、憑感覺或推測動機；沒有理由核對項目時不必反覆強調。買進價來源為買進日收盤价就明確稱成本估算，不能當實際成交價。不能用現在走勢證明當時買對。
 改善題與理由題也要依原問句現寫回應；❓未核實不等於❌錯誤。行情與歷史事實限制仍有效，全部數字照資料，不杜撰，不給個人買賣指令。"""
-    return REVIEW_PROMPT + '\n'+semantic+'\n'+stock_banter.RESPONSE_LANGUAGE_RULES+'\n正文欄位是focus_answer及body，接話僅寫humor_opening；holding時先回答風險與防守條件，已賣出不能當仍持倉。\n'+json.dumps(_slim(payload),ensure_ascii=False,default=str)
+    return REVIEW_PROMPT + '\n'+semantic+'\n'+stock_banter.RESPONSE_LANGUAGE_RULES+'\n'+stock_banter.NATURAL_ANALYSIS_RULES+'\n正文欄位是focus_answer及body，接話僅寫humor_opening；holding時先回答風險與防守條件，已賣出不能當仍持倉。\n'+json.dumps(_slim(payload),ensure_ascii=False,default=str)
 
 
 def review_focus(question):
@@ -1296,11 +1291,9 @@ def sanitize_review(data: Any, payload: Dict[str, Any], prune) -> Tuple[Dict[str
         "body": clean(data.get("body"), BODY_MAX) or fallback["body"],
         last: clean(data.get(last), WATCH_MAX) or fallback[last],
     }
-    # 三條依序是 理由／過程／學習：哪一條被刪光，就用 fallback 同一個位置補，順序不亂
-    raw = list(data.get("highlights") or [])[:3]
-    raw += [""] * (3 - len(raw))
-    review["highlights"] = [clean(h, HIGHLIGHT_MAX) or _clip(fb, HIGHLIGHT_MAX)
-                            for h, fb in zip(raw, fallback["highlights"])]
+    raw=data.get('highlights') or []
+    raw=raw if isinstance(raw,list) else []
+    review['highlights']=[text for text in (clean(h,HIGHLIGHT_MAX) for h in raw[:3]) if text]
     focus=data.get('response_focus')
     if focus in ('holding','improve','reason','general'):
         answer=clean(data.get('focus_answer'),150)

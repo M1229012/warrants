@@ -17,6 +17,12 @@ humor_opening不報行情數字、不承諾漲跌、不給買賣指令；不要�
 在本次輸出內自檢：答到真正問題？接話貼合整句且不牽強？數字有依據？未提供的理由／計畫是否被誤寫成沒有做？若有問題先修正，不另呼叫模型。"""
 
 
+NATURAL_ANALYSIS_RULES = """所有AI解讀的寫作原則：依這次原句與證據現寫，不靠預寫答案或換股名、價格套句。先找出這題最重要的疑問或矛盾，挑真正影響答案的證據；不要每題固定均線→支撐→布林，也不要為變化而改變事實或刻意換同義詞。
+在本次資料內綜合股票位階與近期變化、支撐壓力距離、成本相對現價、使用者表達的情緒和提問目的，決定先解釋什麼。底部、突破、高檔與回檔的風險不同，但位階與型態只能引用已核實資料；不能僅因某個詞就選固定答案。問型態聚焦結構；問防守解釋相關價位失守的意義；問操作改善回看當時證據；玩笑自然接原意；焦慮分析造成擔憂的實際變化。只有使用者明示或資料能支持的背景才使用。
+持倉焦慮要區分帳面虧損、獲利回吐與短線整理，處境依成本與行情確認，不替人推測動機。用當下的具體變化解釋擔心是否有依據；不要固定以「以你提供的成本…計算」「先核對持有理由」「能承受多少獲利回吐」「感到慌張是正常的」開場。不重複朗讀圖上成本與報酬；必要數字才引用，未提供計畫不能說當時沒做。
+解讀可短可長，理由、觀察條件、心得與總結依需求選擇，不強制兩種情境或三條心得。沒有新增資訊的欄位留空；若需要觀察條件，只寫真正相關的1至2項與意義，不硬湊多空各一項。總結若只重複開頭就留空。保留指定資料格式、事實核對與專項資料規則，不增加模型呼叫；無關的提醒省略，不杜撰行情、不給個人買賣決定。"""
+
+
 def wants_analysis(question):
     return bool(_HOLDING.search(question) or COST_RE.search(question))
 
@@ -72,9 +78,5 @@ def holding_reply(question, results, *, semantic_holding=False):
 
 
 def integrate_holding_reply(question,card,results):
-    focus=card.get('response_focus')
-    if focus in ('current','review'):return card
-    lead=holding_reply(question,results,semantic_holding=focus=='holding')
-    if not lead:return card
-    answer=str(card.get('answer') or '')
-    return dict(card,answer=answer+lead if card.get('response_style')=='playful' else lead+answer)
+    """相容舊呼叫；正常AI輸出不再注入持倉模板，失敗備援才用holding_reply。"""
+    return card
