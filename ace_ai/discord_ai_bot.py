@@ -2262,7 +2262,7 @@ AI_CARD_SCHEMA = {
     "properties": {
         "response_style": {"type": "string", "enum": ["serious", "playful", "concerned"],
                            "description": "依完整原句判斷語氣；股票諧音或誇張玩笑即使問明天也可為playful。"},
-        "humor_opening": {"type": "string", "description": "playful時必填一句針對原梗新寫的幽默短句，不含行情數字或漲跌承諾；不知道、無法預測、重述問題不算幽默。serious或concerned填空字串。"},
+        "humor_opening": {"type": "string", "description": "自然延續整句原意時現寫最多一句接話；牽強時可留空，不強制搞笑。認真或擔憂時留空。"},
         "answer": {"type": "string"},
         "why": {"type": "string"},
         "scenarios": {
@@ -2550,14 +2550,13 @@ def build_final_prompt(payload: Dict[str, Any]) -> str:
         sections.append(FINAL_PATTERN_RULES)
     sections.append(FINAL_CARD_FORMAT)
     if names & {'get_technical_analysis', 'get_pattern_scorecard', 'get_volume_profile'}:
-        sections.append("白話／持倉回答：先給目前技術結構偏強、偏弱、中性或資料不足的結論，再給1～2個最重要依據與後續觀察條件；不以成本高低決定股票好壞。問持有、賣出、回本時回答結構與風險，不替人做交易決定，不說續抱、值得持有、賣掉、加碼或保證回本。成本未提供就不計個人損益；日期未提供就不推測進場當天或持有時間；理由是用戶陳述，未核實不可當已知事實。這類問法why限40～80字，scenarios最多2條、每條20～40字，summary限20字，資料不足不硬湊。若原句有玩笑／諧音，answer可先用一句15～25字的溫和幽默接話，再給行情結論；不可嘲笑虧損或用玩笑暗示一定賺錢。用戶要賣不等於已賣出。")
+        sections.append("白話／持倉回答：先給目前技術結構偏強、偏弱、中性或資料不足的結論，再給1～2個最重要依據與後續觀察條件；不以成本高低決定股票好壞。問持有、賣出、回本時回答結構與風險，不替人做交易決定，不說續抱、值得持有、賣掉、加碼或保證回本。成本未提供就不計個人損益；日期未提供就不推測進場當天或持有時間；理由是用戶陳述，未核實不可當已知事實。這類問法why限40～80字，scenarios最多2條、每條20～40字，summary限20字，資料不足不硬湊。用戶要賣不等於已賣出。")
         if review_language.intent(payload['question']) == 'review':
             sections.append('本題是資料不完整的交易回顧，不是一般型態問答：answer先說目前能回顧哪些交易依據、哪些無法核實；why圍繞使用者進場理由與交易規劃，提出可改善的記錄方法，未提供的理由或計畫不可捏造。目前行情只補充成本與風險，不能當成買進當天證據。scenarios可省略，不要硬湊兩種行情；不提供個人買賣指令。')
-        sections.append('必須接住使用者原問句，不能每題只重複多頭排列、支撐壓力。玩笑或諧音直接在answer第一句順著原梗回應15～25字，再接客觀結論；不使用固定笑話模板。焦慮或虧損不嘲笑；沒有玩笑不硬加幽默。問能否持有時，先回答目前結構是否轉弱及風險有無升高，再說原因；成本估算必須稱為估算，不可說成實際成交價。')
     if stock_banter.holding_question(payload['question']):
         sections.append('使用者在問自己的持倉怎麼辦：直接回答這筆持倉目前的風險與下一步需要核對的條件，不只寫結構偏強弱。不重複堆砌成本數字。若虧損，說明原先理由是否仍有支持、哪些條件使風險升高；若獲利，說明回吐風險與結構是否維持。scenarios用「依據仍維持／依據轉弱」呈現具體可核對的條件，不把兩邊都叫轉強條件。未提供風險承受度、期限或部位，最多簡短指出一項需要補充，不自行替人訂停損比例或買賣決定。股票分割前後成本必須同一基準，未提供買進日無法確認成本基準時如實說明，不能擅自再除一次。')
-    sections.append('語氣判斷與回應（優先於一般格式先寫結構及字數限制）：閱讀完整使用者原句，結合股票名稱和上下文，語意判斷 response_style 為 serious、playful 或 concerned；不要依固定關鍵字、特定拼字或笑話清單分類。辨認諧音、錯別字、誇張、比喻與反問；不因換字就忽略原本的玩笑意圖。playful 的 answer 必須先用一句簡短、針對這次原問句新寫的溫和接話，再直接回答股票問題，合計可到100字；幽默直接包含在AI解讀，不能另設區塊或只在summary接梗。不使用固定笑話模板，不要每題同一句量價口號。serious 正常分析，不硬加笑話；concerned 先接住擔心再說可核對的風險，不嘲笑虧損、不用玩笑淡化困境。玩笑不代表看多，不能保證漲跌或替人決定買賣。輸出前自行檢查：playful 的answer是否已接住這次原梗且包含客觀分析，若沒有就在本次輸出內修正。')
-    sections.append('接梗輸出規則：response_style=playful時，先在humor_opening寫一個完整、簡短、有趣的回應，呼應使用者的諧音、比喻或誇張，不能只重述原句。answer另寫客觀行情分析，不重複接梗，程式會把兩者合成同一段AI解讀。不能以「我不知道」「無法預測」「不能保證」充當humor_opening；不預測漲跌限制的是行情事實與承諾，不禁止語言上的幽默。問明天且同時玩梗，不要因此改成嚴肅拒答；接梗後分析目前可觀察的條件即可。幽默不可自創行情、數字、交易經歷或買賣建議。一般認真問題與真正焦慮時humor_opening留空。輸出前檢查playful是否有實際接梗，而不是拒答或表達不知道。此欄位規則取代前文在answer直接撰寫接梗的要求。')
+    sections.append(stock_banter.RESPONSE_LANGUAGE_RULES)
+    sections.append('回答重點：先接住問題而非一律報型態。問持倉後續／要注意什麼，先說最重要的風險與支撐／壓力觀察條件，說明守住或跌破的意義；缺買進理由不阻止目前分析。問改善才回顧交易規劃，問型態則分析目前型態。日期只是背景，不能一律變成覆盤。成本估算稱估算；未提供理由、計畫、日期不能推測當時沒有做。answer寫分析，humor_opening只放自然接話，不重複。')
     payload_json = json.dumps(payload.get("tool_results") or {}, ensure_ascii=False, separators=(",", ":"), default=tools.json_safe)
     return "\n\n".join(sections) + f"\n\n使用者問題：{payload['question']}\n\ntool_results（JSON）：\n{payload_json}\n"
 
@@ -4908,7 +4907,7 @@ class AceQueryEngine:
         # 快取鍵值用「補完股票之後」的問題，避免 A 使用者的「那它的壓力在哪」拿到 B 使用者的答案；籌碼類型分開快取。
         # 族群追問（「那哪檔最強」）要帶族群名稱與模式，不同族群的同一句追問不能共用答案
         sector = parsed.sector or {}
-        key = "|".join(['語意持倉目的解讀v10',compact, ",".join(c for c, _ in parsed.stocks), str(parsed.cost_price or ""), ",".join(parsed.branches),
+        key = "|".join(['自然口語接話v11',compact, ",".join(c for c, _ in parsed.stocks), str(parsed.cost_price or ""), ",".join(parsed.branches),
                         "chip=" + parsed.chip,
                         "sector=" + str(sector.get("name") or sector.get("industry") or "") + ":" + str(sector.get("mode") or "")])
         key = self._access_cache_key(key)

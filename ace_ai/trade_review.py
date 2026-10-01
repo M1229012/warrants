@@ -26,6 +26,7 @@ import pandas as pd
 import warrant_ai_tools as tools
 import local_market_cache
 import review_language
+import stock_banter
 
 _TRIGGER_RE = re.compile(r"覆盤|复盘|復盤")
 _WARRANT_RE = re.compile(r"權證|分點|主力|券商|大戶|[A-E]\s*事件|ABCDE", re.IGNORECASE)
@@ -1094,14 +1095,16 @@ HIGHLIGHT_FACETS = ("理由", "過程", "學習")     # 本次記住的三條固
 def ai_schema(mode: str) -> Dict[str, Any]:
     last = "lesson" if mode == "closed" else "watch"
     return {"type": "object",
-            "properties": {"response_focus": {"type": "string", "enum": ["holding", "improve", "reason", "general"],
+            "properties": {"response_style": {"type": "string", "enum": ["serious", "playful", "concerned"]},
+                           "humor_opening": {"type": "string", "description": "自然延續整句原意時最多一句接話；牽強、認真或擔憂時留空。"},
+                           "response_focus": {"type": "string", "enum": ["holding", "improve", "reason", "general"],
                                               "description": "依完整原問句判斷要回答持倉後續、防守與風險，交易改善，理由合理性，或一般回顧。日期只是持倉背景，不代表要檢討買進理由。"},
                            "focus_answer": {"type": "string", "description": "直接回答這次真正的問題，不固定套理由核對結論。"},
                            "improvements": {"type": "array", "items": {"type": "string"}, "description": "holding時寫1至2條具體觀察條件及其意義；改善題寫改善方法，無相關內容可留空。"},
                            "headline": {"type": "string"}, "body": {"type": "string"},
                            "highlights": {"type": "array", "items": {"type": "string"}},
                            last: {"type": "string"}},
-            "required": ["response_focus", "focus_answer", "improvements", "headline", "body", "highlights", last]}
+            "required": ["response_style", "humor_opening", "response_focus", "focus_answer", "improvements", "headline", "body", "highlights", last]}
 
 
 REVIEW_PROMPT = """幫投資人把這筆交易寫成「自己的覆盤筆記」。review_data 是程式整理好的事實，你只負責讀懂、挑重點、用自然的話寫出來。
@@ -1161,7 +1164,7 @@ response_focus：holding＝詢問目前持倉的後續、風險或防守；impro
 focus_answer直接接住真正的問題。holding時body與highlights圍繞目前結構、風險與後續條件，不套理由／過程／學習三段；improvements寫1～2個可觀察條件與意義。防守位依current.nearest_supports，壓力依nearest_resistances；說明守住代表什麼、跌破時哪些依據變弱，不代替人決定買賣。不把布林上軌當防守位、不自行計算停損比例。資料不足的個別項目簡短略過，不讓缺買進理由阻止目前持倉分析。
 未提供理由、部位或計畫，只能說未提供，不能說當時未設定、沒有規劃、憑感覺或推測動機；沒有理由核對項目時不必反覆強調。買進價來源為買進日收盤价就明確稱成本估算，不能當實際成交價。不能用現在走勢證明當時買對。
 改善題與理由題也要依原問句現寫回應；❓未核實不等於❌錯誤。行情與歷史事實限制仍有效，全部數字照資料，不杜撰，不給個人買賣指令。"""
-    return REVIEW_PROMPT + '\n'+semantic+'\n'+json.dumps(_slim(payload),ensure_ascii=False,default=str)
+    return REVIEW_PROMPT + '\n'+semantic+'\n'+stock_banter.RESPONSE_LANGUAGE_RULES+'\n正文欄位是focus_answer及body，接話僅寫humor_opening；holding時先回答風險與防守條件，已賣出不能當仍持倉。\n'+json.dumps(_slim(payload),ensure_ascii=False,default=str)
 
 
 def review_focus(question):
@@ -1303,6 +1306,11 @@ def sanitize_review(data: Any, payload: Dict[str, Any], prune) -> Tuple[Dict[str
         answer=clean(data.get('focus_answer'),150)
         if answer:
             review['response_focus']=focus
+            style=data.get('response_style','serious')
+            review['response_style']=style if style in ('serious','playful','concerned') else 'serious'
+            opening=clean(data.get('humor_opening'),100) if review['response_style']=='playful' else ''
+            if opening and not answer.startswith(opening):
+                answer=opening+('' if opening[-1] in '。！？!?…' else '。')+answer
             review['focus_answer']=answer
             review['improvements']=[t for t in (clean(x,200) for x in (data.get('improvements') or [])[:3]) if t]
     return apply_question_response(payload,review), removed_all
