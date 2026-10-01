@@ -608,6 +608,28 @@ def _trade_badges(panel: dict, index: dict, px) -> tuple[list[dict], list[dict]]
     return buys, sells
 
 
+def draw_trade_points(draw,panel,bars,px,py,left,right,top,bottom):
+    """把交易價格落在真正的日期／價位座標，日期帶仍保留原有買賣徽章。"""
+    index={b['date']:i for i,b in enumerate(bars)}
+    for trade in panel.get('trades') or []:
+        if trade.get('date') not in index or trade.get('price') is None:
+            continue
+        price=float(trade['price'])
+        if not math.isfinite(price) or price<=0:
+            continue
+        x,y=px(index[trade['date']]),py(price)
+        if not top<=y<=bottom:
+            continue
+        label=str(trade['date'])[5:]+' '+('買' if trade.get('side')=='buy' else '賣')+' '+number(price)+('（估）' if trade.get('estimated') else '')
+        w=font(18,True).getlength(label)+18
+        bx=max(left,min(x+12,right-w))
+        by=max(top,min(y-34,bottom-28))
+        draw.line((x,y,bx,by+14),fill=TRADE_COLOR,width=2)
+        draw.rounded_rectangle((bx,by,bx+w,by+28),radius=8,fill='white',outline=TRADE_COLOR,width=1)
+        text_at(draw,(bx+9,by+3),label,18,TRADE_COLOR,True)
+        draw.ellipse((x-6,y-6,x+6,y+6),fill=TRADE_COLOR,outline='white',width=2)
+
+
 def draw_institutional(draw, top: float, left: float, right: float, px, step: float, bars: list, rows: list,
                        focus: str = '', unit: str = '張', title: str = '', cumulative: bool = True,
                        today_label: str = '今日', extra: str = '', dates: bool = True) -> None:
@@ -1138,7 +1160,10 @@ def draw_chart(draw, y: int, panel: dict) -> None:
     lows = [b['Low'] for b in bars]
     highs = [b['High'] for b in bars]
     # 與週報主程式 adjust_candle_price_ylim 一致：Y 軸只看 K 棒高低，下留 11%、上留 5%；均線／布林超出價格區就裁掉
-    low, high = min(lows), max(highs)
+    visible_dates={b['date'] for b in bars}
+    trade_prices=[float(t['price']) for t in panel.get('trades') or []
+                  if t.get('date') in visible_dates and t.get('price') is not None and float(t['price'])>0]
+    low, high = min(lows+trade_prices), max(highs+trade_prices)
     span = max(high - low, abs(high) * .005, .01)
     low, high = low - span * .11, high + span * .05
     py = lambda value: price_bottom - (value - low) / (high - low) * (price_bottom - price_top)
@@ -1190,6 +1215,8 @@ def draw_chart(draw, y: int, panel: dict) -> None:
             for start in range(0, max(1, math.ceil(distance)), 12):
                 t0, t1 = min(start/max(distance, 1), 1), min((start+7)/max(distance, 1), 1)
                 draw.line((xa+(xb-xa)*t0, ya+(yb-ya)*t0, xa+(xb-xa)*t1, ya+(yb-ya)*t1), fill=band_color, width=2)
+
+    draw_trade_points(draw,panel,bars,px,py,left,right,price_top,price_bottom)
 
     # 日期軸緊貼價格區下方；月份切換的日期用粗體，方便看出 K 棒落在哪個月。
     axis_y = bottom + 2
@@ -2309,13 +2336,16 @@ def ai_card(draw, y: float, data: dict, dry: bool) -> int:
             draw.rounded_rectangle((ix0, cy, ix1, cy + h), radius=12, fill=WARN_BG)
         _para(pen, ix0 + 20, cy + 12, data['notice'], 21, WARN_INK, width - 40)
         cy += h + 14
-    badge_w = font(20, True).getlength('艾斯 AI 解讀') + 58
+    badge_label='艾斯助手｜喬巴 解讀'
+    badge_w = font(20, True).getlength(badge_label) + 58
     if pen:
         draw.rounded_rectangle((ix0, cy, ix0 + badge_w, cy + 38), radius=19, fill=INK)
         draw.ellipse((ix0 + 14, cy + 12, ix0 + 28, cy + 26), fill=ACCENT)
-        text_at(draw, (ix0 + 38, cy + 8), '艾斯 AI 解讀', 20, 'white', True)
+        text_at(draw, (ix0 + 38, cy + 8), badge_label, 20, 'white', True)
     cy += 58
     cy += _para(pen, ix0, cy, data.get('answer', ''), 32, INK, width, True) + 18
+    if data.get('cost_basis'):
+        cy += _para(pen,ix0,cy,data['cost_basis'],20,MUTED,width)+12
 
     def section(title: str) -> int:
         if pen:
@@ -2785,6 +2815,8 @@ def review_card(draw, y: float, data: dict, dry: bool) -> int:
     h += 22 + 8 + max(1, len(reason_lines)) * 32 + 6          # 我的理由（最多兩行）
     h += sum(len(cl) * 30 + len(ev) * 28 + 10 for _, cl, ev in checks) + 8   # 逐條核對（各最多兩行）
     h += 18 + 40 + len(headline) * 34 + len(body) * 33 + 26  # AI 覆盤
+    cost_h = _para(None,0,0,data.get('cost_basis',''),20,MUTED,width)+12 if data.get('cost_basis') else 0
+    h += cost_h
     h += 18 + 38 + len(highlights) * 38                      # 本次記住
     h += (18 + 52) if last else 0                            # 目前觀察
     h += (26 if data.get('source') == 'fallback' else 0) + 22
@@ -2832,6 +2864,8 @@ def review_card(draw, y: float, data: dict, dry: bool) -> int:
     cy += 18                                                  # AI 覆盤
     text_at(draw, (px, cy), 'AI 覆盤', 22, INK, True)
     cy += 40
+    if cost_h:
+        cy += _para(draw,px,cy,data['cost_basis'],20,MUTED,width)+12
     box_h = len(headline) * 34 + len(body) * 33 + 26
     draw.rounded_rectangle((px, cy, px + width, cy + box_h), radius=14, fill=NOTE_BG)
     ty = cy + 13
@@ -2985,7 +3019,7 @@ def text_card(text: str) -> dict:
 
 
 def render_answer(question: str, answer: str, panels: list[dict] | None = None,
-                  *, title: str = '艾斯 AI｜研究筆記', demo: bool = False) -> Image.Image:
+                  *, title: str = '艾斯助手｜喬巴｜研究筆記', demo: bool = False) -> Image.Image:
     panels = panels or []
     debug_panel = next((p.get("kline_debug") for p in panels if p.get("kline_debug")), None)
     if debug_panel is not None:

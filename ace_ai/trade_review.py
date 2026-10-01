@@ -306,16 +306,22 @@ def snapshot_at(df: pd.DataFrame, idx: int) -> Dict[str, Any]:
 
 def after_buy(df: pd.DataFrame, idx: int, price: float, sell_idx: Optional[int],
               sell_price: Optional[float]) -> Dict[str, Any]:
-    """進場到現在（或到賣出日）的報酬、最大浮盈（MFE）、最大回撤（MAE）。"""
+    """報酬、最大浮盈、相對成本浮虧（MAE）及由收盤高點回落的最大回撤。"""
     end = sell_idx if sell_idx is not None else len(df) - 1
     part = df.iloc[idx:end + 1]
     last = float(sell_price) if sell_idx is not None and sell_price else float(part["Close"].iloc[-1])
     high, low = float(part["High"].max()), float(part["Low"].min())
+    closes = pd.Series([price]+[float(v) for v in part['Close']])
+    if sell_idx is not None:
+        closes.iloc[-1] = last
+    drawdown = min(0.0,float((closes/closes.cummax()-1).min()*100))
     return {
         "until": tools._fmt_date(part.index[-1]), "trading_days": len(part) - 1,
         "last_price": round(last, 2), "return_pct": round((last / price - 1) * 100, 2),
-        "max_gain_pct": round((high / price - 1) * 100, 2),
-        "max_drawdown_pct": round((low / price - 1) * 100, 2),
+        "max_gain_pct": round(max(0.0,(high / price - 1) * 100), 2),
+        "max_adverse_pct": round(min(0.0,(low / price - 1) * 100),2),
+        "max_drawdown_pct": round(drawdown, 2),
+        "drawdown_basis": "由先前收盤高點回落的最大幅度；最新盤中價或已提供的出場價作為末值，非盤中逐筆最大回撤",
         "high_date": tools._fmt_date(part["High"].idxmax()), "low_date": tools._fmt_date(part["Low"].idxmin()),
         "closed_trade": sell_idx is not None,
     }
@@ -934,7 +940,7 @@ def _summary_lines(result: Dict[str, Any], buy_price: float, trades: List[Dict[s
         live = "（盤中）" if str(result.get("price_basis", "")).startswith("盤中") else ""
         first = (f"{buy}｜持有 {result['trading_days']} 日｜現價 {result['last_price']:,.6g}{live}"
                  f"｜{result['return_pct']:+.2f}%")
-    second = f"最大浮盈 {result['max_gain_pct']:+.2f}%｜最大回撤 {result['max_drawdown_pct']:+.2f}%"
+    second = f"最大浮盈 {result['max_gain_pct']:+.2f}%｜最大回撤 {result['max_drawdown_pct']:.2f}%"
     return [first, second]
 
 
@@ -1012,9 +1018,9 @@ def build_review(req: Dict[str, Any], mapper=None) -> Dict[str, Any]:
         except Exception as exc:
             print(f"⚠️ 覆盤三大法人略過｜{code}｜{type(exc).__name__}: {exc}", flush=True)
 
-    trades = [{"date": tools._fmt_date(buy_day), "price": buy_price, "side": "buy"}]
+    trades = [{"date": tools._fmt_date(buy_day), "price": buy_price, "side": "buy", "estimated":req.get('price') is None}]
     if closed:
-        trades.append({"date": tools._fmt_date(live.index[sell_idx]), "price": sell_price, "side": "sell"})
+        trades.append({"date": tools._fmt_date(live.index[sell_idx]), "price": sell_price, "side": "sell", "estimated":req.get('sell_price') is None})
     panel["trades"] = trades
     panel["trade_summary_lines"] = _summary_lines(result, buy_price, trades, closed)
     panel["hide_trade_legend"] = True        # 覆盤卡的統計列已經有這些數字，K 線下方不重複
@@ -1261,9 +1267,9 @@ def review_summary(payload: Dict[str, Any]) -> List[Tuple[str, str]]:
         parts = [(f"{t['buy_date'][5:]} 買進 {_price(t['buy_price'])}", ""),
                  (f"現價 {_price(a.get('last_price'))}{live}", ""),
                  (f"報酬 {a['return_pct']:+.2f}%", _pct_color(a["return_pct"]))]
-    # 用中文寫：最大浮盈＝持有期間最高曾賺多少（MFE）、最大回撤＝持有期間最低曾虧多少（MAE）
+    # 最大回撤是從先前高點回落；相對成本的最大浮虧另存為MAE。
     parts += [(f"最大浮盈 {a['max_gain_pct']:+.2f}%", _pct_color(a["max_gain_pct"])),
-              (f"最大回撤 {a['max_drawdown_pct']:+.2f}%", _pct_color(a["max_drawdown_pct"])),
+              (f"最大回撤 {a['max_drawdown_pct']:.2f}%", _pct_color(a["max_drawdown_pct"])),
               (f"持有 {a['trading_days']} 日", "")]
     return parts
 
@@ -1295,6 +1301,7 @@ def review_panel(payload: Dict[str, Any], review: Dict[str, Any], source: str) -
         "summary": review_summary(payload),
         "highlight_icons": highlight_icons(payload),
         "checks": checks,
+        "cost_basis": payload['after_buy'].get('drawdown_basis',''),
     }}
 
 
@@ -1331,7 +1338,8 @@ def save_note(context_key: str, payload: Dict[str, Any], review: Dict[str, Any],
         "checks": [{"claim": c["claim"], "status": c["status"]} for c in payload["reason_checks"]],
         "sell_checks": [{"claim": c["claim"], "status": c["status"]} for c in payload.get("sell_reason_checks") or []],
         "return_pct": payload["after_buy"]["return_pct"],
-        "mfe_pct": payload["after_buy"]["max_gain_pct"], "mae_pct": payload["after_buy"]["max_drawdown_pct"],
+        "mfe_pct": payload["after_buy"]["max_gain_pct"], "mae_pct": payload["after_buy"].get("max_adverse_pct",payload["after_buy"]["max_drawdown_pct"]),
+        "max_drawdown_pct":payload["after_buy"]["max_drawdown_pct"],
         # ↓ AI 產生的覆盤：另外一欄
         "gemini_review": review, "review_source": source,
     }

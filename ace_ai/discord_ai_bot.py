@@ -2547,9 +2547,10 @@ def build_final_prompt(payload: Dict[str, Any]) -> str:
         sections.append(FINAL_PATTERN_RULES)
     sections.append(FINAL_CARD_FORMAT)
     if names & {'get_technical_analysis', 'get_pattern_scorecard', 'get_volume_profile'}:
-        sections.append("白話／持倉回答：先給目前技術結構偏強、偏弱、中性或資料不足的結論，再給1～2個最重要依據與後續觀察條件；不以成本高低決定股票好壞。問持有、賣出、回本時回答結構與風險，不替人做交易決定，不說續抱、值得持有、賣掉、加碼或保證回本。成本未提供就不計個人損益；日期未提供就不推測進場當天或持有時間；理由是用戶陳述，未核實不可當已知事實。這類問法why限40～80字，scenarios最多2條、每條20～40字，summary限20字，資料不足不硬湊。若原句有玩笑／諧音，answer可先用一句15～25字的溫和幽默接話，再給行情結論；不可嘲笑虧損或用玩笑暗示一定賺錢。題目已說幽默開場由程式提供時不重複接梗。用戶要賣不等於已賣出。")
+        sections.append("白話／持倉回答：先給目前技術結構偏強、偏弱、中性或資料不足的結論，再給1～2個最重要依據與後續觀察條件；不以成本高低決定股票好壞。問持有、賣出、回本時回答結構與風險，不替人做交易決定，不說續抱、值得持有、賣掉、加碼或保證回本。成本未提供就不計個人損益；日期未提供就不推測進場當天或持有時間；理由是用戶陳述，未核實不可當已知事實。這類問法why限40～80字，scenarios最多2條、每條20～40字，summary限20字，資料不足不硬湊。若原句有玩笑／諧音，answer可先用一句15～25字的溫和幽默接話，再給行情結論；不可嘲笑虧損或用玩笑暗示一定賺錢。用戶要賣不等於已賣出。")
         if review_language.intent(payload['question']) == 'review':
             sections.append('本題是資料不完整的交易回顧，不是一般型態問答：answer先說目前能回顧哪些交易依據、哪些無法核實；why圍繞使用者進場理由與交易規劃，提出可改善的記錄方法，未提供的理由或計畫不可捏造。目前行情只補充成本與風險，不能當成買進當天證據。scenarios可省略，不要硬湊兩種行情；不提供個人買賣指令。')
+        sections.append('必須接住使用者原問句，不能每題只重複多頭排列、支撐壓力。玩笑或諧音直接在answer第一句順著原梗回應15～25字，再接客觀結論；例如問豁達就回應豁達，問套房就回應套房，不使用固定笑話模板。焦慮或虧損不嘲笑；沒有玩笑不硬加幽默。問能否持有時，先回答目前結構是否轉弱及風險有無升高，再說原因；成本估算必須稱為估算，不可說成實際成交價。')
     payload_json = json.dumps(payload.get("tool_results") or {}, ensure_ascii=False, separators=(",", ":"), default=tools.json_safe)
     return "\n\n".join(sections) + f"\n\n使用者問題：{payload['question']}\n\ntool_results（JSON）：\n{payload_json}\n"
 
@@ -3810,6 +3811,40 @@ class AnswerResult:
     timings: Dict[str, float] = field(default_factory=dict)          # 各階段耗時（PERF log 用）
 
 
+def integrate_trade_context(result: AnswerResult, code: str, trade: dict, note: str) -> AnswerResult:
+    """買點進K線、成本來源進AI解讀，複製資料避免污染共用快取。"""
+    panels=[]
+    text=result.text
+    added_note=False
+    for original in result.panels or []:
+        panel=dict(original)
+        if panel.get('stock_code') == code and panel.get('bars'):
+            if trade['date'] not in {bar['date'] for bar in panel['bars']}:
+                lookback=min(800,max(70,(tools.taipei_now().date()-datetime.strptime(trade['date'],'%Y/%m/%d').date()).days+20))
+                try:
+                    expanded=tools.get_chart_panel(code,with_marks=False,lookback=lookback)
+                    if trade['date'] in {b['date'] for b in expanded.get('bars') or []}:
+                        panel.update(expanded)
+                except tools.ToolDataError:
+                    pass
+            if trade['date'] in {bar['date'] for bar in panel['bars']}:
+                panel['trades']=[dict(t) for t in panel.get('trades') or [] if not(t.get('side')=='buy' and t.get('date')==trade['date'])]+[dict(trade)]
+                panel['hide_trade_legend']=True
+            else:
+                note=(note+' ' if note else '')+'買進日不在可用K線區間，無法標出買點。'
+        if isinstance(panel.get('ai_card'),dict) and note:
+            old=panel['ai_card']
+            card=dict(old,cost_basis=note)
+            old_text=ai_card_text(old)
+            text=text.replace(old_text,ai_card_text(card),1) if old_text in text else note+'\n\n'+text
+            panel['ai_card']=card
+            added_note=True
+        panels.append(panel)
+    if note and not added_note:
+        text=note+'\n\n'+text
+    return replace(result,text=text,panels=panels)
+
+
 # ============================================================
 # 短期追問記憶（依 伺服器＋頻道＋使用者 隔離，只存股票／成本／分點，不存對話原文）
 # ============================================================
@@ -4780,36 +4815,24 @@ class AceQueryEngine:
             req = trade_review.parse_request(question)
             if req.get('parse_error'):
                 raise tools.ToolDataError(req['parse_error'])
-            if not req.get('code') or not req.get('buy_date') or req.get('price') is not None:
+            if not req.get('code') or not req.get('buy_date'):
                 return self._answer_general(question, context_key, on_queue, started, re.sub(r'\s+', '',question))
-            price = trade_review.close_on_date(req['code'],req['buy_date'])
+            price = req.get('price') if req.get('price') is not None else trade_review.close_on_date(req['code'],req['buy_date'])
         except tools.ToolDataError as exc:
             return AnswerResult(text=str(exc),route='clarify',gemini_calls=0,elapsed=time.perf_counter()-started,as_text=True)
-        note = f"買進價未提供：以{req['buy_date']:%Y/%m/%d}收盤價{price:g}元估算成本，並非實際成交價；本題分析目前行情。"
-        effective = question+f"（成本{price:g}元為買進日收盤估算；本題只分析目前行情。）"
+        estimated = req.get('price') is None
+        note = (f"未提供成交價，以{req['buy_date']:%Y/%m/%d}收盤價{price:g}元估算成本，並非實際成交價。" if estimated else '')
+        effective = question+f"（成本{price:g}元{'為買進日收盤估算，並非實際成交價' if estimated else '為使用者提供'}；本題只分析目前行情。）"
         result = self._answer_general(effective,context_key,on_queue,started,re.sub(r'\s+', '',effective))
         if result.route not in CARD_ROUTES and result.route != 'answer_cache':
             return result
-        panel = {'branch_card':{'branch':'成本估算','sections':[{'type':'note','text':note}]},'hide_text':True}
-        return replace(result,text=note+'\n\n'+result.text,panels=[panel]+list(result.panels or []))
+        trade={'date':f"{req['buy_date']:%Y/%m/%d}",'price':price,'side':'buy','estimated':estimated}
+        return integrate_trade_context(result,req['code'],trade,note)
 
     def _answer_general(self, question: str, context_key: str, on_queue: Optional[Callable[[int], None]],
                         started: float, compact: str) -> AnswerResult:
-        """接住股票口語，幽默開場與正常分析共用原本的權限及快取流程。"""
-        banter = None
-        if stock_banter._SLANG.search(question):
-            try:
-                banter = stock_banter.prepare(question, tools.get_stock_name_map())
-            except tools.ToolDataError:
-                pass  # 原有解析流程會回報資料讀取錯誤。
-        if not banter:
-            return self._answer_general_impl(question, context_key, on_queue, started, compact)
-        normalized, opener = banter
-        result = self._answer_general_impl(normalized, context_key, on_queue, started, re.sub(r'\s+', '', normalized))
-        if result.route not in CARD_ROUTES and result.route != 'answer_cache':
-            return result  # 權限、澄清與錯誤訊息照原本處理。
-        panel = {'branch_card': {'branch':'喬巴先說一句','sections':[{'type':'note','text':opener}]}, 'hide_text':True}
-        return replace(result, text=opener+'\n\n'+result.text, panels=[panel]+list(result.panels or []))
+        """原句直接送進既有解析與AI解讀；幽默放在同一張解讀卡。"""
+        return self._answer_general_impl(question, context_key, on_queue, started, compact)
 
     def _answer_general_impl(self, question: str, context_key: str, on_queue: Optional[Callable[[int], None]],
                              started: float, compact: str) -> AnswerResult:
@@ -4873,7 +4896,7 @@ class AceQueryEngine:
         # 快取鍵值用「補完股票之後」的問題，避免 A 使用者的「那它的壓力在哪」拿到 B 使用者的答案；籌碼類型分開快取。
         # 族群追問（「那哪檔最強」）要帶族群名稱與模式，不同族群的同一句追問不能共用答案
         sector = parsed.sector or {}
-        key = "|".join([compact, ",".join(c for c, _ in parsed.stocks), str(parsed.cost_price or ""), ",".join(parsed.branches),
+        key = "|".join(['解讀整合v2',compact, ",".join(c for c, _ in parsed.stocks), str(parsed.cost_price or ""), ",".join(parsed.branches),
                         "chip=" + parsed.chip,
                         "sector=" + str(sector.get("name") or sector.get("industry") or "") + ":" + str(sector.get("mode") or "")])
         key = self._access_cache_key(key)
@@ -5438,8 +5461,10 @@ class AceQueryEngine:
             estimates.append(f"賣出價以{req['sell_date']:%Y/%m/%d}收盤價估算")
         if estimates:
             note='；'.join(estimates)+'，並非實際成交價。'
-            text=note+'\n\n'+text
-            panels.insert(0,{'branch_card':{'branch':'價格估算','sections':[{'type':'note','text':note}]},'hide_text':True})
+            text=text.replace(body,note+'\n\n'+body,1)
+            for item in panels:
+                if isinstance(item.get('review'),dict):
+                    item['review']['cost_basis']=' '.join(x for x in [note,item['review'].get('cost_basis')] if x)
         return AnswerResult(text=text, route="trade_review", gemini_calls=stats.gemini_calls, elapsed=elapsed(),
                             cacheable=False, panels=panels, image_title=heading,
                             input_tokens=stats.input_tokens, output_tokens=stats.output_tokens,
@@ -6903,6 +6928,8 @@ def parse_ai_card(text: str) -> Optional[Dict[str, Any]]:
 def ai_card_text(card: Dict[str, Any]) -> str:
     """解讀卡的文字版：Log、快取、純文字回覆與事實核對用。"""
     parts = [card["answer"]]
+    if card.get('cost_basis'):
+        parts.append(card['cost_basis'])
     if card.get("why"):
         parts.append("為什麼這樣看：" + card["why"])
     for item in card.get("scenarios") or []:

@@ -27,16 +27,5 @@ def prepare(question, names):
     # 多檔比較交給原有流程；不能為了接梗猜一檔股票。
     if len(subjects) != 1:
         return None
-    code, name = subjects[0]
-    if name == '友達' and '豁達' in question:
-        opener = '買友達能不能人生豁達，股名先不算，還得看走勢 😆'
-    elif name == '大亞' and '亞起來' in question:
-        opener = '大亞要不要「亞起來」，先看看量有沒有跟上 😆'
-    elif re.search(r'有點抖|抖爆|救救我|睡公園|吃土|套房|芭比Q|丸子', question):
-        opener = '先穩住，讓數據幫你拆解，別讓心跳代替判斷 😅'
-    elif re.search(r'沒力|真的弱', question):
-        opener = '是暫時喘口氣，還是真的沒力？讓量價來說話 😄'
-    else:
-        opener = '股價的引擎有沒有發動，先看量價，不能只聽群組喊聲 😆'
-    normalized = question + '（請以實際資料分析這檔股票目前的技術走勢、量能、支撐壓力與後續觀察條件。幽默開場已由程式提供，請直接分析。）'
-    return normalized, opener
+    # 語氣交給同一次AI解讀依原句產生，不再注入固定開場或泛用分析問句。
+    return question, None
