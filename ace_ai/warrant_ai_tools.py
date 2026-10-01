@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import contextvars
 import difflib
 import importlib.util
 import html
@@ -606,7 +607,7 @@ class TTLCache:
         self._key_locks: Dict[str, threading.Lock] = {}
 
     def _full_key(self, key: str) -> str:
-        return f"{self.namespace}_{key}"
+        return f"{self.namespace}_{'closed' if closed_quotes_only() else 'admin_live'}_{key}"
 
     def get(self, key: str) -> Tuple[bool, Any]:
         """回傳 (是否命中, 值)。"""
@@ -629,7 +630,7 @@ class TTLCache:
 
     def invalidate(self, prefixes: Sequence[str]) -> int:
         """刪掉 key 以這些前綴開頭的快取；回傳刪了幾筆。"""
-        heads = tuple(self._full_key(p) for p in prefixes)
+        heads = tuple(f"{self.namespace}_{mode}_{p}" for mode in ("closed", "admin_live") for p in prefixes)
         with self._lock:
             doomed = [k for k in self._data if k.startswith(heads)]
             for k in doomed:
@@ -1519,7 +1520,25 @@ def _fugle_rotate_key() -> bool:
     return True
 FUGLE_BASE_URL = "https://api.fugle.tw/marketdata/v1.0/stock"
 FUGLE_TIMEOUT = _env_float("DISCORD_AI_FUGLE_TIMEOUT", 6.0)
-INTRADAY_ENABLE = bool(FUGLE_API_KEYS or FUGLE_API_KEY) and os.getenv("DISCORD_AI_INTRADAY_ENABLE", "1").strip().lower() in ("1", "true", "yes", "on")
+# 預設僅收盤資料；只有通過權限驗證的 /ace 查詢可啟用即時行情。
+_ADMIN_LIVE_QUOTES = contextvars.ContextVar("ace_admin_live_quotes", default=False)
+CLOSED_QUOTES_ONLY = True  # 預設政策；執行時請使用 closed_quotes_only()
+INTRADAY_ENABLE = os.getenv("DISCORD_AI_INTRADAY_ENABLE", "1").strip().lower() in ("1", "true", "yes", "on")
+
+
+def closed_quotes_only():
+    return not (_ADMIN_LIVE_QUOTES.get() and INTRADAY_ENABLE)
+
+
+@contextmanager
+def quote_policy(*, admin_live=False):
+    token = _ADMIN_LIVE_QUOTES.set(bool(admin_live))
+    try:
+        yield
+    finally:
+        _ADMIN_LIVE_QUOTES.reset(token)
+
+
 TTL_INTRADAY_SECONDS = _env_int("DISCORD_AI_TTL_INTRADAY_SECONDS", 60)
 LIVE_PATTERN_SCORE = os.getenv("DISCORD_AI_LIVE_PATTERN_SCORE", "1").strip().lower() in ("1","true","yes","on")
 MARKET_CLOSE_HHMM = (13, 30)
@@ -1542,6 +1561,8 @@ def intraday_session_now(now: Optional[datetime] = None) -> bool:
     - 已看過但仍未正式收盤的股票，背景每 15 分鐘最多再確認一次。
     這只針對曾被查詢的股票，不做全市場富果預抓。
     """
+    if closed_quotes_only():
+        return False
     now = now or taipei_now()
     if now.weekday() >= 5:
         return False
@@ -1551,6 +1572,8 @@ def intraday_session_now(now: Optional[datetime] = None) -> bool:
 
 
 def _fugle_get(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    if closed_quotes_only() and path.strip("/").startswith(("intraday/quote", "intraday/candles", "snapshot/")):
+        raise ToolDataError("即時行情已停用，請使用正式收盤資料")
     kf = core()
     attempts = max(1, len(FUGLE_API_KEYS) or 1)
     last_error: Optional[Exception] = None
@@ -1587,6 +1610,8 @@ def _fugle_timestamp(value: Any) -> Optional[datetime]:
 
 def fetch_fugle_quote(stock_code: str) -> Dict[str, Any]:
     """富果盤中即時報價（intraday/quote）；還沒有成交（開盤前、試撮中）或查不到時回傳空 dict。"""
+    if closed_quotes_only():
+        return {}
     data = _fugle_get(f"intraday/quote/{stock_code}")
     if data.get("isTrial"):
         return {}
@@ -1680,7 +1705,7 @@ def _append_intraday_bar(code: str, stock_df: pd.DataFrame, market: str = "") ->
     仍保留為盤後暫定並在短快取失效後重新確認。只有 isClose=True 才寫入持久化日K。
     """
     now = taipei_now()
-    if not INTRADAY_ENABLE or now.weekday() >= 5 or (now.hour, now.minute) < (9, 0):
+    if closed_quotes_only() or not INTRADAY_ENABLE or now.weekday() >= 5 or (now.hour, now.minute) < (9, 0):
         return stock_df, {}
     if current_api_priority() == "background":
         # 背景掃描（型態分數、底庫維護）一律只用已收盤 K 棒，
@@ -1737,6 +1762,8 @@ def recheck_provisional_closes(max_items: int = 5) -> Dict[str, int]:
     每檔至少隔 POST_CLOSE_RECHECK_MINUTES 才再查一次，且走 background API budget；
     不掃全市場，因此不會用這個功能把 Fugle 60/min 吃滿。
     """
+    if closed_quotes_only():
+        return {"checked": 0, "confirmed": 0, "pending": 0}
     now = taipei_now()
     if now.weekday() >= 5 or (now.hour * 60 + now.minute) < 13 * 60 + 30:
         return {"checked": 0, "confirmed": 0, "pending": provisional_close_stats()["count"]}
@@ -1871,6 +1898,8 @@ FUGLE_INDEX_SYMBOL = {
 
 def _fugle_index_get(path: str) -> Dict[str, Any]:
     """和 _fugle_get 相同的金鑰輪替與額度控管，只是走 index 端點。"""
+    if closed_quotes_only() and path.strip("/").startswith("intraday/"):
+        raise ToolDataError("即時指數已停用，請使用正式收盤資料")
     kf = core()
     attempts = max(1, len(FUGLE_API_KEYS) or 1)
     last_error: Optional[Exception] = None
@@ -1931,6 +1960,8 @@ def fetch_fugle_index_quote(code: str) -> Dict[str, Any]:
 
 def fetch_index_quote(code: str) -> Dict[str, Any]:
     """指數盤中報價：先用富果（和個股同一個來源），失敗才用證交所 MIS。"""
+    if closed_quotes_only():
+        return {}
     if FUGLE_API_KEYS or FUGLE_API_KEY:
         try:
             return fetch_fugle_index_quote(code)
@@ -1949,6 +1980,8 @@ def mis_item_is_today(item: Dict[str, Any], now: Optional[datetime] = None) -> b
 
 def fetch_mis_index_quote(code: str) -> Dict[str, Any]:
     """證交所 MIS 指數報價（免金鑰、不佔富果額度）。"""
+    if closed_quotes_only():
+        return {}
     channel = MIS_INDEX_CHANNEL.get(str(code).upper())
     if not channel:
         raise ToolDataError(f"不支援的指數代碼：{code}")
@@ -1985,7 +2018,7 @@ def fetch_mis_index_quote(code: str) -> Dict[str, Any]:
 def _append_index_intraday(code: str, frame: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     """日K還沒有今天這一根時，接上 MIS 的盤中指數。指數沒有成交量，量留 0。"""
     now = taipei_now()
-    if not INTRADAY_ENABLE or now.weekday() >= 5 or (now.hour, now.minute) < (9, 0):
+    if closed_quotes_only() or not INTRADAY_ENABLE or now.weekday() >= 5 or (now.hour, now.minute) < (9, 0):
         return frame, {}
     if current_api_priority() == "background":
         return frame, {}
@@ -2020,7 +2053,7 @@ def _load_index_bundle(code: str) -> Dict[str, Any]:
     kf = core()
 
     def build() -> Dict[str, Any]:
-        frame = _cached("index_daily_" + code, TTL_PRICE_SECONDS, lambda: _fetch_index_daily(code))
+        frame = _formal_daily_frame(_cached("index_daily_" + code, TTL_PRICE_SECONDS, lambda: _fetch_index_daily(code)))
         closed = kf.calculate_indicators(frame)
         closed["Close_prev"] = closed["Close"].shift(1)
         merged, intraday = _append_index_intraday(code, frame)
@@ -2246,6 +2279,7 @@ def _repair_daily(code: str, df: pd.DataFrame, gaps: List[str], source: str,
             raise ToolDataError("背景工作不用 FinMind 補缺口")
         stock_df, market, _ = core().fetch_stock_data_yf(code, period=PRICE_FETCH_PERIOD)
         stock_df = _drop_invalid_bars(code, stock_df, "FinMind")
+        stock_df = _formal_daily_frame(stock_df)
         if stock_df is not None and not stock_df.empty:
             local_market_cache.save_bars(code, stock_df, market=str(market or ""), source="FinMind", confirmed=True)
             frames.append(stock_df[columns])
@@ -2273,6 +2307,21 @@ def _drop_invalid_bars(code: str, frame: pd.DataFrame, source: str) -> pd.DataFr
     return frame[ok] if bad else frame
 
 
+def _formal_daily_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    """盤中不接受來源混入的當日日K；正式日K尚未發布時維持最近收盤日。"""
+    if not closed_quotes_only() or frame is None or frame.empty:
+        return frame
+    now = taipei_now()
+    today = now.date()
+    allow_today = (now.hour, now.minute) >= (13, 35)
+    dates = pd.to_datetime(frame.index).date
+    mask = [d <= today if allow_today else d < today for d in dates]
+    closed = frame.loc[mask].copy()
+    if closed.empty:
+        raise ToolDataError("最近正式收盤資料尚未取得，不使用盤中資料補足")
+    return closed
+
+
 def _load_price_bundle(stock_code: str) -> Dict[str, Any]:
     """日K：FinMind 為主、失敗改富果日K；盤中再接上富果即時報價。指標沿用 calculate_indicators。"""
     kf = core()
@@ -2296,6 +2345,7 @@ def _load_price_bundle(stock_code: str) -> Dict[str, Any]:
             stock_df, market, _ = kf.fetch_stock_data_yf(code, period=PRICE_FETCH_PERIOD)
             record_api_event("FinMindData", status=200, latency=time.perf_counter()-started)
             stock_df = _drop_invalid_bars(code, stock_df, "FinMind")
+            stock_df = _formal_daily_frame(stock_df)
             if stock_df is not None and not stock_df.empty:
                 local_market_cache.save_bars(code, stock_df, market=str(market or ""), source="FinMind", confirmed=True)
                 if local_last and pd.Timestamp(stock_df.index[-1]).strftime("%Y-%m-%d") <= local_last:
@@ -2310,11 +2360,13 @@ def _load_price_bundle(stock_code: str) -> Dict[str, Any]:
         print(f"⚠️ {code} FinMind 股價失敗，才改用富果歷史日K備援：{type(error).__name__}: {error}", flush=True)
         days = int(re.search(r"\d+", PRICE_FETCH_PERIOD).group(0)) if re.search(r"\d+", PRICE_FETCH_PERIOD) else 180
         frame = _drop_invalid_bars(code, fetch_fugle_daily(code, days), "富果日K")
+        frame = _formal_daily_frame(frame)
         local_market_cache.save_bars(code, frame, market="", source="Fugle-history-fallback", confirmed=True)
         return frame, "", "富果日K備援"
 
     def build() -> Dict[str, Any]:
         daily_df, market, daily_source = _cached(f"price_daily_{code}", TTL_PRICE_SECONDS, daily)
+        daily_df = _formal_daily_frame(daily_df)
         merged, intraday = _append_intraday_bar(code, daily_df, market)
         gaps = _missing_trading_days(merged)
         today = taipei_now().strftime("%Y-%m-%d")
@@ -2328,6 +2380,7 @@ def _load_price_bundle(stock_code: str) -> Dict[str, Any]:
             if unproven:
                 daily_df, daily_source = _repair_daily(code, daily_df, unproven, daily_source,
                                                        allow_finmind=current_api_priority() != "background")
+                daily_df = _formal_daily_frame(daily_df)
                 CACHE.set(f"price_daily_{code}", (daily_df, market, daily_source), TTL_PRICE_SECONDS)
                 merged, intraday = _append_intraday_bar(code, daily_df, market)
             gaps = _missing_trading_days(merged)
@@ -5913,7 +5966,7 @@ HEAVYWEIGHT_CODES = [c.strip() for c in os.getenv(
 
 def _mis_quotes(channels: List[str]) -> List[Dict[str, Any]]:
     """證交所 MIS 批次報價：一個請求可以同時要指數與個股，回傳 [{key, name, change_pct, time}]。"""
-    if not channels:
+    if closed_quotes_only() or not channels:
         return []
     started = time.perf_counter()
     status = 0
@@ -5982,7 +6035,7 @@ def get_market_breadth() -> Dict[str, Any]:
     session = now.weekday() < 5 and 9 * 60 <= minutes <= 13 * 60 + 35
     # 收盤後本地底庫通常還沒有今天的日K，直接拿會變成昨天的漲跌；
     # 交易日 09:00～20:00 一律用即時報價（收盤後取到的就是今天的收盤價）。
-    live = now.weekday() < 5 and 9 * 60 <= minutes <= 20 * 60
+    live = not closed_quotes_only() and now.weekday() < 5 and 9 * 60 <= minutes <= 20 * 60
     result: Dict[str, Any] = {}
     if live:
         sectors: List[Dict[str, Any]] = []

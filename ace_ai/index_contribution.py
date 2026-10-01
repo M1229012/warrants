@@ -519,7 +519,7 @@ def _cache_bucket(market: str) -> Dict[str, Any]:
 
 def _fetch_mis_batch(market: str, codes: List[str], deadline: float) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
     """一次 MIS GET 抓一批股票；同時帶 benchmark，回傳 quotes + 指數昨收/現值。"""
-    if not codes or time.monotonic() >= deadline:
+    if tools.closed_quotes_only() or not codes or time.monotonic() >= deadline:
         return {}, {}
 
     # 先看 20 秒共享快取。網路呼叫放在 lock 內，併發會員會等第一個人抓完後直接共用結果。
@@ -656,6 +656,8 @@ def contribution(market: str, live: bool, top: int = 5, *, deadline: Optional[fl
     直接用 TWSE / TPEx 官方「最新交易日完整收盤快照」的 close + change 做分解。
     這可避免「指數已是今天、個股卻仍停在上一交易日」造成整張貢獻榜失真。
     """
+    if tools.closed_quotes_only():
+        live = False
     if market not in INDEX_OF:
         raise ValueError(f"unsupported market: {market}")
     index_code, index_name = INDEX_OF[market]
@@ -1028,6 +1030,8 @@ def contribution(market: str, live: bool, top: int = 5, *, deadline: Optional[fl
 
 def report(live: Optional[bool] = None, top: int = 5) -> Dict[str, Any]:
     """加權與櫃買一起計算；盤中共享一個總時間預算，避免連線慢時拖垮問答。"""
+    if tools.closed_quotes_only():
+        live = False
     if live is None:
         now = tools.taipei_now()
         live = now.weekday() < 5 and 9 * 60 <= now.hour * 60 + now.minute <= 13 * 60 + 35
@@ -1049,7 +1053,7 @@ def report(live: Optional[bool] = None, top: int = 5) -> Dict[str, Any]:
         except Exception as exc:
             # 已收盤、但交易所當天的全市場收盤檔還沒發布時，改用即時報價估算今天的貢獻，
             # 而不是回頭拿前一個交易日的榜（那會變成昨天的答案）。
-            if not live and PENDING_CLOSE_ESTIMATE:
+            if not tools.closed_quotes_only() and not live and PENDING_CLOSE_ESTIMATE:
                 try:
                     row = contribution(market, live=True, top=top,
                                        deadline=time.monotonic() + LIVE_BUDGET_SECONDS)
@@ -1085,6 +1089,6 @@ def report(live: Optional[bool] = None, top: int = 5) -> Dict[str, Any]:
         "依交易所發行量加權公式計算：收盤後直接讀 TWSE / TPEx 官方全市場收盤快照的收盤價與漲跌價差，"
         "再以官方收盤指數與完整成分母體總發行市值換算每檔貢獻點數；"
         "櫃買優先使用官方公開成分股名冊，TAIEX 依官方編製要點與免費公開資料建立母體。"
-        "盤中使用官方 MIS 批次報價並設時間上限。"
+        "此版本停用即時行情；官方收盤資料未發布時不以即時報價估算。"
     )
     return out

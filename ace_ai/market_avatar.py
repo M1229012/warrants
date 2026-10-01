@@ -114,8 +114,16 @@ class AvatarController:
                     return
             quote = None
             if status != "closed":
-                raw = tools._cached("index_quote_TAIEX", max(20, tools.TTL_INTRADAY_SECONDS),
-                                    lambda: tools.fetch_index_quote("TAIEX"))
+                if tools.closed_quotes_only():
+                    frame = tools._load_index_bundle("TAIEX")["closed_df"]
+                    if len(frame) < 2:
+                        raise ValueError("TAIEX closing history missing; keep avatar")
+                    raw = {"date": frame.index[-1], "time": "13:30",
+                           "close": frame["Close"].iloc[-1],
+                           "previous_close": frame["Close"].iloc[-2]}
+                else:
+                    raw = tools._cached("index_quote_TAIEX", max(20, tools.TTL_INTRADAY_SECONDS),
+                                        lambda: tools.fetch_index_quote("TAIEX"))
                 previous, close = float(raw["previous_close"]), float(raw["close"])
                 if not math.isfinite(previous) or not math.isfinite(close) or previous <= 0 or close <= 0:
                     raise ValueError("TAIEX closing or previous closing index is invalid")

@@ -245,6 +245,8 @@ def basket(refresh: bool = False) -> Dict[str, List[str]]:
 
 def sample_basket() -> Dict[str, int]:
     """背景每 5 分鐘取一次基準股的累積量；走背景額度，忙碌時自動讓給使用者。"""
+    if tools.closed_quotes_only():
+        return {"sampled": 0, "reason": "即時行情已停用"}
     now = tools.taipei_now()
     minutes = now.hour * 60 + now.minute
     if now.weekday() >= 5 or not (OPEN_MINUTES <= minutes <= CLOSE_MINUTES):

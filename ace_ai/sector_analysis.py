@@ -10,6 +10,7 @@ import math
 import re
 import statistics
 import threading
+import contextvars
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from typing import Any, Dict, List, Optional
@@ -440,7 +441,7 @@ def get_ranking(industry: str, mode: str, display_name: str = "") -> Dict[str, A
                     stock = next(remaining, None)
                     if stock is None:
                         break
-                    pending[_POOL.submit(_stock_row, stock, mode, deadline, cancel)] = stock
+                    pending[_POOL.submit(contextvars.copy_context().run, _stock_row, stock, mode, deadline, cancel)] = stock
                 if not pending:
                     break
                 done, _ = wait(pending, timeout=max(0, deadline - time.monotonic()), return_when=FIRST_COMPLETED)
@@ -775,6 +776,8 @@ def _shape_label(k: Dict[str, Any]) -> str:
 def live_group_ranking() -> Optional[Dict[str, Any]]:
     """盤中族群漲幅排行：自己用證交所即時報價算（有效成分股中位漲幅），不依賴 CMoney 排行表。
     報價走 sector_radar 5 分鐘共用快取；背景 tick 會先暖好，會員查詢通常直接讀快取。"""
+    if tools.closed_quotes_only():
+        return None
     import sector_radar
     catalog = sector_roster.catalog()
     if not catalog:

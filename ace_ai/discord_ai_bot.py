@@ -5255,6 +5255,14 @@ class AceQueryEngine:
 
     def answer(self, question: str, context_key: str = "", on_queue: Optional[Callable[[int], None]] = None,
                is_admin: bool = False, admin_mode: bool = False, access=None, image=None) -> AnswerResult:
+        # /ask always stays closed, including requests from administrators.
+        allowed = bool(access.admin_mode) if access is not None else bool(is_admin and admin_mode)
+        with tools.quote_policy(admin_live=allowed):
+            return self._answer_with_quote_policy(question, context_key, on_queue,
+                                                  is_admin, admin_mode, access, image)
+
+    def _answer_with_quote_policy(self, question: str, context_key: str = "", on_queue: Optional[Callable[[int], None]] = None,
+               is_admin: bool = False, admin_mode: bool = False, access=None, image=None) -> AnswerResult:
         """公開入口：替每一題建立 request_id，蒐集這一題實際 API 使用量。"""
         self._request_local.perf = perf = {}
         permission_started = time.perf_counter()
@@ -6474,7 +6482,7 @@ class AceQueryEngine:
             access_policy.require_feature(self._access(), access_policy.FeaturePolicy("WARRANT"))
         cancel_event = threading.Event()
         request_id = str(getattr(self._request_local, "request_id", "") or "")
-        futures = [(call, self.executor.submit(tools.run_tool_scoped, call.name, call.kwargs, cancel_event, request_id)) for call in calls]
+        futures = [(call, self.executor.submit(contextvars.copy_context().run, tools.run_tool_scoped, call.name, call.kwargs, cancel_event, request_id)) for call in calls]
         tools_started = time.perf_counter()
         done, _ = wait([f for _, f in futures], timeout=self.config.tool_timeout_seconds)
         self._perf_add("tools", time.perf_counter() - tools_started)
@@ -7101,6 +7109,12 @@ INTRADAY_SAMPLE_SECONDS = 300             # 盤中量能基準籃子取樣間隔
 
 
 def _intraday_sampling_loop(stop: threading.Event) -> None:
+    # 管理員雷達需要背景快照；/ask 在入口與資料工具仍禁止即時行情。
+    with tools.quote_policy(admin_live=True):
+        _intraday_sampling_loop_admin(stop)
+
+
+def _intraday_sampling_loop_admin(stop: threading.Event) -> None:
     """盤中定時取樣（族群雷達快照、量能基準籃子）獨立一條執行緒，不被底庫同步、型態評分等長工作延後。"""
     last_basket = 0.0
     while not stop.is_set():
@@ -7282,7 +7296,8 @@ def _usage_monitor_loop(engine: "AceQueryEngine", stop: threading.Event) -> None
                 print(f"⚠️ CMoney 成分股名冊背景補齊失敗｜{tools.err_text(exc)}", flush=True)
         # 只重查曾被問過、13:30 後仍未正式收盤的股票。
         try:
-            recheck = tools.recheck_provisional_closes(max_items=5)
+            with tools.quote_policy(admin_live=True):
+                recheck = tools.recheck_provisional_closes(max_items=5)
             if recheck.get("checked"):
                 print(f"🔁 盤後收盤查核｜checked={recheck['checked']}｜confirmed={recheck['confirmed']}｜pending={recheck['pending']}", flush=True)
         except Exception as exc:
@@ -7491,6 +7506,12 @@ def run_discord_bot(config: BotConfig) -> None:
 
     async def handle_question(interaction: "discord.Interaction", question: str, admin_mode: bool,
                               attachment=None) -> None:
+        entitled_admin = access_policy.UserEntitlement.from_member(interaction.user, config.superuser_ids).admin
+        with tools.quote_policy(admin_live=bool(admin_mode and entitled_admin)):
+            await handle_question_with_quote_policy(interaction, question, admin_mode, attachment)
+
+    async def handle_question_with_quote_policy(interaction: "discord.Interaction", question: str, admin_mode: bool,
+                                               attachment=None) -> None:
         request_started = asyncio.get_running_loop().time()
         user_id, channel_id = interaction.user.id, interaction.channel_id or 0
         who = f"{getattr(interaction.user, 'display_name', '') or getattr(interaction.user, 'name', '')}（{user_id}）"
