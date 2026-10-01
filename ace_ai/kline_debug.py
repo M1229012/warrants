@@ -72,6 +72,7 @@ def build_panel(frame: pd.DataFrame, events: dict | None, code: str, name: str =
     return {"kline_debug": {"stock_code": code, "stock_name": name, "bars": bars,
                             "display_start": max(0, len(bars) - kline_patterns.SEARCH_DAYS),
                             "last_official": snapshot["last_official"], "pivots": result["pivots"],
+                            "triangle": result.get("triangle"),
                             "formation": result.get("formation"), "ended": result.get("ended"),
                             "invalid": snapshot.get("invalid"), "trend": snapshot.get("trend"),
                             "summary": result["summary"], "flags": result.get("flags") or [],
@@ -86,7 +87,16 @@ def line_specs(data: dict) -> list[dict]:
     historical = not bool(formation)
     formation = formation or data.get("ended") or data.get("invalid")
     lines = []
-    if formation:
+    triangle = data.get("triangle")
+    if triangle:
+        # detect 的文字優先採用 triangle；畫線也必須使用同組係數。
+        # 兩條邊的錨點起訖可不同，保持完整計算框架的 index，不重新擬合。
+        for edge, label, color in (("upper", "上緣", "#C76C00"), ("lower", "下緣", "#1478B5")):
+            anchors = list(triangle["anchors"][edge])
+            lines.append({"label": label, "coef": triangle[edge],
+                          "start": anchors[0], "fit_end": anchors[-1], "stop": last,
+                          "anchors": anchors, "color": color, "historical": False})
+    elif formation:
         stop = min(last, formation.get("end_day", formation.get("inv_day", last)))
         for edge, label, color in (("upper", "上緣", "#C76C00"), ("lower", "下緣", "#1478B5")):
             lines.append({"label": label + ("（歷史）" if historical else ""),
@@ -130,8 +140,8 @@ def render(data: dict) -> Image.Image:
     for value in data.get("flags") or []:
         flags.extend(wrap("資料旗標：" + str(value), 21, width - 2 * margin))
     metrics = []
-    chosen = data.get("formation") or data.get("ended") or data.get("invalid")
-    if chosen:
+    chosen = data.get("triangle") or data.get("formation") or data.get("ended") or data.get("invalid")
+    if chosen and chosen.get("ref") is not None:
         ref = chosen["ref"]
         metrics.append(f"型態 ATR 基準 {ref:.4f}｜突破距離 {data['break_multiplier'] * ref:.4f}｜回測半寬 {data['retest_multiplier'] * ref:.4f}")
     for line in lines:

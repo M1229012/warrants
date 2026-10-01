@@ -24,6 +24,7 @@ import local_market_cache
 import market_scan
 import sector_roster
 import sector_match
+import custom_chip_compare
 
 
 # 只對照分類名稱與官方代碼，成分股一律從資料來源取得。
@@ -947,11 +948,11 @@ def rank_custom(stocks: List[Dict[str, str]], name: str) -> Dict[str, Any]:
         rank, keep_score = row["rank"], row.get("pattern_score")
         row.update(full)
         row["rank"], row["pattern_score"] = rank, keep_score
-    others = [{"rank": i + 4, **{k: row.get(k) for k in ("stock_code", "stock_name", "market", "close", "change_pct",
-                                                          "pattern_score", "grade")}}
-              for i, row in enumerate(eligible[3:])]
+    others = [dict(row, rank=i + 4) for i, row in enumerate(eligible[3:])]
     ranked = {r["stock_code"] for r in eligible}
     missing = [s for s in stocks if s["stock_code"] not in ranked]
+    # Keep every recognized screenshot stock in chips/margin comparison, even without a technical score.
+    others += [dict(s, rank=None, pattern_score=None, grade="技術資料不足") for s in missing]
     return {"name": name, "mode": "technical", "source": "管理員提供的清單", "members_updated_at": "",
             "members_complete": True, "missing_markets": [], "total_count": len(stocks),
             "compared_count": len(eligible), "failed_count": len(failed), "excluded_count": excluded,
@@ -967,25 +968,31 @@ def _missing_codes_text(missing: List[str], limit: int = 12) -> str:
     return "、".join(codes[:limit]) + (f" 等 {len(codes)} 檔" if len(codes) > limit else "")
 
 
-def answer_custom(stocks: List[Dict[str, str]], name: str, gateway, validate) -> Dict[str, Any]:
+def answer_custom(stocks: List[Dict[str, str]], name: str, gateway, validate, question: str = "") -> Dict[str, Any]:
     """自訂清單型態排行＋前 3 名 AI 解讀；圖卡沿用族群排行版面，所有名次都列出。"""
     data = rank_custom(stocks, name)
     text = format_ranking(data)
     if data.get("missing"):
         text += "\n資料不足未排名：" + "、".join(data["missing"])
-    if not data["rows"]:
+    if not data["rows"] and not data.get("others"):
         return {"text": text, "calls": 0, "cacheable": False, "panels": [ranking_panel(data)], "ai_ok": False}
-    accepted, observations, result = _ai_observations(
-        data, gateway, validate, "這是管理員提供的自訂股票清單，全部列入比較、不套用成交量門檻；只能說是清單內的相對比較。")
-    if accepted:
-        text += "\n\n【AI 解讀】\n" + "\n".join(item[1] for item in sorted(accepted))
-    elif not result.ok:
-        text += "\n\nAI 解讀暫時無法使用，以上為程式計算結果。"
-    panel = ranking_panel(data, observations)
-    panel["sector"]["others_title"] = "其他名次"
-    panel["sector"]["footer_text"] = ("股市艾斯  /  資料不足未排名：" + _missing_codes_text(data["missing"]) if data.get("missing")
-                                      else "股市艾斯  /  型態分數依日 K 收盤資料計算，清單內相對比較")
-    return {"text": text, "calls": 1, "panels": [panel], "ai_ok": bool(accepted),
+    # Only this admin route adds spot/margin comparison; ordinary sector queries stay unchanged.
+    rows = custom_chip_compare.enrich(data)
+    rows = custom_chip_compare.apply_scores(data, rows)
+    complete = [r for r in rows if r['composite_score']['complete']]
+    text += "\n\n【綜合觀察分數】技術60／現股30／融資券10；缺項不算總分、不排名。"
+    for row in rows:
+        score = row['composite_score']
+        value = f"{score['total']:.1f}/100" if score['complete'] else "待補（僅顯示已有單項）"
+        text += f"\n{row['stock_name']}（{row['stock_code']}）：{value}"
+    card, result = custom_chip_compare.ai_compare(data, question or name, gateway, validate)
+    panels = [custom_chip_compare.score_panel(rows), custom_chip_compare.comparison_panel(rows)]
+    if card:
+        panels.append({"ai_card": card})
+        text += "\n\n【AI 清單比較】\n" + "\n".join(card.get(k, '') for k in ('answer', 'why', 'summary'))
+    else:
+        text += "\n\nAI 解讀暫時無法使用，以上為程式整理的資料。"
+    return {"text": text, "calls": 1, "panels": panels, "ai_ok": bool(card), "cacheable": bool(card) and len(complete) == len(rows),
             "input_tokens": int(getattr(result, "input_tokens", 0) or 0),
             "output_tokens": int(getattr(result, "output_tokens", 0) or 0),
             "total_tokens": int(getattr(result, "total_tokens", 0) or 0),

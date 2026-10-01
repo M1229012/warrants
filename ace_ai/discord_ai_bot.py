@@ -1369,9 +1369,21 @@ IMAGE_STOCKS_PROMPT = ("這張圖片是台股的股票清單截圖（例如 Disc
                        "只列股票，不要列價格、日期或其他數字；看不清楚的代號不要猜。只回 JSON。")
 
 
-def is_custom_ranking_question(question: str) -> bool:
-    """「1528 2303 2441 … 誰型態最好」：至少 3 個代號＋排名字眼（2 檔比較仍走原本的比較流程）。"""
-    return len(set(_CODE_TOKEN_RE.findall(question or ""))) >= 3 and bool(_CUSTOM_RANK_WORDS_RE.search(question or ""))
+def is_custom_ranking_question(question: str, name_map=None) -> bool:
+    """管理員兩檔以上清單比較；成本價數字＋單檔型態問題不能誤判成清單。"""
+    text = question or ""
+    if not _CUSTOM_RANK_WORDS_RE.search(text):
+        return False
+    codes = set(_CODE_TOKEN_RE.findall(text))
+    names = {code for code, name in (name_map or {}).items() if len(name) >= 2 and name in text}
+    if name_map:
+        codes.intersection_update(name_map)
+    codes.update(names)
+    if len(codes) < 2:
+        return False
+    explicit = bool(re.search(r"比較|排名|排行|排序|誰|哪(?:一)?檔|(?i:vs)", text))
+    listed = bool(re.search(r"\d{4,6}[A-Z]?\s*(?:跟|和|與|、|\s+)\s*\d{4,6}[A-Z]?", text))
+    return explicit or listed or len(names) >= 2 or len(codes) >= 3
 
 
 def normalize_custom_stocks(items: Sequence[Tuple[str, str]], name_map: Optional[Dict[str, str]] = None) -> Tuple[List[Dict[str, str]], List[str]]:
@@ -4781,7 +4793,13 @@ class AceQueryEngine:
                                     route="weekly_pick_hint", gemini_calls=0, elapsed=time.perf_counter() - started)
             return self._answer_general(question, context_key, on_queue, started, compact)
         # 管理員上傳股票清單截圖，或一次給 3 檔以上代號問誰型態最好 → 自訂清單型態排行。
-        if image is not None or is_custom_ranking_question(question):
+        custom_compare = is_custom_ranking_question(question)
+        if not custom_compare and _CUSTOM_RANK_WORDS_RE.search(question):
+            try:
+                custom_compare = is_custom_ranking_question(question, tools.get_stock_name_map())
+            except Exception:
+                pass
+        if image is not None or custom_compare:
             return self._answer_custom_ranking(question, image, started)
         admin_reply = self._answer_admin_command(question, started, context_key)
         if admin_reply is not None:
@@ -4918,7 +4936,7 @@ class AceQueryEngine:
         # 快取鍵值用「補完股票之後」的問題，避免 A 使用者的「那它的壓力在哪」拿到 B 使用者的答案；籌碼類型分開快取。
         # 族群追問（「那哪檔最強」）要帶族群名稱與模式，不同族群的同一句追問不能共用答案
         sector = parsed.sector or {}
-        key = "|".join(['短結論與族群證據v14',compact, ",".join(c for c, _ in parsed.stocks), str(parsed.cost_price or ""), ",".join(parsed.branches),
+        key = "|".join(['同日技術籌碼綜合v16',compact, ",".join(c for c, _ in parsed.stocks), str(parsed.cost_price or ""), ",".join(parsed.branches),
                         "chip=" + parsed.chip,
                         "sector=" + str(sector.get("name") or sector.get("industry") or "") + ":" + str(sector.get("mode") or "")])
         key = self._access_cache_key(key)
@@ -6362,6 +6380,7 @@ class AceQueryEngine:
         except Exception:
             name_map = {}
         items = [(code, "") for code in _CODE_TOKEN_RE.findall(question or "")]
+        items += [(code, name) for code, name in name_map.items() if len(name) >= 2 and name in question]
         if image is not None:
             data, mime_type = image
             result = self.gateway.generate_with_image(IMAGE_STOCKS_PROMPT, data, mime_type or "image/png",
@@ -6384,17 +6403,20 @@ class AceQueryEngine:
                                 route="clarify", gemini_calls=stats.gemini_calls, elapsed=time.perf_counter() - started)
 
         def validate(explanation: str, row: Dict[str, Any]) -> bool:
-            result = tools.ToolResult("get_sector_candidate", True, row)
-            return not FactSheet("", [result], {"tool_results": {"get_sector_candidate": row}}).check(
-                f"**{row['stock_name']}（{row['stock_code']}）**\n{explanation}")
+            candidates = row.get("stocks") or [row]
+            results = [tools.ToolResult("get_sector_candidate", True, candidate) for candidate in candidates]
+            payload = {"tool_results": {str(candidate.get("stock_code") or i): candidate
+                                        for i, candidate in enumerate(candidates)}}
+            return not FactSheet("", results, payload).check(explanation)
 
         name = f"自訂清單 {len(stocks)} 檔"
-        answer = sector_analysis.answer_custom(stocks, name, self.gateway, validate)
+        access_policy.require_chip(self._access(), "spot")
+        answer = sector_analysis.answer_custom(stocks, name, self.gateway, validate, question=question)
         text = answer["text"] + (f"\n無法辨識的代號：{'、'.join(unknown)}" if unknown else "")
         return AnswerResult(text=text, route="rule_custom_ranking",
                             gemini_calls=stats.gemini_calls + int(answer.get("calls") or 0),
-                            elapsed=time.perf_counter() - started, cacheable=bool(answer.get("ai_ok")),
-                            panels=answer.get("panels") or [], image_title=f"{name}｜誰型態最好",
+                            elapsed=time.perf_counter() - started, cacheable=bool(answer.get("cacheable")),
+                            panels=answer.get("panels") or [], image_title=f"{name}｜技術與籌碼比較",
                             input_tokens=stats.input_tokens + int(answer.get("input_tokens") or 0),
                             output_tokens=stats.output_tokens + int(answer.get("output_tokens") or 0),
                             total_tokens=stats.total_tokens + int(answer.get("total_tokens") or 0),
