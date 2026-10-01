@@ -2798,71 +2798,83 @@ def review_question_block(draw, px, cy, width, data):
 
 
 def review_card(draw, y: float, data: dict, dry: bool) -> int:
-    """簡潔覆盤：結論、交易數據、理由核對、改善重點、目前觀察。"""
+    """緊湊雙欄覆盤；兩欄各自量高，完整AI解讀放在較高欄位下方。"""
     px, width = MARGIN + REVIEW_PAD, CONTENT - REVIEW_PAD * 2
-    if not dry:
-        height = review_card(None, y, data, True)
-        draw.rounded_rectangle((MARGIN,y,WIDTH-MARGIN,y+height),radius=20,fill='white',outline=LINE)
     target = None if dry else draw
-    cy = y + 30
-    def para(text, size=23, color=INK, bold=False, indent=0):
+    if target is not None:
+        height=review_card(None,y,data,True)
+        target.rounded_rectangle((MARGIN,y,WIDTH-MARGIN,y+height),radius=20,fill='white',outline=LINE)
+    cy=y+28
+    def para(text,size=23,color=INK,bold=False):
         nonlocal cy
-        cy += _para(target,px+indent,cy,str(text or ''),size,color,width-indent,bold)
-    def gap(n=18):
-        nonlocal cy
-        cy += n
+        cy+=_para(target,px,cy,str(text or ''),size,color,width,bold)
     def divider():
         nonlocal cy
-        gap(16)
+        cy+=14
         if target is not None:target.line((px,cy,px+width,cy),fill=LINE,width=1)
-        gap(24)
+        cy+=18
     para(data.get('title','交易覆盤'),30,INK,True)
     summary=[(str(t),c or INK) for t,c in data.get('summary') or []]
-    metrics=[(t,c) for t,c in summary if t.startswith(('報酬','實現報酬','最大浮盈','最大回撤'))]
-    meta=[t for t,c in summary if not t.startswith(('報酬','實現報酬','最大浮盈','最大回撤'))]
-    gap(10);para('  ·  '.join(meta),21,MUTED)
-    divider()
-    para('這筆操作，哪裡可以更好？' if data.get('improvements') else '這筆交易的重點',25,INK,True)
-    gap(12);para(data.get('focus_answer') or data.get('headline') or data.get('body'),25,INK,True)
+    held=[t for t,c in summary if t.startswith('持有')]
+    if held:para(' · '.join(held),20,MUTED)
+    metrics=[(t,c) for t,c in summary if not t.startswith('持有')]
     if metrics:
-        gap(24)
-        col=(width-32)/3
-        for n,(text,color) in enumerate(metrics):
-            row=n//3;xx=px+(n%3)*(col+16);yy=cy+row*90
-            label,value=text.rsplit(' ',1) if ' ' in text else (text,'—')
-            if target is not None:
-                text_at(target,(xx,yy),label,20,MUTED)
-                text_at(target,(xx,yy+30),value,32,color,True)
-        gap(((len(metrics)+2)//3)*90)
-    divider()
-    para('買進理由核對',25,INK,True);gap(12)
-    para('你的理由：'+(data.get('reason_raw') or '未提供'),22,MUTED)
-    gap(14)
+        cy+=14;col=width/len(metrics)
+        heights=[]
+        for i,(t,color) in enumerate(metrics):
+            label,value=t.rsplit(' ',1) if ' ' in t else (t,'—')
+            xx=px+i*col+14
+            h=_para(None,xx,cy+12,label,18,MUTED,col-28)
+            v=_para(None,xx,cy+12+h,value,27,color,col-28,True)
+            heights.append(h+v+24)
+        band=max(heights)
+        if target is not None:
+            target.rounded_rectangle((px,cy,px+width,cy+band),radius=12,fill=TILE_BG)
+            for i,(t,color) in enumerate(metrics):
+                label,value=t.rsplit(' ',1) if ' ' in t else (t,'—')
+                xx=px+i*col+14
+                h=_para(target,xx,cy+12,label,18,MUTED,col-28)
+                _para(target,xx,cy+12+h,value,27,color,col-28,True)
+        cy+=band
+    cy+=18
+    focus=data.get('focus_answer') or data.get('headline') or ''
+    if focus:
+        heading='這筆操作，哪裡可以更好？' if data.get('improvements') else '這筆交易的重點'
+        h=_para(None,px+20,cy+12,heading,20,TRADE_COLOR,width-40,True)
+        h+=_para(None,px+20,cy+12+h,focus,24,INK,width-40,True)+24
+        if target is not None:
+            target.rounded_rectangle((px,cy,px+width,cy+h),radius=12,fill='#F5F2FB')
+            yy=cy+12+_para(target,px+20,cy+12,heading,20,TRADE_COLOR,width-40,True)
+            _para(target,px+20,yy,focus,24,INK,width-40,True)
+        cy+=h+22
+    col=(width-64)/2;right=px+col+64;top=cy
+    def cp(x,yy,text,size=22,color=INK,bold=False,indent=0):
+        return yy+_para(target,x+indent,yy,str(text or ''),size,color,col-indent,bold)
+    left=cp(px,top,'理由核對',25,bold=True)+12
+    left=cp(px,left,'你的理由：'+(data.get('reason_raw') or '未提供'),21,MUTED)+14
     for check in data.get('checks') or []:
-        if target is not None:_status_icon(target,px+12,cy+15,str(check.get('status','❓')),r=10)
-        para(check.get('claim',''),22,INK,True,34)
-        para('｜'.join(str(check.get(k) or '') for k in ('status_text','evidence')).strip('｜'),21,MUTED,False,34)
-        gap(12)
-    divider()
+        if target is not None:_status_icon(target,px+10,left+15,str(check.get('status','❓')),r=9)
+        left=cp(px,left,check.get('claim',''),22,bold=True,indent=30)
+        left=cp(px,left,'｜'.join(str(check.get(k) or '') for k in ('status_text','evidence')).strip('｜'),20,MUTED,indent=30)+12
     items=data.get('improvements') or []
-    para('可以改善的地方' if items else '交易回顧',25,INK,True);gap(14)
-    if items:
-        for n,item in enumerate(items,1):
-            if target is not None:text_at(target,(px,cy),f'{n:02d}',22,TRADE_COLOR,True)
-            para(item,23,INK,False,50);gap(18)
-    else:
-        para(data.get('body',''),23)
-        # 綜合敘述已保留；不重複列出理由、過程及學習三段心得。
+    rr=cp(right,top,'下次可以補強' if items else '交易重點',25,bold=True)+14
+    for n,item in enumerate(items or data.get('highlights') or [],1):
+        if target is not None:text_at(target,(right,rr),f'{n:02d}',21,TRADE_COLOR,True)
+        rr=cp(right,rr,item,22,indent=42)+14
+    cy=max(left,rr)
+    if target is not None:target.line((px+col+32,top,px+col+32,cy),fill=LINE,width=1)
+    body=data.get('body','')
+    if body:
+        divider();para('喬巴 · AI 解讀' if data.get('source')!='fallback' else '系統解讀',23,TRADE_COLOR,True)
+        cy+=8;para(body,23)
     if data.get('last_text'):
-        divider()
-        para(data.get('last_label') or '目前觀察',24,INK,True);gap(10)
-        para(data['last_text'],23)
+        divider();para(data.get('last_label') or '目前觀察',23,INK,True)
+        cy+=6;para(data['last_text'],22)
     if data.get('cost_basis'):
-        gap(24);para(data['cost_basis'],18,MUTED)
+        cy+=14;para(data['cost_basis'],18,MUTED)
     if data.get('source')=='fallback':
-        gap(14);para('AI 摘要暫時無法使用，以上為系統整理。',18,MUTED)
-    gap(30)
-    return int(cy-y)
+        cy+=8;para('AI 摘要暫時無法使用，以上為系統整理。',18,MUTED)
+    return int(cy-y+26)
 
 
 def _is_article_panel(panel: dict) -> bool:

@@ -4908,7 +4908,7 @@ class AceQueryEngine:
         # 快取鍵值用「補完股票之後」的問題，避免 A 使用者的「那它的壓力在哪」拿到 B 使用者的答案；籌碼類型分開快取。
         # 族群追問（「那哪檔最強」）要帶族群名稱與模式，不同族群的同一句追問不能共用答案
         sector = parsed.sector or {}
-        key = "|".join(['語意接梗分欄合併v8',compact, ",".join(c for c, _ in parsed.stocks), str(parsed.cost_price or ""), ",".join(parsed.branches),
+        key = "|".join(['雙欄覆盤理由解析v9',compact, ",".join(c for c, _ in parsed.stocks), str(parsed.cost_price or ""), ",".join(parsed.branches),
                         "chip=" + parsed.chip,
                         "sector=" + str(sector.get("name") or sector.get("industry") or "") + ":" + str(sector.get("mode") or "")])
         key = self._access_cache_key(key)
@@ -7532,7 +7532,7 @@ def run_discord_bot(config: BotConfig) -> None:
         is_admin = admin_mode = access.admin_mode
         # /ask 與 /ace 的成功分析公開；/ace 管理指令（狀態、用量、底庫、維護、debug…）一開始就只給本人看，
         # 其他失敗類與管理類回覆在結果出來後改成只有本人看得到。
-        ephemeral = bool(config.ephemeral or (access.entry == "ace" and not demo and _ADMIN_PRIVATE_RE.search(question)))
+        ephemeral = bool(config.ephemeral or (access.entry == "ace" and not demo and (_ADMIN_PRIVATE_RE.search(question) or kline_debug.is_request(question))))
 
         async def send_private(title, text, panels=None, as_text=False):
             followup = not ephemeral and interaction.response.is_done()

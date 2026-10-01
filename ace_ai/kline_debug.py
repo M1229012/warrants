@@ -10,19 +10,32 @@ from PIL import Image, ImageDraw
 
 import kline_patterns
 
-_COMMAND = re.compile(r"^(?:型態驗證|驗證型態|趨勢線驗證)")
-_CODE = re.compile(r"(?:型態驗證|驗證型態|趨勢線驗證)\s*([0-9]{4,6}[A-Za-z]?|TAIEX|TPEX)\s*", re.I)
+_COMMAND = re.compile(r"型態驗證|驗證型態|趨勢線驗證")
+_ACTION = re.compile(r"驗證|核對|檢查|確認|檢視|看一下|看看|畫出|顯示|列出")
+_TARGET = re.compile(r"型態|形態|趨勢線|錨點|轉折確認|轉折點")
 
 
 def is_request(question: str) -> bool:
-    return bool(_COMMAND.match(str(question or "").strip()))
+    q=str(question or '').strip()
+    if re.search(r'不要|不用|別幫|不需要',q):return False
+    return bool(_COMMAND.search(q) or
+                (re.search(r'驗證|核對',q) and _TARGET.search(q)) or
+                (_ACTION.search(q) and re.search(r'錨點|轉折確認|趨勢線.*(?:正確|對不對|怎麼畫|畫法)|(?:偵測|判斷|計算).*(?:型態|形態)',q)) or
+                (re.search(r'型態|形態',q) and re.search(r'畫出|正確|對不對',q)))
 
 
 def parse_code(question: str) -> str:
-    match = _CODE.fullmatch(str(question or "").strip())
-    if not match:
-        raise ValueError("請輸入：型態驗證 2330（一次一檔股票代號）")
-    return match.group(1).upper()
+    q=str(question or '').strip()
+    if not is_request(q):raise ValueError('請說：幫我驗證2330的型態（一次一檔）')
+    codes=set(re.findall(r'(?<![0-9A-Za-z])(?:[0-9]{4,6}[A-Za-z]?|TAIEX|TPEX)(?![0-9A-Za-z])',q,re.I))
+    codes={c.upper() for c in codes}
+    # 代號已有時不額外載入股名；純股名沿用既有正式名稱表。
+    if not codes:
+        import warrant_ai_tools as tools
+        names=tools.get_stock_name_map()
+        codes={str(c).upper() for c,n in names.items() if len(str(n))>=2 and str(n) in q}
+    if len(codes)!=1:raise ValueError('請指定一檔股票，例如：幫我驗證2330的型態，或核對台積電的趨勢線。')
+    return next(iter(codes))
 
 
 def load_panel(code: str) -> dict[str, Any]:
