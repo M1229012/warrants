@@ -56,6 +56,17 @@ def valid_bar(open_: Any, high: Any, low: Any, close: Any, volume: Any = 0.0) ->
     return h >= max(o, c, l) and l <= min(o, c) and h / l <= BAR_MAX_RANGE
 
 
+def normalize_market(market: Any) -> str:
+    """不同來源的市場代碼統一；未知值不可覆蓋已知市場或猜成上市。"""
+    key = str(market or "").strip().lower()
+    return {"twse": "twse", "tse": "twse", "tw": "twse", "上市": "twse",
+            "tpex": "tpex", "otc": "tpex", "two": "tpex", "上櫃": "tpex"}.get(key, "")
+
+
+# 兼容舊資料庫，讀取即可辨認，無須刪庫或更新所有歷史紀錄。
+_KNOWN_MARKET_SQL = "LOWER(TRIM(market)) IN ('twse','tse','tw','上市','tpex','otc','two','上櫃')"
+
+
 def _connect() -> sqlite3.Connection:
     global _INITIALIZED
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -179,6 +190,7 @@ def save_bars(stock_code: str, df: pd.DataFrame, market: str = "", source: str =
     if df is None or df.empty:
         return
     code = str(stock_code).strip()
+    market = normalize_market(market)
     frame = df.tail(max(KEEP_DAYS + 10, 90)).copy()
     now = datetime.now(timezone.utc).isoformat()
     rows, rejected = [], 0
@@ -248,7 +260,7 @@ def load_bars(stock_code: str, limit: int = KEEP_DAYS, confirmed_only: bool = Tr
     df = df.dropna(subset=["Date","Open","High","Low","Close"]).set_index("Date")
     if df.empty:
         return None
-    market = next((str(v) for v in reversed(df["market"].tolist()) if v), "")
+    market = next((normalize_market(v) for v in reversed(df["market"].tolist()) if normalize_market(v)), "")
     source = next((str(v) for v in reversed(df["source"].tolist()) if v), "")
     return {"df": df[["Open","High","Low","Close","Volume"]], "market": market, "source": source,
             "last_date": pd.Timestamp(df.index.max()).normalize(), "count": len(df)}
@@ -732,9 +744,9 @@ def market_closed_days(dates: Iterable[str]) -> List[str]:
 
 def stock_market(stock_code: str) -> str:
     """這檔股票屬於上市（twse）還是上櫃（tpex）：以全市場底庫寫入的 market 欄為準；不知道回空字串。"""
-    rows = _read_strict("SELECT market FROM daily_bars WHERE stock_code=? AND market IN ('twse','tpex') "
+    rows = _read_strict("SELECT market FROM daily_bars WHERE stock_code=? AND " + _KNOWN_MARKET_SQL + " "
                         "ORDER BY date DESC LIMIT 1", (str(stock_code).strip(),))
-    return str(rows[0][0]) if rows else ""
+    return normalize_market(rows[0][0]) if rows else ""
 
 
 def stock_markets(stock_codes: Iterable[str]) -> Dict[str, str]:
@@ -746,10 +758,10 @@ def stock_markets(stock_codes: Iterable[str]) -> Dict[str, str]:
     rows = _read_strict(
         "SELECT b.stock_code, b.market FROM daily_bars AS b JOIN "
         "(SELECT stock_code, MAX(date) AS date FROM daily_bars "
-        f"WHERE stock_code IN ({marks}) AND market IN ('twse','tpex') "
+        f"WHERE stock_code IN ({marks}) AND {_KNOWN_MARKET_SQL} "
         "GROUP BY stock_code) AS latest "
         "ON b.stock_code=latest.stock_code AND b.date=latest.date", tuple(codes))
-    return {str(code): str(market) for code, market in rows}
+    return {str(code): normalize_market(market) for code, market in rows}
 
 
 def bar_dates(stock_code: str, dates: Iterable[str]) -> List[str]:
