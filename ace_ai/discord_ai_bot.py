@@ -2205,7 +2205,7 @@ class GeminiGateway:
 # 最終回答 Prompt 與數字核對
 # ============================================================
 
-FINAL_BASE_PROMPT = """你是「艾斯 AI 台股數據研究助手」。你的回答要像熟悉台股技術面、價量、大量區與權證分點的研究者：先理解使用者真正想問什麼，再從 tool_results 挑最有判別力的證據回答，不要像模板客服，也不要把所有欄位逐項朗讀。
+FINAL_BASE_PROMPT = """你是「艾斯助手｜喬巴」。你的回答要像熟悉台股技術面、價量、大量區與權證分點的研究者：先理解使用者真正想問什麼，再從 tool_results 挑最有判別力的證據回答，不要像模板客服，也不要把所有欄位逐項朗讀。
 
 規則：
 1. 只能依 tool_results 的事實與數字回答，不可自創資料。使用者自己提供的成本或假設價格必須明確標成「你的成本／假設價格」，不可當成現價。
@@ -2260,6 +2260,7 @@ FINAL_FORMAT_PATTERN = """用自然短段落回答，不強制固定標題；先
 AI_CARD_SCHEMA = {
     "type": "object",
     "properties": {
+        "response_style": {"type": "string", "enum": ["serious", "playful", "concerned"]},
         "answer": {"type": "string"},
         "why": {"type": "string"},
         "scenarios": {
@@ -2276,7 +2277,7 @@ AI_CARD_SCHEMA = {
         },
         "summary": {"type": "string"},
     },
-    "required": ["answer", "why", "scenarios", "summary"],
+    "required": ["response_style", "answer", "why", "scenarios", "summary"],
 }
 
 FINAL_CARD_FORMAT = """輸出格式（艾斯 AI 解讀）：只輸出符合 schema 的 JSON，不要 Markdown、不要星號或條列符號。你是在「解讀」，不是在整理資料：K 線、均線、評分卡與關鍵價位表已經在圖上，文字要說明這些訊號代表什麼。
@@ -2550,11 +2551,10 @@ def build_final_prompt(payload: Dict[str, Any]) -> str:
         sections.append("白話／持倉回答：先給目前技術結構偏強、偏弱、中性或資料不足的結論，再給1～2個最重要依據與後續觀察條件；不以成本高低決定股票好壞。問持有、賣出、回本時回答結構與風險，不替人做交易決定，不說續抱、值得持有、賣掉、加碼或保證回本。成本未提供就不計個人損益；日期未提供就不推測進場當天或持有時間；理由是用戶陳述，未核實不可當已知事實。這類問法why限40～80字，scenarios最多2條、每條20～40字，summary限20字，資料不足不硬湊。若原句有玩笑／諧音，answer可先用一句15～25字的溫和幽默接話，再給行情結論；不可嘲笑虧損或用玩笑暗示一定賺錢。用戶要賣不等於已賣出。")
         if review_language.intent(payload['question']) == 'review':
             sections.append('本題是資料不完整的交易回顧，不是一般型態問答：answer先說目前能回顧哪些交易依據、哪些無法核實；why圍繞使用者進場理由與交易規劃，提出可改善的記錄方法，未提供的理由或計畫不可捏造。目前行情只補充成本與風險，不能當成買進當天證據。scenarios可省略，不要硬湊兩種行情；不提供個人買賣指令。')
-        sections.append('必須接住使用者原問句，不能每題只重複多頭排列、支撐壓力。玩笑或諧音直接在answer第一句順著原梗回應15～25字，再接客觀結論；例如問豁達就回應豁達，問套房就回應套房，不使用固定笑話模板。焦慮或虧損不嘲笑；沒有玩笑不硬加幽默。問能否持有時，先回答目前結構是否轉弱及風險有無升高，再說原因；成本估算必須稱為估算，不可說成實際成交價。')
+        sections.append('必須接住使用者原問句，不能每題只重複多頭排列、支撐壓力。玩笑或諧音直接在answer第一句順著原梗回應15～25字，再接客觀結論；不使用固定笑話模板。焦慮或虧損不嘲笑；沒有玩笑不硬加幽默。問能否持有時，先回答目前結構是否轉弱及風險有無升高，再說原因；成本估算必須稱為估算，不可說成實際成交價。')
     if stock_banter.holding_question(payload['question']):
         sections.append('使用者在問自己的持倉怎麼辦：直接回答這筆持倉目前的風險與下一步需要核對的條件，不只寫結構偏強弱。不重複堆砌成本數字。若虧損，說明原先理由是否仍有支持、哪些條件使風險升高；若獲利，說明回吐風險與結構是否維持。scenarios用「依據仍維持／依據轉弱」呈現具體可核對的條件，不把兩邊都叫轉強條件。未提供風險承受度、期限或部位，最多簡短指出一項需要補充，不自行替人訂停損比例或買賣決定。股票分割前後成本必須同一基準，未提供買進日無法確認成本基準時如實說明，不能擅自再除一次。')
-    if stock_banter.humor_reply(payload['question']):
-        sections.append('本題有明確玩笑：answer必須先用一句短句接住原梗，再給技術結論；此要求優先於一般格式的先寫結構。幽默不等於看多，禁止用梗保證漲跌。')
+    sections.append('語氣判斷與回應（優先於一般格式先寫結構及字數限制）：閱讀完整使用者原句，結合股票名稱和上下文，語意判斷 response_style 為 serious、playful 或 concerned；不要依固定關鍵字、特定拼字或笑話清單分類。辨認諧音、錯別字、誇張、比喻與反問；不因換字就忽略原本的玩笑意圖。playful 的 answer 必須先用一句簡短、針對這次原問句新寫的溫和接話，再直接回答股票問題，合計可到100字；幽默直接包含在AI解讀，不能另設區塊或只在summary接梗。不使用固定笑話模板，不要每題同一句量價口號。serious 正常分析，不硬加笑話；concerned 先接住擔心再說可核對的風險，不嘲笑虧損、不用玩笑淡化困境。玩笑不代表看多，不能保證漲跌或替人決定買賣。輸出前自行檢查：playful 的answer是否已接住這次原梗且包含客觀分析，若沒有就在本次輸出內修正。')
     payload_json = json.dumps(payload.get("tool_results") or {}, ensure_ascii=False, separators=(",", ":"), default=tools.json_safe)
     return "\n\n".join(sections) + f"\n\n使用者問題：{payload['question']}\n\ntool_results（JSON）：\n{payload_json}\n"
 
@@ -4088,7 +4088,7 @@ def clarify_message(parsed: "ParsedQuestion") -> str:
         return (f"**查不到這個代號**\n股票名冊裡沒有「{'、'.join(codes)}」，請確認代號是否正確（上市櫃普通股、ETF 皆可），"
                 f"或改用股票名稱問我，例如：\n{examples}")
     unknown = next((t for t in parsed.unknown_terms if 2 <= len(t) <= 8), "")
-    if stock_banter.wants_analysis(question):
+    if stock_banter.wants_analysis(parsed.original):
         if unknown and not parsed.stocks:
             return f'還沒辨識到「{unknown}」是哪一檔，給我股票代號就能接著看；成本可選填。'
         if not parsed.stocks:
@@ -4905,7 +4905,7 @@ class AceQueryEngine:
         # 快取鍵值用「補完股票之後」的問題，避免 A 使用者的「那它的壓力在哪」拿到 B 使用者的答案；籌碼類型分開快取。
         # 族群追問（「那哪檔最強」）要帶族群名稱與模式，不同族群的同一句追問不能共用答案
         sector = parsed.sector or {}
-        key = "|".join(['簡潔覆盤持倉回應v6',compact, ",".join(c for c, _ in parsed.stocks), str(parsed.cost_price or ""), ",".join(parsed.branches),
+        key = "|".join(['語意語氣解讀v7',compact, ",".join(c for c, _ in parsed.stocks), str(parsed.cost_price or ""), ",".join(parsed.branches),
                         "chip=" + parsed.chip,
                         "sector=" + str(sector.get("name") or sector.get("industry") or "") + ":" + str(sector.get("mode") or "")])
         key = self._access_cache_key(key)
@@ -6545,7 +6545,6 @@ class AceQueryEngine:
             if not card['answer']:
                 return 'AI文字未通過檢查，本次僅提供可核實的圖表與資料。\n\n'+rule_answer, False
             card = stock_banter.integrate_holding_reply(question,card,results)
-            card = stock_banter.ensure_inline_humor(question,card)
             if stock_banter.holding_question(question):
                 card['scenario_title'] = '持倉觀察條件'
                 if len(card.get('scenarios') or []) == 2 and card['scenarios'][0]['title'] == card['scenarios'][1]['title']:
@@ -6940,7 +6939,9 @@ def parse_ai_card(text: str) -> Optional[Dict[str, Any]]:
                           "text": _clean_card_text(item.get("text"), 200)})
     if not answer or not (why or summary):
         return None
-    return {"answer": answer, "why": why, "scenarios": scenarios[:2], "summary": summary}
+    style = data.get("response_style", "serious")
+    return {"response_style": style if style in ("serious", "playful", "concerned") else "serious",
+            "answer": answer, "why": why, "scenarios": scenarios[:2], "summary": summary}
 
 
 def ai_card_text(card: Dict[str, Any]) -> str:
