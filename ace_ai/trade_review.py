@@ -1155,7 +1155,7 @@ def build_prompt(payload: Dict[str, Any]) -> str:
 
 
 def review_focus(question):
-    if re.search(r'改善|進步|更好|優缺點|哪裡.*(?:問題|錯)|檢討',str(question)):
+    if re.search(r'改善|改進|進步|更好|優缺點|哪(?:裡|邊).*(?:問題|錯)|檢討|買得.{0,4}(?:如何|怎樣|好不好)',str(question)):
         return 'improve'
     if re.search(r'合理|有沒有道理|對不對|理由.*(?:如何|怎麼看)|這個理由',str(question)):
         return 'reason'
