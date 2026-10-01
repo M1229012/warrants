@@ -566,11 +566,8 @@ def _inst_height(panel: dict) -> int:
 
 
 def _trade_height(panel: dict) -> int:
-    # 覆盤卡已有統計列時，K 線下方不再重複畫交易摘要列
-    if not (panel or {}).get('trades') or (panel or {}).get('hide_trade_legend'):
-        return 0
-    lines = (panel or {}).get('trade_summary_lines') or []
-    return TRADE_LEGEND_H + max(0, len(lines) - 1) * 32
+    lines=trade_detail_lines(panel or {})
+    return len(lines)*32+14 if lines else 0
 
 
 # 單一現股分點明細（K 線下方）：每日買賣超柱（紅買綠賣）＋累積買賣超金線；右側雙刻度（灰＝柱、金＝線），零軸共用
@@ -609,25 +606,21 @@ def _trade_badges(panel: dict, index: dict, px) -> tuple[list[dict], list[dict]]
 
 
 def draw_trade_points(draw,panel,bars,px,py,left,right,top,bottom):
-    """把交易價格落在真正的日期／價位座標，日期帶仍保留原有買賣徽章。"""
-    index={b['date']:i for i,b in enumerate(bars)}
-    for trade in panel.get('trades') or []:
-        if trade.get('date') not in index or trade.get('price') is None:
-            continue
-        price=float(trade['price'])
-        if not math.isfinite(price) or price<=0:
-            continue
-        x,y=px(index[trade['date']]),py(price)
-        if not top<=y<=bottom:
-            continue
-        label=str(trade['date'])[5:]+' '+('買' if trade.get('side')=='buy' else '賣')+' '+number(price)+('（估）' if trade.get('estimated') else '')
-        w=font(18,True).getlength(label)+18
-        bx=max(left,min(x+12,right-w))
-        by=max(top,min(y-34,bottom-28))
-        draw.line((x,y,bx,by+14),fill=TRADE_COLOR,width=2)
-        draw.rounded_rectangle((bx,by,bx+w,by+28),radius=8,fill='white',outline=TRADE_COLOR,width=1)
-        text_at(draw,(bx+9,by+3),label,18,TRADE_COLOR,True)
-        draw.ellipse((x-6,y-6,x+6,y+6),fill=TRADE_COLOR,outline='white',width=2)
+    """交易價位改列於繪圖區外；此處不覆蓋任何 K 棒或指標。"""
+    return
+
+
+def trade_detail_lines(panel):
+    texts=[]
+    for t in panel.get('trades') or []:
+        label='買進' if t.get('side')=='buy' else '賣出'
+        price=number(t['price']) if t.get('price') is not None else '未提供價格'
+        texts.append(f"{t.get('date','')} {label} {price}"+('（估）' if t.get('estimated') else ''))
+    lines=wrap('　｜　'.join(texts),21,CONTENT-120,True) if texts else []
+    if not panel.get('hide_trade_legend'):
+        for t in panel.get('trade_summary_lines') or []:
+            lines.extend(wrap(str(t),19,CONTENT-120))
+    return lines
 
 
 def draw_institutional(draw, top: float, left: float, right: float, px, step: float, bars: list, rows: list,
@@ -907,15 +900,9 @@ def draw_branch_flow(draw, top: float, left: float, right: float, px, step: floa
 
 
 def draw_trade_legend(draw, top: float, left: float, panel: dict) -> None:
-    """K 線下方的交易摘要列：第一行（紫色▲）買進／持有／現價／報酬，第二行最大浮盈／最大回撤。"""
-    r = 8
-    cy = top + 20
-    draw.polygon([(left + r, cy - r), (left + 2 * r, cy + r), (left, cy + r)], fill=TRADE_COLOR)   # 同 K 線上的 ▲
-    lines = [str(t) for t in panel.get('trade_summary_lines') or []] or [str(panel.get('trade_summary') or '我的交易')]
-    for i, line in enumerate(lines[:2]):
-        text, size = fit(line, 21 if i == 0 else 19, CONTENT - 120, i == 0)
-        draw.text((left + 2 * r + 12, cy + i * 32), text, font=font(size, i == 0),
-                  fill=TRADE_COLOR if i == 0 else MUTED, anchor='lm')
+    """日期與價格列在主圖／副圖之外，不遮住任何技術指標。"""
+    for i,line in enumerate(trade_detail_lines(panel)):
+        text_at(draw,(left,top+6+i*32),line,21,TRADE_COLOR,True)
 
 
 def _badge_half(number_text) -> float:
@@ -1008,7 +995,6 @@ def draw_marks(draw, panel: dict, px, py, step: float, price_top: float, price_b
         for badge in buy_badges:
             color = badge.get('color') or UP
             i = min(range(len(bars)), key=lambda k: abs(px(k) - badge['x']))
-            _dotted(draw, badge['x'], py(bars[i]['Low']) + 4, tri_bottom - half, color)
             draw.polygon([(badge['x'], tri_bottom-half),(badge['x']-half,tri_bottom+half),(badge['x']+half,tri_bottom+half)], fill=color, outline='white')
             if str(badge.get('no', '')) != '':
                 cy = tri_bottom + half + 6 + MARK_BADGE_R + badge['row'] * MARK_BADGE_ROW
@@ -1016,7 +1002,6 @@ def draw_marks(draw, panel: dict, px, py, step: float, price_top: float, price_b
         for badge in sell_badges:
             color = badge.get('color') or DOWN
             i = min(range(len(bars)), key=lambda k: abs(px(k) - badge['x']))
-            _dotted(draw, badge['x'], py(bars[i]['High']) - 4, tri_top + half, color)
             draw.polygon([(badge['x']-half,tri_top-half),(badge['x']+half,tri_top-half),(badge['x'],tri_top+half)], fill=color, outline='white')
             # 有編號＝A～E 事件（出清沿用買進編號）；沒編號＝小幅減碼／零星賣出。
             if str(badge.get('no', '')) != '':
@@ -1052,17 +1037,17 @@ def draw_marks(draw, panel: dict, px, py, step: float, price_top: float, price_b
     _assign_rows(buy_badges); _assign_rows(sell_badges)
     tri_bottom = price_bottom + 14
     for i in sorted(buy_days):
-        x = px(i); _dotted(draw, x, py(bars[i]['Low']) + 4, tri_bottom - half, UP)
+        x = px(i)
         draw.polygon([(x, tri_bottom-half),(x-half,tri_bottom+half),(x+half,tri_bottom+half)], fill=UP, outline='white')
     tri_top = price_top - 14
     for j in sorted(set(sell_days) | reduce_days):
-        x = px(j); _dotted(draw, x, py(bars[j]['High']) - 4, tri_top + half, DOWN)
+        x = px(j)
         draw.polygon([(x-half,tri_top-half),(x+half,tri_top-half),(x,tri_top+half)], fill=DOWN, outline='white')
     for badge in trade_buys:
-        x = badge['x']; _dotted(draw, x, py(bars[badge['i']]['Low']) + 4, tri_bottom - half, TRADE_COLOR)
+        x = badge['x']
         draw.polygon([(x, tri_bottom-half),(x-half,tri_bottom+half),(x+half,tri_bottom+half)], fill=TRADE_COLOR, outline='white')
     for badge in trade_sells:
-        x = badge['x']; _dotted(draw, x, py(bars[badge['i']]['High']) - 4, tri_top + half, TRADE_COLOR)
+        x = badge['x']
         draw.polygon([(x-half,tri_top-half),(x+half,tri_top-half),(x,tri_top+half)], fill=TRADE_COLOR, outline='white')
     for badge in buy_badges:
         cy = tri_bottom + half + 6 + MARK_BADGE_R + badge['row'] * MARK_BADGE_ROW
@@ -1160,10 +1145,7 @@ def draw_chart(draw, y: int, panel: dict) -> None:
     lows = [b['Low'] for b in bars]
     highs = [b['High'] for b in bars]
     # 與週報主程式 adjust_candle_price_ylim 一致：Y 軸只看 K 棒高低，下留 11%、上留 5%；均線／布林超出價格區就裁掉
-    visible_dates={b['date'] for b in bars}
-    trade_prices=[float(t['price']) for t in panel.get('trades') or []
-                  if t.get('date') in visible_dates and t.get('price') is not None and float(t['price'])>0]
-    low, high = min(lows+trade_prices), max(highs+trade_prices)
+    low, high = min(lows), max(highs)
     span = max(high - low, abs(high) * .005, .01)
     low, high = low - span * .11, high + span * .05
     py = lambda value: price_bottom - (value - low) / (high - low) * (price_bottom - price_top)
@@ -1216,7 +1198,6 @@ def draw_chart(draw, y: int, panel: dict) -> None:
                 t0, t1 = min(start/max(distance, 1), 1), min((start+7)/max(distance, 1), 1)
                 draw.line((xa+(xb-xa)*t0, ya+(yb-ya)*t0, xa+(xb-xa)*t1, ya+(yb-ya)*t1), fill=band_color, width=2)
 
-    draw_trade_points(draw,panel,bars,px,py,left,right,price_top,price_bottom)
 
     # 日期軸緊貼價格區下方；月份切換的日期用粗體，方便看出 K 棒落在哪個月。
     axis_y = bottom + 2
@@ -2763,13 +2744,8 @@ def _is_review_panel(panel: dict) -> bool:
 
 
 def _capped_lines(text: str, size: int, width: float, limit: int, bold: bool = False) -> list[str]:
-    lines = wrap(clean(text), size, width, bold)
-    if len(lines) <= limit:
-        return lines
-    kept = lines[:limit]
-    kept[-1] = kept[-1].rstrip('，、。；') + '…'
-    _log_truncation(text)
-    return kept
+    """完整換行；limit 留作呼叫相容，不裁切覆盤內容。"""
+    return wrap(clean(text),size,width,bold)
 
 
 def _status_icon(draw, cx: float, cy: float, status: str, r: int = 12) -> None:
@@ -2795,7 +2771,7 @@ def _status_icon(draw, cx: float, cy: float, status: str, r: int = 12) -> None:
 
 def review_card(draw, y: float, data: dict, dry: bool) -> int:
     """交易覆盤卡（定案版，由上往下單欄）：
-    標題 → 一行摘要 → 我的理由＋逐條核對（每條兩行）→ AI 覆盤（結論＋正文）→ 本次記住（理由／過程／學習）→ 目前觀察。"""
+    標題 → 摘要 → 理由核對 → AI 覆盤 → 交易心得 → 目前觀察；完整文字換行並計算高度。"""
     x0, x1 = MARGIN, WIDTH - MARGIN
     px, width = x0 + REVIEW_PAD, CONTENT - REVIEW_PAD * 2
     summary = [(str(t), str(c or INK)) for t, c in data.get('summary') or []]
@@ -2813,13 +2789,13 @@ def review_card(draw, y: float, data: dict, dry: bool) -> int:
 
     h = 24 + 50 + 12                                         # 標題列
     h += 40 if summary else 0                                # 一行摘要
-    h += 22 + 8 + max(1, len(reason_lines)) * 32 + 6          # 我的理由（最多兩行）
-    h += sum(len(cl) * 30 + len(ev) * 28 + 10 for _, cl, ev in checks) + 8   # 逐條核對（各最多兩行）
+    h += 22 + 8 + max(1, len(reason_lines)) * 32 + 6          # 我的理由（完整換行）
+    h += sum(len(cl) * 30 + len(ev) * 28 + 10 for _, cl, ev in checks) + 8   # 逐條核對（完整換行）
     h += 18 + 40 + len(headline) * 34 + len(body) * 33 + 26  # AI 覆盤
     cost_h = _para(None,0,0,data.get('cost_basis',''),20,MUTED,width)+12 if data.get('cost_basis') else 0
     h += cost_h
-    h += 18 + 38 + len(highlights) * 38                      # 本次記住
-    h += (18 + 52) if last else 0                            # 目前觀察
+    h += 18 + 38 + sum(len(lines)*32+6 for lines in highlights)                      # 本次記住
+    h += (18 + len(last)*32 + 20 + 6) if last else 0                            # 目前觀察
     h += (26 if data.get('source') == 'fallback' else 0) + 22
     if dry:
         return int(h)
@@ -2885,14 +2861,17 @@ def review_card(draw, y: float, data: dict, dry: bool) -> int:
         _status_icon(draw, px + 14, cy + 15, icons[i] if i < len(icons) else '✅', r=11)
         for line in lines:
             text_at(draw, (px + 36, cy + 1), line, 22, INK)
-        cy += 38
+            cy += 32
+        cy += 6
 
     if last:                                                  # 目前觀察（只講一件事）
         cy += 18
-        draw.rounded_rectangle((px, cy, px + width, cy + 46), radius=12, fill=WATCH_BG)
+        watch_h=len(last)*32+20
+        draw.rounded_rectangle((px, cy, px + width, cy + watch_h), radius=12, fill=WATCH_BG)
         draw.text((px + 18, cy + 23), f'{label}｜', font=font(22, True), fill=TRADE_COLOR, anchor='lm')
-        draw.text((px + 18 + font(22, True).getlength(f'{label}｜'), cy + 23), last[0], font=font(22), fill=INK, anchor='lm')
-        cy += 52
+        for i,line in enumerate(last):
+            draw.text((px + 18 + font(22, True).getlength(f'{label}｜'), cy + 23+i*32), line, font=font(22), fill=INK, anchor='lm')
+        cy += watch_h+6
 
     if data.get('source') == 'fallback':
         text_at(draw, (px, cy + 6), 'AI 摘要暫時無法使用，以上為系統整理的簡短版本', 18, MUTED)

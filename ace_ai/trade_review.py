@@ -1152,19 +1152,8 @@ def build_prompt(payload: Dict[str, Any]) -> str:
 
 
 def _clip(text: str, limit: int) -> str:
-    """超過字數就截在最後一個完整句子（。！？；）；找不到才截在逗號並改成句號。
-    不讓正文停在「…呈現多頭排列，」這種半句話。"""
-    value = re.sub(r"\s+", " ", str(text or "")).strip()
-    if len(value) <= limit:
-        return value
-    cut = value[:limit]
-    stop = max(cut.rfind(p) for p in "。！？；")
-    if stop >= limit * 0.45:
-        return cut[:stop + 1]
-    comma = cut.rfind("，")
-    if comma >= limit * 0.45:
-        return cut[:comma] + "。"
-    return cut.rstrip("，、；") + "…"
+    """字數由生成提示控制；核對後保留完整文句，不按字元或逗號裁切。"""
+    return re.sub(r"\s+", " ", str(text or "")).strip()
 
 
 def strip_hindsight(text: str) -> Tuple[str, List[str]]:
