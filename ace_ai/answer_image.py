@@ -2316,6 +2316,17 @@ def _para(draw, x: float, y: float, text: str, size: int, color, width: float, b
 AI_SCENARIO_TONES = {'good': (GOOD_INK, GOOD_BG), 'warn': (WARN_INK, WARN_BG), 'neutral': (INK, TILE_BG)}
 
 
+def _answer_emphasis(text: str) -> tuple:
+    """只突出短結論，過長舊回答保留全文並改一般字體，不截字或斷句。"""
+    text = str(text or '').strip()
+    if len(text) <= 80:
+        return text, ''
+    first = re.match(r'.*?[。！？!?][」』”"]?', text, re.S)
+    if first and len(first.group()) <= 80:
+        return first.group(), text[first.end():].strip()
+    return '', text
+
+
 def ai_card(draw, y: float, data: dict, dry: bool) -> int:
     """艾斯 AI 解讀卡：一句話回答 → 為什麼這樣看 → 接下來可能的兩種走法 → 一句話總結。"""
     x0, x1 = MARGIN, WIDTH - MARGIN
@@ -2338,7 +2349,11 @@ def ai_card(draw, y: float, data: dict, dry: bool) -> int:
         draw.ellipse((ix0 + 14, cy + 12, ix0 + 28, cy + 26), fill=ACCENT)
         text_at(draw, (ix0 + 38, cy + 8), badge_label, 20, 'white', True)
     cy += 58
-    cy += _para(pen, ix0, cy, data.get('answer', ''), 32, INK, width, True) + 18
+    headline, details = _answer_emphasis(data.get('answer', ''))
+    if headline:
+        cy += _para(pen, ix0, cy, headline, 32, INK, width, True) + (10 if details else 18)
+    if details:
+        cy += _para(pen, ix0, cy, details, 25, INK, width) + 18
     if data.get('cost_basis'):
         cy += _para(pen,ix0,cy,data['cost_basis'],20,MUTED,width)+12
 
