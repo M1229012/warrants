@@ -2847,22 +2847,27 @@ def review_card(draw, y: float, data: dict, dry: bool) -> int:
             yy=cy+12+_para(target,px+20,cy+12,heading,20,TRADE_COLOR,width-40,True)
             _para(target,px+20,yy,focus,24,INK,width-40,True)
         cy+=h+22
-    col=(width-64)/2;right=px+col+64;top=cy
+    holding_mode=bool(data.get('context_text'))
+    col=width if holding_mode else (width-64)/2
+    right=px if holding_mode else px+col+64
+    top=cy
     def cp(x,yy,text,size=22,color=INK,bold=False,indent=0):
         return yy+_para(target,x+indent,yy,str(text or ''),size,color,col-indent,bold)
-    left=cp(px,top,'持倉背景' if data.get('context_text') else '理由核對',25,bold=True)+12
-    left=cp(px,left,data.get('context_text') or ('你的理由：'+(data.get('reason_raw') or '未提供')),21,MUTED)+14
-    for check in ([] if data.get('context_text') else data.get('checks') or []):
-        if target is not None:_status_icon(target,px+10,left+15,str(check.get('status','❓')),r=9)
-        left=cp(px,left,check.get('claim',''),22,bold=True,indent=30)
-        left=cp(px,left,'｜'.join(str(check.get(k) or '') for k in ('status_text','evidence')).strip('｜'),20,MUTED,indent=30)+12
+    left=top
+    if not holding_mode:
+        left=cp(px,top,'理由核對',25,bold=True)+12
+        left=cp(px,left,'你的理由：'+(data.get('reason_raw') or '未提供'),21,MUTED)+14
+        for check in data.get('checks') or []:
+            if target is not None:_status_icon(target,px+10,left+15,str(check.get('status','❓')),r=9)
+            left=cp(px,left,check.get('claim',''),22,bold=True,indent=30)
+            left=cp(px,left,'｜'.join(str(check.get(k) or '') for k in ('status_text','evidence')).strip('｜'),20,MUTED,indent=30)+12
     items=data.get('improvements') or []
     rr=cp(right,top,data.get('right_label') or ('下次可以補強' if items else '交易重點'),25,bold=True)+14
     for n,item in enumerate(items or data.get('highlights') or [],1):
         if target is not None:text_at(target,(right,rr),f'{n:02d}',21,TRADE_COLOR,True)
         rr=cp(right,rr,item,22,indent=42)+14
     cy=max(left,rr)
-    if target is not None:target.line((px+col+32,top,px+col+32,cy),fill=LINE,width=1)
+    if target is not None and not holding_mode:target.line((px+col+32,top,px+col+32,cy),fill=LINE,width=1)
     body=data.get('body','')
     if body:
         divider();para('喬巴 · AI 解讀' if data.get('source')!='fallback' else '系統解讀',23,TRADE_COLOR,True)
