@@ -587,7 +587,7 @@ def _unresolved(stock_code: str, dates: Sequence[str], status: Optional[Dict[str
 
 
 # 背景補資料：固定 worker 數的執行緒池（不再每檔開一條新 Thread），同一檔排隊中／執行中只算一次。
-BACKGROUND_WORKERS = max(1, int(os.getenv("DISCORD_AI_SPOT_BACKGROUND_WORKERS", "1") or 1))
+BACKGROUND_WORKERS = max(1, int(os.getenv("DISCORD_AI_SPOT_BACKGROUND_WORKERS", "2") or 2))
 _BACKGROUND_POOL: Optional[ThreadPoolExecutor] = None
 
 
@@ -892,6 +892,53 @@ def remember_for_today(stock_code: str, now: Optional[datetime] = None) -> None:
             local_market_cache.set_state(_QUEUE_KEY, {"day": today, "codes": codes + [code]})
     except Exception as exc:
         print(f"⚠️ 今日待抓清單寫入略過｜{code}｜{type(exc).__name__}: {exc}", flush=True)
+
+
+_HISTORY_KEY = "spot_history_queue"
+HISTORY_QUEUE_MAX = max(1, int(os.getenv("DISCORD_AI_SPOT_HISTORY_QUEUE_MAX", "500") or 500))
+
+
+_HISTORY_NEW: List[str] = []
+
+
+def remember_history(stock_code: str) -> None:
+    """會員問過的股票（任何題型）先記在記憶體；背景維護時才寫進 SQLite 待補清單（問答流程不碰資料庫）。"""
+    code = str(stock_code or "").strip()
+    if code and code[:4].isdigit():
+        with _QUEUE_GUARD:
+            if code not in _HISTORY_NEW and len(_HISTORY_NEW) < HISTORY_QUEUE_MAX:
+                _HISTORY_NEW.append(code)
+
+
+def prefetch_history(now: Optional[datetime] = None, fetch_source=open_source, max_submit: int = 4) -> Dict[str, Any]:
+    """背景維護每輪呼叫：清單上還沒補滿 70 日的股票交給背景 worker（同一檔只排一次）；補滿的從清單移除。
+    會員查詢優先（背景 worker 數有限、來源冷卻就停）。"""
+    if source_cooling():
+        return {"skipped": True}
+    with _QUEUE_GUARD:
+        fresh, _HISTORY_NEW[:] = list(_HISTORY_NEW), []
+        codes = list(local_market_cache.get_state(_HISTORY_KEY, []) or [])
+        codes = (codes + [c for c in fresh if c not in codes])[-HISTORY_QUEUE_MAX:]
+        if fresh:
+            local_market_cache.set_state(_HISTORY_KEY, codes)       # 重啟後接著補
+    if not codes:
+        return {"skipped": True}
+    dates, _ = candidate_dates(now or tools.taipei_now())
+    if not dates:
+        return {"skipped": True}
+    finished, submitted = [], 0
+    for code in codes:
+        if submitted >= max_submit:
+            break
+        if not _unresolved(code, dates, local_market_cache.spot_day_status(code, dates)):
+            finished.append(code)
+            continue
+        submitted += continue_in_background(code, dates, dates[-1], (), fetch_source)
+    if finished:
+        with _QUEUE_GUARD:
+            left = [c for c in (local_market_cache.get_state(_HISTORY_KEY, []) or []) if c not in finished]
+            local_market_cache.set_state(_HISTORY_KEY, left)
+    return {"submitted": submitted, "finished": len(finished), "queue": len(codes) - len(finished)}
 
 
 def prefetch_today(now: Optional[datetime] = None, fetch_source=open_source,

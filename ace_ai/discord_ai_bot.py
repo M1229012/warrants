@@ -55,6 +55,7 @@ import sector_match
 import kline_debug
 import sector_radar
 import trade_review
+import member_usage_stats
 
 # 主程式每算一檔股票都會印「📅 週報統計區間」，Bot 一題會印上百行，把真正的訊息洗掉。
 # 這裡只在 Bot 行程過濾，不動主程式，週報與回測的輸出完全不受影響。
@@ -668,6 +669,7 @@ HELP_GROUPS = (
     ("額度", ("我的額度",)),
 )
 ADMIN_HELP_GROUPS = (
+    ("會員統計", ("問答次數（前10名）", "問答次數完整名單（CSV）", "使用統計（可加近7天／本月／今日／累計）")),
     ("型態驗證", ("型態驗證 2330（趨勢線、錨點、轉折確認日）",)),
     ("本週精選", ("本週精選排名", "3006 幫我生成週精選文字", "這版確認，生成圖片")),
     ("草稿", ("直接說修改需求", "還原上一版", "目前草稿")),
@@ -4284,7 +4286,7 @@ REQUIRED_MODULE_API = {
     "weekly_pick": ("layout_card", "verify_layout"),
     "market_data": ("RECENT_DAYS",),
     "warrant_store": ("StoreShrunk",),
-    "spot_chip": ("_official_trading_dates",),
+    "spot_chip": ("_official_trading_dates", "remember_history", "prefetch_history"),
     "kline_patterns": ("detect", "names"),
     "sector_analysis": ("live_group_ranking",),
     "market_scan": ("value_liquid_codes", "EXCLUDED_NAMES"),
@@ -5961,6 +5963,8 @@ class AceQueryEngine:
             plan = plan or (self.router._default_bundle(parsed) if parsed.stocks
                             else QueryPlan(route="help", clarification=HELP_MESSAGE))
         access_policy.require_feature(self._access(), access_policy.FEATURE_POLICIES.get(plan.route, access_policy.FeaturePolicy()))
+        for _code, _ in parsed.stocks[:3]:
+            spot_chip.remember_history(_code)   # 問過的股票先排現股分點 70 日（背景、重啟不丟）
         self.log(
             f"🧭 主題={'族群:' + str((parsed.sector or {}).get('name', '')) if parsed.sector else ('個股:' + ','.join(c for c, _ in parsed.stocks) if parsed.stocks else ('分點:' + ','.join(parsed.branches) if parsed.branches else '無'))}"
             f"｜動作={(parsed.sector or {}).get('mode', '') or ','.join(sorted(parsed.intents)) or '-'}"
@@ -7018,6 +7022,11 @@ def _market_maintenance_loop(stop: threading.Event) -> None:
                 spot_chip.prefetch_today(now=tools.taipei_now(), log=lambda m: print(m, flush=True))
             except Exception as exc:
                 print(f"⚠️ 現股分點今日待抓略過｜{type(exc).__name__}: {exc}", flush=True)
+            # 會員問過的股票（任何題型）：背景補滿 70 日現股分點，重啟後接著補（清單存 SQLite）
+            try:
+                spot_chip.prefetch_history(now=tools.taipei_now())
+            except Exception as exc:
+                print(f"⚠️ 現股分點歷史待補略過｜{type(exc).__name__}: {exc}", flush=True)
             if int(market_data.coverage().get("days") or 0) >= 20:
                 market_scan.score_pending(budget_seconds=MARKET_SCORE_BUDGET)
         except Exception as exc:
@@ -7310,8 +7319,17 @@ def run_discord_bot(config: BotConfig) -> None:
         request_started = asyncio.get_running_loop().time()
         user_id, channel_id = interaction.user.id, interaction.channel_id or 0
         who = f"{getattr(interaction.user, 'display_name', '') or getattr(interaction.user, 'name', '')}（{user_id}）"
+        entitled_admin = access_policy.UserEntitlement.from_member(interaction.user, config.superuser_ids).admin
+        async def record_member_usage(outcome, route=''):
+            if not interaction.response.is_done():
+                await interaction.response.defer(thinking=True, ephemeral=True)
+            await asyncio.to_thread(member_usage_stats.record, interaction.id, interaction.guild_id,
+                                    user_id, outcome, question, route, entitled_admin,
+                                    bool(statistics_access[0] and statistics_access[0].simulation))
+        statistics_access = [None]
         denied = guard.check_permission(user_id, channel_id, interaction.guild_id)
         if denied:
+            await record_member_usage('denied', 'entry_denied')
             await interaction_image(interaction, "使用權限", denied, ephemeral=True)
             return
         question = strip_command_prefix(question)      # 圖片標題、快取、記憶都用清乾淨的問句
@@ -7328,12 +7346,34 @@ def run_discord_bot(config: BotConfig) -> None:
             await send_access_denial(interaction, str(exc), exc.required)
             return
         demo = bool(access.simulation)
+        statistics_access[0] = access
+        stats_command = member_usage_stats.command(question)
+        if stats_command:
+            if not access.admin_mode or demo:
+                await interaction_text(interaction, '會員使用統計僅限管理員透過 /ace 查詢。', ephemeral=True)
+                return
+            await interaction.response.defer(thinking=True, ephemeral=True)
+            excluded = set(config.superuser_ids)
+            excluded.update(m.id for m in getattr(interaction.guild, 'members', ())
+                            if getattr(m, 'bot', False) or access_policy.UserEntitlement.from_member(m, config.superuser_ids).admin)
+            try:
+                summary, attachment_data = await asyncio.to_thread(member_usage_stats.report, question,
+                                                                   interaction.guild_id, excluded)
+                await interaction_text(interaction, summary, ephemeral=True)
+                if attachment_data is not None:
+                    with discord.File(io.BytesIO(attachment_data), filename='member-usage.csv') as stats_file:
+                        await interaction.followup.send(file=stats_file, ephemeral=True, allowed_mentions=no_mentions)
+            except Exception as exc:
+                print(f'會員統計查詢失敗：{type(exc).__name__}: {exc}', flush=True)
+                await interaction_text(interaction, '統計讀取失敗，請稍後再試。', ephemeral=True)
+            return
         original_entitlement = access.entitlement
         access = narrow_by_channel(config, access, getattr(interaction, "channel", None))
         try:
             access_policy.require_question(access, question, tools.get_cached_known_branches())
         except access_policy.AccessDenied as exc:
             hint = chip_channel_hint(config, exc.required, original_entitlement, getattr(interaction, "channel", None))
+            await record_member_usage('denied', 'feature_denied')
             if hint:
                 await interaction_image(interaction, "使用頻道", hint, ephemeral=True)
                 return
@@ -7402,6 +7442,7 @@ def run_discord_bot(config: BotConfig) -> None:
             result = await asyncio.to_thread(engine.answer, question, context_key, on_queue, is_admin, admin_mode, access,
                                              image=image)
             if result.denied_feature:
+                await record_member_usage('denied', result.route)
                 hint = chip_channel_hint(config, result.denied_feature, original_entitlement,
                                          getattr(interaction, "channel", None))
                 if hint:
@@ -7424,6 +7465,10 @@ def run_discord_bot(config: BotConfig) -> None:
                 # 「兩種一起看」：第 1 張現股分點籌碼、第 2 張權證分點籌碼，不硬塞成一張超長圖。
                 await interaction_image(interaction, extra.image_title or question, with_context_note(extra),
                                         panels_with_context(extra), ephemeral=ephemeral, followup=True)
+            if member_usage_stats.successful(result):
+                await record_member_usage('success', result.route)
+            elif re.search(r'error|fail', result.route):
+                await record_member_usage('failed', result.route)
             for required in result.denial_followups:
                 await send_denial_followup(interaction, required, ephemeral)
             if result.private_notice:
@@ -7443,6 +7488,7 @@ def run_discord_bot(config: BotConfig) -> None:
                 f"Gemini={result.gemini_calls}｜tokens={result.input_tokens}+{result.output_tokens}={result.total_tokens}({result.token_source})｜"
                 f"API={result.api_usage}", flush=True)
         except discord.HTTPException as exc:
+            await record_member_usage('failed', 'discord_delivery_failed')
             lag = (f"｜delivery={locals().get('delivery', -1):.2f}s｜pre_defer={locals().get('pre_defer', -1):.2f}s"
                    f"｜loop_lag={locals().get('loop_lag', -1):.2f}s｜deferred={interaction.response.is_done()}")
             print(f"⚠️ Discord /{config.slash_command_name} 回覆失敗：{exc}{lag}", flush=True)
@@ -7452,6 +7498,7 @@ def run_discord_bot(config: BotConfig) -> None:
                 hint = "｜送達很快仍失效：通常是有另一個 Bot 程式用同一個 Token 在執行（舊部署、另一個 Railway 服務或本機）"
             queue_admin_alert(client, config, "Discord 回覆失敗", f"{exc}{lag}{hint}", user=who, question=question)
         except Exception as exc:  # 單題失敗不可讓 Bot 中斷
+            await record_member_usage('failed', 'exception')
             print(f"❌ 艾斯 AI /{config.slash_command_name} 處理失敗：{type(exc).__name__}: {exc}", flush=True)
             traceback.print_exc()   # 印出檔名與行號，numpy/pandas 這類例外沒有堆疊就無法定位
             queue_admin_alert(client, config, "程式例外", f"{type(exc).__name__}: {exc}", user=who, question=question)
