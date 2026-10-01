@@ -2260,6 +2260,8 @@ FINAL_FORMAT_PATTERN = """用自然短段落回答，不強制固定標題；先
 AI_CARD_SCHEMA = {
     "type": "object",
     "properties": {
+        "response_focus": {"type": "string", "enum": ["holding", "current", "review"],
+                           "description": "依整句語意辨識個人持倉風險／現在行情／交易檢討；持倉困境陳述不需問號或疑問詞。不要把單純型態問題誤當個人持倉。"},
         "response_style": {"type": "string", "enum": ["serious", "playful", "concerned"],
                            "description": "依完整原句判斷語氣；股票諧音或誇張玩笑即使問明天也可為playful。"},
         "humor_opening": {"type": "string", "description": "自然延續整句原意時現寫最多一句接話；牽強時可留空，不強制搞笑。認真或擔憂時留空。"},
@@ -2279,7 +2281,7 @@ AI_CARD_SCHEMA = {
         },
         "summary": {"type": "string"},
     },
-    "required": ["response_style", "humor_opening", "answer", "why", "scenarios", "summary"],
+    "required": ["response_focus", "response_style", "humor_opening", "answer", "why", "scenarios", "summary"],
 }
 
 FINAL_CARD_FORMAT = """輸出格式（艾斯 AI 解讀）：只輸出符合 schema 的 JSON，不要 Markdown、不要星號或條列符號。你是在「解讀」，不是在整理資料：K 線、均線、評分卡與關鍵價位表已經在圖上，文字要說明這些訊號代表什麼。
@@ -2556,6 +2558,7 @@ def build_final_prompt(payload: Dict[str, Any]) -> str:
     if stock_banter.holding_question(payload['question']):
         sections.append('使用者在問自己的持倉怎麼辦：直接回答這筆持倉目前的風險與下一步需要核對的條件，不只寫結構偏強弱。不重複堆砌成本數字。若虧損，說明原先理由是否仍有支持、哪些條件使風險升高；若獲利，說明回吐風險與結構是否維持。scenarios用「依據仍維持／依據轉弱」呈現具體可核對的條件，不把兩邊都叫轉強條件。未提供風險承受度、期限或部位，最多簡短指出一項需要補充，不自行替人訂停損比例或買賣決定。股票分割前後成本必須同一基準，未提供買進日無法確認成本基準時如實說明，不能擅自再除一次。')
     sections.append(stock_banter.RESPONSE_LANGUAGE_RULES)
+    sections.append('先判斷response_focus：holding是個人持倉、成本與風險需求，current是行情／型態，review是交易檢討；陳述句也可有隱含求助，不需問號。holding的answer先接住持倉處境，再解釋最重要風險與可觀察条件；不要只報均線或重述成本。')
     sections.append('回答重點：先接住問題而非一律報型態。問持倉後續／要注意什麼，先說最重要的風險與支撐／壓力觀察條件，說明守住或跌破的意義；缺買進理由不阻止目前分析。問改善才回顧交易規劃，問型態則分析目前型態。日期只是背景，不能一律變成覆盤。成本估算稱估算；未提供理由、計畫、日期不能推測當時沒有做。answer寫分析，humor_opening只放自然接話，不重複。')
     payload_json = json.dumps(payload.get("tool_results") or {}, ensure_ascii=False, separators=(",", ":"), default=tools.json_safe)
     return "\n\n".join(sections) + f"\n\n使用者問題：{payload['question']}\n\ntool_results（JSON）：\n{payload_json}\n"
@@ -4907,7 +4910,7 @@ class AceQueryEngine:
         # 快取鍵值用「補完股票之後」的問題，避免 A 使用者的「那它的壓力在哪」拿到 B 使用者的答案；籌碼類型分開快取。
         # 族群追問（「那哪檔最強」）要帶族群名稱與模式，不同族群的同一句追問不能共用答案
         sector = parsed.sector or {}
-        key = "|".join(['自然口語接話v11',compact, ",".join(c for c, _ in parsed.stocks), str(parsed.cost_price or ""), ",".join(parsed.branches),
+        key = "|".join(['陳述句持倉需求v12',compact, ",".join(c for c, _ in parsed.stocks), str(parsed.cost_price or ""), ",".join(parsed.branches),
                         "chip=" + parsed.chip,
                         "sector=" + str(sector.get("name") or sector.get("industry") or "") + ":" + str(sector.get("mode") or "")])
         key = self._access_cache_key(key)
@@ -6947,8 +6950,12 @@ def parse_ai_card(text: str) -> Optional[Dict[str, Any]]:
     if opening and not answer.startswith(opening):
         # 同一次模型產生的接梗與分析在事實核對前合併；不另設圖卡、不注入固定笑話。
         answer = opening + ("" if opening[-1] in "。！？!?…" else "。") + answer
-    return {"response_style": style,
+    focus = data.get("response_focus")
+    card = {"response_style": style,
             "answer": answer, "why": why, "scenarios": scenarios[:2], "summary": summary}
+    if focus in ("holding", "current", "review"):
+        card["response_focus"] = focus
+    return card
 
 
 def ai_card_text(card: Dict[str, Any]) -> str:

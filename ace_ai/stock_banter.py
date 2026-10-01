@@ -10,6 +10,7 @@ COST_RE = re.compile(r'(?:成本價?|均價|買在|買進價|進場價|套在|�
 
 # 一般分析與交易回顧共用；教理解原則，不按用詞匹配或選擇固定答案。
 RESPONSE_LANGUAGE_RULES = """理解與語氣（優先於制式開場與篇幅要求）：先依完整原句、台灣口語／台語借音、錯字與股票語境理解真正的問題；不要依固定關鍵字、單字聯想或題庫作答。
+需求不限問句：陳述持股、成本或困境也可能在尋求協助，不以問號或疑問詞作門檻。像「我買在某價，現在套住了」應先回應持倉處境與風險，說明現有支撐、壓力和轉弱條件；不只是報型態。單純型態或行情陳述仍回答行情，不捏造持倉；成本、日期、部位或計畫缺少時不推測，沒有問號也不用要求重問。
 教學例：「牙起來」在這個股票問句是借用突然發作／發飆，問股價是否突然動起來，不是牙齒或咬勁；這是語意示例，不是指定回覆，也不能把其他玩笑全套成同一解釋。
 判斷response_style：serious認真分析；playful輕鬆玩笑；concerned擔憂。先理解整句原意，再自然接話；能自然延續原意才在humor_opening現寫最多一句短話，不得只抓單字硬湊無關聯想。即使playful，接不自然也可留空並用輕鬆口吻直接分析，不強迫搞笑；serious、concerned留空，不嘲笑虧損、不淡化困境。不使用固定笑話模板。
 humor_opening不報行情數字、不承諾漲跌、不給買賣指令；不要用「我不知道／無法預測」當接話。問明天不代表要拒答：不禁止語言上的幽默，但分析只談有資料依據的目前條件。正文直接回答原意，不重複接話；程式合併成同一段解讀。
@@ -41,10 +42,10 @@ def ensure_inline_humor(question, card):
     return card
 
 
-def holding_reply(question, results):
+def holding_reply(question, results, *, semantic_holding=False):
     """以原始工具結果交代持倉處境，不猜日期、持有期間或使用者的計畫。"""
     import math
-    if not _HOLDING.search(str(question)):
+    if not (semantic_holding or holding_question(str(question))):
         return ''
     contexts=[r.data for r in results if r.ok and getattr(r,'name','')=='get_cost_position_context']
     if len(contexts)!=1:
@@ -71,7 +72,9 @@ def holding_reply(question, results):
 
 
 def integrate_holding_reply(question,card,results):
-    lead=holding_reply(question,results)
+    focus=card.get('response_focus')
+    if focus in ('current','review'):return card
+    lead=holding_reply(question,results,semantic_holding=focus=='holding')
     if not lead:return card
     answer=str(card.get('answer') or '')
     return dict(card,answer=answer+lead if card.get('response_style')=='playful' else lead+answer)
