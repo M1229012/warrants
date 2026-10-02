@@ -2397,12 +2397,19 @@ def _load_price_bundle(stock_code: str) -> Dict[str, Any]:
         # 底庫與日K快取保持原始價，只在分析入口還原一次。
         import price_adjustment
         raw_closed = daily_df.copy()
+        raw_merged = merged.copy()
         actions = get_corporate_actions(code)
         try:
             daily_df = price_adjustment.adjust_shares(daily_df, actions, as_of=merged.index[-1])
             merged = price_adjustment.adjust_shares(merged, actions)
-        except ValueError as exc:
-            raise ToolDataError(str(exc)) from exc
+        except ValueError:
+            # FinMind 回應成功但事件漏列，也必須查官方參考價；成功空表不等於沒有事件。
+            actions = _recover_corporate_reference(code, actions)
+            try:
+                daily_df = price_adjustment.adjust_shares(raw_closed, actions, as_of=raw_merged.index[-1])
+                merged = price_adjustment.adjust_shares(raw_merged, actions)
+            except ValueError as exc:
+                raise ToolDataError(str(exc)) from exc
         closed = kf.calculate_indicators(daily_df)
         closed.attrs.update(daily_df.attrs)
         closed["Close_prev"] = closed["Close"].shift(1)
@@ -2750,6 +2757,7 @@ def analyze_ma_deduction(df: pd.DataFrame, periods: Sequence[int] = (5, 10, 20, 
 
 _CORP_CACHE: Dict[str, Tuple[str, Dict[str, Any]]] = {}
 _CORP_MARKET: Dict[str, Tuple[str, List[Dict[str, Any]]]] = {}
+_CORP_LOCK = threading.RLock()
 
 
 def _market_corp_rows(kf, dataset: str, start: str, today: str) -> List[Dict[str, Any]]:
@@ -2764,12 +2772,19 @@ def _market_corp_rows(kf, dataset: str, start: str, today: str) -> List[Dict[str
 
 
 def get_corporate_actions(code: str) -> Dict[str, Any]:
+    with _CORP_LOCK:
+        return _get_corporate_actions_locked(str(code))
+
+
+def _get_corporate_actions_locked(code: str) -> Dict[str, Any]:
     """公司行動事件（一天查一次）：核對除權息、分割、反分割及面額變更參考價；減資未涵蓋。
     查詢失敗回 status=failed（型態模組會標「公司行動資料未核實」，不當成沒有事件）。"""
     today = taipei_now().strftime("%Y-%m-%d")
     cached = _CORP_CACHE.get(code)
     if cached and cached[0] == today:
-        return cached[1]
+        result = cached[1]
+        if result.get('complete') or time.monotonic() < result.get('_retry_at', 0):
+            return result
     kf = core()
     start = (taipei_now() - timedelta(days=400)).strftime("%Y-%m-%d")
     import price_adjustment
@@ -2794,10 +2809,55 @@ def get_corporate_actions(code: str) -> Dict[str, Any]:
             successes += 1
         except Exception as exc:
             coverage.append(f"{kind}資料暫時無法取得（{type(exc).__name__}）")
-    result = {"status": "ok" if successes else "failed", "items": items, "coverage": coverage}
+    # FinMind 額度或個別資料集失敗時，使用官方核實參考價；不以市場跌幅猜因子。
+    saved = local_market_cache.get_state(f'corporate_verified_v1_{code}', []) or []
+    current = {(e.get('date'), e.get('kind')): e for e in items}
+    if successes < 3:
+        import corporate_action_sources
+        official = corporate_action_sources.twse_events(code, start, today)
+        for event in official:
+            key = (event['date'], event['kind'])
+            if not current.get(key, {}).get('factor'):
+                current[key] = event
+        if official:
+            print(f"ℹ️ 公司行動核實參考價備援｜{code}｜TWSE TWT49U｜{len(official)} 筆", flush=True)
+    for event in saved:
+        key = (event.get('date'), event.get('kind'))
+        if start <= str(event.get('date', '')) <= today and not current.get(key, {}).get('factor'):
+            current[key] = event
+    items = sorted(current.values(), key=lambda e: e['date'])
+    verified = [e for e in items if e.get('factor') and math.isfinite(float(e['factor'])) and float(e['factor']) > 0]
+    if verified:
+        local_market_cache.set_state(f'corporate_verified_v1_{code}', verified)
+    result = {"status": "ok" if successes or verified else "failed", "items": items,
+              "coverage": coverage, "complete": successes == 3,
+              "_retry_at": time.monotonic() + 60}
     record_api_event("FinMindData", status=200 if successes else 500)
     _CORP_CACHE[code] = (today, result)
     return result
+
+
+def _recover_corporate_reference(code, actions):
+    """斷層警示後再查官方資料，使用原始日K重算；來源仍不足就繼續拒絕分析。"""
+    import corporate_action_sources
+    today = taipei_now().strftime('%Y-%m-%d')
+    start = (taipei_now() - timedelta(days=400)).strftime('%Y-%m-%d')
+    official = corporate_action_sources.twse_events(code, start, today)
+    if not official:
+        return actions
+    with _CORP_LOCK:
+        result = dict(actions or {})
+        items = {(e['date'], e['kind']): e for e in result.get('items') or []}
+        for event in official:
+            key = (event['date'], event['kind'])
+            if not items.get(key, {}).get('factor'):
+                items[key] = event
+        result.update(status='ok', items=sorted(items.values(), key=lambda e: e['date']))
+        _CORP_CACHE[code] = (today, result)
+        verified = [e for e in result['items'] if e.get('factor') and math.isfinite(float(e['factor'])) and float(e['factor']) > 0]
+        local_market_cache.set_state(f'corporate_verified_v1_{code}', verified)
+        print(f'ℹ️ 價格斷層重新核實｜{code}｜TWSE TWT49U｜{len(official)} 筆', flush=True)
+        return result
 
 
 def _kline_patterns(df: pd.DataFrame, code: str = "", provisional_today: bool = False) -> Dict[str, Any]:

@@ -173,12 +173,12 @@ def enrich(data):
             row['margin_short'] = {'available': False, 'reason': '融資券資料暫時無法取得'}
         if f is not None and f not in done:
             f.cancel()
-    data['question_context'] = '管理員截圖或文字比較；綜合觀察分數另列技術、現股與融資券，未驗證預測能力。'
+    data['question_context'] = '管理員比較；技術70%＋現股30%；融資券只作觀察，不計分。'
     data['_chip_dates'] = dates
     return rows
 
 
-WEIGHTS = {'technical': 60, 'spot': 30, 'margin': 10}
+WEIGHTS = {'technical': 70, 'spot': 30}
 PERIOD_WEIGHTS = {20: .7, 70: .3}
 
 
@@ -222,67 +222,16 @@ def price_context(code, as_of, dates=None):
 
 
 def score_row(row, as_of, context):
-    """Transparent heuristic observation score, not an investor-identity or trading model."""
-    parts = {k: None for k in WEIGHTS}
-    reasons = []
-    technical = row.get('pattern_score')
-    if isinstance(technical, (int, float)) and math.isfinite(technical) and 0 <= technical <= 100:
-        day = str(row.get('score_date') or as_of)[:10].replace('/', '-')
-        if day == as_of:
-            parts['technical'] = round(technical * .6, 2)
-    spot = row.get('spot_chips', {})
-    margins = row.get('margin_short', {})
-    spot_points, margin_points = [], []
-    for n, weight in PERIOD_WEIGHTS.items():
-        p = spot.get('periods', {}).get(str(n), {})
-        concentration = p.get('net_concentration')
-        if (spot.get('data_date') == as_of and p.get('available', 0) >= n and not p.get('insufficient')
-                and not p.get('ratio_unavailable') and isinstance(concentration, (int,float))
-                and math.isfinite(concentration)):
-            # +/-10 percentage points saturates; a neutral concentration earns 15/30.
-            points = 15 + max(-10, min(10, concentration)) * 1.5
-            spot_points.append(weight * points)
-            reasons.append(f'現股 {n} 日淨集中度 {concentration:+.2f}%（每日前段分點近似）')
-        m = margins.get('periods', {}).get(str(n), {})
-        price = context.get('periods', {}).get(str(n), {})
-        if (margins.get('data_date') != as_of or not m.get('complete') or not price
-                or context.get('data_date') != as_of or price.get('share_adjustment')
-                or m.get('start_date') != price.get('start_date')):
-            continue
-        volume = price.get('volume_lots', 0)
-        if not volume or not math.isfinite(volume):
-            continue
-        price_change = price['price_change_pct']
-        margin_pct, short_pct = m.get('margin_change_pct'), m.get('short_change_pct')
-        margin_change, short_change = m.get('margin_change'), m.get('short_change')
-        if not all(isinstance(v, (int,float)) and math.isfinite(v) for v in (margin_change, short_change)):
-            continue
-        meaningful_margin = abs(margin_change) / volume >= .01
-        meaningful_short = abs(short_change) / volume >= .01
-        points, note = 5, '沒有足夠的價格與槓桿背離，維持中性分'
-        buildup = meaningful_margin and margin_pct is not None and margin_pct >= 10
-        stretched = context.get('range_position_70', 0) >= .8 and context.get('ma20_gap_pct', 0) >= 8
-        if buildup and price_change <= -3:
-            points, note = 2, '股價下跌但融資明顯累積，槓桿承壓風險提高'
-        elif buildup and margin_pct >= 20 and price_change >= 8 and stretched:
-            points, note = 3, '高位階且偏離月線，融資同步明顯累積，留意回檔風險'
-        elif meaningful_margin and margin_pct is not None and margin_pct <= -10 and price_change >= 3:
-            points, note = 7, '價格走強且融資明顯下降，觀察到槓桿減輕；不推定買方身分'
-        if (meaningful_short and short_pct is not None and short_pct >= 20 and price_change <= -3
-                and context.get('ma20_gap_pct', 0) < 0):
-            points = max(0, points-1)
-            note += '；弱勢價格伴隨融券增加，追加風險提醒，不推定軋空'
-        margin_points.append(weight * points)
-        reasons.append(f'融資券 {n} 日：{note}')
-    if len(spot_points) == 2:
-        parts['spot'] = round(sum(spot_points), 2)
-    if len(margin_points) == 2:
-        parts['margin'] = round(sum(margin_points), 2)
-    missing = [k for k,v in parts.items() if v is None]
-    total = round(sum(parts.values()), 2) if not missing else None
-    return {'components': parts, 'weights': WEIGHTS, 'total': total, 'complete': not missing,
-            'missing': missing, 'as_of': as_of, 'reasons': reasons,
-            'method': 'heuristic-v1；區間20日70%、70日30%；不辨識散戶大戶、不代表報酬或勝率'}
+    import stock_chip_scoring as scoring
+    technical=row.get('pattern_score') if str(row.get('score_date') or as_of)[:10].replace('/','-')==as_of else None
+    chip=row.get('spot_scoring') or {'score':None,'complete':False,'data_date':''}
+    result=scoring.combine(technical,chip,as_of)
+    result['components']={'technical':round(technical*.7,2) if result['technical_score'] is not None else None,
+                          'spot':round(chip['score']*.3,2) if chip.get('complete') and chip.get('data_date')==as_of else None}
+    result['missing']=[k for k,v in result['components'].items() if v is None]
+    result['as_of']=as_of
+    result['reasons']=[c['reason'] for c in chip.get('components',[])]
+    return result
 
 
 def apply_scores(data, rows):
@@ -291,6 +240,14 @@ def apply_scores(data, rows):
         row.pop('composite_rank', None)
         context = price_context(row['stock_code'], as_of, data.get('_chip_dates')) if as_of else {'available':False}
         row['price_context'] = context
+        import stock_chip_scoring as scoring
+        dates=[d for d in data.get('_chip_dates',[]) if d<=as_of][-70:]
+        try:
+            row['spot_scoring']=scoring.calculate(dates,store.spot_day_status(row['stock_code'],dates),
+                store.load_spot_rows(row['stock_code'],dates),spot_chip._bars(row['stock_code']))
+        except Exception as exc:
+            print(f'截圖分點評分失敗｜{row["stock_code"]}｜{tools.err_text(exc)}',flush=True)
+            row['spot_scoring']={'score':None,'complete':False,'data_date':''}
         row['composite_score'] = score_row(row, as_of, context)
     complete = sorted((r for r in rows if r['composite_score']['complete']),
                       key=lambda r: (-r['composite_score']['total'], r['stock_code']))
@@ -310,13 +267,13 @@ def score_panel(rows):
         value = row['composite_score']['components'][key]
         return f'{value:.1f}' if value is not None else '—'
     sections = [{'type': 'table', 'title':'綜合觀察分數（100分）',
-        'columns':['股票','技術／60','現股／30','融資券／10','綜合'],
-        'widths':[.30,.16,.18,.19,.17], 'rows':[
+        'columns':['股票','技術／70','現股／30','綜合'],
+        'widths':[.40,.20,.20,.20], 'rows':[
             [f"{r.get('composite_rank', '—')}. {r['stock_code']} {r.get('stock_name','')}",
-             part(r,'technical'),part(r,'spot'),part(r,'margin'),
+             part(r,'technical'),part(r,'spot'),
              f"{r['composite_score']['total']:.1f}" if r['composite_score']['complete'] else '—'] for r in rows]}]
-    sections.append({'type':'note','text':'同日、完整資料才計綜合分及排名；待補不等於0分。技術原分數按60%換算；籌碼及融資券以20日70%、70日30%加權。'})
-    sections.append({'type':'note','text':'融資券以中性5分起算，搭配股價、位階與變化幅度調整。這是觀察規則，未經績效驗證；不判定散戶或大戶身分，不代表買賣推薦。'})
+    sections.append({'type':'note','text':'同日、完整資料才計綜合分及排名；待補不等於0分。技術70%＋現股30%；融資券不計分。'})
+    sections.append({'type':'note','text':'融資券僅供管理員觀察，不計入總分。這是觀察規則，未經績效驗證；不判定散戶或大戶身分，不代表買賣推薦。'})
     for row in rows:
         reasons = row['composite_score']['reasons']
         missing = row['composite_score']['missing']
@@ -365,7 +322,7 @@ def ai_compare(data, question, gateway, validate):
         '不論截圖策略名稱都比較全部股票。技術名次與composite_rank不同；綜合分是程式觀察規則，不是推薦、報酬或勝率。'
         '缺項綜合分為null，禁止自行填分或拿它排名；只能用已有單項資料分別解讀。'
         '融資券使用者可能有不同背景，不能從餘額或增減認定散戶、大戶、主力。'
-        '不能單靠融資增加判弱、融券增加判軋空，也不能拿不同股票張數絕對大小判強弱；'
+        '綜合分只計技術70%及現股30%，融資券不計分。不能單靠融資增加判弱、融券增加判軋空，也不能拿不同股票張數絕對大小判強弱；'
         '搭配餘額變化比例、價格結構與分點集中度判斷。缺資料不當零，僅說可核實的部分。'
         '不同資料日期、區間涵蓋不足或股數分割未校正，不能直接比較；不要把融券當借券。'
         '只回JSON：answer短結論最多80字；why用一般文字說明真正區分各檔的證據，完整句子，不套固定模板；'

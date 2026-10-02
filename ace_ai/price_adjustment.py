@@ -23,7 +23,10 @@ def event_from_row(row, kind):
 
 def adjust_shares(frame, events, as_of=None):
     out = frame.copy()
-    if out.empty or out.attrs.get('share_adjustments') is not None:
+    if out.empty:
+        return out
+    if out.attrs.get('share_adjustments') is not None:
+        validate_adjusted(out)
         return out
     applied=[]
     if events and events.get('status') == 'ok':
@@ -56,11 +59,21 @@ def adjust_shares(frame, events, as_of=None):
                 out.loc[mask,'Volume']=float('nan')
             applied.append(dict(ev))
     # 大幅斷層僅作資料警示，絕不從這個比例反推還原因子。
-    ratios=out['Close'].astype(float).div(out['Close'].astype(float).shift())
+    validate_adjusted(out)
+    out.attrs['share_adjustments']=applied
+    out.attrs['share_adjustment_as_of']=str(pd.Timestamp(as_of if as_of is not None else out.index[-1]).date())
+    return out
+
+
+def validate_adjusted(frame):
+    if frame.empty:
+        return
+    close = pd.to_numeric(frame['Close'], errors='coerce')
+    if not close.map(lambda v: math.isfinite(v) and v > 0).all():
+        raise ValueError('日K含無效價格，暫停覆盤與技術分析')
+    ratios = close.div(close.shift())
     if ((ratios < .65) | (ratios > 1.8)).any():
         raise ValueError('日K仍有未核實的大幅價格斷層，請更新公司行動參考價後再分析')
-    out.attrs['share_adjustments']=applied
-    return out
 
 
 def factor_on_date(frame, day):
