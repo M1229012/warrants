@@ -1781,7 +1781,7 @@ def compare_card(draw, y: float, panels: list[dict], dry: bool) -> int:
 
 
 def _compare_mode(panels: list[dict]) -> bool:
-    return len(panels) >= 2 and all(p.get('scorecard') and p.get('bars') for p in panels)
+    return len(panels) >= 2 and all(p.get('scorecard') and not p['scorecard'].get('hide_score') and p.get('bars') for p in panels)
 
 
 # ============================================================
@@ -3025,7 +3025,9 @@ def text_card(text: str) -> dict:
 
 def render_answer(question: str, answer: str, panels: list[dict] | None = None,
                   *, title: str = '艾斯助手｜喬巴｜研究筆記', demo: bool = False) -> Image.Image:
-    panels = panels or []
+    # 測試版所有舊分數卡都只保留技術價位，不輸出分數／分級／評分條。
+    panels = [dict(p, scorecard=dict(p['scorecard'], hide_score=True, card_title='技術位置', card_note='均線、價量與價位整理'))
+              if p.get('scorecard') else p for p in panels or []]
     debug_panel = next((p.get("kline_debug") for p in panels if p.get("kline_debug")), None)
     if debug_panel is not None:
         from kline_debug import render

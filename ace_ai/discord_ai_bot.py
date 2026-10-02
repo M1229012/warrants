@@ -57,6 +57,7 @@ import sector_radar
 import trade_review
 import review_language
 import stock_banter
+import chip_event_backtest
 import member_usage_stats
 
 # 主程式每算一檔股票都會印「📅 週報統計區間」，Bot 一題會印上百行，把真正的訊息洗掉。
@@ -1427,6 +1428,8 @@ class QueryRouter:
     def plan(self, parsed: ParsedQuestion, stats: "AnswerStats") -> QueryPlan:
         access_policy.require_question(parsed.access, parsed.normalized or parsed.original,
                                        tools.get_cached_known_branches(), parsed)
+        if parsed.stocks and re.search(r"融資.*(?:回測|事件|報酬|勝率)|(?:回測|事件).*融資", parsed.original):
+            return self._pattern_plan(parsed)
         if "index_compare" in parsed.intents:
             return self._index_compare_plan(parsed)
         if parsed.sector is not None:
@@ -2588,6 +2591,8 @@ def build_final_prompt(payload: Dict[str, Any]) -> str:
         sections.append(FINAL_RANK_RULES)
     if "get_spot_chip_summary" in names:
         sections.append(FINAL_SPOT_RULES)
+    if "get_spot_event_backtest" in names:
+        sections.append("測試版現股事件回測：完全不提供分數、評級或按績效選股排名；技術面只描述均線、價量、型態與價位。get_spot_event_backtest的spot是觀察到的持續買進候選，不能推定分點身分、實際庫存或確認佈局意圖。回測是同股訊號次日開盤至5／10／20日收盤的股價報酬，不是分點實際成交獲利；reach_3_pct與reach_5_pct是期末漲幅達3%／5%的歷史比例，不是未來機率，也不是漲0.01%就算成功。必須說明期別、樣本數、資料期間與小樣本；pending不納入。worst_drawdown_pct是已成熟樣本持有期間最差的回撤，不是未來停損。stock_background_avg_pct是相同期間不要求分點訊號的同股平均報酬，並非大盤指數，也不證明訊號有效。沒有margin就省略融資話題；margin存在才說大額融資餘額淨增事件，不能說大戶或散戶進場，不能把淨增等同實際買入。保留依原句接梗，先回答問題，不逐行念表。")
     if "get_spot_branch_flow" in names:
         sections.append(FINAL_SPOT_BRANCH_RULES)
     if "get_branch_warrant_detail" in names:
@@ -4983,7 +4988,7 @@ class AceQueryEngine:
         # 快取鍵值用「補完股票之後」的問題，避免 A 使用者的「那它的壓力在哪」拿到 B 使用者的答案；籌碼類型分開快取。
         # 族群追問（「那哪檔最強」）要帶族群名稱與模式，不同族群的同一句追問不能共用答案
         sector = parsed.sector or {}
-        key = "|".join(['技術70現股30融資管理員v17',compact, ",".join(c for c, _ in parsed.stocks), str(parsed.cost_price or ""), ",".join(parsed.branches),
+        key = "|".join(['現股事件回測無評分v1',compact, ",".join(c for c, _ in parsed.stocks), str(parsed.cost_price or ""), ",".join(parsed.branches),
                         "chip=" + parsed.chip,
                         "sector=" + str(sector.get("name") or sector.get("industry") or "") + ":" + str(sector.get("mode") or "")])
         key = self._access_cache_key(key)
@@ -5174,7 +5179,7 @@ class AceQueryEngine:
         self._perf_add("spot_prepare", time.perf_counter() - prepare_started)
         complete = [d for d in dates if (statuses.get(d) or {}).get("status") == "complete"]
         # 最新完整交易日變了就換 key，舊答案不會被繼續拿出來；/ace 測試不讀寫正式快取。
-        key = self._access_cache_key(f"spot|{code}|{mode}|{complete[-1] if complete else ''}|{len(complete)}|q={stock_banter.answer_question_key(question)}")
+        key = self._access_cache_key(f"spot_events_v1|{code}|{mode}|{complete[-1] if complete else ''}|{len(complete)}|q={stock_banter.answer_question_key(question)}")
         if not simulation:
             hit, cached = self._answer_cache.get(key)
             if hit:
@@ -5190,20 +5195,29 @@ class AceQueryEngine:
             else:
                 card = spot_chip.progress_card(code, name, report)
             return self._spot_alert(self._spot_result(card, title, False, started, f"{code} 現股分點資料建置中"), report, code)
-        card = spot_chip.report_card(report, code, name)
+        card = spot_chip.report_card(dict(report, history=[]), code, name)
         text = (f"{code} {name} 現股分點籌碼｜資料日期 {latest}｜歷史 {report.get('available_days')}/{report.get('requested_days')}｜"
                 f"買超 {', '.join(x['branch'] for x in report.get('latest_top_buy') or [])}｜"
                 f"賣超 {', '.join(x['branch'] for x in report.get('latest_top_sell') or [])}")
         result = self._spot_result(card, title, True, started, text)
         # 使用同一份報表解讀，沒有額外抓價或再次抓 70 日；缺資料卡仍走上方備援。
         payload = dict(spot_chip.summary_payload(report), stock_code=code, stock_name=name,
-                       continuity=report.get("continuity") or [], history=report.get("history") or [])
+                       continuity=report.get("continuity") or [])
+        backtest = self._prepare_event_backtest(code, name, report=report)
+        extra_panels = []
+        study_results = [tools.ToolResult("get_spot_chip_summary", True, payload)]
+        if backtest:
+            study_results.append(tools.ToolResult("get_spot_event_backtest", True, backtest))
+            extra_panels.append({"branch_card": chip_event_backtest.branch_card(backtest), "hide_text": True})
+            margin = chip_event_backtest.margin_card(backtest)
+            if margin:
+                extra_panels.append({"branch_card": margin, "hide_text": True})
         stats = AnswerStats()
         ai_text, llm_ok = self._compose(question, QueryPlan(route="rule_spot_chip", need_final_llm=True),
-                                        [tools.ToolResult("get_spot_chip_summary", True, payload)], stats)
+                                        study_results, stats)
         ai_card = self._take_ai_card()
         result = replace(result, text=ai_text if ai_card else text,
-                         panels=result.panels + ([{"ai_card": ai_card}] if ai_card else []),
+                         panels=result.panels + extra_panels + ([{"ai_card": ai_card}] if ai_card else []),
                          gemini_calls=stats.gemini_calls, elapsed=time.perf_counter() - started,
                          cacheable=llm_ok, input_tokens=stats.input_tokens,
                          output_tokens=stats.output_tokens, total_tokens=stats.total_tokens,
@@ -5219,7 +5233,7 @@ class AceQueryEngine:
                              if (info or {}).get("status") == "complete"])
             complete_now.sort()
             self._answer_cache.set(self._access_cache_key(
-                f"spot|{code}|{mode}|{complete_now[-1] if complete_now else ''}|{len(complete_now)}|q={stock_banter.answer_question_key(question)}"), result,
+                f"spot_events_v1|{code}|{mode}|{complete_now[-1] if complete_now else ''}|{len(complete_now)}|q={stock_banter.answer_question_key(question)}"), result,
                 self.config.answer_cache_seconds)
         return result
 
@@ -5234,7 +5248,7 @@ class AceQueryEngine:
         def cache_key() -> str:
             statuses = local_market_cache.spot_day_status(code, dates)
             complete = [d for d in dates if (statuses.get(d) or {}).get("status") == "complete"]
-            return self._access_cache_key(f"spot_branch|{code}|{spot_chip._branch_key(branch)}|"
+            return self._access_cache_key(f"spot_branch_events_v1|{code}|{spot_chip._branch_key(branch)}|"
                                           f"{complete[-1] if complete else ''}|{len(complete)}|q={stock_banter.answer_question_key(question)}")
         if not simulation:
             hit, cached = self._answer_cache.get(cache_key())
@@ -5261,10 +5275,19 @@ class AceQueryEngine:
         name = name or panel.get("stock_name", "")
         payload = spot_chip.branch_flow_payload(flow, code, name, panel.get("bars") or [])
         results = [tools.ToolResult("get_spot_branch_flow", True, payload)]
+        backtest = self._prepare_event_backtest(code, name, report=report, branch_name=flow['branch'])
+        if backtest:
+            results.append(tools.ToolResult("get_spot_event_backtest", True, backtest))
         stats = AnswerStats()
         text, llm_ok = self._compose(question, QueryPlan(route="rule_spot_branch", need_final_llm=True), results, stats)
         ai_card = self._take_ai_card()
-        panels = [panel] + ([{"ai_card": ai_card}] if ai_card else [])
+        panels = [panel]
+        if backtest:
+            panels.append({"branch_card": chip_event_backtest.branch_card(backtest), "hide_text": True})
+            margin = chip_event_backtest.margin_card(backtest)
+            if margin:
+                panels.append({"branch_card": margin, "hide_text": True})
+        panels += ([{"ai_card": ai_card}] if ai_card else [])
         elapsed = time.perf_counter() - started
         self.log(f"現股分點明細｜{code} {flow['branch']}｜上榜 {flow['listed_days']}/{flow['window_days']}｜"
                  f"Gemini {stats.gemini_calls} 次｜總耗時 {elapsed:.2f}s")
@@ -6142,6 +6165,8 @@ class AceQueryEngine:
         parsed.access = self._access()
         self.log(f"解析結果：{json.dumps(parsed.summary(), ensure_ascii=False)}")
         stocks_only = [c for c, _ in parsed.stocks if c not in tools.INDEX_CODES]
+        if stocks_only and re.search(r"融資.*(?:回測|事件|報酬|勝率)|(?:回測|事件).*融資", question):
+            parsed.intents.add("technical")
         market_inst = market_institutional_wanted(parsed)
         if market_inst and not (parsed.stocks and pattern_asked(parsed)):
             # 「外資今天買超多少」「今天三大法人買賣超」：全市場（上市）三大法人；只問數字不呼叫 AI
@@ -6270,7 +6295,7 @@ class AceQueryEngine:
             else:
                 self._fallback_branch_marks(panel, code, results)
             panels.append(panel)
-        if getattr(parsed, "spot_combo", False):
+        if getattr(parsed, "spot_combo", False) and plan.route != "rule_pattern" and not plan.pattern:
             spot_panel, spot_data = self._spot_combo_section(parsed)
             if spot_data:
                 results.append(tools.ToolResult("get_spot_chip_summary", True, spot_data))
@@ -6341,16 +6366,17 @@ class AceQueryEngine:
                 if focus:
                     panel["institutional_focus"] = _INVESTOR_KEYS[focus]   # 只問單一法人：副圖只畫該法人
         if plan.route in ("rule_pattern", "rule_top_warrant", "rule_index_compare") or plan.pattern:
-            for panel in [p for p in panels if p.get("stock_code")]:   # 只有 K 線面板有評分卡（籌碼重點不是）
-                card = self._pattern_scorecard(panel["stock_code"], results, parsed.cost_price)
-                with_chips = any(r.name == "get_sheet_stock_chips" and r.ok for r in results)
-                if card and (getattr(parsed, "spot_combo", False) or with_chips or market_flow):
-                    if market_flow and not with_chips:
-                        card = dict(card, hide_reasons=True)     # 大盤型態＋法人：不放得分／失分，圖片不要太長
-                    card = dict(card, compact=True)   # 型態＋籌碼整合頁：評分卡精簡（無均線扣抵、價位只留最近 1＋1）
-                if card:
-                    panel["scorecard"] = card
-                    results.append(tools.ToolResult("get_pattern_scorecard", True, card))
+            # 測試版型態頁：保留原 K 線與技術數據，以事件回測取代分數／分級。
+            for panel in [p for p in panels if p.get("stock_code") and p.get("bars")]:
+                panel.pop("scorecard", None)
+                code = panel["stock_code"]
+                data = self._prepare_event_backtest(code, panel.get("stock_name", ""))
+                if data:
+                    results.append(tools.ToolResult("get_spot_event_backtest", True, data))
+                    panels.append({"branch_card": chip_event_backtest.branch_card(data), "hide_text": True})
+                    margin = chip_event_backtest.margin_card(data)
+                    if margin:
+                        panels.append({"branch_card": margin, "hide_text": True})
         contribution = next((r.data for r in results if r.name == "get_index_contribution" and r.ok), None)
         markets = list((contribution or {}).get("markets") or [])
         # 問大盤就只給加權、問櫃買就只給櫃買；沒指定才兩個都給，不要拿另一個市場充數。
@@ -6467,25 +6493,32 @@ class AceQueryEngine:
             return AnswerResult(text="圖片或文字裡找不到 2 檔以上可辨識的股票代號，請換一張清楚的截圖，或直接輸入代號。",
                                 route="clarify", gemini_calls=stats.gemini_calls, elapsed=time.perf_counter() - started)
 
-        def validate(explanation: str, row: Dict[str, Any]) -> bool:
-            candidates = row.get("stocks") or [row]
-            results = [tools.ToolResult("get_sector_candidate", True, candidate) for candidate in candidates]
-            payload = {"tool_results": {str(candidate.get("stock_code") or i): candidate
-                                        for i, candidate in enumerate(candidates)}}
-            return not FactSheet("", results, payload).check(explanation)
-
-        name = f"自訂清單 {len(stocks)} 檔"
+        # 測試版清單保持輸入順序；不用舊技術／籌碼分數決定名次。
         access_policy.require_chip(self._access(), "spot")
-        answer = sector_analysis.answer_custom(stocks, name, self.gateway, validate, question=question)
-        text = answer["text"] + (f"\n無法辨識的代號：{'、'.join(unknown)}" if unknown else "")
+        results, panels = [], []
+        for stock in stocks:
+            data = self._prepare_event_backtest(stock['stock_code'], stock.get('stock_name', ''))
+            if not data:
+                continue
+            results.append(tools.ToolResult("get_spot_event_backtest", True, data))
+            panels.append({"branch_card": chip_event_backtest.branch_card(data), "hide_text": True})
+            margin = chip_event_backtest.margin_card(data)
+            if margin:
+                panels.append({"branch_card": margin, "hide_text": True})
+        if not results:
+            return AnswerResult(text="清單目前沒有可核實的回測資料，請稍後再試。",
+                                route="rule_custom_ranking", cacheable=False,
+                                elapsed=time.perf_counter()-started, gemini_calls=stats.gemini_calls)
+        text, ok = self._compose(question, QueryPlan(route="rule_custom_ranking", need_final_llm=True), results, stats)
+        ai_card = self._take_ai_card()
+        if ai_card:
+            panels.append({"ai_card": ai_card})
         return AnswerResult(text=text, route="rule_custom_ranking",
-                            gemini_calls=stats.gemini_calls + int(answer.get("calls") or 0),
-                            elapsed=time.perf_counter() - started, cacheable=bool(answer.get("cacheable")),
-                            panels=answer.get("panels") or [], image_title=f"{name}｜技術與籌碼比較",
-                            input_tokens=stats.input_tokens + int(answer.get("input_tokens") or 0),
-                            output_tokens=stats.output_tokens + int(answer.get("output_tokens") or 0),
-                            total_tokens=stats.total_tokens + int(answer.get("total_tokens") or 0),
-                            token_source=str(answer.get("token_source") or stats.token_source))
+                            gemini_calls=stats.gemini_calls, elapsed=time.perf_counter()-started,
+                            cacheable=ok and len(results)==len(stocks), panels=panels,
+                            image_title=f"自訂清單 {len(stocks)} 檔｜現股分點事件回測",
+                            input_tokens=stats.input_tokens, output_tokens=stats.output_tokens,
+                            total_tokens=stats.total_tokens, token_source=stats.token_source)
 
     def _answer_sector(self, request: Dict[str, str], started: float) -> AnswerResult:
         def validate(explanation: str, row: Dict[str, Any]) -> bool:
@@ -6495,6 +6528,8 @@ class AceQueryEngine:
             # 一次只核對這檔股票，防止其他成分股的數字通過核對。
             return not facts.check(f"**{row['stock_name']}（{row['stock_code']}）**\n{explanation}")
 
+        if request.get("mode") == "technical":
+            request = dict(request, mode="overview")
         result = sector_analysis.answer(request, self.gateway, validate)
         if request.get("matched_by"):
             # 會員講別名（TGV、CCL…）或模糊比對：卡片說明列與文字都註明對應到哪個族群
@@ -6520,6 +6555,23 @@ class AceQueryEngine:
                             output_tokens=int(result.get("output_tokens") or 0),
                             total_tokens=int(result.get("total_tokens") or 0),
                             token_source=str(result.get("token_source") or "none"))
+
+    def _prepare_event_backtest(self, code: str, name: str = "", report=None, branch_name: str = ""):
+        if code in tools.INDEX_CODES:
+            return None
+        access = self._access()
+        # 保留現股權限；會員與 /ask 即使是管理員本人使用，也不抓融資。
+        if access is not None and not access.entitlement.spot:
+            return None
+        allow_margin = bool(access and access.admin_mode and not access.simulation)
+        try:
+            result = chip_event_backtest.prepare(code, name, report=report,
+                allow_margin=allow_margin, branch_name=branch_name)
+            self.log(f"測試現股回測｜{code}｜分點 {len(result['spot']['branches'])} 家｜融資事件 {len((result.get('margin') or {}).get('events', []))}")
+            return result
+        except Exception as exc:
+            self.log(f"測試現股回測略過｜{code}｜{type(exc).__name__}: {exc}")
+            return None
 
     def _pattern_scorecard(self, code: str, results: Sequence[tools.ToolResult], cost_price: Optional[float]) -> Dict[str, Any]:
         """型態評分卡：與本週精選同一套 100 分制型態評分（純 Python，0 次 Gemini）；資料不足時回傳空 dict。"""
