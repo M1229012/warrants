@@ -32,7 +32,7 @@ PERIODS = (3, 5, 10, 20, 70)
 FETCHER = os.getenv("DISCORD_AI_SPOT_FETCHER", "http").strip().lower() or "http"
 MAX_CONCURRENCY = max(1, int(os.getenv("DISCORD_AI_SPOT_CONCURRENCY", "1") or 1))
 # 會員這一題補歷史時同一檔並行幾條連線（全行程同時抓取的頁數上限也是這個數）；1＝逐頁
-PARALLEL = max(1, int(os.getenv("DISCORD_AI_SPOT_PARALLEL", "4") or 4))
+PARALLEL = max(1, int(os.getenv("DISCORD_AI_SPOT_PARALLEL", "12") or 12))
 # 每頁間隔：原本 0.6 秒 × 71 頁光等待就 43 秒（實際抓取只要約 17 秒），改成 0.2 秒。
 REQUEST_GAP = float(os.getenv("DISCORD_AI_SPOT_REQUEST_GAP", "0.2") or 0.2)
 # 會員這一題最多等幾秒補歷史；沒補完的日期在背景繼續補，下一題就是完整資料。
@@ -117,19 +117,56 @@ def fetch_settings():
         limit = parallel if 'parallel' in saved else max(MAX_CONCURRENCY, parallel)
         _SEMAPHORE.resize(limit) if isinstance(_SEMAPHORE, SourceLimiter) else None
         return {'parallel': parallel, 'global_limit': limit, 'fetcher': FETCHER,
-                'request_gap': REQUEST_GAP}
+                'request_gap': REQUEST_GAP, 'auto': saved.get('auto', parallel == 12),
+                'phase': saved.get('phase', 'normal'), 'successes': saved.get('successes', 0),
+                'epoch': saved.get('epoch', 'initial'), 'reason': saved.get('reason', '')}
 
 
 def set_fetch_parallel(parallel):
     parallel = int(parallel)
     if not 1 <= parallel <= 64:
         raise ValueError('連線數請設定為 1～64 條。')
-    value = {'parallel': parallel}
+    value = {'parallel': parallel, 'auto': parallel == 12, 'phase': 'normal',
+             'successes': 0, 'epoch': str(time.time_ns())}
     local_market_cache.set_state(FETCH_SETTINGS_KEY, value)
     with _FETCH_CONFIG_LOCK:
         _FETCH_CONFIG.update(checked=time.monotonic(), value=value)
     _SEMAPHORE.resize(parallel)
     return fetch_settings()
+def note_fetch_health(batch, *, failed=False, complete=False, code=''):
+    """Only the current configuration generation may change adaptive state.
+
+    A successful round must freshly fetch 70 complete dates, without retries.
+    Cached dates, missing source data, queue waits and database errors don't qualify.
+    """
+    if FETCHER == 'selenium' or not batch.get('auto'):
+        return
+    with _FETCH_CONFIG_LOCK:
+        saved = dict(local_market_cache.get_state(FETCH_SETTINGS_KEY, {}) or {})
+        current_epoch = saved.get('epoch', 'initial')
+        if current_epoch != batch.get('epoch', 'initial'):
+            return
+        parallel = int(saved.get('parallel', PARALLEL))
+        phase = saved.get('phase', 'normal')
+        if failed and parallel == 12:
+            locked = phase == 'probe'
+            saved.update(parallel=8, auto=True, phase='locked' if locked else 'fallback',
+                         successes=0, reason='12條重試仍有來源或連線錯誤',
+                         epoch=str(time.time_ns()))
+        elif parallel == 8 and phase == 'fallback':
+            saved['successes'] = int(saved.get('successes', 0)) + 1 if complete and not failed else 0
+            if saved['successes'] >= 5:
+                saved.update(parallel=12, phase='probe', successes=0, reason='8條連續5次完整70日成功',
+                             epoch=str(time.time_ns()))
+        else:
+            return
+        # Persist before updating active limits; DB failures must surface.
+        local_market_cache.set_state(FETCH_SETTINGS_KEY, saved)
+        _FETCH_CONFIG.update(checked=time.monotonic(), value=saved)
+        _SEMAPHORE.resize(saved['parallel'])
+        print(f"現股自動連線｜{code}｜{parallel}→{saved['parallel']}｜{saved['phase']}｜成功 {saved['successes']}/5｜{saved.get('reason', '')}", flush=True)
+
+
 _BACKGROUND: set = set()
 _BACKGROUND_GUARD = threading.Lock()
 _STOCK_LOCKS: Dict[str, threading.Lock] = {}
@@ -539,16 +576,27 @@ def ensure_days(stock_code: str, dates: Sequence[str], budget: float = BACKFILL_
         busy = 0
         if missing:
             deadline = time.monotonic() + budget
-            # 會員這一題用 PARALLEL 條連線並行抓（每條各自的 session）；背景與 selenium 模式維持 1 條
-            workers = 1 if background or FETCHER == "selenium" else min(fetch_settings()['parallel'], len(missing))
+            # 會員這一題用 PARALLEL 條連線並行抓（每條各自的 session）；前景與背景共用動態設定，selenium 模式維持 1 條
+            batch_settings = fetch_settings()
+            workers = 1 if FETCHER == "selenium" else min(batch_settings['parallel'], len(missing))
             queue, guard, failure = deque(missing), threading.Lock(), []
-            state = {"fetched": 0, "errors": 0, "streak": 0, "busy": 0, "stop": False}
+            state = {"fetched": 0, "errors": 0, "streak": 0, "busy": 0, "stop": False, "retry_seen": False, "health_errors": 0}
             request_id = str(getattr(tools._API_REQUEST_LOCAL, "request_id", "") or "")
 
             def work() -> None:
                 _FETCH_DEADLINE.at = deadline
                 try:
                     _work()
+                except local_market_cache.DBError as exc:
+                    with guard:
+                        failure.append(exc)
+                        state["stop"] = True
+                except Exception as exc:
+                    with guard:
+                        state["health_errors"] += 1
+                        state["stop"] = True
+                    note_fetch_health(batch_settings, failed=True, code=stock_code)
+                    print(f"現股工作連線錯誤｜{stock_code}｜{type(exc).__name__}: {exc}", flush=True)
                 finally:
                     _FETCH_DEADLINE.at = 0.0   # 單一連線時在呼叫端執行緒跑，不能把截止時間留給下一題
 
@@ -571,6 +619,11 @@ def ensure_days(stock_code: str, dates: Sequence[str], budget: float = BACKFILL_
                             return
                         try:
                             failed = _fetch_one(fetch, stock_code, date, latest_date)
+                            if failed and time.monotonic() < deadline:
+                                with guard:
+                                    state["retry_seen"] = True
+                                time.sleep(min(0.2, max(0, deadline-time.monotonic())))
+                                failed = _fetch_one(fetch, stock_code, date, latest_date)
                         except local_market_cache.DBError as exc:
                             with guard:
                                 failure.append(exc)
@@ -578,6 +631,17 @@ def ensure_days(stock_code: str, dates: Sequence[str], budget: float = BACKFILL_
                             return
                         finally:
                             _SEMAPHORE.release()
+                        if failed and time.monotonic() + HTTP_READ_TIMEOUT < deadline:
+                            with guard:
+                                state["health_errors"] += 1
+                            note_fetch_health(batch_settings, failed=True, code=stock_code)
+                            # Retry the failed date once under the reduced global limit.
+                            if batch_settings.get('parallel') == 12 and fetch_settings()['parallel'] == 8:
+                                if _acquire_source(deadline, background):
+                                    try:
+                                        failed = _fetch_one(fetch, stock_code, date, latest_date)
+                                    finally:
+                                        _SEMAPHORE.release()
                         tripped = _note_source(not failed)   # 跨請求累計：不同會員各失敗一次也會觸發冷卻
                         with guard:
                             state["fetched"] += 1
@@ -608,6 +672,12 @@ def ensure_days(stock_code: str, dates: Sequence[str], budget: float = BACKFILL_
             if failure:
                 raise failure[0]
             fetched, errors, busy = state["fetched"], state["errors"], state["busy"]
+            if not handoff:
+                fresh = local_market_cache.spot_day_status(stock_code, missing)
+                note_fetch_health(batch_settings, failed=bool(state["health_errors"]),
+                                  complete=not state["retry_seen"] and len(missing) >= 70 and fetched == len(missing) and
+                                  all((fresh.get(d) or {}).get("status") == "complete" for d in missing),
+                                  code=stock_code)
         if fetched:
             status = local_market_cache.spot_day_status(stock_code, dates)   # 有寫入才重讀
         result = {"fetched": fetched, "remaining": _unresolved(stock_code, dates, status), "errors": errors,
