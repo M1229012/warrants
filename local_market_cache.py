@@ -674,11 +674,6 @@ def load_spot_rows(stock_code: str, dates: Iterable[str]) -> List[Dict[str, Any]
     return [{"date": r[0], "branch_name": r[1], "buy": float(r[2]), "sell": float(r[3]), "net": float(r[4])} for r in rows]
 
 
-def spot_stock_dates(stock_code: str) -> List[str]:
-    """Read retained complete source dates only. No schema or retention changes."""
-    return [r[0] for r in _read_strict("SELECT date FROM spot_branch_days WHERE stock_code=? AND status='complete' ORDER BY date",(str(stock_code),))]
-
-
 def spot_branch_history(branch_name: str, since: str) -> List[Dict[str, Any]]:
     """某分點在本地已有的所有股票現股紀錄（只含已建置過的股票）。"""
     rows = _read("SELECT stock_code,date,buy,sell,net FROM spot_branch_daily WHERE branch_name=? AND date>=? ORDER BY date",

@@ -146,10 +146,9 @@ def _log_truncation(text: str) -> None:
 def wrap_cell(text: str, size: int, width: float, bold: bool = False, minimum: int = 18, max_lines: int = 3) -> tuple[list[str], int]:
     """表格／清單欄位用：先縮字（最多縮到 minimum），還放不下就換行（最多 max_lines 行），不截斷。"""
     text = str(text)
-    paragraphs = text.splitlines() or ['']
-    while size > minimum and max(font(size, bold).getlength(t) for t in paragraphs) > width:
+    while size > minimum and font(size, bold).getlength(text) > width:
         size -= 1
-    lines = [line for t in paragraphs for line in (wrap(t, size, int(max(20, width)), bold) or [''])]
+    lines = wrap(text, size, int(max(20, width)), bold) or ['']
     if len(lines) > max_lines:
         _log_truncation(text)
         lines = lines[:max_lines]
@@ -521,33 +520,6 @@ def _draw_mark_table(draw, x: float, y: float, width: float, events: list[dict])
         ry += MARK_ROW_H
 
 
-def observed_mark_layout(panel):
-    bars = panel.get('bars') or []
-    dates = {str(b['date']).replace('/', '-'): i for i,b in enumerate(bars)}
-    left, right = MARGIN + 36, WIDTH - MARGIN - 118
-    step = (right-left)/max(1,len(bars))
-    result = []; ends = {'buy': [], 'sell': []}
-    for mark in sorted(panel.get('observed_event_marks') or [], key=lambda m:m['date']):
-        i = dates.get(str(mark['date']).replace('/', '-'))
-        if i is None: continue
-        x = left+(i+.5)*step; side=mark['side']; lane=0
-        while lane<len(ends[side]) and x-ends[side][lane]<38: lane+=1
-        if lane==len(ends[side]): ends[side].append(x)
-        else: ends[side][lane]=x
-        result.append(dict(mark,x=x,lane=lane))
-    return result, (len(ends['sell'])*34+10 if ends['sell'] else 0), (len(ends['buy'])*34+10 if ends['buy'] else 0)
-
-
-def draw_observed_marks(draw,panel,price_top,price_bottom):
-    items,_,_=observed_mark_layout(panel)
-    for m in items:
-        x=m['x']; buying=m['side']=='buy'; color=UP if buying else DOWN
-        cy=price_bottom+25+m['lane']*34 if buying else price_top-25-m['lane']*34
-        draw.ellipse((x-13,cy-13,x+13,cy+13),fill=color)
-        label=str(m['no']);f=font(16,True)
-        draw.text((x-f.getlength(label)/2,cy-10),label,font=f,fill='white')
-
-
 def mark_lanes(panel: dict) -> tuple[int, int]:
     """（上方標籤帶, 下方標籤帶）高度。
 
@@ -570,8 +542,7 @@ def mark_lanes(panel: dict) -> tuple[int, int]:
     trades = [t for t in (panel or {}).get('trades') or [] if t.get('date') in dates]
     top = top or any(t.get('side') == 'sell' for t in trades)
     bottom = bottom or any(t.get('side') == 'buy' for t in trades)
-    _, observed_top, observed_bottom = observed_mark_layout(panel)
-    return max(MARK_LANE if top else 0, observed_top), max(MARK_LANE if bottom else 0, observed_bottom)
+    return (MARK_LANE if top else 0), (MARK_LANE if bottom else 0)
 
 
 def _price_extra(panel: dict) -> int:
@@ -1190,7 +1161,6 @@ def draw_chart(draw, y: int, panel: dict) -> None:
     low, high = min(lows), max(highs)
     span = max(high - low, abs(high) * .005, .01)
     low, high = low - span * .11, high + span * .05
-    draw_observed_marks(draw, panel, price_top, price_bottom)
     py = lambda value: price_bottom - (value - low) / (high - low) * (price_bottom - price_top)
     step = (right - left) / len(bars)
     px = lambda i: left + (i + .5) * step
@@ -1304,7 +1274,6 @@ def draw_chart(draw, y: int, panel: dict) -> None:
     if panel.get('institutional'):
         draw_institutional(draw, vbottom + 14, left, right, px, step, bars, panel['institutional'],
                            panel.get('institutional_focus', ''), panel.get('institutional_unit', '張'),
-                           cumulative=not panel.get('institutional_daily_only', False),
                            today_label=panel.get('institutional_day', '今日'),
                            extra=panel.get('institutional_extra', ''), dates=last_sub)
     elif inst_h:
@@ -1812,7 +1781,7 @@ def compare_card(draw, y: float, panels: list[dict], dry: bool) -> int:
 
 
 def _compare_mode(panels: list[dict]) -> bool:
-    return len(panels) >= 2 and all(p.get('scorecard') and not p['scorecard'].get('hide_score') and p.get('bars') for p in panels)
+    return len(panels) >= 2 and all(p.get('scorecard') and p.get('bars') for p in panels)
 
 
 # ============================================================
@@ -2588,7 +2557,7 @@ def _branch_section(draw, x0: float, x1: float, y: float, section: dict, dry: bo
             for c, cell in enumerate(row):
                 strong = c == 0 or bold or (c < len(columns) and columns[c] in accent)
                 room = (edges[0] - x0 if c == 0 else edges[c] - edges[c - 1]) - 26
-                lines, size = wrap_cell(str(cell), 22, max(40, room), strong, max_lines=6)
+                lines, size = wrap_cell(str(cell), 22, max(40, room), strong)
                 cells.append((lines, size, strong))
             layout.append((max(row_h, max((len(l) for l, _, _ in cells), default=1) * 28 + 18), cells))
         if not dry:
@@ -3056,9 +3025,7 @@ def text_card(text: str) -> dict:
 
 def render_answer(question: str, answer: str, panels: list[dict] | None = None,
                   *, title: str = '艾斯助手｜喬巴｜研究筆記', demo: bool = False) -> Image.Image:
-    # 測試版所有舊分數卡都只保留技術價位，不輸出分數／分級／評分條。
-    panels = [dict(p, scorecard=dict(p['scorecard'], hide_score=True, card_title='技術位置', card_note='均線、價量與價位整理'))
-              if p.get('scorecard') else p for p in panels or []]
+    panels = panels or []
     debug_panel = next((p.get("kline_debug") for p in panels if p.get("kline_debug")), None)
     if debug_panel is not None:
         from kline_debug import render
