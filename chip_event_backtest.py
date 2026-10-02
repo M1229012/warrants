@@ -9,7 +9,7 @@ import time
 from collections import defaultdict
 
 HORIZONS = (5, 10, 20)
-VERSION = 'chip-events-compact-v2'
+VERSION = 'chip-events-clear-v3'
 
 
 def finite(value):
@@ -237,18 +237,25 @@ def branch_card(payload, detailed=False, page=1):
     data=payload['spot'];branches=data['branches']
     sections=[{'type':'badge','text':f"觀察{data['requested_days']}日 {data['period_start']}～{data['period_end']}｜完整{data['complete_days']}/{data['requested_days']}"},
               {'type':'note','text':f"回測實際資料 {data['history_start']}～{data['history_end']}｜事件後20日｜買賣超：張"}]
-    rows=[]
+    flows=[];performance=[]
     for b in branches:
         m=b['metrics']['20']
         cost=f"{b['estimated_buy_cost']:,.2f}" if b['estimated_buy_cost'] is not None else '—'
-        label=b['branch']+'\n'+('歷史・'+b['status'] if '歷史表現' in b['selection_reasons'] else b['status'])
-        rows.append([label,f"{b['observed_net_70']:+,.0f}\n{b['observed_net_5']:+,.0f}",
-                     cost+'\n'+pct(b['estimated_return_pct'],True),str(m['samples']),
-                     pct(m['reach_3_pct']),pct(m['reach_5_pct']),pct(m['avg_return_pct'],True),pct(m['worst_drawdown_pct'],True)])
-    if rows:
-        sections.append({'type':'table','columns':['分點／狀態','70日／5日淨超','估均價／報酬','樣本','達3%','達5%','平均報酬','最大回撤'],
-            'widths':[.22,.17,.14,.05,.10,.10,.11,.11], 'signed':('平均報酬','最大回撤'),
-            'accent':('達3%','達5%'),'rows':rows})
+        flows.append([b['branch'],b['status'],f"{b['observed_net_70']:+,.0f}",f"{b['observed_net_5']:+,.0f}",cost,pct(b['estimated_return_pct'],True)])
+        sample=(str(m['samples'])+'筆') if m['samples'] else ('未成熟' if m['pending'] else '無樣本')
+        performance.append([b['branch'],sample,pct(m['reach_3_pct']),pct(m['reach_5_pct']),
+                            pct(m['avg_return_pct'],True),pct(m['worst_drawdown_pct'],True)])
+    if flows:
+        sections.extend([
+            {'type':'heading','text':'目前動向與預估報酬'},
+            {'type':'table','columns':['分點','目前動向','70日淨超','5日淨超','估計均價','預估報酬'],
+             'widths':[.24,.20,.14,.12,.15,.15],'signed':('70日淨超','5日淨超','預估報酬'),'rows':flows},
+            {'type':'heading','text':'歷史回測表現｜事件後20日'},
+            {'type':'table','columns':['分點','樣本數','漲幅≥3%','漲幅≥5%','平均報酬','最大回撤'],
+             'widths':[.24,.10,.15,.15,.18,.18],'signed':('平均報酬','最大回撤'),
+             'accent':('漲幅≥3%','漲幅≥5%'),'rows':performance}])
+        historical=[b['branch'] for b in branches if '歷史表現' in b['selection_reasons'] and '近期累積' not in b['selection_reasons']]
+        if historical:sections.append({'type':'note','text':'歷史表現關注：'+'、'.join(historical)+'；近期即使調節仍保留。'})
     else:
         sections.append({'type':'note','text':'目前沒有符合近期累積或歷史表現條件的分點，不硬湊名單。'})
     if data.get('share_adjusted_window'):
