@@ -4774,6 +4774,18 @@ class AceQueryEngine:
         # 有人會把「/ace 族群資金流向」整串貼進輸入框；前綴要拿掉，否則會被當成族群名稱去查。
         question = strip_command_prefix(question)
         compact = re.sub(r"\s+", "", question)
+        import spot_fetch_admin
+        speed_request = spot_fetch_admin.parse(question)
+        if speed_request is not None:
+            if not (admin_mode and is_admin):
+                return AnswerResult('現股測速與連線設定請使用管理員 /ace 指令。',
+                                    'admin_only', 0, time.perf_counter()-started, as_text=True, cacheable=False)
+            try:
+                speed_text = spot_fetch_admin.execute(speed_request)
+            except (ValueError, tools.ToolDataError) as exc:
+                speed_text = str(exc)
+            return AnswerResult(speed_text, 'admin_spot_speed', 0, time.perf_counter()-started,
+                                as_text=True, cacheable=False)
         if kline_debug.is_request(question):
             return self._answer_kline_debug(question, started, is_admin=is_admin, admin_mode=admin_mode)
         if admin_mode:

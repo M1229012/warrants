@@ -66,7 +66,70 @@ BROKER_TAGS = {
     "土銀": "官股", "台企銀": "官股", "彰銀": "官股",
 }
 
-_SEMAPHORE = threading.BoundedSemaphore(max(MAX_CONCURRENCY, PARALLEL))
+FETCH_SETTINGS_KEY = 'spot_fetch_settings'
+_FETCH_CONFIG = {'checked': 0.0, 'value': {}}
+_FETCH_CONFIG_LOCK = threading.Lock()
+
+
+class SourceLimiter:
+    """Resize without replacing a semaphore that active workers must release."""
+    def __init__(self, limit):
+        self.limit, self.active = limit, 0
+        self.condition = threading.Condition()
+
+    def resize(self, limit):
+        with self.condition:
+            limit = max(1, int(limit))
+            if limit == self.limit:
+                return
+            self.limit = limit
+            self.condition.notify_all()
+
+    def acquire(self, timeout=None):
+        deadline = time.monotonic() + timeout if timeout is not None else None
+        with self.condition:
+            while self.active >= self.limit:
+                left = None if deadline is None else deadline - time.monotonic()
+                if left is not None and left <= 0:
+                    return False
+                self.condition.wait(left)
+            self.active += 1
+            return True
+
+    def release(self):
+        with self.condition:
+            if self.active <= 0:
+                raise ValueError('source limiter released without acquire')
+            self.active -= 1
+            self.condition.notify_all()
+
+
+_SEMAPHORE = SourceLimiter(max(MAX_CONCURRENCY, PARALLEL))
+
+
+def fetch_settings():
+    with _FETCH_CONFIG_LOCK:
+        if time.monotonic() - _FETCH_CONFIG['checked'] > 5:
+            value = local_market_cache.get_state(FETCH_SETTINGS_KEY, {}) or {}
+            _FETCH_CONFIG.update(checked=time.monotonic(), value=value)
+        saved = _FETCH_CONFIG['value']
+        parallel = max(1, min(64, int(saved.get('parallel', PARALLEL))))
+        limit = parallel if 'parallel' in saved else max(MAX_CONCURRENCY, parallel)
+        _SEMAPHORE.resize(limit) if isinstance(_SEMAPHORE, SourceLimiter) else None
+        return {'parallel': parallel, 'global_limit': limit, 'fetcher': FETCHER,
+                'request_gap': REQUEST_GAP}
+
+
+def set_fetch_parallel(parallel):
+    parallel = int(parallel)
+    if not 1 <= parallel <= 64:
+        raise ValueError('連線數請設定為 1～64 條。')
+    value = {'parallel': parallel}
+    local_market_cache.set_state(FETCH_SETTINGS_KEY, value)
+    with _FETCH_CONFIG_LOCK:
+        _FETCH_CONFIG.update(checked=time.monotonic(), value=value)
+    _SEMAPHORE.resize(parallel)
+    return fetch_settings()
 _BACKGROUND: set = set()
 _BACKGROUND_GUARD = threading.Lock()
 _STOCK_LOCKS: Dict[str, threading.Lock] = {}
@@ -87,6 +150,7 @@ _FOREGROUND_WAITING = [0]   # 正在等來源名額的會員題數；背景看�
 
 def _acquire_source(deadline: float, background: bool) -> bool:
     """逐頁取得來源名額（全域 MAX_CONCURRENCY）。會員優先：背景在有會員等待時先讓出，不和會員搶。"""
+    fetch_settings()
     if background:
         while True:
             with _SOURCE_GUARD:
@@ -476,7 +540,7 @@ def ensure_days(stock_code: str, dates: Sequence[str], budget: float = BACKFILL_
         if missing:
             deadline = time.monotonic() + budget
             # 會員這一題用 PARALLEL 條連線並行抓（每條各自的 session）；背景與 selenium 模式維持 1 條
-            workers = 1 if background or FETCHER == "selenium" else max(1, min(PARALLEL, len(missing)))
+            workers = 1 if background or FETCHER == "selenium" else min(fetch_settings()['parallel'], len(missing))
             queue, guard, failure = deque(missing), threading.Lock(), []
             state = {"fetched": 0, "errors": 0, "streak": 0, "busy": 0, "stop": False}
             request_id = str(getattr(tools._API_REQUEST_LOCAL, "request_id", "") or "")

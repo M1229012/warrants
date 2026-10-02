@@ -983,8 +983,8 @@ def daily_maintenance(today: str = "") -> Dict[str, int]:
 # 日 K、型態分數、雷達快照、用量紀錄、名冊都會自己重建，不搬。
 # ============================================================
 
-EXPORT_PREFIXES = ("trade_review:",)
-EXPORT_KEYS = ("ivol_daily_medians", "ivol_curves", "ivol_errors", "ivol_errors_hist")
+EXPORT_PREFIXES = ("trade_review:", "spot_fetch_benchmark:")
+EXPORT_KEYS = ("ivol_daily_medians", "ivol_curves", "ivol_errors", "ivol_errors_hist", "spot_fetch_settings")
 EXPORT_VERSION = 2
 STATE_FILE_MAX_BYTES = 10 * 1024 * 1024
 STATE_JSON_MAX_BYTES = 50 * 1024 * 1024  # 解壓時也設上限，避免小 gzip 展開耗盡記憶體
