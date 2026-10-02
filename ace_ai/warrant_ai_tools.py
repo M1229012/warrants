@@ -2261,6 +2261,16 @@ def legal_gap_days(code: str, gaps: List[str]) -> List[str]:
     return [d for d in gaps if d in closed or d in absent]
 
 
+def _save_daily_cache(code, frame, market="", source="", confirmed=True):
+    """Persist verified source bars when possible; storage failure is not a source-data failure."""
+    import sqlite3
+    try:
+        local_market_cache.save_bars(code, frame, market=market, source=source, confirmed=confirmed)
+    except (sqlite3.Error, OSError) as exc:
+        print(f"⚠️ {code} 日K快取寫入失敗｜來源={source}｜資料庫={local_market_cache.DB_PATH}｜"
+              f"{type(exc).__name__}: {exc}｜保留本次來源資料供後續核實；未保存到磁碟", flush=True)
+
+
 def _repair_daily(code: str, df: pd.DataFrame, gaps: List[str], source: str,
                   allow_finmind: bool = True) -> Tuple[pd.DataFrame, str]:
     """日K 有缺口時，用另一個來源補：本地底庫與 FinMind 都試一次，原本的資料優先。
@@ -2281,7 +2291,7 @@ def _repair_daily(code: str, df: pd.DataFrame, gaps: List[str], source: str,
         stock_df = _drop_invalid_bars(code, stock_df, "FinMind")
         stock_df = _formal_daily_frame(stock_df)
         if stock_df is not None and not stock_df.empty:
-            local_market_cache.save_bars(code, stock_df, market=str(market or ""), source="FinMind", confirmed=True)
+            _save_daily_cache(code, stock_df, market=str(market or ""), source="FinMind", confirmed=True)
             frames.append(stock_df[columns])
             labels.append("FinMind")
     except Exception as exc:
@@ -2347,7 +2357,7 @@ def _load_price_bundle(stock_code: str) -> Dict[str, Any]:
             stock_df = _drop_invalid_bars(code, stock_df, "FinMind")
             stock_df = _formal_daily_frame(stock_df)
             if stock_df is not None and not stock_df.empty:
-                local_market_cache.save_bars(code, stock_df, market=str(market or ""), source="FinMind", confirmed=True)
+                _save_daily_cache(code, stock_df, market=str(market or ""), source="FinMind", confirmed=True)
                 if local_last and pd.Timestamp(stock_df.index[-1]).strftime("%Y-%m-%d") <= local_last:
                     _STALE_CHECKED[code] = (today, local_last)
                 return stock_df, str(market or ""), "FinMind 日K"
@@ -2361,7 +2371,7 @@ def _load_price_bundle(stock_code: str) -> Dict[str, Any]:
         days = int(re.search(r"\d+", PRICE_FETCH_PERIOD).group(0)) if re.search(r"\d+", PRICE_FETCH_PERIOD) else 180
         frame = _drop_invalid_bars(code, fetch_fugle_daily(code, days), "富果日K")
         frame = _formal_daily_frame(frame)
-        local_market_cache.save_bars(code, frame, market="", source="Fugle-history-fallback", confirmed=True)
+        _save_daily_cache(code, frame, market="", source="Fugle-history-fallback", confirmed=True)
         return frame, "", "富果日K備援"
 
     def build() -> Dict[str, Any]:

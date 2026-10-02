@@ -728,7 +728,7 @@ WARRANT_TOOLS = frozenset((
     "get_branch_event_window", "get_branch_warrant_detail",
 ))
 # 「買了哪些權證／權證代號／權證名稱」：列出權證本身（不是標的股）。「哪些股票的權證」仍是標的清單。
-_WARRANT_DETAIL_RE = re.compile(r"(?:[哪那]些|[哪那]幾檔|[哪那]幾支|[哪那]檔|[哪那]支|什麼|甚麼)\s*權證|權證(?:的)?(?:代號|代碼|號碼|名稱|明細|清單)")
+_WARRANT_DETAIL_RE = re.compile(r"(?:[哪那]些|[哪那]幾檔|[哪那]幾支|[哪那]檔|[哪那]支|什麼|甚麼)\s*權證|權證(?:的)?(?:代號|代碼|號碼|名稱|明細|清單)|(?:各檔|每檔)權證|權證(?:目前|現在)?(?:估算|估計|未實現)(?:報酬|損益)")
 
 
 def warrant_allowed(parsed: "ParsedQuestion") -> bool:
@@ -1059,6 +1059,12 @@ def branch_stock_events_card(data: Dict[str, Any], numbers: Optional[Dict[str, i
     tiles = [{"label": "事件總數", "value": f"{total} 筆", "tone": "ink"},
              {"label": "未出清", "value": f"{holding} 筆", "tone": "accent"},
              {"label": "已出清", "value": f"{total - holding} 筆", "tone": "ink"}]
+    samples = int(data.get("closed_return_samples") or 0)
+    avg = _num(data.get("closed_return_avg_pct"))
+    tiles.append({"label": "已出清事件平均報酬",
+                  "value": f"{avg:+.2f}%" if samples and avg is not None else "無有效樣本",
+                  "tone": "signed"})
+    tiles.append({"label": "報酬樣本", "value": f"{samples} 筆", "tone": "ink"})
     if data.get("avg_holding_days") is not None:
         tiles.append({"label": "平均持有", "value": f"{float(data['avg_holding_days']):.0f} 天", "tone": "ink"})
     rows = []
@@ -1074,11 +1080,13 @@ def branch_stock_events_card(data: Dict[str, Any], numbers: Optional[Dict[str, i
                      "parts": [p for p in (str(e.get("buy_amount_text") or ""), warrant_text, state) if p]})
     name = f"{data.get('stock_name', '')}（{data.get('stock_code', '')}）"
     return {"branch": f"{data.get('branch', '')}｜{name}", "tags": ["全部 A～E 事件"], "label": "權證分點", "sections": [
-        {"type": "tiles", "items": tiles},
+        {"type": "tiles", "items": tiles[:3]},
+        {"type": "tiles", "items": tiles[3:]},
         {"type": "rows", "items": rows},
         {"type": "note", "text": "※ " + ("列出此分點在這檔股票的所有 A～E 事件（新到舊）" if total <= len(events)
                                           else f"共 {total} 筆，列出最近 {len(events)} 筆（新到舊）")
-                                 + (f"；K 線涵蓋近 {chart_bars} 個交易日" if chart_bars else "") + "，圈號＝K 線上的標記編號。"}]}
+                                 + (f"；K 線涵蓋近 {chart_bars} 個交易日" if chart_bars else "") + "，圈號＝K 線上的標記編號。"
+                                 + "報酬只計此分點×此股票回測表的已出清有效樣本，採簡單平均，非分點所有股票績效或實際帳戶報酬。"}]}
 
 
 def warrant_summary_card(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -1521,6 +1529,8 @@ class QueryRouter:
             days = parsed.window_days if parsed.days_specified and parsed.window_days else tools.CHIPS_DAYS
             plan.add("get_branch_warrant_detail", branch_name=branch, days=days,
                      stock_code=parsed.stocks[0][0] if parsed.stocks else "")
+            if parsed.stocks and set(parsed.intents) & {"win_rate", "history"}:
+                plan.add("get_branch_stock_history", branch_name=branch, stock_code=parsed.stocks[0][0])
             return plan
         if parsed.stocks:
             code = parsed.stocks[0][0]
@@ -1534,7 +1544,7 @@ class QueryRouter:
             plan = QueryPlan(route="rule_branch_stock", need_final_llm=True)
             plan.add("detect_current_branch_events", stock_code=code, branch_name=branch)
             plan.add("get_branch_stock_position", branch_name=branch, stock_code=code)
-            plan.add("get_branch_event_performance", branch_name=branch)
+            # 指定股票的報酬用下方 history；全分點績效包含其他股票，不能代替。
             plan.add("get_branch_recent_behavior", branch_name=branch, stock_code=code)
             plan.add("get_branch_stock_history", branch_name=branch, stock_code=code)
             if pattern_asked(parsed):
@@ -2259,8 +2269,6 @@ FINAL_NEWS_RULES = """新聞規則：只能用 get_recent_news 的 title、summa
 
 FINAL_PATTERN_RULES = """型態／成本／操作問題（有 get_pattern_scorecard）：
 - 先直接回答使用者真正問的問題，再挑影響最大的型態、大量區／支撐、均線或權證分點證據。不要把評分卡五大項逐一念完。
-- pattern_score是原技術分數；composite_score.total才是技術70%＋主要分點籌碼30%的綜合分。缺資料total為null，不補分或以技術分冒充綜合分。
-- spot_scoring只依每日前段分點近似資料評四項。先說技術與籌碼一致或分歧的證據，不重念表格。分點不是單一投資人，沒出現不等於沒賣；不得推論大戶、散戶、持股或勝率。
 - margin_observation若存在，僅為管理員融資券觀察，完全不計入綜合分。餘額增減不等於買賣超，急跌融資增加不能單憑此判定接貨或散戶套牢；融券增加不直接判定軋空。
 - 問成本／操作：可說成本相對現價與帳面損益，再用「若守住／若跌破／若重新站回」的條件式框架說明，不替使用者下買賣決定。
 - 問型態：可以直接說目前結構偏強、偏弱或中性，並引用型態分數及最關鍵的一個加分、一個壓力。
@@ -2297,7 +2305,7 @@ AI_CARD_SCHEMA = {
                            "description": "依整句語意辨識個人持倉風險／現在行情／交易檢討；持倉困境陳述不需問號或疑問詞。不要把單純型態問題誤當個人持倉。"},
         "response_style": {"type": "string", "enum": ["serious", "playful", "concerned"],
                            "description": "依完整原句判斷語氣；股票諧音或誇張玩笑即使問明天也可為playful。"},
-        "humor_opening": {"type": "string", "description": "自然延續整句原意時現寫最多一句接話；牽強時可留空，不強制搞笑。認真或擔憂時留空。"},
+        "humor_opening": {"type": "string", "description": "自然延續整句原意時現寫最多一句接話；牽強時可留空，不強制搞笑。認真或單純焦慮時留空；使用者主動自嘲時即使concerned也可溫和接住原比喻，不嘲笑、不保證回本。"},
         "answer": {"type": "string"},
         "why": {"type": "string"},
         "scenarios": {
@@ -2424,7 +2432,6 @@ def _compact_tool_data(name: str, data: Dict[str, Any], has_scorecard: bool) -> 
             data["ma_deduction"] = {k: {f: v.get(f) for f in ("direction_now", "turn_text", "outlook", "hold_prices_3d")}
                                     for k, v in (data.get("ma_deduction") or {}).items() if k in ("MA20", "MA60")}
     elif name == "get_pattern_scorecard":
-        data.pop('chip_sections', None)  # 圖片排版資料不重複送AI，保留數值與評分依據。
         data["ma_deduction"] = {k: {f: v.get(f) for f in ("direction_now", "turn_text", "outlook", "hold_prices_3d")}
                                 for k, v in (data.get("ma_deduction") or {}).items()}
         data["plus_reasons"] = (data.get("plus_reasons") or [])[:4]
@@ -2442,6 +2449,9 @@ def _compact_tool_data(name: str, data: Dict[str, Any], has_scorecard: bool) -> 
                                           "near_expiry_holdings", "definition_note", "store_date")}
         data["groups"] = [{**{k: g.get(k) for k in ("label", "event_codes", "buy_amount_text", "remaining_text", "spot", "sigma_pct")},
                            "warrants": [{k: w.get(k) for k in keep} for w in g.get("warrants") or []]} for g in groups]
+    elif name == "get_branch_stock_position":
+        # 全標的背景不送入指定股票的回答，避免範圍混用。
+        data.pop("branch_performance", None)
     elif name == "get_sheet_stock_chips":
         # 分點多的股票這份最大（佔整個 prompt 一半以上）：拿掉和文字版重複的原始金額、和狀態重複的 resolution、
         # 未完成筆數，以及和近期相同的回看金額；圖卡用的是完整資料，不受影響
@@ -2530,7 +2540,7 @@ FINAL_INDEX_COMPARE_RULES = ("【加權 vs 櫃買】圖上已經有兩邊的 K �
 
 
 FINAL_SPOT_RULES = ("【現股分點籌碼】get_spot_chip_summary 是券商分點的買賣超（單位：張），不是三大法人，也不是權證分點。"
-                    "解讀要同時整合技術面與籌碼面：why 先說技術結構，再用最新 Top5 買賣超、近 5／20 日淨集中度與判讀、"
+                    "先回答原句需求：問哪些分點持續買進，依continuity的買超天數與cumulative_buy_top3指認；當日Top5不等於持續買進。使用者用了比喻就自然接住整句，再說具體證據。只有工具提供技術資料時才整合技術面，不為了固定格式杜撰技術結構；只提供現股資料時用最新 Top5 買賣超、近 5／20 日淨集中度與判讀、"
                     "主要累積買超分點、量價加權均價（vwap 欄位；是日收盤×成交量的估算，不是成交金額算的正式 VWAP，要稱「量價加權均價（估）」）與現價差距說明籌碼是否支持目前結構；兩者矛盾要講清楚。"
                     "只引用 1～3 個關鍵籌碼數字，不要逐一念分點；外資券商分點不等於外資法人；資料日期不是今天時要說明資料截至哪天。")
 
@@ -2550,7 +2560,7 @@ FINAL_WARRANT_HABIT_RULES = ("【分點挑權證的習慣】get_branch_warrant_d
                              "解讀這個分點的操作風格：偏好長天期還是短天期、價內還是價外、高槓桿還是低槓桿，代表押波段、押短線或是保守；"
                              "目前主力部位在哪一檔標的、剩多少；哪些持有中的權證快到期（near_expiry_holdings）要注意時間價值流失。"
                              "估算槓桿是用歷史波動率推算的估計值，提到時要說「估算」；est_return_pct 是依標的漲跌與時間推算的估算報酬（非實際成交價），提到時要說「估算」。只引用 1～3 個關鍵數字，不要逐檔念清單；"
-                             "不給買賣指令、不預測漲跌。輸出解讀卡時：answer＝一句話講這個分點的挑權證風格；why 2～3 句；scenarios 給空陣列；"
+                             "不給買賣指令、不預測漲跌。輸出解讀卡時：answer＝先回答本題主要需求；問報酬先說估算報酬及限制，問挑選習慣才說挑權證風格；why 2～3 句；scenarios 給空陣列；"
                              "summary 一句說接下來要留意什麼。")
 
 
@@ -2582,6 +2592,8 @@ def build_final_prompt(payload: Dict[str, Any]) -> str:
         sections.append(FINAL_SPOT_BRANCH_RULES)
     if "get_branch_warrant_detail" in names:
         sections.append(FINAL_WARRANT_HABIT_RULES)
+    if "get_branch_stock_history" in names:
+        sections.append("指定股票分點績效：先回答使用者問的報酬或勝敗，再談事件動向。get_branch_stock_history只涵蓋該branch×stock_code；closed_return_avg_pct是回測表已出清有效樣本的簡單平均，必須連同closed_return_samples說明。未出清不算已實現；沒有有效樣本就說目前無法計算，不填0%。全分點／全部標的的背景勝率不能當作這檔股票勝率，不把回測報酬稱為券商實際帳戶獲利。各檔權證目前估算報酬要用get_branch_warrant_detail的est_return_pct；沒有該工具就不能捏造。不要因有權證習慣規則而忽略報酬問題。")
     if "get_index_comparison" in names:
         sections.append(FINAL_INDEX_COMPARE_RULES)
     elif "get_pattern_scorecard" in names:
@@ -4779,7 +4791,7 @@ class AceQueryEngine:
         access = self._access()
         margin_allowed = bool(access and access.admin_mode and not access.simulation)
         if re.search(r'融資|融券|券資比', question) and not margin_allowed:
-            return AnswerResult('融資券資料目前僅供管理員使用 /ace 查詢；/ask 可查技術與現股籌碼評分。',
+            return AnswerResult('融資券資料目前僅供管理員使用 /ace 查詢；/ask 可查技術分析與現股籌碼資料。',
                                 'admin_only', 0, time.perf_counter()-started, as_text=True, cacheable=False)
         import spot_fetch_admin
         speed_request = spot_fetch_admin.parse(question)
@@ -5183,9 +5195,24 @@ class AceQueryEngine:
                 f"買超 {', '.join(x['branch'] for x in report.get('latest_top_buy') or [])}｜"
                 f"賣超 {', '.join(x['branch'] for x in report.get('latest_top_sell') or [])}")
         result = self._spot_result(card, title, True, started, text)
+        # 使用同一份報表解讀，沒有額外抓價或再次抓 70 日；缺資料卡仍走上方備援。
+        payload = dict(spot_chip.summary_payload(report), stock_code=code, stock_name=name,
+                       continuity=report.get("continuity") or [], history=report.get("history") or [])
+        stats = AnswerStats()
+        ai_text, llm_ok = self._compose(question, QueryPlan(route="rule_spot_chip", need_final_llm=True),
+                                        [tools.ToolResult("get_spot_chip_summary", True, payload)], stats)
+        ai_card = self._take_ai_card()
+        result = replace(result, text=ai_text if ai_card else text,
+                         panels=result.panels + ([{"ai_card": ai_card}] if ai_card else []),
+                         gemini_calls=stats.gemini_calls, elapsed=time.perf_counter() - started,
+                         cacheable=llm_ok, input_tokens=stats.input_tokens,
+                         output_tokens=stats.output_tokens, total_tokens=stats.total_tokens,
+                         token_source=stats.token_source,
+                         errors=[] if llm_ok else ["現股分點 AI 解讀失敗"])
+        self.log(f"現股籌碼解讀｜{code}｜Gemini {stats.gemini_calls} 次｜成功={bool(ai_card)}")
         full = ((mode == "latest" or report.get("available_days", 0) >= report.get("requested_days", spot_chip.REQUESTED_DAYS))
                 and not (report.get("progress") or {}).get("background"))
-        if full and not simulation:
+        if full and not simulation and result.cacheable:
             # build_report 已讀過整個窗口的狀態，直接用（原本這裡逐日各查一次 DB）
             complete_now = (list(report["complete_all"]) if "complete_all" in report else
                             [d for d, info in local_market_cache.spot_day_status(code, dates).items()
@@ -6273,9 +6300,8 @@ class AceQueryEngine:
                     numbers.setdefault(str(mark["buy_date"]), int(mark["no"]))
             card = branch_stock_events_card(history, numbers, len((chart_panel or {}).get("bars") or [])) if history else None
             if card:
-                # K 線點位＋全部事件清單已經說清楚：不再呼叫 Gemini、也不排文字區塊（省 5～10 秒）
-                panels.append({"branch_card": card, "hide_text": True})
-                plan.need_final_llm = plan.pattern   # 一起問了型態才需要 AI
+                # 保留清單排版；不關掉原計畫的 AI，讓它回答報酬與白話提問。
+                panels.append({"branch_card": card, "hide_text": not plan.need_final_llm})
                 if chart_panel:
                     chart_panel["hide_mark_table"] = True   # 完整清單在下方卡片，K 線下只有 70 日的標註表不重複畫
         elif "warrant" in parsed.intents and warrant_ok and plan.route != "rule_branch":
@@ -6385,10 +6411,6 @@ class AceQueryEngine:
             text = notice + chr(10) + chr(10) + text
             if ai_card:
                 ai_card["notice"] = notice
-        if ai_card and any(p.get("branch_card", {}).get("tags") == ["全部 A～E 事件"] for p in panels):
-            # 下方已有完整事件清單：AI 解讀只留一句回答、一個理由、一句總結，圖片不會太長
-            first = re.split(r"(?<=[。！？])", str(ai_card.get("why") or ""), maxsplit=1)[0]
-            ai_card = dict(ai_card, why=first, scenarios=[])
         if ai_card:
             for panel in panels:
                 card = panel.get("branch_card") or {}
@@ -6508,23 +6530,6 @@ class AceQueryEngine:
         try:
             extras = weekly_pick._technical_extras(code)
             card = weekly_pick.build_pattern_scorecard(tech, vp, extras, found.get("get_sheet_stock_chips"), cost_price)
-            if card and code not in tools.INDEX_CODES:
-                import stock_chip_scoring
-                access = self._access()
-                allow_margin = bool(access and access.admin_mode and not access.simulation)
-                try:
-                    card = stock_chip_scoring.enrich_card(card, allow_margin=allow_margin)
-                    if not card['composite_score']['complete'] or (allow_margin and not all(
-                            card.get('margin_observation', {}).get('periods', {}).get(str(n), {}).get('complete') for n in (20,70))):
-                        self._request_local.spot_partial = True
-                except Exception as exc:
-                    # Keep verified technical data and explicitly unavailable composite; never reuse an old score.
-                    self.log(f'主要分點評分略過：{code}｜{type(exc).__name__}: {exc}')
-                    scoring = {'score':None,'complete':False,'data_date':'','components':[]}
-                    composite = stock_chip_scoring.combine(card.get('pattern_score'),scoring,str(card.get('data_date') or '')[:10].replace('/','-'))
-                    card.update(spot_scoring=scoring,composite_score=composite,
-                                chip_sections=stock_chip_scoring.sections(scoring,composite),card_title='技術評分')
-                    self._request_local.spot_partial = True
             return card
         except Exception as exc:  # 評分失敗只少一張卡，不影響回答
             self.log(f"型態評分卡略過：{code}｜{type(exc).__name__}: {exc}")
@@ -6626,6 +6631,8 @@ class AceQueryEngine:
             return f"{prefix}\n\n{rule_answer}", False
         facts = FactSheet(question, results, payload)
         card = parse_ai_card(result.text)
+        if card is not None:
+            self.log(f"AI語氣｜style={card.get('response_style')}｜route={plan.route}")
         if card is None and str(result.text or "").lstrip().startswith("{"):
             self.log("AI 解讀卡 JSON 無法解析，改用規則式回答")
             return f"（AI 回覆格式異常，這次不附 AI 解讀）\n\n{rule_answer}", False
@@ -7036,7 +7043,7 @@ def parse_ai_card(text: str) -> Optional[Dict[str, Any]]:
         return None
     style = data.get("response_style", "serious")
     style = style if style in ("serious", "playful", "concerned") else "serious"
-    opening = _clean_card_text(data.get("humor_opening"), 100) if style == "playful" else ""
+    opening = _clean_card_text(data.get("humor_opening"), 100) if style in ("playful", "concerned") else ""
     if opening and not answer.startswith(opening):
         # 同一次模型產生的接梗與分析在事實核對前合併；不另設圖卡、不注入固定笑話。
         answer = opening + ("" if opening[-1] in "。！？!?…" else "。") + answer
