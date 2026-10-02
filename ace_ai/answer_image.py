@@ -1640,8 +1640,6 @@ def scorecard(draw, y: float, card: dict, dry: bool) -> int:
 
 def _scorecard_tail(draw, y: float, h: float, px: float, width: float, card: dict, dry: bool) -> int:
     """均線扣抵＋關鍵價位＋追蹤分點；型態評分卡與覆盤持股狀態卡共用。"""
-    for section in card.get('chip_sections') or []:
-        h += _branch_section(draw, px, px + width, y + h, section, dry)
     compact = bool(card.get('compact'))
     if not compact:   # 整合頁（型態＋籌碼）不放均線扣抵列
         h += _deduction_chips(draw, px, y + h, width, card, dry) + 18
@@ -1723,10 +1721,6 @@ def compare_card(draw, y: float, panels: list[dict], dry: bool) -> int:
     head_h = _sub_heading(None, px, 0, '型態比較', f'{basis}｜只評技術結構，不含籌碼，不是買賣建議', width, True)
     body_h = TABLE_HEAD_H + COMPARE_SCORE_H + (len(rows) - 1) * COMPARE_ROW_H
     extras = []
-    for panel,card in zip(panels,cards):
-        if card.get('chip_sections'):
-            extras.append({'type':'heading','text':f"{panel.get('stock_code','')} {panel.get('stock_name','')}"})
-            extras.extend(card['chip_sections'])
     extra_height = sum(_branch_section(None, px, px + width, 0, section, True) for section in extras)
     total = int(30 + head_h + 6 + body_h + 30 + extra_height)
     if dry:
