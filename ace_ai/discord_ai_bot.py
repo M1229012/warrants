@@ -2117,9 +2117,7 @@ class GeminiGateway:
             _AI_GATE.blocked = True
             return GeminiResult(ok=False, error="user_ai_quota", purpose=purpose)
         # 對所有使用者可見的AI文字套用共同原則；分類、OCR與純排版不混入寫作要求。
-        if purpose in ('final_answer','trade_review','sector_answer','weekly_pick','weekly_draft','weekly_draft_revision'):
-            if stock_banter.NATURAL_ANALYSIS_RULES not in prompt:
-                prompt += '\n\n'+stock_banter.NATURAL_ANALYSIS_RULES
+        prompt = stock_banter.user_response_prompt(prompt, purpose, schema)
         result = self._run_with_deadline(purpose, lambda deadline: self._generate(prompt, purpose, schema, temperature, deadline))
         if result.ok and purpose not in ("planner", "intent"):   # 判斷題意不算 AI 解讀次數
             _AI_GATE.used = True
@@ -5164,7 +5162,7 @@ class AceQueryEngine:
         self._perf_add("spot_prepare", time.perf_counter() - prepare_started)
         complete = [d for d in dates if (statuses.get(d) or {}).get("status") == "complete"]
         # 最新完整交易日變了就換 key，舊答案不會被繼續拿出來；/ace 測試不讀寫正式快取。
-        key = self._access_cache_key(f"spot|{code}|{mode}|{complete[-1] if complete else ''}|{len(complete)}")
+        key = self._access_cache_key(f"spot|{code}|{mode}|{complete[-1] if complete else ''}|{len(complete)}|q={stock_banter.answer_question_key(question)}")
         if not simulation:
             hit, cached = self._answer_cache.get(key)
             if hit:
@@ -5194,7 +5192,7 @@ class AceQueryEngine:
                              if (info or {}).get("status") == "complete"])
             complete_now.sort()
             self._answer_cache.set(self._access_cache_key(
-                f"spot|{code}|{mode}|{complete_now[-1] if complete_now else ''}|{len(complete_now)}"), result,
+                f"spot|{code}|{mode}|{complete_now[-1] if complete_now else ''}|{len(complete_now)}|q={stock_banter.answer_question_key(question)}"), result,
                 self.config.answer_cache_seconds)
         return result
 
@@ -5210,7 +5208,7 @@ class AceQueryEngine:
             statuses = local_market_cache.spot_day_status(code, dates)
             complete = [d for d in dates if (statuses.get(d) or {}).get("status") == "complete"]
             return self._access_cache_key(f"spot_branch|{code}|{spot_chip._branch_key(branch)}|"
-                                          f"{complete[-1] if complete else ''}|{len(complete)}")
+                                          f"{complete[-1] if complete else ''}|{len(complete)}|q={stock_banter.answer_question_key(question)}")
         if not simulation:
             hit, cached = self._answer_cache.get(cache_key())
             if hit:
@@ -5294,7 +5292,7 @@ class AceQueryEngine:
                is_admin: bool = False, admin_mode: bool = False, access=None, image=None) -> AnswerResult:
         # /ask always stays closed, including requests from administrators.
         allowed = bool(access.admin_mode) if access is not None else bool(is_admin and admin_mode)
-        with tools.quote_policy(admin_live=allowed):
+        with stock_banter.question_scope(question), tools.quote_policy(admin_live=allowed):
             return self._answer_with_quote_policy(question, context_key, on_queue,
                                                   is_admin, admin_mode, access, image)
 
