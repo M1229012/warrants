@@ -210,9 +210,24 @@ def _index_on_date(df: pd.DataFrame, day: date) -> Optional[int]:
     return hits[-1] if hits else None
 
 
+def _review_price_bundle(code):
+    """覆盤與一般型態共用還原入口，並再次核對快取的價格基準。"""
+    import price_adjustment
+    bundle = tools._load_price_bundle(code)
+    closed, live = tools.closed_frame(bundle), bundle['df']
+    try:
+        price_adjustment.validate_adjusted(closed)
+        price_adjustment.validate_adjusted(live)
+        if closed.attrs.get('share_adjustments', []) != live.attrs.get('share_adjustments', []):
+            raise ValueError('覆盤收盤價與最新行情的公司行動基準不一致，請更新行情後再試')
+    except ValueError as exc:
+        raise tools.ToolDataError(str(exc)) from exc
+    return bundle
+
+
 def close_on_date(code: str, day: date) -> float:
     """只使用指定日已收盤行情，不偷偷改成下一個交易日或盤中價。"""
-    frame = tools.closed_frame(tools._load_price_bundle(code)).sort_index()
+    frame = tools.closed_frame(_review_price_bundle(code)).sort_index()
     idx = _index_on_date(frame, day)
     if idx is None:
         raise tools.ToolDataError(f'{day:%Y/%m/%d}沒有可用的收盤資料，可能是休市、尚未收盤或資料未更新；請確認交易日或補實際成交價。')
@@ -225,7 +240,9 @@ def close_on_date(code: str, day: date) -> float:
 def adjust_entry_price(code, day, price):
     """已提供的歷史成交價換成圖表的最新股數基準，保留來源說明。"""
     import price_adjustment
-    frame=tools.closed_frame(tools._load_price_bundle(code))
+    frame=tools.closed_frame(_review_price_bundle(code))
+    if _index_on_date(frame, day) is None:
+        raise tools.ToolDataError('成交日不在已核實日K範圍，無法確認歷史成交價的還原基準；請確認日期或更新行情。')
     factor=price_adjustment.factor_on_date(frame,day)
     value=float(price)*factor
     note=(f'使用者提供{day:%Y/%m/%d}成交價{price:g}元，已依股數變動換算為{value:g}元，與還原K線使用同一基準。' if factor != 1 else '')
@@ -966,7 +983,7 @@ def build_review(req: Dict[str, Any], mapper=None) -> Dict[str, Any]:
     """回傳 {payload, panel}；payload 給 Gemini 與事實核對，panel 給 K 線圖卡。
     mapper(claims) → {"items": [{claim, canonical}]}：規則認不得的理由交給 Gemini 翻成標準說法（可省略）。"""
     code = req["code"]
-    bundle = tools._load_price_bundle(code)
+    bundle = _review_price_bundle(code)
     # 買進當時用已收盤 K 棒；「到現在」用含盤中即時 K 的完整資料，損益才會和圖上的現價一致
     df = tools.closed_frame(bundle).sort_index()
     df = df[~df.index.duplicated(keep="last")]

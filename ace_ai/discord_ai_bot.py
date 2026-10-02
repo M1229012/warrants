@@ -2117,9 +2117,7 @@ class GeminiGateway:
             _AI_GATE.blocked = True
             return GeminiResult(ok=False, error="user_ai_quota", purpose=purpose)
         # 對所有使用者可見的AI文字套用共同原則；分類、OCR與純排版不混入寫作要求。
-        if purpose in ('final_answer','trade_review','sector_answer','weekly_pick','weekly_draft','weekly_draft_revision'):
-            if stock_banter.NATURAL_ANALYSIS_RULES not in prompt:
-                prompt += '\n\n'+stock_banter.NATURAL_ANALYSIS_RULES
+        prompt = stock_banter.user_response_prompt(prompt, purpose, schema)
         result = self._run_with_deadline(purpose, lambda deadline: self._generate(prompt, purpose, schema, temperature, deadline))
         if result.ok and purpose not in ("planner", "intent"):   # 判斷題意不算 AI 解讀次數
             _AI_GATE.used = True
@@ -2261,6 +2259,9 @@ FINAL_NEWS_RULES = """新聞規則：只能用 get_recent_news 的 title、summa
 
 FINAL_PATTERN_RULES = """型態／成本／操作問題（有 get_pattern_scorecard）：
 - 先直接回答使用者真正問的問題，再挑影響最大的型態、大量區／支撐、均線或權證分點證據。不要把評分卡五大項逐一念完。
+- pattern_score是原技術分數；composite_score.total才是技術70%＋主要分點籌碼30%的綜合分。缺資料total為null，不補分或以技術分冒充綜合分。
+- spot_scoring只依每日前段分點近似資料評四項。先說技術與籌碼一致或分歧的證據，不重念表格。分點不是單一投資人，沒出現不等於沒賣；不得推論大戶、散戶、持股或勝率。
+- margin_observation若存在，僅為管理員融資券觀察，完全不計入綜合分。餘額增減不等於買賣超，急跌融資增加不能單憑此判定接貨或散戶套牢；融券增加不直接判定軋空。
 - 問成本／操作：可說成本相對現價與帳面損益，再用「若守住／若跌破／若重新站回」的條件式框架說明，不替使用者下買賣決定。
 - 問型態：可以直接說目前結構偏強、偏弱或中性，並引用型態分數及最關鍵的一個加分、一個壓力。
 - 比較兩檔：描述兩者技術結構差異與各自風險，不提供投資選擇或推薦。
@@ -2423,6 +2424,7 @@ def _compact_tool_data(name: str, data: Dict[str, Any], has_scorecard: bool) -> 
             data["ma_deduction"] = {k: {f: v.get(f) for f in ("direction_now", "turn_text", "outlook", "hold_prices_3d")}
                                     for k, v in (data.get("ma_deduction") or {}).items() if k in ("MA20", "MA60")}
     elif name == "get_pattern_scorecard":
+        data.pop('chip_sections', None)  # 圖片排版資料不重複送AI，保留數值與評分依據。
         data["ma_deduction"] = {k: {f: v.get(f) for f in ("direction_now", "turn_text", "outlook", "hold_prices_3d")}
                                 for k, v in (data.get("ma_deduction") or {}).items()}
         data["plus_reasons"] = (data.get("plus_reasons") or [])[:4]
@@ -4774,6 +4776,11 @@ class AceQueryEngine:
         # 有人會把「/ace 族群資金流向」整串貼進輸入框；前綴要拿掉，否則會被當成族群名稱去查。
         question = strip_command_prefix(question)
         compact = re.sub(r"\s+", "", question)
+        access = self._access()
+        margin_allowed = bool(access and access.admin_mode and not access.simulation)
+        if re.search(r'融資|融券|券資比', question) and not margin_allowed:
+            return AnswerResult('融資券資料目前僅供管理員使用 /ace 查詢；/ask 可查技術與現股籌碼評分。',
+                                'admin_only', 0, time.perf_counter()-started, as_text=True, cacheable=False)
         import spot_fetch_admin
         speed_request = spot_fetch_admin.parse(question)
         if speed_request is not None:
@@ -4964,7 +4971,7 @@ class AceQueryEngine:
         # 快取鍵值用「補完股票之後」的問題，避免 A 使用者的「那它的壓力在哪」拿到 B 使用者的答案；籌碼類型分開快取。
         # 族群追問（「那哪檔最強」）要帶族群名稱與模式，不同族群的同一句追問不能共用答案
         sector = parsed.sector or {}
-        key = "|".join(['同日技術籌碼綜合v16',compact, ",".join(c for c, _ in parsed.stocks), str(parsed.cost_price or ""), ",".join(parsed.branches),
+        key = "|".join(['技術70現股30融資管理員v17',compact, ",".join(c for c, _ in parsed.stocks), str(parsed.cost_price or ""), ",".join(parsed.branches),
                         "chip=" + parsed.chip,
                         "sector=" + str(sector.get("name") or sector.get("industry") or "") + ":" + str(sector.get("mode") or "")])
         key = self._access_cache_key(key)
@@ -5155,7 +5162,7 @@ class AceQueryEngine:
         self._perf_add("spot_prepare", time.perf_counter() - prepare_started)
         complete = [d for d in dates if (statuses.get(d) or {}).get("status") == "complete"]
         # 最新完整交易日變了就換 key，舊答案不會被繼續拿出來；/ace 測試不讀寫正式快取。
-        key = self._access_cache_key(f"spot|{code}|{mode}|{complete[-1] if complete else ''}|{len(complete)}")
+        key = self._access_cache_key(f"spot|{code}|{mode}|{complete[-1] if complete else ''}|{len(complete)}|q={stock_banter.answer_question_key(question)}")
         if not simulation:
             hit, cached = self._answer_cache.get(key)
             if hit:
@@ -5185,7 +5192,7 @@ class AceQueryEngine:
                              if (info or {}).get("status") == "complete"])
             complete_now.sort()
             self._answer_cache.set(self._access_cache_key(
-                f"spot|{code}|{mode}|{complete_now[-1] if complete_now else ''}|{len(complete_now)}"), result,
+                f"spot|{code}|{mode}|{complete_now[-1] if complete_now else ''}|{len(complete_now)}|q={stock_banter.answer_question_key(question)}"), result,
                 self.config.answer_cache_seconds)
         return result
 
@@ -5201,7 +5208,7 @@ class AceQueryEngine:
             statuses = local_market_cache.spot_day_status(code, dates)
             complete = [d for d in dates if (statuses.get(d) or {}).get("status") == "complete"]
             return self._access_cache_key(f"spot_branch|{code}|{spot_chip._branch_key(branch)}|"
-                                          f"{complete[-1] if complete else ''}|{len(complete)}")
+                                          f"{complete[-1] if complete else ''}|{len(complete)}|q={stock_banter.answer_question_key(question)}")
         if not simulation:
             hit, cached = self._answer_cache.get(cache_key())
             if hit:
@@ -5285,7 +5292,7 @@ class AceQueryEngine:
                is_admin: bool = False, admin_mode: bool = False, access=None, image=None) -> AnswerResult:
         # /ask always stays closed, including requests from administrators.
         allowed = bool(access.admin_mode) if access is not None else bool(is_admin and admin_mode)
-        with tools.quote_policy(admin_live=allowed):
+        with stock_banter.question_scope(question), tools.quote_policy(admin_live=allowed):
             return self._answer_with_quote_policy(question, context_key, on_queue,
                                                   is_admin, admin_mode, access, image)
 
@@ -6500,7 +6507,25 @@ class AceQueryEngine:
             return {}
         try:
             extras = weekly_pick._technical_extras(code)
-            return weekly_pick.build_pattern_scorecard(tech, vp, extras, found.get("get_sheet_stock_chips"), cost_price)
+            card = weekly_pick.build_pattern_scorecard(tech, vp, extras, found.get("get_sheet_stock_chips"), cost_price)
+            if card and code not in tools.INDEX_CODES:
+                import stock_chip_scoring
+                access = self._access()
+                allow_margin = bool(access and access.admin_mode and not access.simulation)
+                try:
+                    card = stock_chip_scoring.enrich_card(card, allow_margin=allow_margin)
+                    if not card['composite_score']['complete'] or (allow_margin and not all(
+                            card.get('margin_observation', {}).get('periods', {}).get(str(n), {}).get('complete') for n in (20,70))):
+                        self._request_local.spot_partial = True
+                except Exception as exc:
+                    # Keep verified technical data and explicitly unavailable composite; never reuse an old score.
+                    self.log(f'主要分點評分略過：{code}｜{type(exc).__name__}: {exc}')
+                    scoring = {'score':None,'complete':False,'data_date':'','components':[]}
+                    composite = stock_chip_scoring.combine(card.get('pattern_score'),scoring,str(card.get('data_date') or '')[:10].replace('/','-'))
+                    card.update(spot_scoring=scoring,composite_score=composite,
+                                chip_sections=stock_chip_scoring.sections(scoring,composite),card_title='技術評分')
+                    self._request_local.spot_partial = True
+            return card
         except Exception as exc:  # 評分失敗只少一張卡，不影響回答
             self.log(f"型態評分卡略過：{code}｜{type(exc).__name__}: {exc}")
             return {}
