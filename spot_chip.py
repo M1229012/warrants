@@ -23,6 +23,7 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tupl
 import pandas as pd
 
 import local_market_cache
+import spot_history
 import warrant_ai_tools as tools
 
 SOURCE_URL = "https://fubon-ebrokerdj.fbs.com.tw/z/zc/zco/zco.djhtm"
@@ -548,7 +549,17 @@ def _fetch_status(state: str, stock_code: str, date: str, latest_date: str) -> s
     return "source_error"                                             # blocked／錯誤頁／找不到表格
 
 
-def ensure_days(stock_code: str, dates: Sequence[str], budget: float = BACKFILL_BUDGET,
+def ensure_days(stock_code, dates, *args, **kwargs):
+    # Pin active jobs so LRU cannot remove data halfway through a fetch.
+    with spot_history.active(stock_code):
+        if not spot_history.tracked(stock_code):
+            if kwargs.get('background'):
+                return {'fetched':0,'remaining':len(dates),'evicted':1}
+            spot_history.touch(stock_code)
+        return _ensure_days_inner(stock_code, dates, *args, **kwargs)
+
+
+def _ensure_days_inner(stock_code: str, dates: Sequence[str], budget: float = BACKFILL_BUDGET,
                 now: Optional[datetime] = None, fetch_source=open_source, latest_date: str = "",
                 bar_dates: Optional[Sequence[str]] = None, lock_wait: Optional[float] = None,
                 background: bool = False, retry_pending: bool = False) -> Dict[str, int]:
@@ -578,15 +589,18 @@ def ensure_days(stock_code: str, dates: Sequence[str], budget: float = BACKFILL_
             deadline = time.monotonic() + budget
             # 會員這一題用 PARALLEL 條連線並行抓（每條各自的 session）；前景與背景共用動態設定，selenium 模式維持 1 條
             batch_settings = fetch_settings()
-            workers = 1 if FETCHER == "selenium" else min(batch_settings['parallel'], len(missing))
+            workers = 1 if background or FETCHER == "selenium" else min(batch_settings['parallel'], len(missing))
             queue, guard, failure = deque(missing), threading.Lock(), []
             state = {"fetched": 0, "errors": 0, "streak": 0, "busy": 0, "stop": False, "retry_seen": False, "health_errors": 0}
             request_id = str(getattr(tools._API_REQUEST_LOCAL, "request_id", "") or "")
 
             def work() -> None:
                 _FETCH_DEADLINE.at = deadline
+                _FETCH_DEADLINE.background = background
                 try:
                     _work()
+                except HistoryBudgetReached:
+                    with guard: state["stop"] = True
                 except local_market_cache.DBError as exc:
                     with guard:
                         failure.append(exc)
@@ -598,6 +612,7 @@ def ensure_days(stock_code: str, dates: Sequence[str], budget: float = BACKFILL_
                     note_fetch_health(batch_settings, failed=True, code=stock_code)
                     print(f"現股工作連線錯誤｜{stock_code}｜{type(exc).__name__}: {exc}", flush=True)
                 finally:
+                    _FETCH_DEADLINE.background = False
                     _FETCH_DEADLINE.at = 0.0   # 單一連線時在呼叫端執行緒跑，不能把截止時間留給下一題
 
             def _work() -> None:
@@ -697,7 +712,26 @@ def ensure_days(stock_code: str, dates: Sequence[str], budget: float = BACKFILL_
             lock.release()
 
 
+class HistoryBudgetReached(Exception):pass
+
+_HISTORY_RATE_LOCK=threading.Lock()
+HISTORY_REQUESTS_PER_HOUR=max(1,min(600,int(os.getenv('DISCORD_AI_SPOT_HISTORY_REQUESTS_PER_HOUR','120'))))
+
+def _take_history_budget():
+    if spot_history.usage()['pause']:return False
+    with _HISTORY_RATE_LOCK:
+        hour=int(time.time()//3600)
+        state=local_market_cache.get_state('spot_history_hourly_budget',{}) or {}
+        used=int(state.get('used',0)) if state.get('hour')==hour else 0
+        if used>=HISTORY_REQUESTS_PER_HOUR:return False
+        local_market_cache.set_state('spot_history_hourly_budget',{'hour':hour,'used':used+1})
+        return True
+
+
 def _fetch_one(fetch, stock_code: str, date: str, latest_date: str) -> bool:
+    if getattr(_FETCH_DEADLINE, 'background', False) and not _take_history_budget():
+        _FETCH_DEADLINE.at = 0.0
+        raise HistoryBudgetReached('背景每小時上限或容量保護')
     """抓一天、驗證、寫入（同一個 transaction）；回傳 True＝來源失敗。DBError 往上丟。"""
     started = time.perf_counter()
     try:
@@ -732,7 +766,7 @@ def _background_pool() -> ThreadPoolExecutor:
     global _BACKGROUND_POOL
     with _BACKGROUND_GUARD:
         if _BACKGROUND_POOL is None:
-            _BACKGROUND_POOL = ThreadPoolExecutor(max_workers=BACKGROUND_WORKERS, thread_name_prefix="spot-backfill")
+            _BACKGROUND_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="spot-backfill")
         return _BACKGROUND_POOL
 
 
@@ -942,6 +976,7 @@ def build_report(stock_code: str, mode: str = "full", now: Optional[datetime] = 
     mode=latest：只確保最近完整日，不排背景、不掃 70 日。
     calendar＝呼叫端已算好的 candidate_dates() 結果（同一題重用，不重查行事曆）。
     本地資料庫讀取失敗時丟 local_market_cache.DBError（不當成沒資料去整批重抓）。"""
+    spot_history.touch(stock_code)
     now = now or tools.taipei_now()
     t0 = time.perf_counter()
     dates, today_state = calendar if calendar is not None else candidate_dates(now)
@@ -967,12 +1002,6 @@ def build_report(stock_code: str, mode: str = "full", now: Optional[datetime] = 
         state = ((step.get("statuses") or local_market_cache.spot_day_status(stock_code, [date])).get(date) or {}).get("status")
         if state == "complete" or step.get("cooldown"):
             break
-    left = deadline - time.monotonic()
-    if mode == "full" and left > 1 and not progress.get("cooldown") and not progress.get("errors"):
-        step = ensure_days(stock_code, dates, budget=left, now=now, fetch_source=fetch_source,
-                           latest_date=dates[-1], lock_wait=0.5)
-        progress["fetched"] += step.get("fetched", 0)
-        progress["errors"] += step.get("errors", 0)
     t_fetched = time.perf_counter()
     statuses = local_market_cache.spot_day_status(stock_code, dates)   # 這一題只讀一次全窗口狀態，之後重用
     if mode != "latest":
@@ -1008,7 +1037,7 @@ def build_report(stock_code: str, mode: str = "full", now: Optional[datetime] = 
 # ============================================================
 
 TODAY_PREFETCH_ENABLE = os.getenv("DISCORD_AI_SPOT_TODAY_PREFETCH_ENABLE", "1").strip() != "0"
-TODAY_QUEUE_MAX = max(1, int(os.getenv("DISCORD_AI_SPOT_TODAY_QUEUE_MAX", "300") or 300))
+TODAY_QUEUE_MAX = min(spot_history.MAX_STOCKS, max(1, int(os.getenv("DISCORD_AI_SPOT_TODAY_QUEUE_MAX", "200") or 200)))
 TODAY_PREFETCH_BUDGET = float(os.getenv("DISCORD_AI_SPOT_TODAY_PREFETCH_BUDGET", "120") or 120)
 _QUEUE_KEY = "spot_today_queue"
 _QUEUE_GUARD = threading.Lock()
@@ -1032,50 +1061,74 @@ def remember_for_today(stock_code: str, now: Optional[datetime] = None) -> None:
 
 
 _HISTORY_KEY = "spot_history_queue"
-HISTORY_QUEUE_MAX = max(1, int(os.getenv("DISCORD_AI_SPOT_HISTORY_QUEUE_MAX", "500") or 500))
+HISTORY_QUEUE_MAX = min(spot_history.MAX_STOCKS, max(1, int(os.getenv("DISCORD_AI_SPOT_HISTORY_QUEUE_MAX", "200") or 200)))
 
 
 _HISTORY_NEW: List[str] = []
 
 
 def remember_history(stock_code: str) -> None:
-    """會員問過的股票（任何題型）先記在記憶體；背景維護時才寫進 SQLite 待補清單（問答流程不碰資料庫）。"""
+    """會員問过的股票立即更新持久化LRU；待補清單交背景維護，不阻塞下載。"""
     code = str(stock_code or "").strip()
     if code and code[:4].isdigit():
+        spot_history.touch(code)
         with _QUEUE_GUARD:
             if code not in _HISTORY_NEW and len(_HISTORY_NEW) < HISTORY_QUEUE_MAX:
                 _HISTORY_NEW.append(code)
 
 
-def prefetch_history(now: Optional[datetime] = None, fetch_source=open_source, max_submit: int = 4) -> Dict[str, Any]:
-    """背景維護每輪呼叫：清單上還沒補滿 70 日的股票交給背景 worker（同一檔只排一次）；補滿的從清單移除。
-    會員查詢優先（背景 worker 數有限、來源冷卻就停）。"""
-    if source_cooling():
-        return {"skipped": True}
+def prefetch_history(now=None, fetch_source=open_source, max_submit=1):
+    """One-year target, one background job; source-date probe gates older downloads."""
+    now=now or tools.taipei_now()
+    if source_cooling() or spot_history.usage()['pause']:return {'skipped':True}
     with _QUEUE_GUARD:
-        fresh, _HISTORY_NEW[:] = list(_HISTORY_NEW), []
-        codes = list(local_market_cache.get_state(_HISTORY_KEY, []) or [])
-        codes = (codes + [c for c in fresh if c not in codes])[-HISTORY_QUEUE_MAX:]
-        if fresh:
-            local_market_cache.set_state(_HISTORY_KEY, codes)       # 重啟後接著補
-    if not codes:
-        return {"skipped": True}
-    dates, _ = candidate_dates(now or tools.taipei_now())
-    if not dates:
-        return {"skipped": True}
-    finished, submitted = [], 0
+        fresh,_HISTORY_NEW[:]=list(_HISTORY_NEW),[]
+        tracked=spot_history.codes()[:HISTORY_QUEUE_MAX]
+        queued=list(local_market_cache.get_state(_HISTORY_KEY,[]) or [])
+        codes=[c for c in fresh+queued+tracked if c in tracked]
+        codes=list(dict.fromkeys(codes))[:HISTORY_QUEUE_MAX]
+        local_market_cache.set_state(_HISTORY_KEY,codes)
+    if not codes:return {'skipped':True}
+    dates=trading_dates(now,270)
+    cutoff=(now-timedelta(days=365)).strftime('%Y-%m-%d')
+    dates=[d for d in dates if cutoff<=d<now.strftime('%Y-%m-%d') or (d==now.strftime('%Y-%m-%d') and now.strftime('%H:%M')>=TODAY_READY)]
+    if not dates:return {'skipped':True}
+    submitted=0
     for code in codes:
-        if submitted >= max_submit:
-            break
-        if not _unresolved(code, dates, local_market_cache.spot_day_status(code, dates)):
-            finished.append(code)
-            continue
-        submitted += continue_in_background(code, dates, dates[-1], (), fetch_source)
-    if finished:
-        with _QUEUE_GUARD:
-            left = [c for c in (local_market_cache.get_state(_HISTORY_KEY, []) or []) if c not in finished]
-            local_market_cache.set_state(_HISTORY_KEY, left)
-    return {"submitted": submitted, "finished": len(finished), "queue": len(codes) - len(finished)}
+        if submitted>=min(1,max_submit):break
+        with _BACKGROUND_GUARD:
+            if code in _BACKGROUND:continue
+        # Probe the oldest exact date once a day. Existing complete date proves access.
+        statuses=local_market_cache.spot_day_status(code,dates)
+        probe=local_market_cache.get_state('spot_year_probe:'+code,{}) or {}
+        proven=(statuses.get(dates[0]) or {}).get('status')=='complete'
+        if not proven and probe.get('day')!=now.strftime('%Y-%m-%d'):
+            result=ensure_days(code,[dates[0]],budget=12,now=now,fetch_source=fetch_source,latest_date=dates[-1],background=True,lock_wait=0)
+            if result.get('busy') or result.get('evicted'):continue
+            status=(local_market_cache.spot_day_status(code,[dates[0]]).get(dates[0]) or {}).get('status')
+            proven=status=='complete'
+            local_market_cache.set_state('spot_year_probe:'+code,{'day':now.strftime('%Y-%m-%d'),'date':dates[0],'available':proven})
+            print(f'📚 一年分點來源探測｜{code}｜{dates[0]}｜{status}｜未證實不大量補舊日',flush=True)
+        elif not proven:proven=bool(probe.get('available'))
+        target=dates if proven else dates[-70:]
+        # Price history: max one stock per maintenance cycle; no blanket market expansion.
+        if proven and spot_history.price_check_due(code):
+            try:
+                with spot_history.active(code):
+                    if not spot_history.tracked(code):continue
+                    spot_history.mark_price_check(code)
+                    with tools.api_priority('background'):
+                        frame,market,_=tools.core().fetch_stock_data_yf(code,period='400d')
+                    frame=tools._formal_daily_frame(tools._drop_invalid_bars(code,frame,'分點一年日K'))
+                    spot_history.save_prices(code,frame,market,'FinMind')
+            except Exception as exc:print(f'⚠️ 分點配套日K略過｜{code}｜{type(exc).__name__}: {exc}',flush=True)
+        if _unresolved(code,target,statuses):
+            submitted+=continue_in_background(code,target,dates[-1],(),fetch_source)
+        # Rotate fairly; completed stocks stay enrolled for new trading days.
+        codes=codes[1:]+codes[:1]
+        break
+    local_market_cache.set_state(_HISTORY_KEY,[c for c in codes if c in spot_history.codes()][:HISTORY_QUEUE_MAX])
+    return {'submitted':submitted,'finished':0,'queue':len(codes)}
 
 
 def prefetch_today(now: Optional[datetime] = None, fetch_source=open_source,

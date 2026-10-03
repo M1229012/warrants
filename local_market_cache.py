@@ -606,7 +606,7 @@ def _read(sql: str, params: tuple) -> List[tuple]:
 
 
 SPOT_STATUSES = ("complete", "pending_update", "market_closed", "stock_no_trade", "source_error", "retry")
-SPOT_KEEP_CALENDAR_DAYS = 160   # 約 110 個交易日，足夠 70 日統計＋延續性／事件回測
+SPOT_KEEP_CALENDAR_DAYS = 365   # 測試版：一年；200檔LRU與容量管理由spot_history負責
 
 
 def save_spot_day(stock_code: str, date: str, rows: Iterable[Dict[str, Any]], status: str,
@@ -969,6 +969,9 @@ def daily_maintenance(today: str = "") -> Dict[str, int]:
                          "radar_turnover:" + today)):
                     removed[label] = conn.execute(sql, (arg,)).rowcount
                 conn.commit()
+        import spot_history
+        history = spot_history.maintain(today)
+        removed["spot_history_evicted"] = len(history["evicted"])
         removed["daily_bars"] = trim_history(KEEP_DAYS)
         with _LOCK:
             with _db() as conn:
