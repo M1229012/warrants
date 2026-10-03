@@ -1880,6 +1880,7 @@ def weekly_article_parts(draft: str, stock_code: str, stock_name: str = "") -> D
 # 人工文章自動排版：Gemini 只重新分段、加固定小標、把數字整理成資料列；程式逐字核對，不通過就用原文排版
 # ============================================================
 
+WEEKLY_LAYOUT_VERSION = "weekly-note-v2"
 LAYOUT_HEADINGS = ("技術面", "籌碼面", "操作觀察")
 LAYOUT_SCHEMA = {
     "type": "object",
@@ -2133,21 +2134,21 @@ def rule_layout(body: str) -> Optional[Dict[str, Any]]:
     return {"sections": [s for s in sections if s["paragraphs"] or s["rows"]]}
 
 
-def layout_card(layout: Dict[str, Any], title: str, label: str, disclaimers: List[str]) -> Dict[str, Any]:
+def layout_card(layout: Dict[str, Any], title: str, label: str, disclaimers: List[str], keep_words=()) -> Dict[str, Any]:
     """排版結果 → 和其他研究筆記同一套卡片（金色小標、段落、淺底資料列、註解）。"""
     sections: List[Dict[str, Any]] = []
-    for sec in layout["sections"]:
-        sections.append({"type": "heading", "text": sec["heading"]})
+    for index, sec in enumerate(layout["sections"]):
+        sections.append({"type": "heading", "text": sec["heading"], "weekly_note": True, "divider": index > 0})
         # 每個小標底下一段完整文字：句子接在一起自然換行，不在句號處拆成好幾段（看起來零碎）
         merged = "".join(p.strip() for p in sec["paragraphs"] if p.strip())
         if merged:
-            sections.append({"type": "paragraph", "text": merged})
+            sections.append({"type": "paragraph", "text": merged, "weekly_note": True, "keep_words": list(keep_words)})
         if sec["rows"]:
-            # 數字並排成一列小格（原本一列一筆太佔空間）
-            sections.append({"type": "stats", "items": [{"label": r["label"], "value": r["value"]} for r in sec["rows"]]})
+            # 原文數字以緊湊行內資訊呈現，不為單筆數字建立滿版小格
+            sections.append({"type": "stats", "presentation": "inline", "items": [{"label": r["label"], "value": r["value"]} for r in sec["rows"]]})
     notes = [re.sub(r"^[^\w一-鿿]+", "", str(d)).strip() for d in disclaimers]
     sections.append({"type": "note", "text": "※ " + "｜".join(n for n in notes if n)})
-    return {"branch": title, "tags": ["權證分點觀察", "週精選"], "label": label, "sections": sections}
+    return {"branch": title, "tags": [], "label": label, "sections": sections, "weekly_note": True}
 
 
 def weekly_image_text(draft: str, stock_code: str, stock_name: str = "") -> str:

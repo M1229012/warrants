@@ -5795,9 +5795,15 @@ class AceQueryEngine:
     def _weekly_layout(self, context_key: str, session: Dict[str, Any], body: str) -> Tuple[Optional[Dict[str, Any]], str, int]:
         """人工文章的圖片排版：同一版文字只排一次（存在草稿 session）；Gemini 失敗或逐字核對沒過就回 None 用原文排版。
         回傳 (排版, 給管理員的提示, Gemini 次數)。"""
-        key = hashlib.sha1(body.encode("utf-8")).hexdigest()
+        key = hashlib.sha1((weekly_pick.WEEKLY_LAYOUT_VERSION + "\n" + body).encode("utf-8")).hexdigest()
         if session.get("layout") and session.get("layout_for") == key:
-            return session["layout"], "", 0
+            cached = weekly_pick.parse_layout(session["layout"])
+            if cached:
+                cached = weekly_pick.tidy_layout(cached)
+                valid, why = weekly_pick.verify_layout(body, cached)
+                if valid:
+                    return cached, "", 0
+                self.log(f"週精選排版快取未通過原文核對：{why}，重新排版")
         reason, calls = "", 0
         for _attempt in range(2):          # 沒通過核對時把原因告訴 Gemini 重排一次
             calls += 1
@@ -5814,11 +5820,16 @@ class AceQueryEngine:
             layout = weekly_pick.parse_layout(data)
             ok, reason = weekly_pick.verify_layout(body, layout) if layout else (False, "格式不符")
             if ok:
-                return self._keep_layout(context_key, session, key, weekly_pick.tidy_layout(layout), f"Gemini 第 {calls} 次"), "", calls
+                layout = weekly_pick.tidy_layout(layout)
+                ok, reason = weekly_pick.verify_layout(body, layout)
+                if ok:
+                    return self._keep_layout(context_key, session, key, layout, f"Gemini 第 {calls} 次"), "", calls
             rows = [f"{r['label']}={r['value']}" for s in (layout or {}).get("sections", []) for r in s["rows"]]
             self.log(f"週精選自動排版未通過核對（第 {calls} 次）：{reason}｜資料列：{rows or '-'}")
         # Gemini 沒排好：改用程式規則排版（只刪減與搬動原句，同一套逐句核對）
         layout = weekly_pick.rule_layout(body)
+        if layout:
+            layout = weekly_pick.tidy_layout(layout)
         ok, rule_reason = weekly_pick.verify_layout(body, layout) if layout else (False, "無法分段")
         if ok:
             return self._keep_layout(context_key, session, key, weekly_pick.tidy_layout(layout), "程式規則"), "", calls
@@ -5991,7 +6002,7 @@ class AceQueryEngine:
         if session.get("manual") and not session.get("layout_off"):
             layout, layout_note, layout_calls = self._weekly_layout(context_key, session, article["body"])
         if layout:
-            card = weekly_pick.layout_card(layout, article["title"], f"資料日 {data_date}".strip(), article["disclaimers"])
+            card = weekly_pick.layout_card(layout, article["title"], f"資料日 {data_date}".strip(), article["disclaimers"], keep_words=branches)
             panels = list(panels) + [{"branch_card": card, "hide_text": True,
                                       "footer_text": "股市艾斯  /  日 K 為收盤資料，非盤中即時行情"}]
         else:
