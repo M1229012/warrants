@@ -60,7 +60,7 @@ TABLE_HEAD_H = 34
 CENTER_WATERMARK_TEXT = '股市艾斯\n台股DC討論群'
 CENTER_WATERMARK_COLOR = '#1D2B44'
 CENTER_WATERMARK_ALPHA = 0.06
-CHIP_LAYOUT_VERSION = 'chip-events-year-v7'
+CHIP_LAYOUT_VERSION = 'chip-events-year-v9'
 CENTER_WATERMARK_FONT_SIZE = 200
 CENTER_WATERMARK_ROTATION = 18
 
@@ -655,12 +655,12 @@ def trade_detail_lines(panel):
 
 
 
-def observed_cumulative(values):
+def observed_cumulative(values, carry_missing=False):
     """Sum only observed values; gaps remain gaps rather than zero-trade days."""
     running=0.;result=[]
     for value in values:
         value=_finite(value)
-        if value is None:result.append(None)
+        if value is None:result.append(running if carry_missing else None)
         else:
             running+=value;result.append(running)
     return result
@@ -949,7 +949,7 @@ def draw_branch_flow(draw, top, left, right, px, step, bars, flow):
     """Observed daily net bars plus a visible-window cumulative line; never fill missing days."""
     daily=flow.get('daily') or {}
     values=[_finite(daily.get(str(b['date']).replace('/','-'))) for b in bars]
-    cums=observed_cumulative(values)
+    cums=observed_cumulative(values,carry_missing=True)
     text_at(draw,(left,top+4),str(flow.get('branch',''))+'｜現股買賣超',26,INK,True)
     draw.rectangle((left,top+48,left+9,top+64),fill=UP)
     draw.rectangle((left+9,top+48,left+18,top+64),fill=DOWN)
@@ -2530,6 +2530,37 @@ def _branch_section(draw, x0: float, x1: float, y: float, section: dict, dry: bo
     """分點圖卡的單一區塊；回傳高度。dry=True 只算高度。"""
     kind = section.get('type')
     width = x1 - x0
+    if kind == 'spot_meta':
+        lines=wrap(section.get('text',''),18,width)
+        if not dry:
+            for i,line in enumerate(lines):text_at(draw,(x0,y+i*27),line,18,'#98A2B3')
+        return len(lines)*27+12
+    if kind == 'spot_brief':
+        lines=wrap(section.get('history',''),22,width-48)
+        height=max(102,60+len(lines)*32+14)
+        if not dry:
+            draw.rounded_rectangle((x0,y,x1,y+height),radius=12,fill='#F8FAFC',outline='#DDE3EB',width=1)
+            value=float(section.get('net_5') or 0)
+            value_text=f'{value:+,.0f} 張';vw=font(30,True).getlength(value_text)
+            right=x1-24;label='近5日淨買賣超';lw=font(20).getlength(label)
+            badges=[section.get('status',''),section.get('badge','')]
+            badges=[str(b) for b in badges if b]
+            tag_w=sum(font(18).getlength(b)+30 for b in badges)
+            name,ns=fit(section.get('branch',''),29,max(120,width-vw-lw-tag_w-110),True,21)
+            text_at(draw,(x0+24,y+14),name,ns,INK,True)
+            tx=x0+24+font(ns,True).getlength(name)+18
+            for tag in badges:
+                tw=font(18).getlength(tag)+22
+                selling='調節' in tag or '賣超' in tag
+                bg,fg=(WARN_BG,WARN_INK) if selling else (GOOD_BG,GOOD_INK)
+                if tag=='疑似隔日沖':bg,fg=ACCENT_BG,ACCENT
+                draw.rounded_rectangle((tx,y+15,tx+tw,y+43),radius=7,fill=bg)
+                draw.text((tx+11,y+29),tag,font=font(18),fill=fg,anchor='lm')
+                tx+=tw+8
+            draw.text((right-vw-18,y+28),label,font=font(20),fill=MUTED,anchor='rm')
+            draw.text((right,y+28),value_text,font=font(30,True),fill=UP if value>0 else DOWN if value<0 else MUTED,anchor='rm')
+            for i,line in enumerate(lines):text_at(draw,(x0+24,y+60+i*32),line,22,INK if section.get('samples',0)>=5 else MUTED)
+        return height+16
     if kind == 'heading':
         if section.get('weekly_note'):
             offset = 18 if section.get('divider') else 0
