@@ -2266,6 +2266,9 @@ def _save_daily_cache(code, frame, market="", source="", confirmed=True):
     import sqlite3
     try:
         local_market_cache.save_bars(code, frame, market=market, source=source, confirmed=confirmed)
+        if confirmed:
+            import spot_history
+            spot_history.save_prices(code, frame, market, source)
     except (sqlite3.Error, OSError) as exc:
         print(f"⚠️ {code} 日K快取寫入失敗｜來源={source}｜資料庫={local_market_cache.DB_PATH}｜"
               f"{type(exc).__name__}: {exc}｜保留本次來源資料供後續核實；未保存到磁碟", flush=True)
@@ -2332,7 +2335,7 @@ def _formal_daily_frame(frame: pd.DataFrame) -> pd.DataFrame:
     return closed
 
 
-def _load_price_bundle(stock_code: str) -> Dict[str, Any]:
+def _load_price_bundle(stock_code: str, spot_history_mode: bool = False) -> Dict[str, Any]:
     """日K：FinMind 為主、失敗改富果日K；盤中再接上富果即時報價。指標沿用 calculate_indicators。"""
     kf = core()
     if str(stock_code or "").strip().upper() in INDEX_CODES:
@@ -2376,6 +2379,14 @@ def _load_price_bundle(stock_code: str) -> Dict[str, Any]:
 
     def build() -> Dict[str, Any]:
         daily_df, market, daily_source = _cached(f"price_daily_{code}", TTL_PRICE_SECONDS, daily)
+        if spot_history_mode:
+            import spot_history
+            archived = spot_history.load_prices(code)
+            if archived is not None and not archived.empty:
+                daily_df = pd.concat([archived, daily_df]).sort_index()
+                daily_df = daily_df[~daily_df.index.duplicated(keep='last')]
+                cutoff = pd.Timestamp(taipei_now().date()) - pd.Timedelta(days=365)
+                daily_df = daily_df.loc[daily_df.index >= cutoff]
         daily_df = _formal_daily_frame(daily_df)
         merged, intraday = _append_intraday_bar(code, daily_df, market)
         gaps = _missing_trading_days(merged)
@@ -2440,7 +2451,7 @@ def _load_price_bundle(stock_code: str) -> Dict[str, Any]:
     # 背景掃描的結果不含盤中 K 棒，另存一個 key，免得使用者接著問同一檔時
     # 拿到背景剛寫進去、沒有即時價的版本。
     prefix = "price_closed_" if current_api_priority() == "background" else "price_"
-    return _cached(f"{prefix}{code}", ttl, build)
+    return _cached(f"{prefix}{code}" + ("_spot_year_v4" if spot_history_mode else ""), ttl, build)
 
 
 def closed_frame(bundle: Dict[str, Any]) -> pd.DataFrame:

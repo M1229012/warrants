@@ -60,6 +60,7 @@ TABLE_HEAD_H = 34
 CENTER_WATERMARK_TEXT = '股市艾斯\n台股DC討論群'
 CENTER_WATERMARK_COLOR = '#1D2B44'
 CENTER_WATERMARK_ALPHA = 0.06
+CHIP_LAYOUT_VERSION = 'chip-events-year-v4'
 CENTER_WATERMARK_FONT_SIZE = 200
 CENTER_WATERMARK_ROTATION = 18
 
@@ -591,7 +592,8 @@ def _inst_height(panel: dict) -> int:
     panel = panel or {}
     if not ((panel.get('institutional') or (panel.get('futures') or {}).get('rows')) and panel.get('bars')):
         return 0
-    return INST_BLOCK_H - (36 if _retail_height(panel) else 0)   # 下面還有散戶副圖：這張不標日期，收掉日期列的高度
+    height = 290 if panel.get('institutional_daily_only') and panel.get('institutional') else INST_BLOCK_H
+    return height - (36 if _retail_height(panel) else 0)   # 下面還有散戶副圖：這張不標日期，收掉日期列的高度
 
 
 def _trade_height(panel: dict) -> int:
@@ -617,7 +619,7 @@ def _retail_height(panel: dict) -> int:
 
 
 def panel_height(panel: dict) -> int:
-    return (CHART_HEIGHT + _price_extra(panel) + sum(mark_lanes(panel)) + _inst_height(panel) + _retail_height(panel)
+    return (CHART_HEIGHT - (CAPTION_H if panel.get("clean_display") else 0) + _price_extra(panel) + sum(mark_lanes(panel)) + _inst_height(panel) + _retail_height(panel)
             + _flow_height(panel) + _trade_height(panel) + mark_legend(None, panel, 0, True))
 
 
@@ -654,26 +656,33 @@ def trade_detail_lines(panel):
 
 def draw_institutional(draw, top: float, left: float, right: float, px, step: float, bars: list, rows: list,
                        focus: str = '', unit: str = '張', title: str = '', cumulative: bool = True,
-                       today_label: str = '今日', extra: str = '', dates: bool = True) -> None:
+                       today_label: str = '今日', extra: str = '', dates: bool = True, block_height: int = INST_BLOCK_H) -> None:
     """法人買賣超（和 K 線同一組日期座標）：每日柱（單一法人＝紅買綠賣；三大法人＝堆疊）＋整段 K 線期間的累積金線。
     右側雙刻度：灰＝每日柱、金＝累積線；下方日期與 K 線對齊。"""
     by_date = {r['date']: r for r in rows}
     series = [c for c in INST_COLORS if c[0] == focus] or list(INST_COLORS)
     single = len(series) == 1
     title = title or (f'{series[0][1]}買賣超' if single else '三大法人買賣超')
-    text_at(draw, (left, top + 6), title, 22, INK, True)
     last = by_date.get(bars[-1]['date']) or (rows[-1] if rows else {})
-    lx = left + font(22, True).getlength(title) + 28
-    for key, label, color in series:
-        value = float(last.get(key) or 0)
-        if single:
-            draw.rectangle((lx, top + 12, lx + 8, top + 28), fill=UP)
-            draw.rectangle((lx + 8, top + 12, lx + 16, top + 28), fill=DOWN)
-        else:
-            draw.rectangle((lx, top + 12, lx + 16, top + 28), fill=color)
-        text = f'{today_label if single else label} {_inst_num(value, unit)}{unit}'
-        draw.text((lx + 22, top + 20), text, font=font(19), fill=INK, anchor='lm')
-        lx += 22 + font(19).getlength(text) + 22
+    if not cumulative:
+        text_at(draw,(left,top+4),title+'｜每日',26,INK,True)
+        draw.text((right,top+8),'資料 '+str(last.get('date','')),font=font(19),fill=MUTED,anchor='rt')
+        third=(right-left)/len(series)
+        for j,(key,label,color) in enumerate(series):
+            lx=left+j*third
+            draw.rectangle((lx,top+47,lx+16,top+63),fill=color)
+            text=label+' '+_inst_num(float(last.get(key) or 0),unit)+unit
+            draw.text((lx+25,top+55),text,font=font(22),fill=INK,anchor='lm')
+        lx=right
+    else:
+        text_at(draw, (left, top + 6), title, 22, INK, True)
+        lx = left + font(22, True).getlength(title) + 28
+        for key,label,color in series:
+            value=float(last.get(key) or 0)
+            draw.rectangle((lx,top+12,lx+16,top+28),fill=(UP if value>=0 else DOWN) if single else color)
+            text=f'{today_label if single else label} {_inst_num(value,unit)}{unit}'
+            draw.text((lx+22,top+20),text,font=font(19),fill=INK,anchor='lm')
+            lx+=22+font(19).getlength(text)+22
     daily = [None if bar['date'] not in by_date else sum(float(by_date[bar['date']].get(k) or 0) for k, *_ in series)
              for bar in bars]
     cums, running = [], 0.0
@@ -690,7 +699,7 @@ def draw_institutional(draw, top: float, left: float, right: float, px, step: fl
         room = right - lx
         text, size = fit(extra, 18, max(80, room), False, 14)
         draw.text((lx, top + 20), text, font=font(size), fill=MUTED, anchor='lm')
-    ctop, cbottom = top + 48, top + INST_BLOCK_H - 52
+    ctop, cbottom = top + (82 if not cumulative else 48), top + block_height - 52
     mid = (ctop + cbottom) / 2
     half_h = (cbottom - ctop) / 2
     ticks = _date_ticks(bars, step)
@@ -1257,13 +1266,14 @@ def draw_chart(draw, y: int, panel: dict) -> None:
                   fill=INK if new_month else MUTED, anchor='mt')
 
     # 成交量標題列：今日量＋均量線圖例（單位張，Volume 為股數）。
-    legend = '價量分布｜紅：最大量區  /  橘：第二大量區  /  藍：其他價位' if profile_rectangles else '價量分布暫無有效資料'
-    text_at(draw, (left, bottom + 40), legend + '  /  虛線：布林軌道', 17, MUTED)
-    basis = panel.get('price_basis_note', '')
-    state = ('還原股價｜' if '已依核實參考價還原' in basis else '') + '布林｜' + '；'.join((panel.get('bollinger') or {}).get('signals', ['資料不足'])[:3])
-    state, state_size = fit(state, 20, CONTENT - 80, False, 16)
-    text_at(draw, (left, bottom + 66), state, state_size, INK)
-    bottom += CAPTION_H
+    if not panel.get('clean_display'):
+        legend = '價量分布｜紅：最大量區  /  橘：第二大量區  /  藍：其他價位' if profile_rectangles else '價量分布暫無有效資料'
+        text_at(draw, (left, bottom + 40), legend + '  /  虛線：布林軌道', 17, MUTED)
+        basis = panel.get('price_basis_note', '')
+        state = ('還原股價｜' if '已依核實參考價還原' in basis else '') + '布林｜' + '；'.join((panel.get('bollinger') or {}).get('signals', ['資料不足'])[:3])
+        state, state_size = fit(state, 20, CONTENT - 80, False, 16)
+        text_at(draw, (left, bottom + 66), state, state_size, INK)
+    bottom += 0 if panel.get("clean_display") else CAPTION_H
     label_y = bottom + 58
     draw.text((left, label_y), '成交量', font=font(20), fill=MUTED, anchor='lm')
     lx = left + font(20).getlength('成交量') + 18
@@ -1306,7 +1316,8 @@ def draw_chart(draw, y: int, panel: dict) -> None:
                            panel.get('institutional_focus', ''), panel.get('institutional_unit', '張'),
                            cumulative=not panel.get('institutional_daily_only', False),
                            today_label=panel.get('institutional_day', '今日'),
-                           extra=panel.get('institutional_extra', ''), dates=last_sub)
+                           extra=panel.get('institutional_extra', ''), dates=last_sub,
+                           block_height=290 if panel.get('institutional_daily_only') else INST_BLOCK_H)
     elif inst_h:
         draw_futures(draw, vbottom + 14, left, right, px, step, bars, dict(futures, _dates=last_sub))
     retail_h = _retail_height(panel)
@@ -2588,7 +2599,8 @@ def _branch_section(draw, x0: float, x1: float, y: float, section: dict, dry: bo
             for c, cell in enumerate(row):
                 strong = c == 0 or bold or (c < len(columns) and columns[c] in accent)
                 room = (edges[0] - x0 if c == 0 else edges[c] - edges[c - 1]) - 26
-                lines, size = wrap_cell(str(cell), 22, max(40, room), strong, max_lines=6)
+                base_size = 18 if columns[c] == '目前動向' else 24 if c == 0 else 22
+                lines, size = wrap_cell(str(cell), base_size, max(40, room), strong, minimum=17, max_lines=6)
                 cells.append((lines, size, strong))
             layout.append((max(row_h, max((len(l) for l, _, _ in cells), default=1) * 28 + 18), cells))
         if not dry:
@@ -2602,7 +2614,7 @@ def _branch_section(draw, x0: float, x1: float, y: float, section: dict, dry: bo
                     draw.rectangle((x0, ry, x1, ry + height), fill='#FAFBFC')
                 for c, (cell, (lines, size, strong)) in enumerate(zip(row, cells)):
                     cx = x0 + 18 if c == 0 else edges[c] - 18
-                    color = _tone_color(cell, 'auto') if columns[c] in signed else (ACCENT if columns[c] in accent else INK)
+                    color = MUTED if columns[c] == '目前動向' else _tone_color(cell, 'auto') if columns[c] in signed else (ACCENT if columns[c] in accent else INK)
                     top = ry + height / 2 - (len(lines) - 1) * 14
                     for i, line in enumerate(lines):
                         draw.text((cx, top + i * 28), line, font=font(size, strong),
@@ -3059,6 +3071,25 @@ def render_answer(question: str, answer: str, panels: list[dict] | None = None,
     # 測試版所有舊分數卡都只保留技術價位，不輸出分數／分級／評分條。
     panels = [dict(p, scorecard=dict(p['scorecard'], hide_score=True, card_title='技術位置', card_note='均線、價量與價位整理'))
               if p.get('scorecard') else p for p in panels or []]
+    clean_display=any((p.get('branch_card') or {}).get('clean_display') for p in panels)
+    if clean_display:
+        cleaned=[]
+        for original in panels:
+            item=dict(original)
+            item['clean_display']=True
+            if item.get('ai_card'):
+                card=dict(item['ai_card'])
+                for key in ('footer','cost_basis'):
+                    if card.get(key):print('📝 圖片省略註解｜'+str(card.pop(key)),flush=True)
+                item['ai_card']=card
+            if item.get('branch_card'):
+                card=dict(item['branch_card'])
+                notes=[v for v in card.get('sections',[]) if v.get('type')=='note']
+                for note in notes:print('📝 圖片省略註解｜'+note.get('text',''),flush=True)
+                card['sections']=[v for v in card.get('sections',[]) if v.get('type')!='note']
+                item['branch_card']=card
+            cleaned.append(item)
+        panels=cleaned
     debug_panel = next((p.get("kline_debug") for p in panels if p.get("kline_debug")), None)
     if debug_panel is not None:
         from kline_debug import render
@@ -3098,7 +3129,7 @@ def render_answer(question: str, answer: str, panels: list[dict] | None = None,
     panels_height += sum(review_card(None, 0, p['review'], True) + 24 for p in review_panels)
     panels_height += sum(branch_card(None, 0, p['branch_card'], True) + 24 for p in branch_panels)
     panels_height += sum(ai_card(None, 0, p['ai_card'], True) + 24 for p in ai_panels)
-    height = header_height + panels_height + body_height + 112
+    height = header_height + panels_height + body_height + (40 if clean_display else 112)
     if review_panels:
         print(f"📝 交易覆盤圖片｜render height={height}px", flush=True)
     image = Image.new('RGB', (WIDTH, height), BG)
@@ -3148,7 +3179,7 @@ def render_answer(question: str, answer: str, panels: list[dict] | None = None,
                 text_at(draw, (MARGIN + 36, cursor + i * (36 if small else 45)), line,
                         23 if small else 29, MUTED if small else INK)
         cursor += block.height
-    draw.line((MARGIN, height - 71, WIDTH - MARGIN, height - 71), fill=LINE)
+    if not clean_display:draw.line((MARGIN, height - 71, WIDTH - MARGIN, height - 71), fill=LINE)
     if article_panels:
         footer = '股市艾斯  /  日 K 為收盤資料，非盤中即時行情'
     elif sector_panels:
@@ -3168,7 +3199,8 @@ def render_answer(question: str, answer: str, panels: list[dict] | None = None,
     suffix = next((p.get('footer_suffix') for p in branch_panels if p.get('footer_suffix')), '')
     if suffix:
         footer = f'{footer}｜{suffix}'
-    text_at(draw, (MARGIN, height - 49), footer, 20, MUTED)
+    if not clean_display:text_at(draw, (MARGIN, height - 49), footer, 20, MUTED)
+    else:print("📝 圖片頁尾留Log｜"+footer,flush=True)
     preserved = [(rect,image.crop(rect)) for rect in protected_reviews]
     image = add_center_watermarks(image)
     for rect,crop in preserved:image.paste(crop,rect)
