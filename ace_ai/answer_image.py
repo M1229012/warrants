@@ -60,7 +60,7 @@ TABLE_HEAD_H = 34
 CENTER_WATERMARK_TEXT = '股市艾斯\n台股DC討論群'
 CENTER_WATERMARK_COLOR = '#1D2B44'
 CENTER_WATERMARK_ALPHA = 0.06
-CHIP_LAYOUT_VERSION = 'chip-events-year-v9'
+CHIP_LAYOUT_VERSION = 'chip-events-year-v10'
 CENTER_WATERMARK_FONT_SIZE = 200
 CENTER_WATERMARK_ROTATION = 18
 
@@ -2537,7 +2537,7 @@ def _branch_section(draw, x0: float, x1: float, y: float, section: dict, dry: bo
         return len(lines)*27+12
     if kind == 'spot_brief':
         lines=wrap(section.get('history',''),22,width-48)
-        height=max(102,60+len(lines)*32+14)
+        height=102 if section.get('metrics') else max(102,60+len(lines)*32+14)
         if not dry:
             draw.rounded_rectangle((x0,y,x1,y+height),radius=12,fill='#F8FAFC',outline='#DDE3EB',width=1)
             value=float(section.get('net_5') or 0)
@@ -2559,7 +2559,18 @@ def _branch_section(draw, x0: float, x1: float, y: float, section: dict, dry: bo
                 tx+=tw+8
             draw.text((right-vw-18,y+28),label,font=font(20),fill=MUTED,anchor='rm')
             draw.text((right,y+28),value_text,font=font(30,True),fill=UP if value>0 else DOWN if value<0 else MUTED,anchor='rm')
-            for i,line in enumerate(lines):text_at(draw,(x0+24,y+60+i*32),line,22,INK if section.get('samples',0)>=5 else MUTED)
+            metrics=section.get('metrics') or []
+            if metrics:
+                cell=(width-48)/len(metrics)
+                for i,item in enumerate(metrics):
+                    cx=x0+24+i*cell
+                    if i:draw.line((cx-12,y+60,cx-12,y+92),fill='#DDE3EB',width=1)
+                    label=str(item['label']);value=str(item['value'])
+                    color=_tone_color(value,item.get('tone',''))
+                    draw.text((cx,y+76),label,font=font(18),fill=MUTED,anchor='lm')
+                    draw.text((cx+font(18).getlength(label)+14,y+76),value,font=font(24,True),fill=color,anchor='lm')
+            else:
+                for i,line in enumerate(lines):text_at(draw,(x0+24,y+60+i*32),line,22,MUTED)
         return height+16
     if kind == 'heading':
         if section.get('weekly_note'):
@@ -2940,7 +2951,8 @@ def branch_card(draw, y: float, data: dict, dry: bool) -> int:
     """分點勝率／近期買賣圖卡：數字卡、勝率比較條、事件表、買賣超清單，和 K 線／評分卡同一套卡片風格。"""
     x0, x1 = MARGIN, WIDTH - MARGIN
     ix0, ix1 = x0 + 36, x1 - 36
-    head_h = 96
+    meta_lines=wrap(data.get('compact_meta',''),16,ix1-ix0) if data.get('compact_meta') else []
+    head_h = 96+max(0,len(meta_lines)-1)*23
     body = sum(_branch_section(None, ix0, ix1, 0, s, True) for s in data.get('sections') or [])
     height = int(head_h + body + 24)
     if dry:
@@ -2954,6 +2966,7 @@ def branch_card(draw, y: float, data: dict, dry: bool) -> int:
         draw.text((tag_x + w / 2, y + 48), tag, font=font(19, True), fill=ACCENT, anchor='mm')
         tag_x += w + 10
     draw.text((ix1, y + 48), data.get('label', '權證分點'), font=font(20), fill=MUTED, anchor='rm')
+    for i,line in enumerate(meta_lines):text_at(draw,(ix0,y+70+i*23),line,16,'#98A2B3')
     cursor = y + head_h
     for section in data.get('sections') or []:
         cursor += _branch_section(draw, ix0, ix1, cursor, section, False)

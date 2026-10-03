@@ -1823,6 +1823,7 @@ class GeminiResult:
     output_tokens: int = 0
     total_tokens: int = 0
     token_source: str = "none"
+    late_future: Optional[Future] = field(default=None, repr=False, compare=False)
 
 
 # 思考程度：3.x 模型用 thinking_level（minimal／low…）、2.5 用 thinking_budget=0；default＝不帶參數
@@ -2071,7 +2072,7 @@ class GeminiGateway:
     - 模型鏈 GEMINI_MODEL_CHAIN 依序嘗試；金鑰輪流用；每個金鑰×模型各自記錄額度與限流（GeminiQuota）
     - 503 塞車整個模型暫停、429 每日額度用完停到太平洋時間午夜、每分鐘限流停 60 秒、404 模型停用
     - 同時最多 DISCORD_AI_GEMINI_CONCURRENCY（預設 4）個請求在路上；只在真的打 API 時佔名額，不會一題卡住全部
-    - 整體時限 DEADLINE；逾時的那次在背景跑完後丟棄"""
+    - 整體時限 DEADLINE；最終解讀逾時後保留同一次結果，最多再等5分鐘覆蓋原圖，其餘用途丟棄"""
 
     DAILY_LIMIT = max(0, tools._env_int("DISCORD_AI_GEMINI_DAILY_LIMIT", 0))   # 全系統每日呼叫軟上限；0＝不限（各金鑰×模型另有額度追蹤）
     DEADLINE = max(0.0, tools._env_float("DISCORD_AI_GEMINI_DEADLINE_SECONDS", 40.0))   # 0＝不限
@@ -2110,6 +2111,7 @@ class GeminiGateway:
         deadline = time.monotonic() + self.DEADLINE
         box: Dict[str, GeminiResult] = {}
         done = threading.Event()
+        late_future = Future()
 
         def run() -> None:
             try:
@@ -2119,12 +2121,14 @@ class GeminiGateway:
                 box["result"] = GeminiResult(ok=False, error=f"{type(exc).__name__}: {exc}", purpose=purpose)
             finally:
                 gate.release()
+                late_future.set_result(box["result"])
                 done.set()
         threading.Thread(target=run, name="ace-gemini", daemon=True).start()
         if not done.wait(self.DEADLINE):
             self.log(f"Gemini 超過 {self.DEADLINE:.0f} 秒，改用規則式內容：{purpose}")
             tools.record_api_event("Gemini", status=504, latency=self.DEADLINE, detail=purpose)
-            return GeminiResult(ok=False, error=f"deadline {self.DEADLINE:.0f}s", latency=self.DEADLINE, purpose=purpose)
+            return GeminiResult(ok=False, error=f"deadline {self.DEADLINE:.0f}s", latency=self.DEADLINE, purpose=purpose,
+                                late_future=late_future if purpose == "final_answer" else None)
         return box["result"]
 
     def generate(self, prompt: str, purpose: str, schema: Optional[Dict[str, Any]] = None, temperature: float = 0.3) -> GeminiResult:
@@ -2135,7 +2139,7 @@ class GeminiGateway:
         # 對所有使用者可見的AI文字套用共同原則；分類、OCR與純排版不混入寫作要求。
         prompt = stock_banter.user_response_prompt(prompt, purpose, schema)
         result = self._run_with_deadline(purpose, lambda deadline: self._generate(prompt, purpose, schema, temperature, deadline))
-        if result.ok and purpose not in ("planner", "intent"):   # 判斷題意不算 AI 解讀次數
+        if (result.ok or result.late_future is not None) and purpose not in ("planner", "intent"):   # 判斷題意不算 AI 解讀次數
             _AI_GATE.used = True
         return result
 
@@ -2481,12 +2485,39 @@ def _compact_tool_data(name: str, data: Dict[str, Any], has_scorecard: bool) -> 
     return _drop_keys(data)
 
 
+def _spot_price_ai_scope(name, data):
+    """Label AI price inputs by stock/branch and period; never change computed values."""
+    if name not in {'get_spot_chip_summary','get_spot_branch_flow','get_spot_event_backtest'} or not isinstance(data,dict):
+        return data
+    scoped=dict(data);references=[]
+    vwap=data.get('vwap') or {}
+    if isinstance(vwap,dict) and vwap.get('vwap') is not None:
+        scoped['vwap']=dict(vwap,scope='整檔股票，非任何券商分點',
+            label='全股成交量加權收盤參考價',definition='每日股票收盤價以全股成交量加權；非實際成交均價、分點成本或持股成本')
+        references.append(dict(scope='stock',label='全股成交量加權收盤參考價',value=vwap['vwap'],days=vwap.get('days')))
+    for row in data.get('continuity') or []:
+        if row.get('est_cost') is not None:
+            references.append(dict(scope='branch',branch=row.get('branch'),label='分點買超日收盤加權參考價',
+                value=row['est_cost'],days=20,definition='觀察到的淨買超日，以淨買超張數加權當日收盤價；非分點實際買價或持股成本'))
+    if data.get('est_cost_20d') is not None:
+        references.append(dict(scope='branch',branch=data.get('branch'),label='分點買超日收盤加權參考價',
+            value=data['est_cost_20d'],days=20))
+    for row in (data.get('spot') or {}).get('branches') or []:
+        if row.get('estimated_buy_cost') is not None:
+            references.append(dict(scope='branch',branch=row.get('branch'),label='分點買超日收盤加權參考價',
+                value=row['estimated_buy_cost'],period='近70交易日；公司行動時以實際可比期間為準',
+                definition='與回測圖卡同一數值；現價相對此價的差距不是實際獲利'))
+    scoped['price_references']=references
+    return scoped
+
+
 def build_final_payload(question: str, results: Sequence[tools.ToolResult]) -> Dict[str, Any]:
     has_scorecard = any(r.ok and r.name == "get_pattern_scorecard" for r in results)
     tool_results: Dict[str, Any] = {}
     for result in results:
         if result.ok:
             data = _compact_tool_data(result.name, result.data, has_scorecard)
+            data = _spot_price_ai_scope(result.name, data)
             if data is None:
                 continue
         else:
@@ -2555,10 +2586,10 @@ FINAL_SPOT_BRANCH_RULES = ("【單一現股分點】get_spot_branch_flow 是某�
                            "來源每日只列前段分點，沒上榜的日子視為 0，是近似值；外資券商分點不等於外資法人。"
                            "圖上已經有每日買賣超柱與累積線，文字要解讀這個分點在做什麼（布局、加碼、調節、出貨或短進短出），不要逐日念數字："
                            "累積線的高低點（cumulative_peak／cumulative_trough）落在哪段時間、和同期股價（price_path、close）是否同步；"
-                           "最近 5／20 日是在延續還是轉向；估算成本 est_cost_20d 與現價的關係；股價相對均線的位置只當背景一句。"
+                           "最近 5／20 日是在延續還是轉向；分點買超日收盤加權參考價與現價的差距（不得稱真實成本）；股價相對均線的位置只當背景一句。"
                            "只引用 1～3 個關鍵數字；資料日期不是今天時要說明資料截至哪天。"
                            "輸出解讀卡時：answer＝一句話判斷這個分點的動向；why 2～3 句；scenarios 給空陣列；"
-                           "summary 一句說接下來要觀察什麼（可用均線或估算成本當觀察價位），不可給買賣指令。")
+                           "summary 一句說接下來要觀察什麼（可用工具提供的均線或技術支撐壓力當觀察價位；不得僅以分點參考價當支撐壓力），不可給買賣指令。")
 
 
 FINAL_WARRANT_HABIT_RULES = ("【分點挑權證的習慣】get_branch_warrant_detail 是某個分點近 N 日買進的權證清單，habits 是買進當下的統計"
@@ -2572,6 +2603,16 @@ FINAL_WARRANT_HABIT_RULES = ("【分點挑權證的習慣】get_branch_warrant_d
 
 FINAL_FUTURES_RULES = ("【台指期未平倉】只陳述口數與前一日變化，並說明未平倉含現貨避險部位、不能單獨當多空訊號；不可用它推論明天漲跌，也不可給買賣建議。"
                        "get_retail_futures＝小台／微台散戶多空比（散戶＝全市場未平倉扣掉三大法人），只陳述比例、散戶多單／空單口數與前一日變化，不可當成反向指標下結論。")
+
+
+FINAL_SPOT_PRICE_RULES = ("【現股價格歸屬，必須遵守】price_references標明每個價格的對象、期間及來源。"
+    "vwap是整檔股票的全股成交量加權收盤參考價，不屬於任何分點；continuity.est_cost與est_cost_20d才是對應分點近20日買超日收盤加權參考價。"
+    "get_spot_event_backtest.spot.branches[].estimated_buy_cost是該分點回測圖卡的近70日可比期間參考價；不能與20日價格互換。"
+    "提到價格時同一句明確寫出全股或分點名稱與期間，不在分點名稱後直接接全股價格造成錯誤歸屬。"
+    "若同一分點同時有20日與70日數值，以這次圖卡對應期間為準；需要比較時分別標明期間。"
+    "不得把以上參考價稱為真實持股成本、實際成交均價、已實現報酬；現價高於參考價只表示價格差距，不證明分點正在獲利。"
+    "參考價本身不能證明支撐、壓力、盤整成本支撐或買盤防守；支撐壓力只能依工具提供的技術價位與結構解讀。"
+    "值缺失時不要拿全股參考價代替分點均價，也不要自行填值。保持原問句的客製化回應及自然接梗，不把這些規則或計算說明逐條寫給使用者。")
 
 
 def build_final_prompt(payload: Dict[str, Any]) -> str:
@@ -2592,6 +2633,8 @@ def build_final_prompt(payload: Dict[str, Any]) -> str:
         sections.append(FINAL_FUTURES_RULES)
     if "get_top_warrant_buy_stocks" in names:
         sections.append(FINAL_RANK_RULES)
+    if names & {"get_spot_chip_summary", "get_spot_branch_flow", "get_spot_event_backtest"}:
+        sections.append(FINAL_SPOT_PRICE_RULES)
     if "get_spot_chip_summary" in names:
         sections.append(FINAL_SPOT_RULES)
     if "get_spot_event_backtest" in names:
@@ -3875,6 +3918,7 @@ class AnswerResult:
     errors: List[str] = field(default_factory=list)   # 這題失敗的工具／Gemini（管理員錯誤通知用）
     followups: List["AnswerResult"] = field(default_factory=list)   # 「兩種一起看」：第二張圖（權證分點籌碼）
     denial_followups: List[str] = field(default_factory=list)       # 「兩種一起看」但缺一邊權限：另送鎖定卡（SPOT／WARRANT）
+    late_ai: Optional[Dict[str, Any]] = field(default=None, repr=False, compare=False)
     timings: Dict[str, float] = field(default_factory=dict)          # 各階段耗時（PERF log 用）
 
 
@@ -4425,8 +4469,8 @@ def module_version_problems() -> List[str]:
             continue
         if name in ("chip_event_backtest", "answer_image"):
             version = getattr(module, "VERSION" if name == "chip_event_backtest" else "CHIP_LAYOUT_VERSION", "未知")
-            if version != "chip-events-year-v9":
-                problems.append(f"{name}.py 版本 {version}，需要 chip-events-year-v9")
+            if version != "chip-events-year-v10":
+                problems.append(f"{name}.py 版本 {version}，需要 chip-events-year-v10")
         missing = [a for a in attrs if not hasattr(module, a)]
         if missing:
             problems.append(f"{name}.py 缺少 {'、'.join(missing)}")
@@ -5001,7 +5045,7 @@ class AceQueryEngine:
         # 快取鍵值用「補完股票之後」的問題，避免 A 使用者的「那它的壓力在哪」拿到 B 使用者的答案；籌碼類型分開快取。
         # 族群追問（「那哪檔最強」）要帶族群名稱與模式，不同族群的同一句追問不能共用答案
         sector = parsed.sector or {}
-        key = "|".join(['現股分點精簡排版v9',compact, ",".join(c for c, _ in parsed.stocks), str(parsed.cost_price or ""), ",".join(parsed.branches),
+        key = "|".join(['現股分點精簡排版v10價格歸屬v1',compact, ",".join(c for c, _ in parsed.stocks), str(parsed.cost_price or ""), ",".join(parsed.branches),
                         "chip=" + parsed.chip,
                         "sector=" + str(sector.get("name") or sector.get("industry") or "") + ":" + str(sector.get("mode") or "")])
         key = self._access_cache_key(key)
@@ -5036,6 +5080,7 @@ class AceQueryEngine:
             with (contextlib.nullcontext() if priority else self._slots):
                 effective = f"{question}（{note}）" if note else question
                 result = self._answer_uncached(effective, started, parsed)
+                result = self._attach_late_ai(result)
             future.set_result(result)
         except BaseException as exc:
             future.set_exception(exc)
@@ -5045,6 +5090,7 @@ class AceQueryEngine:
                 if not priority:
                     self._pending -= 1
                 self._inflight.pop(key, None)
+        self._bind_late_cache(result, key, not getattr(self._request_local, "spot_partial", False))
         # 只快取「資料全部成功、且 Gemini 沒有失敗」的回答，避免限流或逾時訊息被重複送出。
         # 現股歷史還沒補完的整合頁不快取：背景補完後下一題要看到完整 70 日，不能拿到舊的 1/70
         if (result.cacheable and not (self._access() and self._access().simulation)
@@ -5192,7 +5238,7 @@ class AceQueryEngine:
         self._perf_add("spot_prepare", time.perf_counter() - prepare_started)
         complete = [d for d in dates if (statuses.get(d) or {}).get("status") == "complete"]
         # 最新完整交易日變了就換 key，舊答案不會被繼續拿出來；/ace 測試不讀寫正式快取。
-        key = self._access_cache_key(f"spot_events_v9|{code}|{mode}|{complete[-1] if complete else ''}|{len(complete)}|q={stock_banter.answer_question_key(question)}")
+        key = self._access_cache_key(f"spot_events_v10_price_scope_v1|{code}|{mode}|{complete[-1] if complete else ''}|{len(complete)}|q={stock_banter.answer_question_key(question)}")
         if not simulation:
             hit, cached = self._answer_cache.get(key)
             if hit:
@@ -5244,9 +5290,12 @@ class AceQueryEngine:
                          output_tokens=stats.output_tokens, total_tokens=stats.total_tokens,
                          token_source=stats.token_source,
                          errors=[] if llm_ok else ["現股分點 AI 解讀失敗"])
+        result = self._attach_late_ai(result)
         self.log(f"現股籌碼解讀｜{code}｜Gemini {stats.gemini_calls} 次｜成功={bool(ai_card)}")
         full = ((mode == "latest" or report.get("available_days", 0) >= report.get("requested_days", spot_chip.REQUESTED_DAYS))
                 and not (report.get("progress") or {}).get("background"))
+        if full and not simulation:
+            self._bind_late_cache(result, key)
         if full and not simulation and result.cacheable:
             # build_report 已讀過整個窗口的狀態，直接用（原本這裡逐日各查一次 DB）
             complete_now = (list(report["complete_all"]) if "complete_all" in report else
@@ -5254,7 +5303,7 @@ class AceQueryEngine:
                              if (info or {}).get("status") == "complete"])
             complete_now.sort()
             self._answer_cache.set(self._access_cache_key(
-                f"spot_events_v9|{code}|{mode}|{complete_now[-1] if complete_now else ''}|{len(complete_now)}|q={stock_banter.answer_question_key(question)}"), result,
+                f"spot_events_v10_price_scope_v1|{code}|{mode}|{complete_now[-1] if complete_now else ''}|{len(complete_now)}|q={stock_banter.answer_question_key(question)}"), result,
                 self.config.answer_cache_seconds)
         return result
 
@@ -5269,7 +5318,7 @@ class AceQueryEngine:
         def cache_key() -> str:
             statuses = local_market_cache.spot_day_status(code, dates)
             complete = [d for d in dates if (statuses.get(d) or {}).get("status") == "complete"]
-            return self._access_cache_key(f"spot_branch_events_v9|{code}|{spot_chip._branch_key(branch)}|"
+            return self._access_cache_key(f"spot_branch_events_v10_price_scope_v1|{code}|{spot_chip._branch_key(branch)}|"
                                           f"{complete[-1] if complete else ''}|{len(complete)}|q={stock_banter.answer_question_key(question)}")
         if not simulation:
             hit, cached = self._answer_cache.get(cache_key())
@@ -5299,7 +5348,7 @@ class AceQueryEngine:
         self._attach_daily_institutional(panel, next((t.data for t in chart_results if t.name == "get_institutional_flow" and t.ok), {}))
         name = name or panel.get("stock_name", "")
         panel['branch_flow']={'branch':flow['branch'],'daily':dict(flow.get('daily') or {})}
-        self.log(f"副圖版本 v9｜{code} {flow['branch']}｜分點柱線={len(panel['branch_flow']['daily'])}日｜法人資料={len(panel.get('institutional') or [])}日｜現股K線標記=0")
+        self.log(f"副圖版本 v10｜{code} {flow['branch']}｜分點柱線={len(panel['branch_flow']['daily'])}日｜法人資料={len(panel.get('institutional') or [])}日｜現股K線標記=0")
         payload = spot_chip.branch_flow_payload(flow, code, name, panel.get("bars") or [])
         payload.pop("est_cost_20d", None)
         results = [tools.ToolResult("get_spot_branch_flow", True, payload)] + [t for t in chart_results if t.ok]
@@ -5327,6 +5376,9 @@ class AceQueryEngine:
             input_tokens=stats.input_tokens, output_tokens=stats.output_tokens,
             total_tokens=stats.total_tokens, token_source=stats.token_source)
         full = report.get("available_days", 0) >= report.get("requested_days", spot_chip.REQUESTED_DAYS)
+        result = self._attach_late_ai(result)
+        if full and not simulation:
+            self._bind_late_cache(result, cache_key())
         if result.cacheable and full and not simulation:
             self._answer_cache.set(cache_key(), result, self.config.answer_cache_seconds)
         return result
@@ -5377,6 +5429,7 @@ class AceQueryEngine:
     def _answer_with_quote_policy(self, question: str, context_key: str = "", on_queue: Optional[Callable[[int], None]] = None,
                is_admin: bool = False, admin_mode: bool = False, access=None, image=None) -> AnswerResult:
         """公開入口：替每一題建立 request_id，蒐集這一題實際 API 使用量。"""
+        self._request_local.late_ai = None
         self._request_local.perf = perf = {}
         permission_started = time.perf_counter()
         try:
@@ -5424,6 +5477,7 @@ class AceQueryEngine:
                                                image=image)
                 except access_policy.AccessDenied as exc:
                     result = self._denied_result(exc)
+            result = self._attach_late_ai(result)
             usage = tools.request_api_usage(request_id, clear=True)
             # 每題的用量寫進本地 SQLite（保留 30 天），「/ace 用量」與負載評估都讀這張表。
             try:
@@ -5448,6 +5502,7 @@ class AceQueryEngine:
             _AI_GATE.allowed = True
             self._request_local.request_id = ""
             self._request_local.access = None
+            self._request_local.late_ai = None
             if access and access.simulation:
                 self.memory.clear(context_key)
 
@@ -6637,7 +6692,7 @@ class AceQueryEngine:
         detailed = bool(re.search(r'明細|詳細|歷史操作|買賣點位|進出點位|第\s*\d+\s*頁|(?:5|10)\s*日回測', question))
         match = re.search(r'第\s*(\d+)\s*頁', question)
         card = chip_event_backtest.branch_card(data, detailed=detailed, page=int(match.group(1)) if match else 1)
-        print(f"🧩 分點排版 v9｜{'詳細明細' if detailed else '精簡主畫面'}｜{data.get('stock_code', '')}｜分點 {len(data.get('spot', {}).get('branches', []))} 家", flush=True)
+        print(f"🧩 分點排版 v10｜{'詳細明細' if detailed else '精簡主畫面'}｜{data.get('stock_code', '')}｜分點 {len(data.get('spot', {}).get('branches', []))} 家", flush=True)
         return card
 
     def _prepare_event_backtest(self, code: str, name: str = "", report=None, branch_name: str = "", question: str = ""):
@@ -6743,9 +6798,52 @@ class AceQueryEngine:
             return None
         return card
 
+    def _attach_late_ai(self, result):
+        local=getattr(self,'_request_local',None)
+        job=getattr(local,'late_ai',None)
+        if local is not None:local.late_ai=None
+        if job and result.panels and not result.as_text and not any(p.get('ai_card') for p in result.panels):
+            return replace(result,late_ai=job)
+        return result
+
+    def _bind_late_cache(self, result, key, eligible=True):
+        job=result.late_ai
+        access=self._access()
+        if job and eligible and not (access and access.simulation) and all(r.ok for r in job['results']):
+            job['targets'].append((key,self.config.answer_cache_seconds))
+
+    def finish_late_ai(self, original, raw):
+        job=original.late_ai
+        if not job or not raw.ok or time.monotonic()>=job['expires']:
+            return None
+        with job['lock']:
+            if 'checked' not in job:
+                self._set_ai_card(None)
+                text,ok=self._finish_compose(job['question'],job['plan'],job['results'],job['payload'],raw,job['rule_answer'])
+                card=self._take_ai_card()
+                job['checked']=(text,card) if ok and card else None
+            checked=job['checked']
+        if not checked:return None
+        text,card=checked
+        if 'AI 解讀暫時無法使用' in original.text:
+            prefix=original.text.split('AI 解讀暫時無法使用',1)[0].strip()
+            if prefix:text=prefix+'\n\n'+text
+        panels=[dict(p) for p in original.panels if not p.get('ai_card')]
+        panels.append({'ai_card':card})
+        return replace(original,text=text,panels=panels,late_ai=None,
+            cacheable=bool(job['targets']),input_tokens=original.input_tokens+raw.input_tokens,
+            output_tokens=original.output_tokens+raw.output_tokens,total_tokens=original.total_tokens+raw.total_tokens,
+            token_source=raw.token_source,errors=[e for e in original.errors if not e.startswith(('Gemini','現股分點 AI'))])
+
+    def cache_late_ai(self, original, completed):
+        for key,seconds in original.late_ai.get('targets',[]):
+            hit,_=self._answer_cache.get(key)
+            if not hit:self._answer_cache.set(key,completed,seconds)
+
     def _compose(self, question: str, plan: QueryPlan, results: List[tools.ToolResult], stats: AnswerStats) -> Tuple[str, bool]:
         """回傳 (回答文字, 是否可快取)；AI 解讀卡另存在 _request_local.ai_card，由 _answer_uncached 取走。"""
         self._set_ai_card(None)
+        if getattr(self,'_request_local',None) is not None:self._request_local.late_ai = None
         # 有圖卡的回答（K 線、評分卡、分點標註、法人卡…）：AI 不在時文字只留「圖上沒有的」（新聞、台指期、取不到的資料），
         # 不再把圖上數字整段重打一次（圖片變很長、內容跟圖重複）
         brief = plan.route in CARD_ROUTES or plan.pattern
@@ -6762,6 +6860,13 @@ class AceQueryEngine:
         self._perf_add("gemini", time.perf_counter() - gemini_started)
         stats.record_gemini(result)
         if not result.ok:
+            if getattr(result, "late_future", None) is not None:
+                import copy
+                self._request_local.late_ai = dict(future=result.late_future,
+                    expires=time.monotonic()+300, question=question, plan=copy.deepcopy(plan),
+                    results=copy.deepcopy(results), payload=copy.deepcopy(payload), rule_answer=rule_answer,
+                    targets=[], lock=threading.Lock())
+                self.log("AI 晚到補圖已保留｜最長再等300秒｜同一次請求，不再次計會員次數")
             self.log(f"最終回答 Gemini 失敗：{result.error}")
             if getattr(_AI_GATE, "blocked", False):
                 prefix = "今天的 AI 解讀次數已用完；圖表與數據照常，AI 解讀下午 4 點恢復。"
@@ -6770,6 +6875,10 @@ class AceQueryEngine:
             else:
                 prefix = "AI 解讀暫時無法使用" + ("；上方圖表與評分卡的資料照常可參考。" if brief else "，以下先提供系統整理的資料。")
             return f"{prefix}\n\n{rule_answer}", False
+        return AceQueryEngine._finish_compose(self, question, plan, results, payload, result, rule_answer)
+
+    def _finish_compose(self, question, plan, results, payload, result, rule_answer):
+        """Validate normal and late AI output identically; never call Gemini again."""
         facts = FactSheet(question, results, payload)
         card = parse_ai_card(result.text)
         if card is not None:
@@ -6828,6 +6937,43 @@ class AceQueryEngine:
 # ============================================================
 # Discord Bot
 # ============================================================
+
+_LATE_IMAGE_TASKS = set()
+
+
+async def replace_late_ai_image(engine, original, target, make_files, no_mentions):
+    """Edit exactly the original message; no send/reply fallback, quota or notification."""
+    job=original.late_ai
+    if not job or target is None:return False
+    files=[]
+    try:
+        remaining=job['expires']-time.monotonic()
+        if remaining<=0:return False
+        raw=await asyncio.wait_for(asyncio.shield(asyncio.wrap_future(job['future'])),timeout=remaining)
+        completed=await asyncio.to_thread(engine.finish_late_ai,original,raw)
+        if completed is None:return False
+        files=await make_files(completed)
+        if time.monotonic()>=job['expires']:return False
+        await target.edit(content=None,attachments=files,allowed_mentions=no_mentions)
+        engine.cache_late_ai(original,completed)
+        engine.log(f"AI 晚到補圖完成｜request_id={original.request_id}｜已覆蓋原訊息，沒有另發通知")
+        return True
+    except asyncio.TimeoutError:
+        engine.log(f"AI 晚到補圖停止｜request_id={original.request_id}｜背景等候已逾時")
+    except Exception as exc:
+        engine.log(f"AI 晚到補圖略過｜request_id={original.request_id}｜{type(exc).__name__}: {exc}")
+    finally:
+        for file in files:file.close()
+    return False
+
+
+def schedule_late_ai_image(engine, original, target, make_files, no_mentions):
+    if not original.late_ai or target is None:return None
+    task=asyncio.create_task(replace_late_ai_image(engine,original,target,make_files,no_mentions))
+    _LATE_IMAGE_TASKS.add(task)
+    task.add_done_callback(_LATE_IMAGE_TASKS.discard)
+    return task
+
 
 PUBLIC_ANSWER_ROUTES = frozenset(("planner", "answer_cache"))
 # /ace 管理指令字眼：含內部狀態、路徑、快取、筆數、log 的回覆一開始就 ephemeral defer。
@@ -7589,7 +7735,7 @@ def run_discord_bot(config: BotConfig) -> None:
     no_mentions = discord.AllowedMentions.none()
     prefix = config.command_prefix.lower()
 
-    async def image_files(question: str, text: str, panels=None, guild=None, weekly=None):
+    async def image_files(question: str, text: str, panels=None, guild=None, weekly=None, *, strict=False):
         """回傳 discord.File 清單；本週精選會拆成多張（每張最多 3 檔股票）。"""
         limit = min(7_500_000, getattr(guild, "filesize_limit", 7_500_000))
         render_started = asyncio.get_running_loop().time()
@@ -7599,6 +7745,7 @@ def run_discord_bot(config: BotConfig) -> None:
             else:
                 images = [await asyncio.to_thread(answer_image.make_attachment, question, text, panels, max_bytes=limit)]
         except Exception as exc:
+            if strict:raise
             print(f"⚠️ 圖片產生失敗：{type(exc).__name__}: {exc}", flush=True)
             images = [await asyncio.to_thread(answer_image.make_attachment, "暫時無法產生回答",
                       "圖片產生失敗或內容超過附件容量，請縮小查詢範圍後再試。", max_bytes=limit)]
@@ -7608,6 +7755,11 @@ def run_discord_bot(config: BotConfig) -> None:
             discord.File(io.BytesIO(data), filename=f"ace-answer-{i}.{extension}" if len(images) > 1 else f"ace-answer.{extension}")
             for i, (data, extension) in enumerate(images, 1)
         ]
+
+    def schedule_refresh(original, target, title, guild):
+        async def make_files(completed):
+            return await image_files(title,with_context_note(completed),panels_with_context(completed),guild,strict=True)
+        return schedule_late_ai_image(engine,original,target,make_files,no_mentions)
 
     async def reply_image(message, question: str, text: str, panels=None, *, pending=None, weekly=None):
         files = await image_files(question, text, panels, message.guild, weekly)
@@ -7709,7 +7861,9 @@ def run_discord_bot(config: BotConfig) -> None:
             # 只上傳部分檔案：新舊版混用，某些功能會在執行時才壞掉（09-27 AI 回答失敗就是這樣）
             notify_admin("❌ 檔案版本不一致，請把 ace_ai 資料夾整批重新上傳：" + "；".join(stale))
         else:
-            print("✅ 必要函式與回測排版版本檢查通過｜chip-events-year-v9", flush=True)
+            print("✅ 必要函式與回測排版版本檢查通過｜chip-events-year-v10", flush=True)
+        print("✅ AI晚到補圖｜late-image-v1｜最多再等300秒｜只覆蓋原訊息", flush=True)
+        print("✅ 現股AI價格解讀｜price-scope-v1｜全股與分點參考價分開", flush=True)
         print(f"📦 測試排版｜回測={getattr(chip_event_backtest, 'VERSION', '未知')}｜圖片={getattr(answer_image, 'CHIP_LAYOUT_VERSION', '未知')}｜Bot={Path(__file__).resolve()}", flush=True)
 
     async def handle_question(interaction: "discord.Interaction", question: str, admin_mode: bool,
@@ -7803,9 +7957,9 @@ def run_discord_bot(config: BotConfig) -> None:
             if followup:
                 await interaction.delete_original_response()
             if as_text:
-                await interaction_text(interaction, text, ephemeral=True, followup=followup)
+                return await interaction_text(interaction, text, ephemeral=True, followup=followup)
             else:
-                await interaction_image(interaction, title, text, panels, ephemeral=True, followup=followup)
+                return await interaction_image(interaction, title, text, panels, ephemeral=True, followup=followup)
         state = guard.enter(user_id)
         if state == "reject":
             await interaction_image(interaction, "請稍候", "你已經有一題在等候，請等上一題回覆後再問下一題。", ephemeral=True)
@@ -7868,17 +8022,20 @@ def run_discord_bot(config: BotConfig) -> None:
             image_question = result.image_title or image_question
             upload_started = asyncio.get_running_loop().time()
             render_seconds.set(0.0)
+            sent = None
             if not ephemeral and not is_public_answer(result):
-                await send_private(image_question, with_context_note(result), result.panels, result.as_text)
+                sent = await send_private(image_question, with_context_note(result), result.panels, result.as_text)
             elif result.as_text:
                 await interaction_text(interaction, with_context_note(result), ephemeral=ephemeral)
             else:
-                await interaction_image(interaction, image_question, with_context_note(result), panels_with_context(result), ephemeral=ephemeral,
+                sent = await interaction_image(interaction, image_question, with_context_note(result), panels_with_context(result), ephemeral=ephemeral,
                                         weekly=result.weekly if result.layout == "weekly_pick" else None)
+            schedule_refresh(result,sent,image_question,interaction.guild)
             for extra in result.followups:
                 # 「兩種一起看」：第 1 張現股分點籌碼、第 2 張權證分點籌碼，不硬塞成一張超長圖。
-                await interaction_image(interaction, extra.image_title or question, with_context_note(extra),
+                extra_sent = await interaction_image(interaction, extra.image_title or question, with_context_note(extra),
                                         panels_with_context(extra), ephemeral=ephemeral, followup=True)
+                schedule_refresh(extra,extra_sent,extra.image_title or question,interaction.guild)
             if member_usage_stats.successful(result):
                 await record_member_usage('success', result.route, result)
             elif re.search(r'error|fail', result.route):
@@ -8093,8 +8250,9 @@ def run_discord_bot(config: BotConfig) -> None:
             image_question = result.image_title or image_question
             upload_started = asyncio.get_running_loop().time()
             render_seconds.set(0.0)
-            await reply_image(message, image_question, with_context_note(result), result.panels, pending=pending,
+            sent = await reply_image(message, image_question, with_context_note(result), result.panels, pending=pending,
                               weekly=result.weekly if result.layout == "weekly_pick" else None)
+            schedule_refresh(result,sent,image_question,message.guild)
             upload_elapsed = asyncio.get_running_loop().time() - upload_started
             total_elapsed = asyncio.get_running_loop().time() - request_started
             render_elapsed = render_seconds.get()

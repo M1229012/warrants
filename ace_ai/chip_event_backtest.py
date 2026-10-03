@@ -10,7 +10,7 @@ from statistics import median
 from collections import defaultdict
 
 HORIZONS = (5, 10, 20)
-VERSION = 'chip-events-year-v9'
+VERSION = 'chip-events-year-v10'
 
 
 def finite(value):
@@ -278,21 +278,25 @@ def _brief_spot_card(payload):
     done=int(ready['resolved_days']);wanted=int(ready['requested_days'])
     progress=f'近70日 {done}/{wanted}日已確認'+('（補齊中）' if done<wanted else '')
     history='歷史 '+data.get('history_start','')+'～'+data.get('history_end','')
-    sections.append({'type':'spot_meta','text':progress+'  ｜  '+history})
+    metadata=progress+'  ｜  '+history
     for b in data.get('branches',[]):
         m=b['metrics']['20'];n=int(m['samples'])
         history=(f'20日成熟波段 {n}筆  ・  20日收盤達3% {pct(m["reach_3_pct"])}  ・  報酬中位數 {pct(m["median_return_pct"],True)}  ・  最深跌幅 {pct(m["median_entry_depth_pct"],True)}'
                  if n>=5 else f'20日成熟波段 {n}筆，樣本不足；逐筆結果請查分點明細' if n else '尚無完成20日觀察的波段')
         sections.append({'type':'spot_brief','branch':b['branch'],'status':b['status'],
             'badge':'疑似隔日沖' if b.get('overnight',{}).get('recent_match') else '',
-            'net_5':b['observed_net_5'],'history':history,'samples':n})
+            'net_5':b['observed_net_5'],'history':history,'samples':n,
+            'metrics':[{'label':'成熟波段','value':f'{n}筆'},
+                       {'label':'20日收盤達3%','value':pct(m['reach_3_pct']),'tone':'accent'},
+                       {'label':'報酬中位數','value':pct(m['median_return_pct'],True),'tone':'signed'},
+                       {'label':'最深跌幅中位數','value':pct(m['median_entry_depth_pct'],True),'tone':'signed'}] if n>=5 else []})
     if not data.get('branches'):sections.append({'type':'paragraph','text':'目前沒有可顯示的分點動向'})
     base=data.get('background',{})
-    sections.append({'type':'spot_meta','text':'同期20日收盤參考：達3% '+pct(base.get('background_reach_3_pct'))
-        if base.get('background_samples',0)>=40 else '同期20日收盤參考：資料不足'})
+    metadata+='  ｜  '+('同期20日收盤達3% '+pct(base.get('background_reach_3_pct'))
+        if base.get('background_samples',0)>=40 else '同期參考不足')
     sections.extend(_margin_sections(payload))
     return {'branch':f"{payload['stock_code']} {payload['stock_name']}｜分點動向",'label':data.get('period_end',''),
-            'tags':[],'clean_display':True,'layout_version':VERSION,'sections':sections}
+            'tags':[],'clean_display':True,'compact_meta':metadata,'layout_version':VERSION,'sections':sections}
 
 
 def branch_card(payload,detailed=False,page=1):
