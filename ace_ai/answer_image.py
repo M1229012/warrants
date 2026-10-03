@@ -60,7 +60,7 @@ TABLE_HEAD_H = 34
 CENTER_WATERMARK_TEXT = '股市艾斯\n台股DC討論群'
 CENTER_WATERMARK_COLOR = '#1D2B44'
 CENTER_WATERMARK_ALPHA = 0.06
-CHIP_LAYOUT_VERSION = 'chip-events-year-v4'
+CHIP_LAYOUT_VERSION = 'chip-events-year-v5'
 CENTER_WATERMARK_FONT_SIZE = 200
 CENTER_WATERMARK_ROTATION = 18
 
@@ -2462,11 +2462,41 @@ def _tone_color(text: str, tone: str) -> str:
     return {'up': UP, 'down': DOWN}.get(tone, INK)
 
 
+def _wrap_weekly_note(text: str, size: int, width: float, keep_words=()) -> list[str]:
+    """Weekly paragraphs only: keep the article's tracked branch names together."""
+    words = sorted({str(w) for w in keep_words if str(w)}, key=len, reverse=True)
+    if not words:
+        return wrap(text, size, width)
+    pattern = '|'.join(re.escape(w) for w in words) + r'|[A-Za-z0-9][A-Za-z0-9.,/%+-]*|.'
+    f = font(size)
+    lines = []
+    for paragraph in clean(text).splitlines():
+        current = ''
+        for token in re.findall(pattern, paragraph):
+            units = [token] if f.getlength(token) <= width else list(token)
+            for unit in units:
+                if current and f.getlength(current + unit) > width:
+                    lines.append(current)
+                    current = ''
+                current += unit
+        if current:
+            lines.append(current)
+    return lines or ['']
+
+
 def _branch_section(draw, x0: float, x1: float, y: float, section: dict, dry: bool) -> int:
     """分點圖卡的單一區塊；回傳高度。dry=True 只算高度。"""
     kind = section.get('type')
     width = x1 - x0
     if kind == 'heading':
+        if section.get('weekly_note'):
+            offset = 18 if section.get('divider') else 0
+            if not dry:
+                if offset:
+                    draw.line((x0, y + 1, x1, y + 1), fill=LINE, width=1)
+                draw.rectangle((x0, y + offset + 7, x0 + 5, y + offset + 34), fill=ACCENT)
+                text_at(draw, (x0 + 18, y + offset), section['text'], 28, INK, True)
+            return 54 + offset
         if not dry:
             draw.rectangle((x0, y + 8, x0 + 5, y + 36), fill=ACCENT)
             text_at(draw, (x0 + 18, y + 4), section['text'], 27, INK, True)
@@ -2525,6 +2555,33 @@ def _branch_section(draw, x0: float, x1: float, y: float, section: dict, dry: bo
                 value, size = fit(item['value'], 38, tile_w - 36, True, 22)
                 text_at(draw, (tx + 20, y + 50), value, size, _tone_color(item['value'], item.get('tone', 'ink')), True)
         return tile_h + 22
+    if kind == 'stats' and section.get('presentation') == 'inline':
+        # Weekly article only: fit label/value pairs on a line; never stretch one value into a full-width tile.
+        cursor, row, total = x0, 0, 0
+        for item in section.get('items') or []:
+            label, value = str(item.get('label', '')), str(item.get('value', ''))
+            label_width = font(24).getlength(label)
+            item_width = label_width + 14 + font(26, True).getlength(value)
+            if item_width > width:
+                if cursor != x0:
+                    row += 46
+                lines = wrap(label + '　' + value, 25, width)
+                if not dry:
+                    for i, line in enumerate(lines):
+                        text_at(draw, (x0, y + row + i * 40), line, 25, INK)
+                row += len(lines) * 40
+                cursor = x0
+                total = max(total, row)
+                continue
+            if cursor != x0 and cursor + item_width > x1:
+                row += 46
+                cursor = x0
+            if not dry:
+                text_at(draw, (cursor, y + row + 2), label, 24, MUTED)
+                text_at(draw, (cursor + label_width + 14, y + row), value, 26, ACCENT, True)
+            cursor += item_width + 40
+            total = max(total, row + 40)
+        return total + 12 if total else 0
     if kind == 'stats':
         # 並排小格（和 K 線卡上方 MA 小格同風格）：上面小字名稱、下面粗體數值。
         # 每列最多 3 格；名稱、數值太長就換行（不截斷），同一列的格子一起長高。
@@ -2593,12 +2650,16 @@ def _branch_section(draw, x0: float, x1: float, y: float, section: dict, dry: bo
         accent = section.get('accent', ('勝率',))
         # 每格先縮字、放不下就換行（不截斷）；一列的高度取該列最多行的那一格
         layout = []
-        for row in rows:
+        row_badges = section.get('row_badges') or []
+        for r, row in enumerate(rows):
             bold = str(row[0]).startswith('全部')
             cells = []
             for c, cell in enumerate(row):
                 strong = c == 0 or bold or (c < len(columns) and columns[c] in accent)
                 room = (edges[0] - x0 if c == 0 else edges[c] - edges[c - 1]) - 26
+                badge = str(row_badges[r]) if c == 0 and r < len(row_badges) else ''
+                if badge:
+                    room -= font(16, True).getlength(badge) + 26
                 base_size = 18 if columns[c] == '目前動向' else 24 if c == 0 else 22
                 lines, size = wrap_cell(str(cell), base_size, max(40, room), strong, minimum=17, max_lines=6)
                 cells.append((lines, size, strong))
@@ -2619,6 +2680,14 @@ def _branch_section(draw, x0: float, x1: float, y: float, section: dict, dry: bo
                     for i, line in enumerate(lines):
                         draw.text((cx, top + i * 28), line, font=font(size, strong),
                                   fill=color, anchor='lm' if c == 0 else 'rm')
+                badge = str(row_badges[r]) if r < len(row_badges) else ''
+                if badge and cells:
+                    lines, size, strong = cells[0]
+                    bx = x0 + 18 + max(font(size, strong).getlength(line) for line in lines) + 10
+                    bw = font(16, True).getlength(badge) + 16
+                    by = ry + height / 2 - 12
+                    draw.rounded_rectangle((bx, by, bx + bw, by + 24), radius=6, fill=ACCENT_BG)
+                    draw.text((bx + 8, by + 12), badge, font=font(16, True), fill=ACCENT, anchor='lm')
                 draw.line((x0, ry + height, x1, ry + height), fill=GRID)
                 ry += height
         return head_h + sum(h for h, _ in layout) + 20
@@ -2772,11 +2841,13 @@ def _branch_section(draw, x0: float, x1: float, y: float, section: dict, dry: bo
             total += h + 10
         return total + 8
     if kind == 'paragraph':
-        lines = wrap(section.get('text', ''), 25, width, False)
+        size, line_height = (28, 44) if section.get('weekly_note') else (25, 38)
+        lines = (_wrap_weekly_note(section.get('text', ''), size, width, section.get('keep_words', ()))
+                 if section.get('weekly_note') else wrap(section.get('text', ''), size, width, False))
         if not dry:
             for i, line in enumerate(lines):
-                text_at(draw, (x0, y + i * 38), line, 25, INK)
-        return len(lines) * 38 + 14
+                text_at(draw, (x0, y + i * line_height), line, size, INK)
+        return len(lines) * line_height + 14
     if kind == 'badge':
         if not dry:
             w = font(20, True).getlength(section['text']) + 32

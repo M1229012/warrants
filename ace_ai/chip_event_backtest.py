@@ -10,7 +10,7 @@ from statistics import median
 from collections import defaultdict
 
 HORIZONS = (5, 10, 20)
-VERSION = 'chip-events-year-v4'
+VERSION = 'chip-events-year-v5'
 
 
 def finite(value):
@@ -168,6 +168,7 @@ def branch_study(dates,complete_dates,rows,prices,branch_name='',action_dates=()
         is_active=active(b)
         status='累積・近期調節' if is_active and latest is not None and latest<0 else '持續買進' if is_active else '近期調節' if net5<0 else '近期買超' if net5>0 else '近期未上榜'
         overnight=overnight_study(b,daily,dates,complete,prices,actions)
+        overnight['recent_match'] = overnight['label']=='疑似隔日沖' and any(q['sell_date'] in window for q in overnight['pairs'])
         studied.append({'branch':b,'active_now':is_active,'status':status,'latest_net':latest,
             'buy_days_5':sum(daily[d].get(b,0)>0 for d in window),'buy_days_70':sum(daily[d].get(b,0)>0 for d in observation),
             'observed_net_5':round(net5,1),'observed_net_20':round(sum(daily[d].get(b,0) for d in dates[-20:]),1),
@@ -273,48 +274,45 @@ def _margin_sections(payload, detailed=False):
 
 def branch_card(payload,detailed=False,page=1):
     data=payload['spot'];branches=data['branches'];sections=[]
-    flows=[];performance=[];small=[];overnight=[]
+    flows=[];performance=[];small=[];badges=[]
+    ready=data.get('readiness') or {'resolved_days':data.get('complete_days',0),'requested_days':data.get('requested_days',70)}
+    done=int(ready['resolved_days']);wanted=int(ready['requested_days'])
+    sections.append({'type':'paragraph','text':f'近70日資料：{done}/{wanted}日已確認'+('｜補齊中' if done<wanted else '｜本期已齊')})
     for b in branches:
         m=b['metrics']['20'];cost=f"{b['estimated_buy_cost']:,.2f}" if b['estimated_buy_cost'] is not None else '—'
-        status=b['status']+('・疑似隔日沖' if b.get('overnight',{}).get('label')=='疑似隔日沖' else '')
+        status=b['status']
+        badges.append('疑似隔日沖' if b.get('overnight',{}).get('recent_match') else '')
         flows.append([b['branch'],status,f"{b['observed_net_5']:+,.0f}",f"{b['observed_net_70']:+,.0f}",cost,pct(b['estimated_return_pct'],True)])
         if m['samples']>=5:
             performance.append([b['branch'],str(m['samples'])+'筆',pct(m['median_return_pct'],True),pct(m['reach_3_pct']),pct(m['reach_5_pct']),pct(m['median_entry_depth_pct'],True)])
         elif m['samples']:
             small.append([b['branch'],str(m['samples'])+'筆', '｜'.join(e['signal_date'][5:]+' '+pct(e['return_pct'],True) for e in m['recent_events'])])
-        daytrade=b.get('overnight',{})
-        if daytrade.get('pairs'):
-            pair=daytrade['pairs'][-1]
-            overnight.append([b['branch'],str(daytrade['checked_pairs'])+'筆',pct(daytrade['reverse_rate_pct']) if daytrade['checked_pairs']>=5 else '少量紀錄',
-                pair['buy_date'][5:]+f" +{pair['buy_lots']:,.0f}",pair['sell_date'][5:]+f" -{pair['sell_lots']:,.0f}"])
     if flows:
         sections+=[{'type':'heading','text':'近期動向｜淨買賣超：張'},
             {'type':'table','columns':['券商分點','目前動向','5日淨超','70日淨超','估計均價','現價相對估均價'],
-             'widths':[.22,.16,.12,.13,.15,.22],'signed':['5日淨超','70日淨超','現價相對估均價'],'rows':flows}]
+             'widths':[.28,.12,.10,.12,.14,.24],'signed':['5日淨超','70日淨超','現價相對估均價'],'rows':flows,'row_badges':badges}]
     else:sections.append({'type':'paragraph','text':'目前沒有可顯示的分點動向'})
     if performance or small:
-        sections.append({'type':'paragraph','text':'歷史涵蓋｜'+data.get('history_start','')+'～'+data.get('history_end','')})
+        sections.append({'type':'paragraph','text':'歷史區間｜'+data.get('history_start','')+'～'+data.get('history_end','')+f"｜已確認{data.get('history_complete_days',0)}日"})
     if performance:
-        sections+=[{'type':'heading','text':'歷史表現｜波段成立後20日'},
-            {'type':'table','columns':['券商分點','成熟波段數','報酬中位數','達3%比例','達5%比例','最深跌幅中位數'],
-             'widths':[.22,.13,.17,.13,.13,.22],'signed':['報酬中位數','最深跌幅中位數'],'accent':['達3%比例','達5%比例'],'rows':performance}]
+        sections+=[{'type':'heading','text':'歷史表現｜次日開盤至第20個交易日收盤'},
+            {'type':'table','columns':['券商分點','成熟波段數','收盤報酬中位數','20日達3%','20日達5%','最深跌幅中位數'],
+             'widths':[.22,.13,.17,.13,.13,.22],'signed':['收盤報酬中位數','最深跌幅中位數'],'accent':['20日達3%','20日達5%'],'rows':performance}]
     if small:
-        sections+=[{'type':'heading','text':'少量歷史紀錄｜波段成立後20日'},
-            {'type':'table','columns':['券商分點','成熟波段數','逐筆報酬'],'widths':[.24,.13,.63],'rows':small}]
-    if not performance and not small:sections.append({'type':'paragraph','text':'歷史表現：尚無成熟波段'})
+        sections.append({'type':'paragraph','text':f'{len(small)}家分點僅有1～4筆成熟波段，逐筆結果請查分點明細'})
+    if not performance and not small:sections.append({'type':'paragraph','text':'歷史表現：尚無完成20日觀察的波段'})
     base=data.get('background',{})
     sections.append({'type':'paragraph','text':
-        '同期股價參考｜達3% '+pct(base.get('background_reach_3_pct'))+'・達5% '+pct(base.get('background_reach_5_pct'))
+        '同期20日收盤參考｜達3% '+pct(base.get('background_reach_3_pct'))+'・達5% '+pct(base.get('background_reach_5_pct'))
         if base.get('background_samples',0)>=40 else '同期股價參考：資料不足'})
-    if overnight:
-        sections+=[{'type':'heading','text':'隔日反向紀錄'},
-            {'type':'table','columns':['券商分點','可核對筆數','隔日轉賣比例','最近買超','隔日賣超'],
-             'widths':[.25,.13,.18,.22,.22],'rows':overnight}]
     sections.extend(_margin_sections(payload,detailed))
     if detailed:
         for b in branches:
             sections+=[{'type':'heading','text':b['branch']+'｜各期結果'},metric_table(b['metrics'])]
             m=b['metrics']['20']
+            if 0<m['samples']<5:
+                sections.append({'type':'table','columns':['事件成立','20日收盤報酬'],'widths':[.45,.55],
+                    'signed':['20日收盤報酬'],'rows':[[e['signal_date'],pct(e['return_pct'],True)] for e in m['recent_events']]})
             if m.get('excluded_count'):
                 labels={'open_at_verified_limit':'開盤觸及漲停，成交可行性未確認','unverified_price':'價格還原未核實','missing_signal_price':'缺少事件日價格'}
                 sections.append({'type':'table','columns':['排除事件日期','原因'],'widths':[.25,.75],
@@ -409,6 +407,8 @@ def _prepare_inner(code, name='', as_of='', report=None, allow_margin=False, bra
               'version': VERSION, 'spot': branch_study(dates, complete, rows, prices, branch_name, action_dates),
               'price_period_start': min(prices), 'price_period_end': max(prices),
               'price_basis': '已核實股數還原收盤OHLC；不含盤中棒；現金股利不計入報酬'}
+    result['spot']['readiness']={'resolved_days':report.get('resolved_days',len(report.get('complete_dates',[]))),
+        'requested_days':report.get('requested_days',70)}
     if allow_margin:
         try:
             margin = margin_study(load_margin_records(code, list(prices)), prices, action_dates)
