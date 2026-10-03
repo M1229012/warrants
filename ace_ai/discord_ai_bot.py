@@ -4425,8 +4425,8 @@ def module_version_problems() -> List[str]:
             continue
         if name in ("chip_event_backtest", "answer_image"):
             version = getattr(module, "VERSION" if name == "chip_event_backtest" else "CHIP_LAYOUT_VERSION", "未知")
-            if version != "chip-events-year-v5":
-                problems.append(f"{name}.py 版本 {version}，需要 chip-events-year-v5")
+            if version != "chip-events-year-v7":
+                problems.append(f"{name}.py 版本 {version}，需要 chip-events-year-v7")
         missing = [a for a in attrs if not hasattr(module, a)]
         if missing:
             problems.append(f"{name}.py 缺少 {'、'.join(missing)}")
@@ -5192,7 +5192,7 @@ class AceQueryEngine:
         self._perf_add("spot_prepare", time.perf_counter() - prepare_started)
         complete = [d for d in dates if (statuses.get(d) or {}).get("status") == "complete"]
         # 最新完整交易日變了就換 key，舊答案不會被繼續拿出來；/ace 測試不讀寫正式快取。
-        key = self._access_cache_key(f"spot_events_v4|{code}|{mode}|{complete[-1] if complete else ''}|{len(complete)}|q={stock_banter.answer_question_key(question)}")
+        key = self._access_cache_key(f"spot_events_v7|{code}|{mode}|{complete[-1] if complete else ''}|{len(complete)}|q={stock_banter.answer_question_key(question)}")
         if not simulation:
             hit, cached = self._answer_cache.get(key)
             if hit:
@@ -5254,7 +5254,7 @@ class AceQueryEngine:
                              if (info or {}).get("status") == "complete"])
             complete_now.sort()
             self._answer_cache.set(self._access_cache_key(
-                f"spot_events_v4|{code}|{mode}|{complete_now[-1] if complete_now else ''}|{len(complete_now)}|q={stock_banter.answer_question_key(question)}"), result,
+                f"spot_events_v7|{code}|{mode}|{complete_now[-1] if complete_now else ''}|{len(complete_now)}|q={stock_banter.answer_question_key(question)}"), result,
                 self.config.answer_cache_seconds)
         return result
 
@@ -5269,7 +5269,7 @@ class AceQueryEngine:
         def cache_key() -> str:
             statuses = local_market_cache.spot_day_status(code, dates)
             complete = [d for d in dates if (statuses.get(d) or {}).get("status") == "complete"]
-            return self._access_cache_key(f"spot_branch_events_v4|{code}|{spot_chip._branch_key(branch)}|"
+            return self._access_cache_key(f"spot_branch_events_v7|{code}|{spot_chip._branch_key(branch)}|"
                                           f"{complete[-1] if complete else ''}|{len(complete)}|q={stock_banter.answer_question_key(question)}")
         if not simulation:
             hit, cached = self._answer_cache.get(cache_key())
@@ -5298,6 +5298,8 @@ class AceQueryEngine:
         panel["marks"] = {}
         self._attach_daily_institutional(panel, next((t.data for t in chart_results if t.name == "get_institutional_flow" and t.ok), {}))
         name = name or panel.get("stock_name", "")
+        panel['branch_flow']={'branch':flow['branch'],'daily':dict(flow.get('daily') or {})}
+        self.log(f"副圖版本 v7｜{code} {flow['branch']}｜分點柱線={len(panel['branch_flow']['daily'])}日｜法人資料={len(panel.get('institutional') or [])}日｜現股K線標記=0")
         payload = spot_chip.branch_flow_payload(flow, code, name, panel.get("bars") or [])
         payload.pop("est_cost_20d", None)
         results = [tools.ToolResult("get_spot_branch_flow", True, payload)] + [t for t in chart_results if t.ok]
@@ -6613,11 +6615,19 @@ class AceQueryEngine:
         if rows:
             panel['institutional'] = rows
             panel['institutional_daily_only'] = True
+            panel['institutional_cumulative_separate'] = True
 
     @staticmethod
     def _attach_observed_marks(panel, data, question, branch=''):
         finance = bool(re.search(r'融資.*(?:點位|明細|進出|買賣)', question))
-        marks = chip_event_backtest.event_marks(data, panel.get('bars') or [], branch, finance)
+        if branch:
+            scoped=next((b for b in data.get('spot',{}).get('branches',[]) if b.get('branch')==branch),None)
+            if scoped:
+                panel['branch_flow']={'branch':branch,'daily':{r['date']:r['net'] for r in scoped.get('records',[])}}
+        # Daily spot trading belongs in the subchart, never in K-line annotation lanes.
+        panel.pop('observed_event_marks', None)
+        data.pop('display_marks', None)
+        marks = chip_event_backtest.event_marks(data, panel.get('bars') or [], '', finance)
         if marks:
             panel['observed_event_marks'] = marks
             data['display_marks'] = marks
@@ -7697,7 +7707,7 @@ def run_discord_bot(config: BotConfig) -> None:
             # 只上傳部分檔案：新舊版混用，某些功能會在執行時才壞掉（09-27 AI 回答失敗就是這樣）
             notify_admin("❌ 檔案版本不一致，請把 ace_ai 資料夾整批重新上傳：" + "；".join(stale))
         else:
-            print("✅ 必要函式與回測排版版本檢查通過｜chip-events-year-v5", flush=True)
+            print("✅ 必要函式與回測排版版本檢查通過｜chip-events-year-v7", flush=True)
         print(f"📦 測試排版｜回測={getattr(chip_event_backtest, 'VERSION', '未知')}｜圖片={getattr(answer_image, 'CHIP_LAYOUT_VERSION', '未知')}｜Bot={Path(__file__).resolve()}", flush=True)
 
     async def handle_question(interaction: "discord.Interaction", question: str, admin_mode: bool,

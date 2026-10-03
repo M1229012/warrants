@@ -10,7 +10,7 @@ from statistics import median
 from collections import defaultdict
 
 HORIZONS = (5, 10, 20)
-VERSION = 'chip-events-year-v5'
+VERSION = 'chip-events-year-v7'
 
 
 def finite(value):
