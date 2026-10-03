@@ -60,7 +60,7 @@ TABLE_HEAD_H = 34
 CENTER_WATERMARK_TEXT = '股市艾斯\n台股DC討論群'
 CENTER_WATERMARK_COLOR = '#1D2B44'
 CENTER_WATERMARK_ALPHA = 0.06
-CHIP_LAYOUT_VERSION = 'chip-events-year-v6'
+CHIP_LAYOUT_VERSION = 'chip-events-year-v8'
 CENTER_WATERMARK_FONT_SIZE = 200
 CENTER_WATERMARK_ROTATION = 18
 
@@ -593,8 +593,6 @@ def _inst_height(panel: dict) -> int:
     if not ((panel.get('institutional') or (panel.get('futures') or {}).get('rows')) and panel.get('bars')):
         return 0
     height = 290 if panel.get('institutional_daily_only') and panel.get('institutional') else INST_BLOCK_H
-    if panel.get('institutional_cumulative_separate') and panel.get('institutional') and panel.get('institutional_focus','') in ('','foreign','invest'):
-        height += INST_CUM_H
     return height - (36 if _retail_height(panel) else 0)   # 下面還有散戶副圖：這張不標日期，收掉日期列的高度
 
 
@@ -657,12 +655,12 @@ def trade_detail_lines(panel):
 
 
 
-def observed_cumulative(values):
+def observed_cumulative(values, carry_missing=False):
     """Sum only observed values; gaps remain gaps rather than zero-trade days."""
     running=0.;result=[]
     for value in values:
         value=_finite(value)
-        if value is None:result.append(None)
+        if value is None:result.append(running if carry_missing else None)
         else:
             running+=value;result.append(running)
     return result
@@ -715,7 +713,7 @@ def draw_institutional_cumulative(draw, top, left, right, px, step, bars, rows, 
 
 def draw_institutional(draw, top: float, left: float, right: float, px, step: float, bars: list, rows: list,
                        focus: str = '', unit: str = '張', title: str = '', cumulative: bool = True,
-                       today_label: str = '今日', extra: str = '', dates: bool = True, block_height: int = INST_BLOCK_H) -> None:
+                       today_label: str = '今日', extra: str = '', dates: bool = True, block_height: int = INST_BLOCK_H, cumulative_keys=()) -> None:
     """法人買賣超（和 K 線同一組日期座標）：每日柱（單一法人＝紅買綠賣；三大法人＝堆疊）＋整段 K 線期間的累積金線。
     右側雙刻度：灰＝每日柱、金＝累積線；下方日期與 K 線對齊。"""
     by_date = {r['date']: r for r in rows}
@@ -723,15 +721,25 @@ def draw_institutional(draw, top: float, left: float, right: float, px, step: fl
     single = len(series) == 1
     title = title or (f'{series[0][1]}買賣超' if single else '三大法人買賣超')
     last = by_date.get(bars[-1]['date']) or (rows[-1] if rows else {})
+    curves=[]
+    for key,label,color in series:
+        if key in cumulative_keys:
+            values=observed_cumulative([by_date.get(b['date'],{}).get(key) for b in bars])
+            curves.append((key,label,color,values))
     if not cumulative:
-        text_at(draw,(left,top+4),title+'｜每日',26,INK,True)
+        text_at(draw,(left,top+4),title+('｜每日柱＋累積線' if curves else '｜每日'),26,INK,True)
         draw.text((right,top+8),'資料 '+str(last.get('date','')),font=font(19),fill=MUTED,anchor='rt')
         third=(right-left)/len(series)
         for j,(key,label,color) in enumerate(series):
             lx=left+j*third
             draw.rectangle((lx,top+47,lx+16,top+63),fill=color)
             text=label+' '+_inst_num(float(last.get(key) or 0),unit)+unit
-            draw.text((lx+25,top+55),text,font=font(22),fill=INK,anchor='lm')
+            curve=next((v for k,_,_,v in curves if k==key),None)
+            if curve is not None:
+                observed=next((v for v in reversed(curve) if v is not None),None)
+                text+='／累積 '+(_inst_num(observed,unit)+unit if observed is not None else '未取得')
+            text,size=fit(text,20,third-30,False,16)
+            draw.text((lx+25,top+55),text,font=font(size),fill=INK,anchor='lm')
         lx=right
     else:
         text_at(draw, (left, top + 6), title, 22, INK, True)
@@ -795,6 +803,13 @@ def draw_institutional(draw, top: float, left: float, right: float, px, step: fl
     if points:
         ex, ey = points[-1]
         draw.ellipse((ex - 5, ey - 5, ex + 5, ey + 5), fill=ACCENT)
+    if curves:
+        line_peak=max([abs(v) for _,_,_,vs in curves for v in vs if v is not None]+[1.])*1.15
+        for key,_,_,values in curves:
+            color='#2467B2' if key=='foreign' else '#C27511'
+            _draw_gapped_line(draw,values,px,lambda v:mid-v/line_peak*half_h,color,3)
+        for sign,yy in ((1,ctop+48),(-1,cbottom-48)):
+            draw.text((right+10,yy),f'{sign*line_peak/1.15:+,.0f}',font=font(16),fill=ACCENT,anchor='lm')
     edge = half_h / 1.15
     for sign, yy in ((1, mid - edge), (-1, mid + edge)):
         text_at(draw, (right + 10, yy - 22 if cumulative else yy - 12), f'{sign * peak / 1.15:+,.0f}', 16, MUTED)
@@ -934,7 +949,7 @@ def draw_branch_flow(draw, top, left, right, px, step, bars, flow):
     """Observed daily net bars plus a visible-window cumulative line; never fill missing days."""
     daily=flow.get('daily') or {}
     values=[_finite(daily.get(str(b['date']).replace('/','-'))) for b in bars]
-    cums=observed_cumulative(values)
+    cums=observed_cumulative(values,carry_missing=True)
     text_at(draw,(left,top+4),str(flow.get('branch',''))+'｜現股買賣超',26,INK,True)
     draw.rectangle((left,top+48,left+9,top+64),fill=UP)
     draw.rectangle((left+9,top+48,left+18,top+64),fill=DOWN)
@@ -1342,11 +1357,9 @@ def draw_chart(draw, y: int, panel: dict) -> None:
                            panel.get('institutional_focus', ''), panel.get('institutional_unit', '張'),
                            cumulative=not panel.get('institutional_daily_only', False),
                            today_label=panel.get('institutional_day', '今日'),
-                           extra=panel.get('institutional_extra', ''), dates=last_sub and not (panel.get('institutional_cumulative_separate') and panel.get('institutional_focus','') in ('','foreign','invest')),
-                           block_height=290 if panel.get('institutional_daily_only') else INST_BLOCK_H)
-        if panel.get('institutional_cumulative_separate'):
-            draw_institutional_cumulative(draw,vbottom+14+290,left,right,px,step,bars,panel['institutional'],
-                panel.get('institutional_focus',''),last_sub,panel.get('institutional_unit','張'))
+                           extra=panel.get('institutional_extra', ''), dates=last_sub,
+                           block_height=290 if panel.get('institutional_daily_only') else INST_BLOCK_H,
+                           cumulative_keys=('foreign','invest') if panel.get('institutional_daily_only') else ())
     elif inst_h:
         draw_futures(draw, vbottom + 14, left, right, px, step, bars, dict(futures, _dates=last_sub))
     retail_h = _retail_height(panel)
@@ -2517,6 +2530,37 @@ def _branch_section(draw, x0: float, x1: float, y: float, section: dict, dry: bo
     """分點圖卡的單一區塊；回傳高度。dry=True 只算高度。"""
     kind = section.get('type')
     width = x1 - x0
+    if kind == 'spot_meta':
+        lines=wrap(section.get('text',''),18,width)
+        if not dry:
+            for i,line in enumerate(lines):text_at(draw,(x0,y+i*27),line,18,'#98A2B3')
+        return len(lines)*27+12
+    if kind == 'spot_brief':
+        lines=wrap(section.get('history',''),22,width-48)
+        height=max(102,60+len(lines)*32+14)
+        if not dry:
+            draw.rounded_rectangle((x0,y,x1,y+height),radius=12,fill='#F8FAFC',outline='#DDE3EB',width=1)
+            value=float(section.get('net_5') or 0)
+            value_text=f'{value:+,.0f} 張';vw=font(30,True).getlength(value_text)
+            right=x1-24;label='近5日淨買賣超';lw=font(20).getlength(label)
+            badges=[section.get('status',''),section.get('badge','')]
+            badges=[str(b) for b in badges if b]
+            tag_w=sum(font(18).getlength(b)+30 for b in badges)
+            name,ns=fit(section.get('branch',''),29,max(120,width-vw-lw-tag_w-110),True,21)
+            text_at(draw,(x0+24,y+14),name,ns,INK,True)
+            tx=x0+24+font(ns,True).getlength(name)+18
+            for tag in badges:
+                tw=font(18).getlength(tag)+22
+                selling='調節' in tag or '賣超' in tag
+                bg,fg=(WARN_BG,WARN_INK) if selling else (GOOD_BG,GOOD_INK)
+                if tag=='疑似隔日沖':bg,fg=ACCENT_BG,ACCENT
+                draw.rounded_rectangle((tx,y+15,tx+tw,y+43),radius=7,fill=bg)
+                draw.text((tx+11,y+29),tag,font=font(18),fill=fg,anchor='lm')
+                tx+=tw+8
+            draw.text((right-vw-18,y+28),label,font=font(20),fill=MUTED,anchor='rm')
+            draw.text((right,y+28),value_text,font=font(30,True),fill=UP if value>0 else DOWN if value<0 else MUTED,anchor='rm')
+            for i,line in enumerate(lines):text_at(draw,(x0+24,y+60+i*32),line,22,INK if section.get('samples',0)>=5 else MUTED)
+        return height+16
     if kind == 'heading':
         if section.get('weekly_note'):
             offset = 18 if section.get('divider') else 0
