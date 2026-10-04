@@ -157,7 +157,7 @@ def report(question, guild_id, excluded=()):
         conn.executemany('INSERT OR IGNORE INTO member_usage_admins VALUES (?,?)',
                          [(str(guild_id), str(uid)) for uid in excluded])
         started = conn.execute("SELECT value FROM member_usage_meta WHERE key='started'").fetchone()[0]
-        valid="u.guild_id=? AND NOT EXISTS (SELECT 1 FROM member_usage_admins a WHERE a.guild_id=u.guild_id AND a.user_id=u.user_id)"
+        valid="u.guild_id GLOB ? AND NOT EXISTS (SELECT 1 FROM member_usage_admins a WHERE a.user_id=u.user_id)"
         rows=conn.execute(f"SELECT u.user_id,u.outcome,u.category,COUNT(*),COUNT(DISTINCT u.day),MAX(u.day) FROM member_usage u WHERE {valid} AND u.day BETWEEN ? AND ? GROUP BY u.user_id,u.outcome,u.category",(str(guild_id),start,today.isoformat())).fetchall()
         first=dict(conn.execute(f"SELECT u.user_id,MIN(u.day) FROM member_usage u WHERE {valid} AND u.outcome='success' AND u.day<=? GROUP BY u.user_id",(str(guild_id),today.isoformat())).fetchall())
         active=dict(conn.execute(f"SELECT u.user_id,COUNT(DISTINCT u.day) FROM member_usage u WHERE {valid} AND u.outcome='success' AND u.day BETWEEN ? AND ? GROUP BY u.user_id",(str(guild_id),start,today.isoformat())).fetchall())
@@ -203,7 +203,7 @@ def stock_report(match,guild_id,excluded,start,today):
         _init(conn)
         conn.executemany('INSERT OR IGNORE INTO member_usage_admins VALUES (?,?)',[(str(guild_id),str(uid)) for uid in excluded])
         since=conn.execute("SELECT value FROM member_usage_meta WHERE key='stock_started'").fetchone()[0][:10]
-        valid="u.guild_id=? AND u.outcome='success' AND u.day BETWEEN ? AND ? AND NOT EXISTS (SELECT 1 FROM member_usage_admins a WHERE a.guild_id=u.guild_id AND a.user_id=u.user_id)"
+        valid="u.guild_id GLOB ? AND u.outcome='success' AND u.day BETWEEN ? AND ? AND NOT EXISTS (SELECT 1 FROM member_usage_admins a WHERE a.user_id=u.user_id)"
         args=(str(guild_id),start,end)
         kinds=conn.execute(f"SELECT q.question_type,COUNT(*),COUNT(DISTINCT u.user_id) FROM question_types q JOIN member_usage u ON u.request_id=q.request_id WHERE {valid} GROUP BY q.question_type ORDER BY COUNT(*) DESC,q.question_type",args).fetchall()
         rows=conn.execute(f"SELECT s.stock_code,MAX(s.stock_name),COUNT(*),COUNT(DISTINCT u.user_id) FROM stock_questions s JOIN member_usage u ON u.request_id=s.request_id WHERE {valid} GROUP BY s.stock_code ORDER BY COUNT(*) DESC,s.stock_code",args).fetchall()
