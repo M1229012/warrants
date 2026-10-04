@@ -649,6 +649,18 @@ class TTLCache:
             if len(self._data) > self.MAX_ENTRIES:
                 self._evict()
 
+    def snapshot_keys(self) -> set:
+        with self._lock:
+            return set(self._data)
+
+    def drop_new_since(self, before: set) -> int:
+        """刪掉 before 之後才新增的 key（背景批次算完就釋放記憶體，不碰會員查詢原本就有的快取）。"""
+        with self._lock:
+            doomed = [k for k in self._data if k not in before]
+            for k in doomed:
+                del self._data[k]
+        return len(doomed)
+
     def _evict(self) -> None:
         """超過上限：先清過期，仍超過就淘汰最快到期的，留到上限的九成；沒在用的 key lock 一併清掉。呼叫端持有 _lock。"""
         now = time.time()
@@ -2366,7 +2378,8 @@ def _load_price_bundle(stock_code: str) -> Dict[str, Any]:
             record_api_event("FinMindData", status=500)
             error = exc
         if not (FUGLE_API_KEYS or FUGLE_API_KEY):
-            raise ToolDataError(f"{code} 沒有股價資料：{type(error).__name__}: {error}")
+            print(f"⚠️ {code} 股價取得失敗（無富果備援）：{type(error).__name__}: {error}", flush=True)
+            raise ToolDataError(f"{code} 暫時取不到股價資料")   # 細節只寫 Log，不外漏給會員
         print(f"⚠️ {code} FinMind 股價失敗，才改用富果歷史日K備援：{type(error).__name__}: {error}", flush=True)
         days = int(re.search(r"\d+", PRICE_FETCH_PERIOD).group(0)) if re.search(r"\d+", PRICE_FETCH_PERIOD) else 180
         frame = _drop_invalid_bars(code, fetch_fugle_daily(code, days), "富果日K")

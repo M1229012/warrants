@@ -16,7 +16,7 @@ COST_RE = re.compile(r'(?:成本價?|均價|買在|買進價|進場價|套在|�
 RESPONSE_LANGUAGE_RULES = """理解與語氣（優先於制式開場與篇幅要求）：先依完整原句、台灣口語／台語借音、錯字與股票語境理解真正的問題；不要依固定關鍵字、單字聯想或題庫作答。
 需求不限問句：陳述持股、成本或困境也可能在尋求協助，不以問號或疑問詞作門檻。像「我買在某價，現在套住了」應先回應持倉處境與風險，說明現有支撐、壓力和轉弱條件；不只是報型態。單純型態或行情陳述仍回答行情，不捏造持倉；成本、日期、部位或計畫缺少時不推測，沒有問號也不用要求重問。
 教學例：「牙起來」在這個股票問句是借用突然發作／發飆，問股價是否突然動起來，不是牙齒或咬勁；這是語意示例，不是指定回覆，也不能把其他玩笑全套成同一解釋。
-判斷response_style：serious認真分析；playful輕鬆玩笑；concerned擔憂。先理解整句原意，再自然接話；能自然延續原意才在humor_opening現寫最多一句短話，不得只抓單字硬湊無關聯想。語氣與接話分開判斷：使用者一面擔憂一面自嘲時可為concerned，仍可溫和延續他主動提出的比喻或反差，不因有成本或虧損就一律留空。playful或自嘲中的concerned，能自然銜接就寫一句貼合這題的接話；接不自然才留空。serious或單純焦慮、未主動開玩笑時留空。不嘲笑虧損、不淡化困境，不使用固定笑話模板。
+判斷response_style：serious認真分析；playful輕鬆玩笑；concerned擔憂。先理解整句原意，再自然接話；能自然延續原意才在humor_opening現寫最多一句短話，不得只抓單字硬湊無關聯想。語氣與接話分開判斷：使用者一面擔憂一面主動自嘲、開玩笑時判為playful。playful能自然銜接就寫一句貼合這題的短接話；接不自然就留空。不強迫搞笑：使用者口吻帶玩笑、比喻或自嘲時，可簡短自然接一句；明顯認真提問就留空。接話不可影響後面解說的正確性。不嘲笑虧損、不淡化困境，不使用固定笑話模板。
 humor_opening不報行情數字、不承諾漲跌、不給買賣指令；不要用「我不知道／無法預測」當接話。問明天不代表要拒答：不禁止語言上的幽默，但分析只談有資料依據的目前條件。正文直接回答原意，不重複接話；程式合併成同一段解讀。
 在本次輸出內自檢：答到真正問題？接話貼合整句且不牽強？數字有依據？未提供的理由／計畫是否被誤寫成沒有做？若有問題先修正，不另呼叫模型。"""
 
@@ -27,12 +27,23 @@ NATURAL_ANALYSIS_RULES = """所有AI解讀的寫作原則：依這次原句與�
 解讀可短可長，理由、觀察條件、心得與總結依需求選擇，不強制兩種情境或三條心得。沒有新增資訊的欄位留空；若需要觀察條件，只寫真正相關的1至2項與意義，不硬湊多空各一項。總結若只重複開頭就留空。保留指定資料格式、事實核對與專項資料規則，不增加模型呼叫；無關的提醒省略，不杜撰行情、不給個人買賣決定。"""
 
 
+# 「分點／主力／大戶在加碼」是問籌碼，不是自己的持股（10-04 corpus：3006最近哪些分點在加碼）
+_CHIP_ACTOR = re.compile(r'(?:分點|主力|大戶|外資|投信|法人|誰|哪些|哪家|券商).{0,6}(?:在)?(?:加碼|減碼|出場)')
+
+
+def _holding_hit(question):
+    if COST_RE.search(question):
+        return True
+    text = _CHIP_ACTOR.sub('', question)
+    return bool(_HOLDING.search(text))
+
+
 def wants_analysis(question):
-    return bool(_HOLDING.search(question) or COST_RE.search(question))
+    return _holding_hit(question)
 
 
 def holding_question(question):
-    return bool(_HOLDING.search(question) or COST_RE.search(question))
+    return _holding_hit(question)
 
 
 def prepare(question, names):
