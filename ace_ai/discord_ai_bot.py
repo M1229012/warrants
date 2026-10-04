@@ -7757,7 +7757,9 @@ def run_discord_bot(config: BotConfig) -> None:
                             if getattr(m, 'bot', False) or access_policy.UserEntitlement.from_member(m, config.superuser_ids).admin)
             try:
                 summary, attachment_data = await asyncio.to_thread(member_usage_stats.report, question,
-                                                                   '*', excluded)   # 管理員查詢：所有伺服器合計（10-04）
+                                                                   '*', excluded,   # 管理員查詢：所有伺服器合計（10-04）
+                                                                   {m.id: (getattr(m, 'display_name', '') or getattr(m, 'name', ''))
+                                                                    for g in getattr(client, 'guilds', ()) for m in getattr(g, 'members', ())})
                 await interaction_text(interaction, summary, ephemeral=True)
                 if attachment_data is not None:
                     with discord.File(io.BytesIO(attachment_data), filename='stock-questions.csv' if stats_command.kind in ('股票詢問統計','熱門股票') else 'member-usage.csv') as stats_file:

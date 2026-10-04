@@ -133,7 +133,12 @@ def successful(result):
             (route.startswith('rule_') or route in ('planner', 'answer_cache', 'trade_review')))
 
 
-def report(question, guild_id, excluded=()):
+NAMES = {}   # Discord 使用者 ID → 顯示名稱（查詢時由 Bot 填入，10-04）
+
+
+def report(question, guild_id, excluded=(), names=None):
+    if names:
+        NAMES.update({str(k): v for k, v in names.items()})
     match = command(question)
     if not match:return '請詢問使用統計、熱門股票或問題類型統計。',None
     kind, period = match.groups()
@@ -184,16 +189,16 @@ def report(question, guild_id, excluded=()):
                 ('\n'.join(f'{name}：{count} 題' for name, count in sorted(features.items(), key=lambda x: -x[1])) or '尚無資料'))
         return text, None
     text = heading + f'\n成功問答 {total} 題｜使用 {len(users)} 人\n\n'
-    text += '\n'.join(f'{i}. ID {uid}：{row["count"]} 題'
+    text += '\n'.join(f'{i}. {NAMES.get(uid) or "ID " + uid}：{row["count"]} 題'
                       for i, (uid, row) in enumerate(ranking[:10], 1)) or '尚無資料'
     if kind != '問答次數完整名單':
         return text, None
     buf = io.StringIO(newline='')
     writer = csv.writer(buf)
-    writer.writerow(['排名', 'Discord ID', '成功問答次數', '使用天數', '首次成功日期', '最近成功日期'])
+    writer.writerow(['排名', '名稱', 'Discord ID', '成功問答次數', '使用天數', '首次成功日期', '最近成功日期'])
     for i, (uid, row) in enumerate(ranking, 1):
         # ID 以文字保留，避免 Excel 把 18 位 ID 四捨五入。
-        writer.writerow([i, "'" + uid, row['count'], len(row['days']), first[uid], row['last']])
+        writer.writerow([i, NAMES.get(uid, ''), "'" + uid, row['count'], len(row['days']), first[uid], row['last']])
     return text + '\n\n完整名單請見 CSV 附件（ID 欄為文字）。', buf.getvalue().encode('utf-8-sig')
 
 
