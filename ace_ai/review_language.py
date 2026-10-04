@@ -37,6 +37,9 @@ def intent(text):
         return 'review'
     if _CURRENT.search(text):
         return 'current'
+    # 10-04：「友達我9/1買的，現在這樣要注意什麼」問的是接下來，不是檢討交易（會員會被擋在覆盤）
+    if re.search(r'注意什麼|要注意|怎麼看|接下來|之後|還能|還可以|要不要|該不該|該怎麼|怎麼辦|會不會|風險|支撐|壓力|抱|續抱|現在', text):
+        return 'current'
     if dated_purchase(text):
         return 'review'
     # 已完成的買賣／操作檢討，即使沒有日期或「覆盤」二字，也屬於交易回顧。

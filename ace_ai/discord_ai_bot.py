@@ -4917,7 +4917,10 @@ class AceQueryEngine:
                 except tools.ToolDataError:   # 除權息核對取不到資料：照使用者給的價格分析，不整題失敗
                     price, adjustment_note = float(req['price']), '除權息還原暫時無法核對，成本以你提供的價格計算。'
             else:
-                price = trade_review.close_on_date(req['code'],req['buy_date'])
+                try:
+                    price = trade_review.close_on_date(req['code'],req['buy_date'])
+                except tools.ToolDataError:   # 買進日價格取不到：不估成本，照樣分析目前行情（10-04）
+                    return self._answer_general(question, context_key, on_queue, started, re.sub(r'\s+', '',question))
         except tools.ToolDataError as exc:
             return AnswerResult(text=str(exc),route='clarify',gemini_calls=0,elapsed=time.perf_counter()-started,as_text=True)
         estimated = req.get('price') is None
