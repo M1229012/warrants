@@ -387,6 +387,8 @@ class ParsedQuestion:
     spot_branch: str = "" # 用現股資料庫分點名單辨識出的分點（和權證分點名單分開）
     spot_combo: bool = False  # 同時問型態＋現股籌碼：型態分析頁加一段精簡「籌碼重點」
     unknown_terms: List[str] = field(default_factory=list)   # 沒有對到股票／分點的剩餘字（反問「找不到 X」用）
+    branch_leftover: List[str] = field(default_factory=list) # 權證／籌碼題沒對到分點的剩餘字（交給 AI 讀整句判斷）
+    warrant_list: bool = False                               # AI 判斷：要列出分點買了哪些權證
 
     def summary(self) -> Dict[str, Any]:
         return {
@@ -482,8 +484,8 @@ class QuestionParser:
         work = self._remove_keywords(work)
         work = self._extract_stock_names(work, parsed)
         self._fuzzy_branch(work, parsed)
-        if not parsed.stocks and not parsed.stock_candidates and not parsed.branches:
-            self._fuzzy_stock(work, parsed)
+        if not parsed.stocks and not parsed.stock_candidates:
+            self._fuzzy_stock(work, parsed)   # 已認出分點時，分點那段字不拿來猜股票（見 _fuzzy_stock）
         if len(parsed.stocks) > 1:
             upper = question.upper()
             parsed.stocks.sort(key=lambda s: min([i for i in (upper.find(s[0]), upper.find(str(s[1]).upper())) if i >= 0] or [len(upper)]))
@@ -564,9 +566,23 @@ class QuestionParser:
         wants_branch = bool(parsed.intents & {"win_rate", "recent_trades", "warrant", "history", "behavior"})
         if parsed.access is not None and not parsed.access.entitlement.warrant:
             return
-        if parsed.branches or not wants_branch:
+        if not wants_branch:
             return
-        for chunk in self._leftover_chunks(work):
+        chunks = self._leftover_chunks(work)
+        try:
+            known = tools.get_known_branches()
+        except Exception:
+            known = {}
+        # 分點名冊（資料，不是個別問句規則）：剩餘字開頭是已知分點（含「美好」這類 2 字券商）就認，可多個
+        aliases = sorted((a for a in known if len(a) >= 2), key=len, reverse=True)
+        for chunk in chunks:
+            alias = next((a for a in aliases if chunk.startswith(a.upper())), "")
+            if alias and known[alias] not in parsed.branches:
+                parsed.branches.append(known[alias])
+        if parsed.branches:
+            return
+        parsed.branch_leftover = [c for c in chunks if c not in _NOT_A_NAME]
+        for chunk in chunks:
             prefix = next((p for p in BROKER_PREFIXES if chunk.startswith(p)), "")
             if not prefix or len(chunk) <= len(prefix):
                 continue
@@ -589,7 +605,8 @@ class QuestionParser:
         except Exception:
             return
         for chunk in self._leftover_chunks(work):
-            if any(chunk.startswith(p) for p in BROKER_PREFIXES) and parsed.branches:
+            if parsed.branches and (any(chunk.startswith(p) for p in BROKER_PREFIXES)
+                                    or any(chunk.startswith(str(b).upper()) for b in parsed.branches)):
                 continue
             matches = sorted({(code, name) for code, name in name_map.items() if name.upper().startswith(chunk)})
             if len(matches) == 1:
@@ -728,7 +745,7 @@ WARRANT_TOOLS = frozenset((
     "get_branch_event_window", "get_branch_warrant_detail",
 ))
 # 「買了哪些權證／權證代號／權證名稱」：列出權證本身（不是標的股）。「哪些股票的權證」仍是標的清單。
-_WARRANT_DETAIL_RE = re.compile(r"(?:[哪那]些|[哪那]幾檔|[哪那]幾支|[哪那]檔|[哪那]支|什麼|甚麼)\s*權證|權證(?:的)?(?:代號|代碼|號碼|名稱|明細|清單)|(?:各檔|每檔)權證|權證(?:目前|現在)?(?:估算|估計|未實現)(?:報酬|損益)")
+_WARRANT_DETAIL_RE = re.compile(r"(?:[哪那]些|[哪那]幾檔|[哪那]幾支|[哪那]檔|[哪那]支|什麼|甚麼)(?:(?!股票|標的|個股)[^，,。？?！!\s]){0,8}權證|權證(?:的)?(?:代號|代碼|號碼|名稱|明細|清單)|權證(?:是|有)?[哪那](?:些|幾檔|幾支|幾隻)|買(?:了|的|進的)權證|(?:各檔|每檔)權證|權證(?:目前|現在)?(?:估算|估計|未實現)(?:報酬|損益)")
 
 
 def warrant_allowed(parsed: "ParsedQuestion") -> bool:
@@ -1199,6 +1216,8 @@ def build_branch_card(results: Sequence[tools.ToolResult]) -> Optional[Dict[str,
         elif r.name == "get_branch_warrant_detail" and d.get("found"):
             card["branch"] = card["branch"] or d.get("branch", "")
             card["tags"].append(f"權證明細｜近 {d.get('trading_days')} 日")
+            if sum(x.name == "get_branch_warrant_detail" for x in results) > 1:
+                sections.append({"type": "heading", "text": f"{d.get('branch', '')} 權證明細"})   # 一次問多個分點：各自加小標
             sections.extend(branch_store_warrant_sections(d) if d.get("source") == "store" else branch_warrant_sections(d))
         elif r.name == "get_branch_event_window" and d.get("found"):
             card["branch"] = card["branch"] or d.get("branch", "")
@@ -1522,13 +1541,14 @@ class QueryRouter:
 
     def _branch_plan(self, parsed: ParsedQuestion, categories: Set[str], analysis: bool) -> QueryPlan:
         branch = parsed.branches[0]
-        if _WARRANT_DETAIL_RE.search(parsed.original or ""):
+        if parsed.warrant_list or _WARRANT_DETAIL_RE.search(parsed.original or ""):
             # 「第一金中壢近70日買了哪些權證」「第一金中壢 7788 買哪幾檔權證」：列出權證代號與名稱，
             # 另請 AI 解讀這個分點挑權證的習慣（天期、價內外、槓桿）
             plan = QueryPlan(route="rule_branch", need_final_llm=True)
             days = parsed.window_days if parsed.days_specified and parsed.window_days else tools.CHIPS_DAYS
-            plan.add("get_branch_warrant_detail", branch_name=branch, days=days,
-                     stock_code=parsed.stocks[0][0] if parsed.stocks else "")
+            for name in parsed.branches[:3]:   # 「美好、元大南屯買的權證」：一句問幾個分點就列幾個
+                plan.add("get_branch_warrant_detail", branch_name=name, days=days,
+                         stock_code=parsed.stocks[0][0] if parsed.stocks else "")
             if parsed.stocks and set(parsed.intents) & {"win_rate", "history"}:
                 plan.add("get_branch_stock_history", branch_name=branch, stock_code=parsed.stocks[0][0])
             return plan
@@ -6111,15 +6131,17 @@ class AceQueryEngine:
         if not INTENT_FALLBACK_ENABLE or getattr(self, "gateway", None) is None:
             return None
         schema = {"type": "object", "properties": {
-            "subject": {"type": "string"}, "action": {"type": "string"}, "target": {"type": "string"}},
-            "required": ["subject", "action", "target"]}
+            "subject": {"type": "string"}, "action": {"type": "string"}, "target": {"type": "string"},
+            "branch": {"type": "string"}},
+            "required": ["subject", "action", "target", "branch"]}
         prompt = ("你是台股問句分類器，只輸出 JSON，不要解釋、不要回答問題本身。請讀完整句再判斷真正想問的事，口語、錯字、繞圈子的說法都要理解。\n"
                   'subject 從 ["stock","sector","market","branch","none"] 擇一；'
                   'action 從 ["pattern","members","rank","compare","chips","news","price","institutional","futures","cost","none"] 擇一'
                   "（pattern＝走勢／型態／技術面／能不能追／會不會跌、institutional＝外資投信自營商法人、futures＝台指期未平倉、"
                   "cost＝使用者講自己的成本、套牢、賠錢、還值得持有嗎、要不要賣、回本或進場理由；沒有成本數字也可選cost。股票諧音、玩笑、火箭、帶我飛、豁達等投資口語，若是在問這檔的好壞或走勢，選pattern，不能因為是玩笑就選none。無關股市的聊天仍選none。news＝消息題材新聞、price＝只問價格漲跌、chips＝分點籌碼主力、"
-                  "compare＝比較兩檔、members＝族群成分股、rank＝排行）；"
-                  "target 寫問題裡提到的股票名稱或代號、或族群名稱，沒有就填空字串。\n問題：" + question)
+                  "compare＝比較兩檔、members＝族群成分股、rank＝排行、warrant_list＝問某分點（券商）買了哪些權證／權證代號）；"
+                  "target 寫問題裡提到的股票名稱或代號、或族群名稱，沒有就填空字串；"
+                  "branch 寫問題裡提到的券商分點名稱（可能是簡稱，例如美好、元大南屯），沒有就填空字串。\n問題：" + question)
         result = self.gateway.generate(prompt, purpose="intent", schema=schema, temperature=0.0)
         stats.record_gemini(result)
         if not result.ok:
@@ -6131,7 +6153,20 @@ class AceQueryEngine:
         subject = str(payload.get("subject") or "").strip()
         action = str(payload.get("action") or "").strip()
         target = str(payload.get("target") or "").strip()
-        self.log(f"🧭 AI 分類：subject={subject}｜action={action}｜target={target}")
+        branch = str(payload.get("branch") or "").strip()
+        self.log(f"🧭 AI 分類：subject={subject}｜action={action}｜target={target}｜branch={branch}")
+        if branch and self._warrant_entitled():
+            # AI 只負責讀懂句子；分點名稱一定要在名冊找得到（唯一命中）才採用，不讓 AI 自創分點
+            try:
+                canonical, _ = tools.resolve_branch(branch)
+            except Exception:
+                canonical = ""
+            if canonical:
+                if canonical not in parsed.branches:
+                    parsed.branches.append(canonical)
+                parsed.warrant_list = parsed.warrant_list or action == "warrant_list"
+                parsed.intents = set(parsed.intents) | {"warrant"}
+                return self.router.plan(parsed, stats)
         if subject == "market":
             parsed.stocks = [("TAIEX", tools.INDEX_CODES["TAIEX"])]
             parsed.intents = set(parsed.intents) | {"index"}
@@ -6212,6 +6247,9 @@ class AceQueryEngine:
         if plan.route in ("help", "rule_stock_bundle") and not (unknown_codes(parsed) and not parsed.stocks):
             # 規則沒把握（看不懂，或認得股票但看不出要問什麼）→ 1 次 Gemini 用「完整原句」分類，程式再檢查；
             # 寫了代號但名冊查不到（0000）：直接說查不到，不花 1 次 Gemini 去猜
+            plan = self._classify_fallback(question, parsed, stats) or plan
+        elif parsed.branch_leftover and not parsed.branches and self._warrant_entitled() and plan.route != "clarify":
+            # 權證／籌碼題還有規則讀不懂的字（可能是分點簡稱、口語）：1 次 Gemini 讀整句，分點名稱再由名冊核對
             plan = self._classify_fallback(question, parsed, stats) or plan
         if access_policy.beta_blocked(self._access(), plan.route):
             # Beta gate 在 Tool／Gemini 之前：非 tester 不提示 Beta，有舊 route 走舊 route，沒有就走一般 fallback。
