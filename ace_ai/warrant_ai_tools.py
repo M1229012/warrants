@@ -5372,6 +5372,11 @@ def _warrant_detail_from_store(canonical: str, requested: int, days: int, stock_
         p = (next((x for x in candidates if x["stock"] == stock), None)
              or next((x for x in candidates if not x["stock"]), None)
              or (candidates[0] if len(candidates) == 1 else None))
+        last_store = max((str(d[0])[:10].replace("/", "-") for d in p["days"]), default="") if p is not None else ""
+        if p is not None and p["remaining"] <= 0 and info["last"] > last_store:
+            # 事件表比歷史庫新（例：10/02 事件買進、歷史庫還沒收到）：歷史庫看到的是舊一輪已賣完，
+            # 不能標「已出清」，改用事件表狀態（和上方分點動向表一致）
+            p = None
         if p is not None:
             buy_sh, _, buy_amt, _, _ = _window_sums(p, s, e)
             p = dict(p, stock=stock, name=p["name"] or info["name"],
@@ -5440,11 +5445,13 @@ def _warrant_detail_from_store(canonical: str, requested: int, days: int, stock_
             hidden.append(label)
             continue
         remaining = sum(x["p"]["remaining"] for x in items if x["p"]["remaining"] > 0 and not x["p"]["expired"])
+        # 歷史庫沒有張數、但事件表仍持有／只減碼：整組不能寫「已全部賣出」
+        event_open = any(x["p"].get("event_only") and not str(x["event_state"]).startswith("出清") for x in items)
         groups.append({"stock_code": stock, "label": label,
                        # 同一筆事件常同時買好幾檔權證，標題要數「事件」不是「權證×事件」，否則次數會被灌大
                        "event_codes": _event_codes_text(stock_events.get(stock, [])),
                        "buy_amount_text": _plain_money(sum(x["buy_amt"] for x in items)),
-                       "remaining_text": _lots_text(remaining) if remaining else "已全部賣出",
+                       "remaining_text": _lots_text(remaining) if remaining else "持有中" if event_open else "已全部賣出",
                        "spot": _num(spot_now, 2), "sigma_pct": _num(sigma_now * 100 if sigma_now else None, 0),
                        "warrant_count": len(rows), "warrants": rows[:warrant_limit], "other_warrants": others.get(stock, 0)})
     median = lambda xs: float(pd.Series(xs).median()) if xs else None

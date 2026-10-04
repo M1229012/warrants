@@ -1277,7 +1277,7 @@ def branch_store_warrant_sections(d: Dict[str, Any]) -> List[Dict[str, Any]]:
         {"label": "估算槓桿", "value": f"{lev:.1f} 倍" if lev is not None else "-", "tone": "accent"}]})
     for group in (d.get("groups") or [])[:3]:
         remaining = group.get("remaining_text") or ""
-        head = [group["label"], group.get("event_codes") or "", remaining if remaining == "已全部賣出" else f"剩 {remaining}"]
+        head = [group["label"], group.get("event_codes") or "", remaining if remaining in ("已全部賣出", "持有中") else f"剩 {remaining}"]
         sections.append({"type": "heading", "text": "｜".join(x for x in head if x)})
         rows = []
         for w in group["warrants"][:4]:
