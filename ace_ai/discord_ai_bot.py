@@ -4970,7 +4970,10 @@ class AceQueryEngine:
                 except tools.ToolDataError:   # 除權息核對取不到資料：照使用者給的價格分析，不整題失敗
                     price, adjustment_note = float(req['price']), '除權息還原暫時無法核對，成本以你提供的價格計算。'
             else:
-                price = trade_review.close_on_date(req['code'],req['buy_date'])
+                try:
+                    price = trade_review.close_on_date(req['code'],req['buy_date'])
+                except tools.ToolDataError:   # 買進日價格取不到：不估成本，照樣分析目前行情（10-04）
+                    return self._answer_general(question, context_key, on_queue, started, re.sub(r'\s+', '',question))
         except tools.ToolDataError as exc:
             return AnswerResult(text=str(exc),route='clarify',gemini_calls=0,elapsed=time.perf_counter()-started,as_text=True)
         estimated = req.get('price') is None
@@ -5753,6 +5756,9 @@ class AceQueryEngine:
             threading.Thread(target=job, name="ace-market-sync", daemon=True).start()
             return AnswerResult(text="已開始在背景更新全市場日K底庫（每個交易日 2 個請求）。完成後可用「系統狀態」查看。",
                                 route="admin_market_sync", gemini_calls=0, elapsed=time.perf_counter()-started, cacheable=False)
+        if compact in ("統計診斷", "會員統計診斷"):
+            return AnswerResult(text=member_usage_stats.diagnose(), route="admin_stats_diag", gemini_calls=0,
+                                elapsed=time.perf_counter() - started, cacheable=False, as_text=True)
         if compact in ("錯誤紀錄", "錯誤記錄", "錯誤", "errors"):
             return AnswerResult(text=ADMIN_ALERTS.summary(), route="admin_errors", gemini_calls=0,
                                 elapsed=time.perf_counter()-started, cacheable=False)
@@ -7935,7 +7941,18 @@ def run_discord_bot(config: BotConfig) -> None:
                             if getattr(m, 'bot', False) or access_policy.UserEntitlement.from_member(m, config.superuser_ids).admin)
             try:
                 summary, attachment_data = await asyncio.to_thread(member_usage_stats.report, question,
-                                                                   interaction.guild_id, excluded)
+                                                                   '*', excluded,   # 管理員查詢：所有伺服器合計（10-04）
+                                                                   {m.id: (getattr(m, 'display_name', '') or getattr(m, 'name', ''))
+                                                                    for g in getattr(client, 'guilds', ()) for m in getattr(g, 'members', ())})
+                # 沒開 members intent 時成員名單是空的：排名裡的 ID 直接向 Discord 查名字（只查前幾名，10-04）
+                for uid in dict.fromkeys(re.findall(r'ID (\d{15,20})', summary)):
+                    try:
+                        user = client.get_user(int(uid)) or await client.fetch_user(int(uid))
+                        name = getattr(user, 'global_name', None) or getattr(user, 'name', '')
+                        if name:
+                            summary = summary.replace(f'ID {uid}', name)
+                    except Exception:
+                        pass
                 await interaction_text(interaction, summary, ephemeral=True)
                 if attachment_data is not None:
                     with discord.File(io.BytesIO(attachment_data), filename='stock-questions.csv' if stats_command.kind in ('股票詢問統計','熱門股票') else 'member-usage.csv') as stats_file:

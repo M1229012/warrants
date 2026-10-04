@@ -260,6 +260,24 @@ def fugle_background_allowed() -> bool:
     return _fugle_slots_used() < _fugle_background_cap()
 
 
+FINMIND_BACKGROUND_MIN_REMAINING = float(os.getenv("DISCORD_AI_FINMIND_BACKGROUND_MIN_REMAINING", "0.5") or 0.5)
+_FM_BG_LOGGED = {"day": ""}
+
+
+def finmind_background_allowed() -> bool:
+    """背景作業（補資料、算分數）只在目前 Token 還剩一半以上額度時才用 FinMind（10-04：會員優先）。
+    第一支用到一半就停，第二支完整留給會員；查不到用量時保守不用。"""
+    usage = finmind_usage()
+    limit, remaining = usage.get("limit") or 0, usage.get("remaining")
+    ok = bool(usage.get("available") and limit and remaining is not None and remaining >= limit * FINMIND_BACKGROUND_MIN_REMAINING)
+    if not ok:
+        day = taipei_now().strftime("%Y-%m-%d")
+        if _FM_BG_LOGGED["day"] != day:
+            _FM_BG_LOGGED["day"] = day
+            print(f"ℹ️ FinMind 背景暫停｜剩餘 {remaining}／{limit}（保留給會員）；公司行動改用證交所與本地資料", flush=True)
+    return ok
+
+
 def finmind_usage(force: bool = False) -> Dict[str, Any]:
     token = current_finmind_token()
     if not token:
@@ -2825,7 +2843,10 @@ def _get_corporate_actions_locked(code: str) -> Dict[str, Any]:
     items: List[Dict[str, Any]] = []
     coverage = ["減資資料未涵蓋（資料源權限不足）"]
     successes = 0
+    skip_finmind = current_api_priority() == "background" and not finmind_background_allowed()   # 背景只用一半額度
     try:
+        if skip_finmind:
+            raise RuntimeError("背景保留 FinMind 額度給會員")
         div = kf._finmind_get_data("TaiwanStockDividendResult", data_id=code, start_date=start, end_date=today, allow_empty=True)
         for r in (div.to_dict("records") if div is not None else []):
             kind = str(r.get("stock_or_cache_dividend") or "")
@@ -2833,9 +2854,12 @@ def _get_corporate_actions_locked(code: str) -> Dict[str, Any]:
         successes += 1
     except Exception as exc:
         coverage.append(f"除權息資料暫時無法取得（{type(exc).__name__}）")
-        print(f"⚠️ 公司行動資料查詢失敗｜{code}｜{err_text(exc)}", flush=True)
+        if not skip_finmind:
+            print(f"⚠️ 公司行動資料查詢失敗｜{code}｜{err_text(exc)}", flush=True)
     # 獨立查詢：除權息失敗不會阻斷分割／面額變更的核實資料。
     for dataset, kind in (("TaiwanStockSplitPrice", "分割"), ("TaiwanStockParValueChange", "面額變更")):
+        if skip_finmind:
+            continue
         try:
             rows = _market_corp_rows(kf, dataset, start, today)
             items += [price_adjustment.event_from_row(r, str(r.get('type') or kind))

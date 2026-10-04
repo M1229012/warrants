@@ -133,7 +133,12 @@ def successful(result):
             (route.startswith('rule_') or route in ('planner', 'answer_cache', 'trade_review')))
 
 
-def report(question, guild_id, excluded=()):
+NAMES = {}   # Discord 使用者 ID → 顯示名稱（查詢時由 Bot 填入，10-04）
+
+
+def report(question, guild_id, excluded=(), names=None):
+    if names:
+        NAMES.update({str(k): v for k, v in names.items()})
     match = command(question)
     if not match:return '請詢問使用統計、熱門股票或問題類型統計。',None
     kind, period = match.groups()
@@ -157,7 +162,7 @@ def report(question, guild_id, excluded=()):
         conn.executemany('INSERT OR IGNORE INTO member_usage_admins VALUES (?,?)',
                          [(str(guild_id), str(uid)) for uid in excluded])
         started = conn.execute("SELECT value FROM member_usage_meta WHERE key='started'").fetchone()[0]
-        valid="u.guild_id=? AND NOT EXISTS (SELECT 1 FROM member_usage_admins a WHERE a.guild_id=u.guild_id AND a.user_id=u.user_id)"
+        valid="u.guild_id GLOB ? AND NOT EXISTS (SELECT 1 FROM member_usage_admins a WHERE a.user_id=u.user_id)"
         rows=conn.execute(f"SELECT u.user_id,u.outcome,u.category,COUNT(*),COUNT(DISTINCT u.day),MAX(u.day) FROM member_usage u WHERE {valid} AND u.day BETWEEN ? AND ? GROUP BY u.user_id,u.outcome,u.category",(str(guild_id),start,today.isoformat())).fetchall()
         first=dict(conn.execute(f"SELECT u.user_id,MIN(u.day) FROM member_usage u WHERE {valid} AND u.outcome='success' AND u.day<=? GROUP BY u.user_id",(str(guild_id),today.isoformat())).fetchall())
         active=dict(conn.execute(f"SELECT u.user_id,COUNT(DISTINCT u.day) FROM member_usage u WHERE {valid} AND u.outcome='success' AND u.day BETWEEN ? AND ? GROUP BY u.user_id",(str(guild_id),start,today.isoformat())).fetchall())
@@ -184,16 +189,16 @@ def report(question, guild_id, excluded=()):
                 ('\n'.join(f'{name}：{count} 題' for name, count in sorted(features.items(), key=lambda x: -x[1])) or '尚無資料'))
         return text, None
     text = heading + f'\n成功問答 {total} 題｜使用 {len(users)} 人\n\n'
-    text += '\n'.join(f'{i}. ID {uid}：{row["count"]} 題'
+    text += '\n'.join(f'{i}. {NAMES.get(uid) or "ID " + uid}：{row["count"]} 題'
                       for i, (uid, row) in enumerate(ranking[:10], 1)) or '尚無資料'
     if kind != '問答次數完整名單':
         return text, None
     buf = io.StringIO(newline='')
     writer = csv.writer(buf)
-    writer.writerow(['排名', 'Discord ID', '成功問答次數', '使用天數', '首次成功日期', '最近成功日期'])
+    writer.writerow(['排名', '名稱', 'Discord ID', '成功問答次數', '使用天數', '首次成功日期', '最近成功日期'])
     for i, (uid, row) in enumerate(ranking, 1):
         # ID 以文字保留，避免 Excel 把 18 位 ID 四捨五入。
-        writer.writerow([i, "'" + uid, row['count'], len(row['days']), first[uid], row['last']])
+        writer.writerow([i, NAMES.get(uid, ''), "'" + uid, row['count'], len(row['days']), first[uid], row['last']])
     return text + '\n\n完整名單請見 CSV 附件（ID 欄為文字）。', buf.getvalue().encode('utf-8-sig')
 
 
@@ -203,7 +208,7 @@ def stock_report(match,guild_id,excluded,start,today):
         _init(conn)
         conn.executemany('INSERT OR IGNORE INTO member_usage_admins VALUES (?,?)',[(str(guild_id),str(uid)) for uid in excluded])
         since=conn.execute("SELECT value FROM member_usage_meta WHERE key='stock_started'").fetchone()[0][:10]
-        valid="u.guild_id=? AND u.outcome='success' AND u.day BETWEEN ? AND ? AND NOT EXISTS (SELECT 1 FROM member_usage_admins a WHERE a.guild_id=u.guild_id AND a.user_id=u.user_id)"
+        valid="u.guild_id GLOB ? AND u.outcome='success' AND u.day BETWEEN ? AND ? AND NOT EXISTS (SELECT 1 FROM member_usage_admins a WHERE a.user_id=u.user_id)"
         args=(str(guild_id),start,end)
         kinds=conn.execute(f"SELECT q.question_type,COUNT(*),COUNT(DISTINCT u.user_id) FROM question_types q JOIN member_usage u ON u.request_id=q.request_id WHERE {valid} GROUP BY q.question_type ORDER BY COUNT(*) DESC,q.question_type",args).fetchall()
         rows=conn.execute(f"SELECT s.stock_code,MAX(s.stock_name),COUNT(*),COUNT(DISTINCT u.user_id) FROM stock_questions s JOIN member_usage u ON u.request_id=s.request_id WHERE {valid} GROUP BY s.stock_code ORDER BY COUNT(*) DESC,s.stock_code",args).fetchall()
@@ -320,3 +325,20 @@ def stock_types(question,stocks,route=''):
     if len(segments)==len(pairs):
         return {code:sorted(kinds|({'比較'} if '比較' in overall else set())) for code,kinds in segments.items()}
     return {code:overall for code,_ in pairs}
+
+
+def diagnose():
+    """管理員診斷：各伺服器寫入筆數、管理員排除數、最後紀錄時間、資料表欄位（查「為什麼統計是 0」）。"""
+    try:
+        with db._LOCK, db._db() as conn:
+            _init(conn)
+            cols = [r[1] for r in conn.execute("PRAGMA table_info(member_usage)")]
+            started = conn.execute("SELECT value FROM member_usage_meta WHERE key='started'").fetchone()[0]
+            rows = conn.execute("SELECT guild_id, outcome, COUNT(*), COUNT(DISTINCT user_id), MAX(ts) FROM member_usage GROUP BY guild_id, outcome").fetchall()
+            admins = conn.execute("SELECT guild_id, COUNT(*) FROM member_usage_admins GROUP BY guild_id").fetchall()
+    except Exception as exc:
+        return f"會員統計診斷失敗：{type(exc).__name__}: {exc}"
+    lines = [f"資料庫：{db.DB_PATH}", f"統計起算：{started}", f"member_usage 欄位：{', '.join(cols)}"]
+    lines += [f"伺服器 {g}｜{o}｜{n} 筆｜{u} 人｜最後 {t}" for g, o, n, u, t in rows] or ["member_usage 沒有任何紀錄"]
+    lines += [f"伺服器 {g}｜被排除的管理員 {n} 人" for g, n in admins]
+    return chr(10).join(lines)
