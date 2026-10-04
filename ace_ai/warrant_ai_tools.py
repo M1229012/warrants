@@ -1174,6 +1174,7 @@ SHEET_REGISTRY: Dict[str, str] = {
     "近兩月買賣金額排行": "近兩月權證淨買進金額最高的標的與買進分點",
     "快取_近7日權證分點共識TOP15": "精選分點近7日共識買賣超權證 TOP15",
     "快取_TOP15共識淨買超": "近40日分點共識淨買超 TOP15 標的與型態",
+    "快取_TOP15部位明細": "TOP15 分點×標的逐檔權證部位（事件日、原始成本、剩餘股數）；歷史庫落後時補最新事件",
     "每日賣出明細": "分點每日權證賣出（減碼／出清）明細與報酬率",
     **{title: f"{letter} 類事件明細（{EVENT_TYPE_LABELS[letter]}）" for letter, title in AMOUNT_CLASS_SHEETS.items()},
 }
@@ -5326,6 +5327,31 @@ def _warrant_metrics(p: Dict[str, Any], closes: Dict[str, float], buy_day: str, 
     return out
 
 
+def _sheet_event_warrant_costs(branch: str, stock_code: str = "") -> Dict[Tuple[str, str, str], Tuple[float, float]]:
+    """Sheet「快取_TOP15部位明細」：(標的, 權證, 事件日) → (原始成本, 剩餘股數)。
+    歷史庫落後時用來補最新事件的逐檔金額；讀不到回傳空 dict，不讓主要回答失敗。"""
+    kf = core()
+    try:
+        df = read_sheet_table("快取_TOP15部位明細")["df"]
+    except ToolDataError as exc:
+        print(f"⚠️ 快取_TOP15部位明細略過：{exc}", flush=True)
+        return {}
+    need = {"分點", "標的股", "事件日", "權證代號", "原始成本", "剩餘股數"}
+    if df.empty or not need.issubset(df.columns):
+        return {}
+    rows = df[df["分點"].map(kf.normalize_branch_name) == branch]
+    if stock_code:
+        rows = rows[rows["標的股"].map(kf._normalize_stock_name_code_key) == stock_code]
+    out: Dict[Tuple[str, str, str], Tuple[float, float]] = {}
+    for _, row in rows.iterrows():
+        day = _parse_sheet_date(row["事件日"])
+        if day is None:
+            continue
+        key = (kf._normalize_stock_name_code_key(row["標的股"]), _clean_cell(row["權證代號"]), day.strftime("%Y-%m-%d"))
+        out[key] = (_count_value(row["原始成本"]) or 0.0, _count_value(row["剩餘股數"]) or 0.0)
+    return out
+
+
 MINOR_WARRANT_AMOUNT = 100_000   # 同事件非最大單筆權證，當天買進金額 < 10 萬視為零星、不進明細表
 
 
@@ -5351,6 +5377,8 @@ def _warrant_detail_from_store(canonical: str, requested: int, days: int, stock_
             day_amount[key] = day_amount.get(key, 0.0) + float(d[3] or 0)
     minor_skipped = 0
     pending_codes: List[str] = []
+    sheet_costs: Optional[Dict[Tuple[str, str, str], Tuple[float, float]]] = None
+    sheet_left: Dict[Tuple[str, str], float] = {}                # 歷史庫沒有時，Sheet 部位明細的剩餘股數
     for _, row in events.sort_values("event_date").iterrows():
         if code and row["stock_code"] != code:
             continue
@@ -5359,14 +5387,24 @@ def _warrant_detail_from_store(canonical: str, requested: int, days: int, stock_
         day = _fmt_date(row["event_date"]).replace("/", "-")
         items = _warrant_items(row)
         for wcode, wname in items:
-            if len(items) > 1 and max_code and wcode != max_code:   # 不知道哪檔是最大單筆時不過濾
-                # 同一事件常順手買幾張別檔：事件表只有最大單筆的金額，其他檔用歷史庫當天金額判斷
-                if day > store_max:
-                    if wcode not in pending_codes:    # 歷史庫還沒更新到事件日：金額未知，照列並註明
+            minor_candidate = len(items) > 1 and bool(max_code) and wcode != max_code   # 不知道哪檔是最大單筆時不過濾
+            if day > store_max:
+                # 歷史庫還沒更新到事件日：改用 Sheet「快取_TOP15部位明細」的逐檔成本；Sheet 也沒有才照列並註明
+                if sheet_costs is None:
+                    sheet_costs = _sheet_event_warrant_costs(canonical, code)
+                hit = sheet_costs.get((row["stock_code"], wcode, day))
+                if hit is None:
+                    if minor_candidate and wcode not in pending_codes:
                         pending_codes.append(wcode)
-                elif day_amount.get((wcode, day), 0.0) < MINOR_WARRANT_AMOUNT:
+                elif minor_candidate and hit[0] < MINOR_WARRANT_AMOUNT:
                     minor_skipped += 1                # 零星（例：640 萬事件裡只買 2 張）不列
                     continue
+                else:
+                    sheet_left[(row["stock_code"], wcode)] = sheet_left.get((row["stock_code"], wcode), 0.0) + hit[1]
+            elif minor_candidate and day_amount.get((wcode, day), 0.0) < MINOR_WARRANT_AMOUNT:
+                # 同一事件常順手買幾張別檔：事件表只有最大單筆的金額，其他檔用歷史庫當天金額判斷
+                minor_skipped += 1
+                continue
             event_codes[wcode].append(row["event_code"])
             info = event_warrants.setdefault((row["stock_code"], wcode), {"name": wname, "amount": 0.0, "last": "", "state": "",
                                                                          "lots": 0.0, "lots_exact": True})
@@ -5405,6 +5443,8 @@ def _warrant_detail_from_store(canonical: str, requested: int, days: int, stock_
             # 只有「都是單一權證事件、狀態仍是持有（沒有減碼／出清）」時，事件張數加總就是剩餘張數；否則只顯示狀態。
             buy_sh, buy_amt = 0.0, 0.0
             lots = info["lots"] * 1000 if info["lots_exact"] and info["state"] == "持有" else 0.0
+            if (stock, wcode) in sheet_left and info["state"] == "持有":
+                lots = sheet_left[(stock, wcode)]                    # Sheet 部位明細有逐檔剩餘股數
             store_missing.append(wcode)
             p = {"warrant": wcode, "name": info["name"], "stock": stock, "stock_name": stock_name_map.get(stock, ""),
                  "remaining": lots, "cycle_bought": lots, "expired": False, "event_only": True,
