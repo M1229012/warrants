@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import gc
 import json
 import math
 from pathlib import Path
@@ -218,9 +219,15 @@ def score_pending(budget_seconds: float = SCORE_BUDGET, log: Callable[[str], Non
         todo = [c for c in universe
                 if (not last_bars.get(c) or scored.get(c) != last_bars[c])
                 and not (last_bars.get(c) and _FAILED_AT.get(c) == last_bars[c])]
+        before_keys, batch = tools.CACHE.snapshot_keys(), 0
         for code in todo:
             if time.monotonic() - started > budget_seconds:
                 break
+            batch += 1
+            if batch % 50 == 0:      # 10-01 OOM：1,070 檔的資料表一起留在快取；每 50 檔釋放一次
+                tools.CACHE.drop_new_since(before_keys)
+                gc.collect()
+                before_keys = tools.CACHE.snapshot_keys()
             try:
                 # 背景優先權：不搶使用者的即時行情額度，也不接盤中報價（分數只用收盤 K 棒）。
                 with tools.api_priority("background"):
@@ -254,6 +261,8 @@ def score_pending(budget_seconds: float = SCORE_BUDGET, log: Callable[[str], Non
         return {"done": done, "failed": failed, "pending": pending, "latest": latest,
                 "elapsed": time.monotonic() - started}
     finally:
+        if "before_keys" in locals():
+            tools.CACHE.drop_new_since(before_keys)   # 收尾也釋放
         _SCORE_LOCK.release()
 
 

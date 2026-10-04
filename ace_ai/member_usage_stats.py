@@ -29,6 +29,17 @@ def command(question):
     elif re.search(r'(?:大家|會員|群組).*(?:問|詢問).*(?:股票|哪幾檔)|(?:股票|股號|個股).*(?:問|詢問).*(?:次|多少|統計)|(?:股票|股號|個股).*(?:被問|詢問|問得|問最多|最多人問|熱門|詢問次數)|(?:問|詢問|關注).*(?:哪些股票|什麼股票|哪幾檔|哪檔最多)|熱門股票',text):kind='股票詢問統計'
     elif re.search(r'(?:誰|哪些人).*(?:問最多|用最多|最常問|最常用)|(?:問答|提問|使用|用量).*(?:排名|排行|次數|完整名單)',text):kind='問答次數'
     elif re.search(r'(?:群組|會員|大家|機器人|助手|喬巴).*(?:使用情況|使用狀況|使用統計|用量|使用人數)|使用統計',text):kind='使用統計'
+    # 10-04 白話補強：「大家都問什麼問題」「哪個會員問最多次」「最常被問的股票」「熱門個股排行」等
+    if not kind:
+        stock_word=re.search(r'股票|個股|哪檔|哪幾檔|哪些股|哪支|哪隻',text)
+        who_word=re.search(r'誰|哪個會員|哪位|哪些會員|重度使用|使用者排|會員排',text)
+        rank_word=re.search(r'最多|最常|最愛|熱門|排行|排名|前\d+|前十|多少人|幾個人|次數',text)
+        ask_word=re.search(r'問|詢問|查|用|使用',text)
+        if re.search(r'(?:大家|會員|群組).*(?:問|查).*(?:什麼|哪些|哪類).*(?:問題|類型)',text):kind='問題類型統計'
+        elif stock_word and (rank_word or re.search(r'大家|會員|群組',text)) and (ask_word or '熱門' in text):kind='股票詢問統計'
+        elif who_word and (rank_word or ask_word):kind='問答次數'
+        elif re.search(r'(?:多少人|幾個人|幾人).*(?:用|使用|在用)|使用人數|有人在用',text):kind='使用統計'
+        elif re.search(r'排行榜|排名榜',text):kind='問答次數'
     if not kind:return None
     period='近30天'
     days=re.search(r'(?:近|最近|過去|這)(\d+)(?:天|日)',text)
