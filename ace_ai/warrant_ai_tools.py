@@ -5349,7 +5349,8 @@ def _warrant_detail_from_store(canonical: str, requested: int, days: int, stock_
         for d in p["days"]:
             key = (p["warrant"], str(d[0])[:10].replace("/", "-"))
             day_amount[key] = day_amount.get(key, 0.0) + float(d[3] or 0)
-    minor_skipped = pending_skipped = 0
+    minor_skipped = 0
+    pending_codes: List[str] = []
     for _, row in events.sort_values("event_date").iterrows():
         if code and row["stock_code"] != code:
             continue
@@ -5361,9 +5362,9 @@ def _warrant_detail_from_store(canonical: str, requested: int, days: int, stock_
             if len(items) > 1 and max_code and wcode != max_code:   # 不知道哪檔是最大單筆時不過濾
                 # 同一事件常順手買幾張別檔：事件表只有最大單筆的金額，其他檔用歷史庫當天金額判斷
                 if day > store_max:
-                    pending_skipped += 1              # 歷史庫還沒更新到事件日，金額未知 → 先不列
-                    continue
-                if day_amount.get((wcode, day), 0.0) < MINOR_WARRANT_AMOUNT:
+                    if wcode not in pending_codes:    # 歷史庫還沒更新到事件日：金額未知，照列並註明
+                        pending_codes.append(wcode)
+                elif day_amount.get((wcode, day), 0.0) < MINOR_WARRANT_AMOUNT:
                     minor_skipped += 1                # 零星（例：640 萬事件裡只買 2 張）不列
                     continue
             event_codes[wcode].append(row["event_code"])
@@ -5483,7 +5484,7 @@ def _warrant_detail_from_store(canonical: str, requested: int, days: int, stock_
         "trading_days": days, "period_start": ctx["start"].strftime("%Y/%m/%d"), "period_end": ctx["end"].strftime("%Y/%m/%d"),
         "store_date": pos["store_max"], "data_note": _store_notes(pos),
         "warrant_count": sum(len(v) for v in bought.values()), "groups": groups, "hidden_stocks": hidden,
-        "minor_skipped": minor_skipped, "pending_skipped": pending_skipped,
+        "minor_skipped": minor_skipped, "pending_codes": pending_codes,
         "habits": habits, "near_expiry_holdings": near_expiry[:6], "available": bool(groups),
         "other_warrants": int(sum(others.values())),
         "store_missing": store_missing,     # 歷史庫沒有、張數依 Sheet 事件表的權證

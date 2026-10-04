@@ -1295,8 +1295,10 @@ def branch_store_warrant_sections(d: Dict[str, Any]) -> List[Dict[str, Any]]:
     tail = f"另有 {hidden} 檔標的未列出，可問「{d.get('branch')} 代號 買哪些權證」。" if hidden else ""
     if d.get("other_warrants"):
         tail += f"另有 {d['other_warrants']} 檔未達事件門檻的零星買進未列出。"
-    if d.get("minor_skipped") or d.get("pending_skipped"):
-        tail += "同事件順手買的零星權證不列" + ("（最新事件日的個別金額待歷史庫更新）" if d.get("pending_skipped") else "") + "。"
+    if d.get("minor_skipped"):
+        tail += "同事件單筆未滿 10 萬的零星權證不列。"
+    if d.get("pending_codes"):
+        tail += f"{'、'.join(d['pending_codes'][:4])} 為同事件其他權證，個別金額待歷史庫更新。"
     if d.get("store_missing"):
         tail += f"{'、'.join(d['store_missing'][:3])} 張數依事件表。"
     if d.get("near_expiry_holdings"):
