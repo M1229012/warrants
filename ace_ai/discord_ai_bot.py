@@ -7760,6 +7760,15 @@ def run_discord_bot(config: BotConfig) -> None:
                                                                    '*', excluded,   # 管理員查詢：所有伺服器合計（10-04）
                                                                    {m.id: (getattr(m, 'display_name', '') or getattr(m, 'name', ''))
                                                                     for g in getattr(client, 'guilds', ()) for m in getattr(g, 'members', ())})
+                # 沒開 members intent 時成員名單是空的：排名裡的 ID 直接向 Discord 查名字（只查前幾名，10-04）
+                for uid in dict.fromkeys(re.findall(r'ID (\d{15,20})', summary)):
+                    try:
+                        user = client.get_user(int(uid)) or await client.fetch_user(int(uid))
+                        name = getattr(user, 'global_name', None) or getattr(user, 'name', '')
+                        if name:
+                            summary = summary.replace(f'ID {uid}', name)
+                    except Exception:
+                        pass
                 await interaction_text(interaction, summary, ephemeral=True)
                 if attachment_data is not None:
                     with discord.File(io.BytesIO(attachment_data), filename='stock-questions.csv' if stats_command.kind in ('股票詢問統計','熱門股票') else 'member-usage.csv') as stats_file:
