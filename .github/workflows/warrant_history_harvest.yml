@@ -28,6 +28,11 @@
 #     2. 還原要完整：下載失敗就停，不可以用空的累積庫往下跑。
 #     3. 上傳前比列數：任何一個累積檔比還原時少，就拒絕上傳，
 #        不讓一次異常的執行把 Release 上的完整資料覆蓋掉。
+#     4. Release 清單：每次上傳完最後再傳 store_manifest.json（每個檔案的列數）。
+#        下一輪還原時比對，有檔案不見或變少就停。2026-09-18 發現 Release 上的
+#        2024–2026 年 OHLCV 和工作快取不見了，那一輪默默從頭重抓 3 小時、回補從 0 開始。
+#        （--clobber 是先刪舊檔再傳新檔，上傳中斷就會少檔案。）
+#        真的要從頭重建時，到 Release 頁面刪掉 store_manifest.json 即可。
 #
 # 為什麼 backfill 不用主程式的 repair：
 #   repair 每個 API4 請求都查 1,300 天、沒有續跑、任何一組失敗就整輪作廢，
@@ -63,7 +68,7 @@ permissions:
 
 env:
   # 必須與 warrant_harvest/ 底下三支程式的 HARVEST_BUILD 相同
-  HARVEST_BUILD: "2026-09-18.1"
+  HARVEST_BUILD: "2026-09-18.2"
   STORE_TAG: data-store
   OUTPUT_DIR: output
   JOB_TIMEOUT_MINUTES: "350"
@@ -87,7 +92,8 @@ jobs:
           mismatch=0
           for f in warrant_harvest/warrant_backfill.py \
                    warrant_harvest/warrant_history_store.py \
-                   warrant_harvest/warrant_reference_harvest.py; do
+                   warrant_harvest/warrant_reference_harvest.py \
+                   warrant_analysis/broker_quality_diagnostics.py; do
             v=$(sed -n 's/^HARVEST_BUILD = "\([^"]*\)".*/\1/p' "$f" | head -1)
             if [ "$v" = "$HARVEST_BUILD" ]; then
               echo "  ✅ $f  $v"
@@ -134,6 +140,11 @@ jobs:
               tar -xzf /tmp/warrant_cache.tar.gz -C output/
               echo "已還原工作快取"
             fi
+            rm -f /tmp/store_manifest.json
+            if echo "$assets" | grep -qx 'store_manifest.json'; then
+              gh release download "$STORE_TAG" \
+                --dir /tmp --pattern "store_manifest.json" --clobber
+            fi
             # 上一段的回補紀錄一還原就刪掉。
             # 這一段如果在回補之前就失敗，接續步驟不能拿上一段的「有進度」
             # 去觸發下一段 —— 那會在同一個錯誤上空轉到 MAX_CHAIN。
@@ -162,6 +173,28 @@ jobs:
           with open("/tmp/restore_manifest.json", "w", encoding="utf-8") as fh:
               json.dump(manifest, fh, ensure_ascii=False, indent=2)
           print(f"已記錄 {len(manifest)} 個累積檔的列數，上傳前會比對")
+
+          # 與上一輪上傳完留下的清單比對：Release 上的檔案不可以不見或變少
+          if not os.path.exists("/tmp/store_manifest.json"):
+              print("ℹ️ Release 上還沒有 store_manifest.json（第一次使用這道檢查），這次略過比對")
+          else:
+              with open("/tmp/store_manifest.json", encoding="utf-8") as fh:
+                  expected = json.load(fh)
+              problems = []
+              for path, rows in expected.items():
+                  now = manifest.get(path)
+                  if now is None:
+                      problems.append(f"{path}：上一輪有 {rows:,} 列，這次 Release 上找不到")
+                  elif now < rows:
+                      problems.append(f"{path}：上一輪 {rows:,} 列，這次只有 {now:,} 列")
+              if problems:
+                  print("::error::Release 上的累積資料和上一輪留下的清單對不起來，停止執行，不抓也不上傳：")
+                  for item in problems:
+                      print(f"  ❌ {item}")
+                  print("  可能是上一輪上傳中途被中斷（--clobber 會先刪舊檔）。")
+                  print("  請先到 Release 頁面確認檔案；若確定要從頭重建，刪掉 store_manifest.json 再重跑。")
+                  raise SystemExit(1)
+              print(f"✅ 與上一輪清單比對通過：{len(expected)} 個檔案都在，列數都沒有變少")
           PY
 
       # ── 抓資料的步驟用 !cancelled()：彼此獨立，一步失敗不該擋住其他步驟。
@@ -201,7 +234,34 @@ jobs:
 
       - name: 每日增量（daily）
         if: ${{ !cancelled() && steps.restore.outcome == 'success' && github.event.inputs.mode != 'backfill' }}
+        # 到點就收手，留時間給後面的合併與上傳（job 350 分鐘）。
+        timeout-minutes: 290
         env:
+          # MoneyDJ 抓取參數照抄 warrant_backtest_MONEYDJ_NEW 正式 workflow（每天都跑得完）。
+          # 沒設的話主程式預設 25 req/s 起跑、最低降到 2，
+          # 2026/10/02 實測跑到 4,000 檔就被限流卡在冷卻等級 6，之後 5 小時零進度。
+          MONEYDJ_DAILY_TODAY_FIRST: "0"
+          MONEYDJ_DAILY_USE_API6: "1"
+          MONEYDJ_DYNAMIC_HASH_ENABLED: "1"
+          MONEYDJ_PRESCAN_WORKERS: "20"
+          MONEYDJ_HISTORY_WORKERS: "20"
+          MONEYDJ_MAX_RETRIES: "3"
+          MONEYDJ_RETRY_BASE_SECONDS: "1.0"
+          MONEYDJ_RATE_LIMIT_ENABLED: "1"
+          MONEYDJ_RATE_START_PER_SECOND: "15"
+          MONEYDJ_RATE_MIN_PER_SECOND: "5"
+          MONEYDJ_RATE_MAX_PER_SECOND: "15"
+          MONEYDJ_THROTTLE_DETECT_ENABLED: "1"
+          MONEYDJ_THROTTLE_ESCALATE_MIN_GAP: "10"
+          MONEYDJ_THROTTLE_BASE_COOLDOWN: "15"
+          MONEYDJ_THROTTLE_MAX_COOLDOWN: "45"
+          MONEYDJ_HOLD_ON_EXTRA_ATTEMPTS: "6"
+          MONEYDJ_FAILURE_SAMPLE_PRINTS: "3"
+          MONEYDJ_API5_PREFLIGHT_ENABLED: "1"
+          MONEYDJ_DEGRADED_FALLBACK_ENABLED: "1"
+          MONEYDJ_DEGRADED_MAX_LOOKBACK_DAYS: "10"
+          MONEYDJ_MIN_PRESCAN_SUCCESS_RATIO: "0.97"
+          MONEYDJ_API5_STRICT: "1"
           GSHEET_RESULT_ENABLED: "0"
           GSHEET_CACHE_ENABLED: "0"
           SHEETLESS_MODE: "1"
@@ -230,6 +290,12 @@ jobs:
         run: |
           python warrant_harvest/warrant_history_store.py export --scope recent
           python warrant_harvest/warrant_history_store.py export --scope summary
+
+      # 報表失敗不影響資料保存：continue-on-error 讓後面的上傳照常執行
+      - name: 產出分點勝率報表
+        if: ${{ always() && steps.restore.outcome == 'success' }}
+        continue-on-error: true
+        run: python warrant_analysis/broker_quality_diagnostics.py --excel
 
       - name: 上傳前檢查（累積庫不可以比還原時少）
         id: guard
@@ -284,6 +350,27 @@ jobs:
           echo "上傳 ${#files[@]} 個檔案："
           ls -lh "${files[@]}"
           gh release upload "$STORE_TAG" "${files[@]}" --clobber
+
+          # 資料全部傳完才寫清單、最後才傳清單。
+          # 順序很重要：中途被中斷時，清單還是上一輪的，下一輪比對就會發現少了檔案。
+          python - <<'PY'
+          import glob, json, os
+          import pyarrow.parquet as pq
+          paths = (
+              glob.glob("output/warrant_history_store/*.parquet")
+              + glob.glob("output/warrant_history_store/ohlcv/*.parquet")
+              + [p for p in (
+                  "output/warrant_cache/backfill/api4_state.parquet",
+                  "output/warrant_cache/backfill/api6_state.parquet",
+                  "output/warrant_cache/backfill/candidates.parquet",
+              ) if os.path.exists(p)]
+          )
+          manifest = {p: pq.ParquetFile(p).metadata.num_rows for p in sorted(paths)}
+          with open("/tmp/store_manifest.json", "w", encoding="utf-8") as fh:
+              json.dump(manifest, fh, ensure_ascii=False, indent=2)
+          print(f"清單：{len(manifest)} 個檔案")
+          PY
+          gh release upload "$STORE_TAG" /tmp/store_manifest.json --clobber
 
       - name: 回補進度
         if: ${{ always() && steps.restore.outcome == 'success' && github.event.inputs.mode == 'backfill' }}
