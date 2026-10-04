@@ -320,3 +320,20 @@ def stock_types(question,stocks,route=''):
     if len(segments)==len(pairs):
         return {code:sorted(kinds|({'比較'} if '比較' in overall else set())) for code,kinds in segments.items()}
     return {code:overall for code,_ in pairs}
+
+
+def diagnose():
+    """管理員診斷：各伺服器寫入筆數、管理員排除數、最後紀錄時間、資料表欄位（查「為什麼統計是 0」）。"""
+    try:
+        with db._LOCK, db._db() as conn:
+            _init(conn)
+            cols = [r[1] for r in conn.execute("PRAGMA table_info(member_usage)")]
+            started = conn.execute("SELECT value FROM member_usage_meta WHERE key='started'").fetchone()[0]
+            rows = conn.execute("SELECT guild_id, outcome, COUNT(*), COUNT(DISTINCT user_id), MAX(ts) FROM member_usage GROUP BY guild_id, outcome").fetchall()
+            admins = conn.execute("SELECT guild_id, COUNT(*) FROM member_usage_admins GROUP BY guild_id").fetchall()
+    except Exception as exc:
+        return f"會員統計診斷失敗：{type(exc).__name__}: {exc}"
+    lines = [f"資料庫：{db.DB_PATH}", f"統計起算：{started}", f"member_usage 欄位：{', '.join(cols)}"]
+    lines += [f"伺服器 {g}｜{o}｜{n} 筆｜{u} 人｜最後 {t}" for g, o, n, u, t in rows] or ["member_usage 沒有任何紀錄"]
+    lines += [f"伺服器 {g}｜被排除的管理員 {n} 人" for g, n in admins]
+    return "\n".join(lines)

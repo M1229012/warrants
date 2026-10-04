@@ -5660,6 +5660,9 @@ class AceQueryEngine:
             threading.Thread(target=job, name="ace-market-sync", daemon=True).start()
             return AnswerResult(text="已開始在背景更新全市場日K底庫（每個交易日 2 個請求）。完成後可用「系統狀態」查看。",
                                 route="admin_market_sync", gemini_calls=0, elapsed=time.perf_counter()-started, cacheable=False)
+        if compact in ("統計診斷", "會員統計診斷"):
+            return AnswerResult(text=member_usage_stats.diagnose(), route="admin_stats_diag", gemini_calls=0,
+                                elapsed=time.perf_counter() - started, cacheable=False, as_text=True)
         if compact in ("錯誤紀錄", "錯誤記錄", "錯誤", "errors"):
             return AnswerResult(text=ADMIN_ALERTS.summary(), route="admin_errors", gemini_calls=0,
                                 elapsed=time.perf_counter()-started, cacheable=False)
