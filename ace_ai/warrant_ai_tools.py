@@ -1174,6 +1174,7 @@ SHEET_REGISTRY: Dict[str, str] = {
     "近兩月買賣金額排行": "近兩月權證淨買進金額最高的標的與買進分點",
     "快取_近7日權證分點共識TOP15": "精選分點近7日共識買賣超權證 TOP15",
     "快取_TOP15共識淨買超": "近40日分點共識淨買超 TOP15 標的與型態",
+    "快取_TOP15部位明細": "TOP15 分點×標的逐檔權證部位（事件日、原始成本、剩餘股數）；歷史庫落後時補最新事件",
     "每日賣出明細": "分點每日權證賣出（減碼／出清）明細與報酬率",
     **{title: f"{letter} 類事件明細（{EVENT_TYPE_LABELS[letter]}）" for letter, title in AMOUNT_CLASS_SHEETS.items()},
 }
@@ -5337,6 +5338,34 @@ def _warrant_metrics(p: Dict[str, Any], closes: Dict[str, float], buy_day: str, 
     return out
 
 
+def _sheet_event_warrant_costs(branch: str, stock_code: str = "") -> Dict[Tuple[str, str, str], Tuple[float, float]]:
+    """Sheet「快取_TOP15部位明細」：(標的, 權證, 事件日) → (原始成本, 剩餘股數)。
+    歷史庫落後時用來補最新事件的逐檔金額；讀不到回傳空 dict，不讓主要回答失敗。"""
+    kf = core()
+    try:
+        df = read_sheet_table("快取_TOP15部位明細")["df"]
+    except ToolDataError as exc:
+        print(f"⚠️ 快取_TOP15部位明細略過：{exc}", flush=True)
+        return {}
+    need = {"分點", "標的股", "事件日", "權證代號", "原始成本", "剩餘股數"}
+    if df.empty or not need.issubset(df.columns):
+        return {}
+    rows = df[df["分點"].map(kf.normalize_branch_name) == branch]
+    if stock_code:
+        rows = rows[rows["標的股"].map(kf._normalize_stock_name_code_key) == stock_code]
+    out: Dict[Tuple[str, str, str], Tuple[float, float]] = {}
+    for _, row in rows.iterrows():
+        day = _parse_sheet_date(row["事件日"])
+        if day is None:
+            continue
+        key = (kf._normalize_stock_name_code_key(row["標的股"]), _clean_cell(row["權證代號"]), day.strftime("%Y-%m-%d"))
+        out[key] = (_count_value(row["原始成本"]) or 0.0, _count_value(row["剩餘股數"]) or 0.0)
+    return out
+
+
+MINOR_WARRANT_AMOUNT = 100_000   # 同事件非最大單筆權證，當天買進金額 < 10 萬視為零星、不進明細表
+
+
 def _warrant_detail_from_store(canonical: str, requested: int, days: int, stock_code: str = "") -> Optional[Dict[str, Any]]:
     ctx = _store_window(canonical, days)
     if ctx is None:
@@ -5351,6 +5380,16 @@ def _warrant_detail_from_store(canonical: str, requested: int, days: int, stock_
     event_codes: Dict[str, List[str]] = defaultdict(list)       # 每檔權證出現在哪些事件
     stock_events: Dict[str, List[str]] = defaultdict(list)      # 每檔標的的事件（一筆事件只算一次）
     event_warrants: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    store_max = str(pos.get("store_max") or "")
+    day_amount: Dict[Tuple[str, str], float] = {}                # (權證, 日期) → 歷史庫當天買進金額
+    for p in pos["positions"].values():
+        for d in p["days"]:
+            key = (p["warrant"], str(d[0])[:10].replace("/", "-"))
+            day_amount[key] = day_amount.get(key, 0.0) + float(d[3] or 0)
+    minor_skipped = 0
+    pending_codes: List[str] = []
+    sheet_costs: Optional[Dict[Tuple[str, str, str], Tuple[float, float]]] = None
+    sheet_left: Dict[Tuple[str, str], float] = {}                # 歷史庫沒有時，Sheet 部位明細的剩餘股數
     for _, row in events.sort_values("event_date").iterrows():
         if code and row["stock_code"] != code:
             continue
@@ -5359,6 +5398,24 @@ def _warrant_detail_from_store(canonical: str, requested: int, days: int, stock_
         day = _fmt_date(row["event_date"]).replace("/", "-")
         items = _warrant_items(row)
         for wcode, wname in items:
+            minor_candidate = len(items) > 1 and bool(max_code) and wcode != max_code   # 不知道哪檔是最大單筆時不過濾
+            if day > store_max:
+                # 歷史庫還沒更新到事件日：改用 Sheet「快取_TOP15部位明細」的逐檔成本；Sheet 也沒有才照列並註明
+                if sheet_costs is None:
+                    sheet_costs = _sheet_event_warrant_costs(canonical, code)
+                hit = sheet_costs.get((row["stock_code"], wcode, day))
+                if hit is None:
+                    if minor_candidate and wcode not in pending_codes:
+                        pending_codes.append(wcode)
+                elif minor_candidate and hit[0] < MINOR_WARRANT_AMOUNT:
+                    minor_skipped += 1                # 零星（例：640 萬事件裡只買 2 張）不列
+                    continue
+                else:
+                    sheet_left[(row["stock_code"], wcode)] = sheet_left.get((row["stock_code"], wcode), 0.0) + hit[1]
+            elif minor_candidate and day_amount.get((wcode, day), 0.0) < MINOR_WARRANT_AMOUNT:
+                # 同一事件常順手買幾張別檔：事件表只有最大單筆的金額，其他檔用歷史庫當天金額判斷
+                minor_skipped += 1
+                continue
             event_codes[wcode].append(row["event_code"])
             info = event_warrants.setdefault((row["stock_code"], wcode), {"name": wname, "amount": 0.0, "last": "", "state": "",
                                                                          "lots": 0.0, "lots_exact": True})
@@ -5383,8 +5440,14 @@ def _warrant_detail_from_store(canonical: str, requested: int, days: int, stock_
         p = (next((x for x in candidates if x["stock"] == stock), None)
              or next((x for x in candidates if not x["stock"]), None)
              or (candidates[0] if len(candidates) == 1 else None))
+        last_store = max((str(d[0])[:10].replace("/", "-") for d in p["days"]), default="") if p is not None else ""
+        if p is not None and p["remaining"] <= 0 and info["last"] > last_store:
+            # 事件表比歷史庫新（例：10/02 事件買進、歷史庫還沒收到）：歷史庫看到的是舊一輪已賣完，
+            # 不能標「已出清」，改用事件表狀態（和上方分點動向表一致）
+            p = None
         if p is not None:
             buy_sh, _, buy_amt, _, _ = _window_sums(p, s, e)
+
             p = dict(p, stock=stock, name=p["name"] or info["name"],
                      stock_name=p["stock_name"] or stock_name_map.get(stock, ""))
         else:
@@ -5392,6 +5455,8 @@ def _warrant_detail_from_store(canonical: str, requested: int, days: int, stock_
             # 只有「都是單一權證事件、狀態仍是持有（沒有減碼／出清）」時，事件張數加總就是剩餘張數；否則只顯示狀態。
             buy_sh, buy_amt = 0.0, 0.0
             lots = info["lots"] * 1000 if info["lots_exact"] and info["state"] == "持有" else 0.0
+            if (stock, wcode) in sheet_left and info["state"] == "持有":
+                lots = sheet_left[(stock, wcode)]                    # Sheet 部位明細有逐檔剩餘股數
             store_missing.append(wcode)
             p = {"warrant": wcode, "name": info["name"], "stock": stock, "stock_name": stock_name_map.get(stock, ""),
                  "remaining": lots, "cycle_bought": lots, "expired": False, "event_only": True,
@@ -5451,11 +5516,13 @@ def _warrant_detail_from_store(canonical: str, requested: int, days: int, stock_
             hidden.append(label)
             continue
         remaining = sum(x["p"]["remaining"] for x in items if x["p"]["remaining"] > 0 and not x["p"]["expired"])
+        # 歷史庫沒有張數、但事件表仍持有／只減碼：整組不能寫「已全部賣出」
+        event_open = any(x["p"].get("event_only") and not str(x["event_state"]).startswith("出清") for x in items)
         groups.append({"stock_code": stock, "label": label,
                        # 同一筆事件常同時買好幾檔權證，標題要數「事件」不是「權證×事件」，否則次數會被灌大
                        "event_codes": _event_codes_text(stock_events.get(stock, [])),
                        "buy_amount_text": _plain_money(sum(x["buy_amt"] for x in items)),
-                       "remaining_text": _lots_text(remaining) if remaining else "已全部賣出",
+                       "remaining_text": _lots_text(remaining) if remaining else "持有中" if event_open else "已全部賣出",
                        "spot": _num(spot_now, 2), "sigma_pct": _num(sigma_now * 100 if sigma_now else None, 0),
                        "warrant_count": len(rows), "warrants": rows[:warrant_limit], "other_warrants": others.get(stock, 0)})
     median = lambda xs: float(pd.Series(xs).median()) if xs else None
@@ -5469,6 +5536,7 @@ def _warrant_detail_from_store(canonical: str, requested: int, days: int, stock_
         "trading_days": days, "period_start": ctx["start"].strftime("%Y/%m/%d"), "period_end": ctx["end"].strftime("%Y/%m/%d"),
         "store_date": pos["store_max"], "data_note": _store_notes(pos),
         "warrant_count": sum(len(v) for v in bought.values()), "groups": groups, "hidden_stocks": hidden,
+        "minor_skipped": minor_skipped, "pending_codes": pending_codes,
         "habits": habits, "near_expiry_holdings": near_expiry[:6], "available": bool(groups),
         "other_warrants": int(sum(others.values())),
         "store_missing": store_missing,     # 歷史庫沒有、張數依 Sheet 事件表的權證

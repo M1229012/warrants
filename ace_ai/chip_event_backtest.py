@@ -10,6 +10,8 @@ from statistics import median
 from collections import defaultdict
 
 HORIZONS = (5, 10, 20)
+# 一買一賣成本（手續費 0.1425%×2＋證交稅 0.3%，未打折）；扣掉成本後報酬 > 0 才算贏
+ROUND_TRIP_COST_PCT = max(0., float(os.getenv('TEST_ROUND_TRIP_COST_PCT', '0.585')))
 VERSION = 'chip-events-year-v10'
 
 
@@ -69,9 +71,14 @@ def summarize(prices,signals,background_dates):
         n=len(mature);returns=[v['return_pct'] for v in mature]
         baseline=sum(v['return_pct'] for v in background)/len(background) if background else None
         avg=sum(returns)/n if n else None
+        net=[r-ROUND_TRIP_COST_PCT for r in returns]
         output[str(h)]={'samples':n,'pending':sum(exclusion_reason(prices,d,h)=='pending' for d in signals),
             'excluded':excluded,'excluded_count':len(excluded),'small_sample':n<5,
             'avg_return_pct':round(avg,2) if avg is not None else None,
+            'win_rate_pct':round(sum(r>0 for r in net)/n*100,1) if n else None,
+            'avg_net_return_pct':round(sum(net)/n,2) if n else None,
+            'median_net_return_pct':round(median(net),2) if n else None,
+            'cost_pct':ROUND_TRIP_COST_PCT,
             'median_return_pct':round(median(returns),2) if n else None,
             'reach_3_pct':round(sum(v>=3-1e-9 for v in returns)/n*100,1) if n else None,
             'reach_5_pct':round(sum(v>=5-1e-9 for v in returns)/n*100,1) if n else None,
@@ -197,38 +204,69 @@ def branch_study(dates,complete_dates,rows,prices,branch_name='',action_dates=()
         'definition':f'觀察到的買超波段：相隔不超過5交易日歸同一波，累積淨買超達20日均量{threshold_ratio*100:g}%且至少{minimum:g}張才成立；次日開盤起算。一波只成立一次。未上榜不是零，資料缺日中止波段；訊號觀察期仍可能重疊。門檻為測試預設，非已驗證策略。'}
 
 
+def _quantile(values, q):
+    values=sorted(values);pos=(len(values)-1)*q;lo=int(pos);hi=min(lo+1,len(values)-1)
+    return values[lo]+(values[hi]-values[lo])*(pos-lo)
+
+
+def _non_overlap(prices, days, horizon):
+    """同一持有期內的觸發算同一波：進場後 horizon 個交易日內的新觸發不另計（每個天期各自不重疊）。"""
+    order={d:i for i,d in enumerate(prices)};kept=[];last=-10**9
+    for d in days:
+        if order[d]-last>=horizon:
+            kept.append(d);last=order[d]
+    return kept
+
+
 def margin_study(records, prices, action_dates=()):
+    """融資突增事件（測試版）：
+    - 指標＝融資餘額單日淨增張數 ÷ 前20日均量（看張數不看使用率，避免融資限額變動造成假訊號）。
+    - 門檻滾動計算，只用事件日「之前」最多250個交易日（至少120日）的分位數，不偷看未來。
+    - 隔日開盤進場、第5/10/20個交易日收盤出場；每個天期各自不重疊；扣成本後報酬>0才算贏。"""
     rows = {}
     for row in records:
         day = str(row.get('date', ''))[:10]
         today = finite(row.get('MarginPurchaseTodayBalance'))
         yesterday = finite(row.get('MarginPurchaseYesterdayBalance'))
         if day in prices and today is not None and yesterday is not None and today >= 0 and yesterday > 0:
-            rows[day] = {'delta': today - yesterday, 'base': yesterday,
+            rows[day] = {'delta': today - yesterday, 'base': yesterday, 'balance': today,
                          'action': day in action_dates or any(w in str(row.get('Note', '')) for w in ('分割', '合併', '減資'))}
     dates = list(prices)
-    signals, details, background, reductions, last = [], [], [], [], -1000
-    ratio = max(0.001, float(os.getenv('TEST_MARGIN_EVENT_BALANCE_RATIO', '0.05')))
-    multiple = max(1.0, float(os.getenv('TEST_MARGIN_EVENT_DELTA_MULTIPLE', '2')))
+    window = max(20, int(os.getenv('TEST_MARGIN_ROLLING_DAYS', '250')))
+    minimum = max(20, int(os.getenv('TEST_MARGIN_ROLLING_MIN_DAYS', '120')))
+    delta_q = min(.99, max(.5, float(os.getenv('TEST_MARGIN_DELTA_Q', '0.90'))))
+    level_q = min(.99, max(0., float(os.getenv('TEST_MARGIN_LEVEL_Q', '0.60'))))
+    floor = max(0., float(os.getenv('TEST_MARGIN_MIN_BALANCE_PCT', '0.5'))) / 100
+    ratio, qualifying, background, reductions = {}, [], [], []
     for i, day in enumerate(dates):
-        past = dates[i - 20:i]
-        if i < 20 or day not in rows or any(d not in rows or rows[d]['action'] for d in past + [day]):
+        mean = volume_mean(prices, dates, i)
+        r = rows.get(day)
+        if r is None or r['action'] or mean is None:
+            continue
+        ratio[day] = r['delta'] / mean
+        past = [d for d in dates[max(0, i - window):i] if d in ratio]
+        if len(past) < minimum:
             continue
         background.append(day)
-        r = rows[day]
-        positive_mean = sum(max(0, rows[d]['delta']) for d in past) / 20
-        threshold = max(r['base'] * ratio, positive_mean * multiple)
-        if r['delta'] < 0 and abs(r['delta']) >= threshold:
-            reductions.append({'date':day,'balance_delta':r['delta'],'balance_increase_pct':round(r['delta']/r['base']*100,2)})
-        if r['delta'] > 0 and r['delta'] >= threshold and i - last >= 20:
-            signals.append(day)
-            details.append({'date': day, 'balance_delta': r['delta'],
-                            'balance_increase_pct': round(r['delta'] / r['base'] * 100, 2)})
-            last = i
-    return {'events': details, 'reductions':reductions, 'signal_dates': signals,
-            'metrics': summarize(prices, signals, background),
-            'period_start': min(rows) if rows else '', 'period_end': max(rows) if rows else '',
-            'definition': f'單日融資餘額淨增加至少為前日餘額{ratio * 100:g}%，且至少為前20日正增量日均值{multiple:g}倍；前20日須完整，排除標記股數調整的區間，事件間隔至少20個股票交易日。餘額淨增加不等於實際融資買入額，不能判定大戶或散戶。'}
+        delta_thr = _quantile([ratio[d] for d in past], delta_q)
+        level_thr = _quantile([rows[d]['balance'] for d in past], level_q)
+        reduce_thr = _quantile([ratio[d] for d in past], 1 - delta_q)
+        if r['delta'] < 0 and ratio[day] <= reduce_thr:
+            reductions.append({'date': day, 'balance_delta': r['delta'], 'balance_increase_pct': round(r['delta'] / r['base'] * 100, 2)})
+        if r['delta'] > 0 and ratio[day] >= delta_thr and r['delta'] >= r['base'] * floor and r['balance'] >= level_thr:
+            qualifying.append({'date': day, 'balance_delta': r['delta'], 'balance_increase_pct': round(r['delta'] / r['base'] * 100, 2),
+                               'volume_ratio_pct': round(ratio[day] * 100, 2), 'threshold_pct': round(delta_thr * 100, 2)})
+    days = [e['date'] for e in qualifying]
+    metrics = {str(h): summarize(prices, _non_overlap(prices, days, h), background)[str(h)] for h in HORIZONS}
+    waves = set(_non_overlap(prices, days, 5))           # 圖上標記：連續觸發只標第一天
+    events = [e for e in qualifying if e['date'] in waves]
+    return {'events': events, 'reductions': reductions, 'signal_dates': [e['date'] for e in events],
+            'qualifying_days': len(qualifying), 'metrics': metrics, 'tested_days': len(background),
+            'period_start': background[0] if background else '', 'period_end': background[-1] if background else '',
+            'definition': (f'融資餘額單日淨增張數÷前20日均量 ≥ 前{window}個交易日（至少{minimum}日）的PR{delta_q*100:g}，'
+                           f'且餘額 ≥ 同期PR{level_q*100:g}、淨增至少為前日餘額{floor*100:g}%；排除股數調整日。'
+                           f'次日開盤進場、第N個交易日收盤出場，各天期不重疊；扣成本{ROUND_TRIP_COST_PCT:g}%後報酬>0算贏。'
+                           '餘額淨增加不等於實際融資買入額，不能判定大戶或散戶。')}
 
 
 def load_margin_records(code, dates):
@@ -264,12 +302,14 @@ def metric_table(metrics):
 def _margin_sections(payload, detailed=False):
     data=payload.get('margin')
     if not data or not data.get('events'):return []
-    m=data['metrics']['20'];event=data['events'][-1]
-    return [{'type':'heading','text':'大額融資淨增｜管理員'},
-        {'type':'table','columns':['最近事件','樣本','達3%','達5%','報酬中位數','最深跌幅中位數'],
-         'widths':[.27,.09,.16,.16,.16,.16],'accent':('達3%','達5%'),'signed':('報酬中位數','最深跌幅中位數'),
+    m=data['metrics']['20'];event=data['events'][-1];ok=m['samples']>=5
+    return [{'type':'heading','text':'融資突增｜管理員'},
+        {'type':'table','columns':['最近事件','20日樣本','勝率','平均報酬','報酬中位數','最深跌幅中位數'],
+         'widths':[.27,.11,.13,.16,.16,.17],'accent':('勝率',),'signed':('平均報酬','報酬中位數','最深跌幅中位數'),
          'rows':[[event['date'][5:]+f" 淨增 {event['balance_increase_pct']:+.1f}%",str(m['samples']),
-                 pct(m['reach_3_pct']) if m['samples']>=5 else '不足',pct(m['reach_5_pct']) if m['samples']>=5 else '不足',pct(m['median_return_pct'],True),pct(m['median_entry_depth_pct'],True)]]}]
+                 pct(m['win_rate_pct']) if ok else '不足',pct(m['avg_net_return_pct'],True) if ok else '不足',
+                 pct(m['median_net_return_pct'],True),pct(m['median_entry_depth_pct'],True)]]},
+        {'type':'paragraph','text':'報酬已扣一買一賣成本；次日開盤進場、第20個交易日收盤出場'}]
 
 
 def _brief_spot_card(payload):
@@ -440,6 +480,12 @@ def _prepare_inner(code, name='', as_of='', report=None, allow_margin=False, bra
     if allow_margin:
         try:
             margin = margin_study(load_margin_records(code, list(prices)), prices, action_dates)
+            # 同期基準（任一天次日開盤買進）只寫 Log 給管理員看，不上會員圖
+            for h in HORIZONS:
+                m = margin['metrics'][str(h)]
+                print(f"📊 融資突增｜{code}｜{h}日｜樣本{m['samples']}｜勝率{m['win_rate_pct']}｜平均淨報酬{m['avg_net_return_pct']}"
+                      f"｜同期平均{m['stock_background_avg_pct']}｜超額{m['excess_return_pct']}", flush=True)
+            print(f"📊 融資突增規則｜{code}｜{margin['definition']}", flush=True)
             if margin['events']:
                 result['margin'] = margin
         except Exception as exc:
