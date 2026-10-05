@@ -62,6 +62,8 @@ def _init(conn):
     conn.execute("CREATE TABLE IF NOT EXISTS member_usage_meta (key TEXT PRIMARY KEY,value TEXT NOT NULL)")
     conn.execute("INSERT OR IGNORE INTO member_usage_meta VALUES ('started',?)", (now().isoformat(timespec='seconds'),))
     conn.execute("CREATE TABLE IF NOT EXISTS member_usage_admins (guild_id TEXT,user_id TEXT,PRIMARY KEY(guild_id,user_id))")
+    # AI 解讀額度用完（仍可問一般題）：每人每天一筆，用來判斷額度是不是使用量的瓶頸
+    conn.execute("CREATE TABLE IF NOT EXISTS member_ai_quota_hits (user_id TEXT,day TEXT,PRIMARY KEY(user_id,day))")
 
 
     conn.execute("CREATE INDEX IF NOT EXISTS idx_member_usage_guild_outcome_day ON member_usage(guild_id,outcome,day,user_id)")
@@ -126,6 +128,16 @@ def record(request_id, guild_id, user_id, outcome, question='', route='', admin=
         db._warn('會員統計寫入', exc)
 
 
+def record_ai_quota_hit(user_id):
+    """會員這一題已沒有 AI 解讀額度：同一人同一天只記一次。失敗只寫 Log，不影響回答。"""
+    try:
+        with db._LOCK, db._db() as conn, conn:
+            _init(conn)
+            conn.execute('INSERT OR IGNORE INTO member_ai_quota_hits VALUES (?,?)', (str(user_id), now().strftime('%Y-%m-%d')))
+    except Exception as exc:
+        db._warn('AI額度用完紀錄', exc)
+
+
 def successful(result):
     route = str(result.route)
     return (not result.denied_feature and
@@ -165,6 +177,8 @@ def report(question, guild_id, excluded=(), names=None):
         valid="u.guild_id GLOB ? AND NOT EXISTS (SELECT 1 FROM member_usage_admins a WHERE a.user_id=u.user_id)"
         rows=conn.execute(f"SELECT u.user_id,u.outcome,u.category,COUNT(*),COUNT(DISTINCT u.day),MAX(u.day) FROM member_usage u WHERE {valid} AND u.day BETWEEN ? AND ? GROUP BY u.user_id,u.outcome,u.category",(str(guild_id),start,today.isoformat())).fetchall()
         first=dict(conn.execute(f"SELECT u.user_id,MIN(u.day) FROM member_usage u WHERE {valid} AND u.outcome='success' AND u.day<=? GROUP BY u.user_id",(str(guild_id),today.isoformat())).fetchall())
+        hits=conn.execute("SELECT COUNT(*),COUNT(DISTINCT h.user_id) FROM member_ai_quota_hits h WHERE h.day BETWEEN ? AND ? "
+                          "AND NOT EXISTS (SELECT 1 FROM member_usage_admins a WHERE a.user_id=h.user_id)",(start,today.isoformat())).fetchone()
         active=dict(conn.execute(f"SELECT u.user_id,COUNT(DISTINCT u.day) FROM member_usage u WHERE {valid} AND u.outcome='success' AND u.day BETWEEN ? AND ? GROUP BY u.user_id",(str(guild_id),start,today.isoformat())).fetchall())
     users,features={},{}
     denied=failed=0
@@ -185,7 +199,8 @@ def report(question, guild_id, excluded=(), names=None):
                 f'新使用者：{sum(first[uid] >= start for uid in users)} 人（紀錄起算後首次成功）\n'
                 f'回訪人數：{sum(len(row["days"]) >= 2 for row in users.values())} 人（期間內跨日使用）\n'
                 f'前10名用量占比：{top / total * 100 if total else 0:.1f}%\n'
-                f'權限拒絕：{denied} 次｜失敗：{failed} 次\n\n功能使用（按問句分類）：\n' +
+                f'權限拒絕：{denied} 次｜失敗：{failed} 次\n'
+                f'AI 解讀額度用完：{hits[0]} 人次（{hits[1]} 人）\n\n功能使用（按問句分類）：\n' +
                 ('\n'.join(f'{name}：{count} 題' for name, count in sorted(features.items(), key=lambda x: -x[1])) or '尚無資料'))
         return text, None
     text = heading + f'\n成功問答 {total} 題｜使用 {len(users)} 人\n\n'

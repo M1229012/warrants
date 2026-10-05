@@ -693,13 +693,18 @@ HELP_GROUPS = (
     ("額度", ("我的額度",)),
 )
 ADMIN_HELP_GROUPS = (
-    ("會員統計", ("問答次數（前10名）", "問答次數完整名單（CSV）", "使用統計（可加近7天／本月／今日／累計）", "最近7天大家問哪些股票", "大家都問什麼類型的問題", "熱門股票完整名單")),
+    ("會員統計", ("使用統計（可加近7天／本月／今日／累計）", "問答次數（前10名）", "問答次數完整名單（CSV）",
+                  "熱門股票今日／近7天", "大家都問什麼類型的問題", "統計診斷")),
+    ("額度（/額度 指令）", ("贈送 AI 次數", "設定身分組每日 AI 次數", "清除身分組每日設定", "查詢某人／身分組額度")),
     ("型態驗證", ("型態驗證 2330（趨勢線、錨點、轉折確認日）",)),
     ("本週精選", ("本週精選排名", "3006 幫我生成週精選文字", "這版確認，生成圖片")),
     ("草稿", ("直接說修改需求", "還原上一版", "目前草稿")),
-    ("資料維護", ("系統狀態", "用量（含費用估算）", "錯誤紀錄", "更新市場底庫")),
+    ("資料維護", ("系統狀態", "用量（含費用估算）", "錯誤紀錄", "更新市場底庫", "更新族群名冊", "匯出狀態／匯入狀態")),
+    ("現股抓取", ("現股測速 2330（70 日）", "現股改成 8 條", "現股恢復自動", "現股抓取狀態")),
+    ("族群", ("族群雷達", "族群別名（清單）", "新增族群別名 TGV=玻璃基板", "刪除族群別名 TGV")),
     ("測試員", ("新增測試員 <ID或@人>", "移除測試員 <ID>", "測試員名單")),
-    ("其他", ("族群雷達", "型態排名＋截圖", "測試 guest <問題>")),
+    ("其他", ("型態排名＋截圖", "測試 guest／general／warrant／both <問題>（模擬會員身分）", "2330 融資（融資券只限管理員）")),
+    ("測試版限定", ("2330 籌碼（含融資突增回測）", "一年測速 連線=12 代號=3231（富邦一年抓取測速）")),
 )
 
 
@@ -5532,6 +5537,8 @@ class AceQueryEngine:
             if not ok:   # 圖卡版提醒（只給本人看）
                 return AnswerResult(message, "user_limit", 0, 0.0, image_title="提問次數")
             _AI_GATE.allowed = ai_ok
+            if not ai_ok and not (access is not None and access.simulation):
+                member_usage_stats.record_ai_quota_hit(quota_user)   # 統計「AI 解讀額度用完 N 人次」
         if not self._is_priority(access) and getattr(self, "_pending", 0) >= ANSWER_CONCURRENCY + ANSWER_QUEUE_LIMIT:
             return AnswerResult(QUEUE_FULL_MESSAGE, "queue_full", 0, 0.0)
         result = None
@@ -5789,7 +5796,10 @@ class AceQueryEngine:
     def _admin_command(self, question: str, started: float, context_key: str = "") -> Optional[AnswerResult]:
         """管理員維護指令：更新市場底庫／更新族群名冊／系統狀態。找不到對應指令時回 None。"""
         compact = re.sub(r"\s+", "", question)
-        if compact in ("說明", "help", "HELP", "指令", "使用說明"):
+        if compact in ("說明", "help", "HELP", "指令", "使用說明") or re.fullmatch(
+                r"(?:管理員)?(?:指令|命令)(?:表|清單|列表|有哪些|大全)?|有(?:哪些|什麼)(?:管理員)?(?:指令|命令|功能)|"
+                r"你(?:會|能|可以)(?:做|幫我做)?(?:什麼|哪些)|(?:怎麼|如何)用|說明書?|(?:管理員)?功能(?:表|清單|列表)", compact):
+            # 新增管理員指令時，同時加進 ADMIN_HELP_GROUPS（test_admin_help_complete 會檢查有沒有漏）
             return help_result(started, admin=self._show_admin_help(True))
         if compact in ("目前草稿", "現在草稿", "看草稿"):
             session = self._load_draft_session(context_key)
