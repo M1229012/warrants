@@ -44,7 +44,10 @@ QUICK_BUDGET = float(os.getenv("DISCORD_AI_SPOT_QUICK_BUDGET", "8") or 8)
 # 一般現股籌碼題（full／latest）同步階段只確保最近完整日，總時間上限；70 日歷史一律交給背景
 SYNC_BUDGET = float(os.getenv("DISCORD_AI_SPOT_SYNC_BUDGET", "10") or 10)
 # 單頁讀取逾時（秒）：來源很慢時不要一頁等 20 秒
-HTTP_READ_TIMEOUT = float(os.getenv("DISCORD_AI_SPOT_HTTP_TIMEOUT", "10") or 10)
+# 10-05：12 條連線抓一年時 6～12% 頁面卡滿 10 秒；正常頁 0.5～2 秒，改 4 秒逾時＋立即重抓比較快
+HTTP_READ_TIMEOUT = float(os.getenv("DISCORD_AI_SPOT_HTTP_TIMEOUT", "4") or 4)
+# 第一次查詢同步補一年分點的等待上限（秒）；0＝關閉（只補 70 日、其餘交給背景）
+YEAR_SYNC_BUDGET = float(os.getenv("DISCORD_AI_SPOT_YEAR_SYNC_BUDGET", "60") or 0)
 # 背景補資料排隊上限（排隊中＋執行中的股票數）；滿了這次就不排，下次有人查再試
 MAX_PENDING_BACKFILLS = max(1, int(os.getenv("DISCORD_AI_SPOT_MAX_PENDING_BACKFILLS", "24") or 24))
 # 來源連續失敗幾次就停止本輪，並讓新的抓取暫停 SOURCE_COOLDOWN 秒（已在 DB 的資料照常回答）
@@ -207,11 +210,11 @@ def _acquire_source(deadline: float, background: bool) -> bool:
             _FOREGROUND_WAITING[0] -= 1
 
 
-def _note_source(ok: bool) -> bool:
+def _note_source(ok: bool, limit: int = 0) -> bool:
     """全程式累計富邦連續失敗次數（不同會員、不同請求都算）；達 SOURCE_FAIL_LIMIT 就冷卻，成功就歸零。回傳是否剛觸發冷卻。"""
     with _SOURCE_GUARD:
         _SOURCE_STATE["fails"] = 0 if ok else _SOURCE_STATE.get("fails", 0) + 1
-        tripped = _SOURCE_STATE["fails"] >= SOURCE_FAIL_LIMIT
+        tripped = _SOURCE_STATE["fails"] >= max(SOURCE_FAIL_LIMIT, limit)
         if tripped:
             _SOURCE_STATE["fails"] = 0
     if tripped:
@@ -562,7 +565,8 @@ def ensure_days(stock_code, dates, *args, **kwargs):
 def _ensure_days_inner(stock_code: str, dates: Sequence[str], budget: float = BACKFILL_BUDGET,
                 now: Optional[datetime] = None, fetch_source=open_source, latest_date: str = "",
                 bar_dates: Optional[Sequence[str]] = None, lock_wait: Optional[float] = None,
-                background: bool = False, retry_pending: bool = False) -> Dict[str, int]:
+                background: bool = False, retry_pending: bool = False,
+                max_errors: int = 3, fail_streak: int = SOURCE_FAIL_LIMIT) -> Dict[str, int]:
     """只補還沒確認的日期（新→舊）；每抓完一天立刻寫 SQLite；同股票同時只有一個執行緒在補（拿到鎖後重讀狀態，
     同一 stock＋date 不會重抓），全域同時最多 MAX_CONCURRENCY。latest_date＝目前最新交易日（查不到資料時判 pending_update）。
     回傳的 remaining 是「重新讀 DB 後仍未確認」的天數（嘗試過≠完成）。bar_dates 保留相容，不再用來判斷停牌。
@@ -657,16 +661,16 @@ def _ensure_days_inner(stock_code: str, dates: Sequence[str], budget: float = BA
                                         failed = _fetch_one(fetch, stock_code, date, latest_date)
                                     finally:
                                         _SEMAPHORE.release()
-                        tripped = _note_source(not failed)   # 跨請求累計：不同會員各失敗一次也會觸發冷卻
+                        tripped = _note_source(not failed, fail_streak)   # 跨請求累計：不同會員各失敗一次也會觸發冷卻
                         with guard:
                             state["fetched"] += 1
                             state["errors"] += int(failed)
                             state["streak"] = state["streak"] + 1 if failed else 0
-                            if (tripped or state["streak"] >= SOURCE_FAIL_LIMIT) and not state["stop"]:
+                            if (tripped or state["streak"] >= fail_streak) and not state["stop"]:
                                 state["stop"] = True
                                 if not tripped:
                                     _trip_source()   # 來源異常（被擋、連線失敗）時不要一路打完 70 天
-                            elif state["errors"] >= 3:
+                            elif state["errors"] >= max_errors:
                                 state["stop"] = True
                         time.sleep(REQUEST_GAP)
 
@@ -978,6 +982,10 @@ def build_report(stock_code: str, mode: str = "full", now: Optional[datetime] = 
     本地資料庫讀取失敗時丟 local_market_cache.DBError（不當成沒資料去整批重抓）。"""
     spot_history.touch(stock_code)
     now = now or tools.taipei_now()
+    if mode == "full" and fetch_source is open_source:
+        # 第一次查：一年分點同步補齊才出圖（已齊的股票只讀狀態表）；不算進下面 70 日的等待預算。
+        # 測試注入的假來源不走這段，避免單元測試真的去排一年抓取。
+        ensure_year(stock_code, now)
     t0 = time.perf_counter()
     dates, today_state = calendar if calendar is not None else candidate_dates(now)
     if not dates:
@@ -1075,6 +1083,44 @@ def remember_history(stock_code: str) -> None:
         with _QUEUE_GUARD:
             if code not in _HISTORY_NEW and len(_HISTORY_NEW) < HISTORY_QUEUE_MAX:
                 _HISTORY_NEW.append(code)
+
+
+def year_dates(now: datetime) -> List[str]:
+    """近一年交易日（不含今天，今天要過 TODAY_READY 才算）。"""
+    today = now.strftime('%Y-%m-%d')
+    cutoff = (now - timedelta(days=365)).strftime('%Y-%m-%d')
+    return [d for d in trading_dates(now, 270)
+            if cutoff <= d < today or (d == today and now.strftime('%H:%M') >= TODAY_READY)]
+
+
+def ensure_year(stock_code: str, now: Optional[datetime] = None, budget: float = 0.0,
+                fetch_source=open_source) -> Dict[str, Any]:
+    """會員第一次查某檔：同步把一年分點補齊（PARALLEL 條連線、約 30～60 秒），補完再出圖。
+    會員問完拿不到回測通常不會再問，所以不交給背景慢慢補。已補齊的股票只讀一次狀態表就返回。"""
+    budget = budget or YEAR_SYNC_BUDGET
+    if budget <= 0 or source_cooling():
+        return {}
+    now = now or tools.taipei_now()
+    dates = year_dates(now)
+    if not dates or not _unresolved(stock_code, dates):
+        return {}
+    began = time.monotonic()
+    result = ensure_days(stock_code, dates, budget=budget, now=now, fetch_source=fetch_source,
+                         latest_date=dates[-1], lock_wait=2.0,
+                         max_errors=max(3, len(dates) // 8), fail_streak=max(SOURCE_FAIL_LIMIT, 8))
+    # 回測要一年價格：沿用背景的配套日K（同一檔一段時間只抓一次）
+    if spot_history.price_check_due(stock_code):
+        try:
+            spot_history.mark_price_check(stock_code)
+            with tools.api_priority('background'):
+                frame, market, _ = tools.core().fetch_stock_data_yf(stock_code, period='400d')
+            frame = tools._formal_daily_frame(tools._drop_invalid_bars(stock_code, frame, '分點一年日K'))
+            spot_history.save_prices(stock_code, frame, market, 'FinMind')
+        except Exception as exc:
+            print(f'⚠️ 分點一年日K略過｜{stock_code}｜{type(exc).__name__}: {exc}', flush=True)
+    print(f"📚 一年分點同步補齊｜{stock_code}｜{len(dates)} 日｜抓 {result.get('fetched', 0)}｜"
+          f"錯誤 {result.get('errors', 0)}｜仍未確認 {result.get('remaining', 0)}｜{time.monotonic() - began:.1f} 秒", flush=True)
+    return result
 
 
 def prefetch_history(now=None, fetch_source=open_source, max_submit=1):
