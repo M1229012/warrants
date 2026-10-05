@@ -4439,7 +4439,7 @@ _SPOT_RATE_LOCK = threading.Lock()
 
 
 def _spot_rate_test(workers: int, gap: float, code: str, days: int, log) -> None:
-    """管理員「分點測速」：在 Railway 實際 IP 上測富邦 zco 並行抓取，只讀網頁、不寫資料庫。"""
+    """管理員「一年測速」：在 Railway 實際 IP 上測富邦 zco 並行抓取，只讀網頁、不寫資料庫。"""
     from collections import Counter
     from concurrent.futures import ThreadPoolExecutor
     from datetime import date, timedelta
@@ -4462,10 +4462,10 @@ def _spot_rate_test(workers: int, gap: float, code: str, days: int, log) -> None
             with ThreadPoolExecutor(workers) as pool:
                 list(pool.map(one, dates))
         spent = time.time() - began
-        log(f"📶 分點測速｜連線 {workers}｜間隔 {gap}｜{code}｜{len(dates)} 日｜{spent:.1f} 秒｜"
+        log(f"📶 一年測速｜連線 {workers}｜間隔 {gap}｜{code}｜{len(dates)} 日｜{spent:.1f} 秒｜"
             f"{len(dates) / spent:.2f} 次/秒｜最慢一頁 {slowest[0]:.1f} 秒｜{dict(stats)}")
     except Exception as exc:
-        log(f"📶 分點測速失敗｜{type(exc).__name__}: {exc}")
+        log(f"📶 一年測速失敗｜{type(exc).__name__}: {exc}")
     finally:
         _SPOT_RATE_LOCK.release()
 
@@ -5815,20 +5815,20 @@ class AceQueryEngine:
             threading.Thread(target=job, name="ace-market-sync", daemon=True).start()
             return AnswerResult(text="已開始在背景更新全市場日K底庫（每個交易日 2 個請求）。完成後可用「系統狀態」查看。",
                                 route="admin_market_sync", gemini_calls=0, elapsed=time.perf_counter()-started, cacheable=False)
-        rate_cmd = re.match(r"^分點測速(?:連線=?(\d+))?(?:間隔=?([\d.]+))?(?:代號=?(\w+))?(?:天數=?(\d+))?$", compact)
+        rate_cmd = re.match(r"^一年測速(?:連線=?(\d+))?(?:間隔=?([\d.]+))?(?:代號=?(\w+))?(?:天數=?(\d+))?$", compact)
         if rate_cmd:
-            # 富邦 zco 並行抓取測速（只讀網頁、不寫資料庫），結果寫 Log：/ace 分點測速 連線=12 間隔=0.2 代號=3231 天數=250
-            workers = min(24, max(1, int(rate_cmd.group(1) or 1)))
+            # 富邦 zco 並行抓取測速（只讀網頁、不寫資料庫），結果寫 Log：/ace 一年測速 連線=12 間隔=0.2 代號=3231 天數=250（和「現股70日測速」分開）
+            workers = min(24, max(1, int(rate_cmd.group(1) or 12)))
             gap = min(5.0, max(0.0, float(rate_cmd.group(2) or 0.2)))
             code = rate_cmd.group(3) or "2454"
             days = min(400, max(5, int(rate_cmd.group(4) or 250)))
             if not _SPOT_RATE_LOCK.acquire(blocking=False):
-                return AnswerResult(text="上一輪分點測速還在跑，請等它結束（看 Log「分點測速」）。", route="admin_spot_rate",
+                return AnswerResult(text="上一輪一年測速還在跑，請等它結束（看 Log「一年測速」）。", route="admin_spot_rate",
                                     gemini_calls=0, elapsed=time.perf_counter() - started, cacheable=False)
             threading.Thread(target=_spot_rate_test, args=(workers, gap, code, days, self.log),
                              name="ace-spot-rate", daemon=True).start()
-            return AnswerResult(text=f"已開始分點測速：連線 {workers}｜間隔 {gap} 秒｜{code}｜{days} 個平日。"
-                                     "結果寫在 Railway Log（搜尋「分點測速」）。",
+            return AnswerResult(text=f"已開始一年測速：連線 {workers}｜間隔 {gap} 秒｜{code}｜{days} 個平日。"
+                                     "結果寫在 Railway Log（搜尋「一年測速」）。",
                                 route="admin_spot_rate", gemini_calls=0, elapsed=time.perf_counter() - started, cacheable=False)
         if compact in ("統計診斷", "會員統計診斷"):
             return AnswerResult(text=member_usage_stats.diagnose(), route="admin_stats_diag", gemini_calls=0,
