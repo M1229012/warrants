@@ -4435,6 +4435,41 @@ ANSWER_QUEUE_LIMIT = max(1, tools._env_int("DISCORD_AI_QUEUE_LIMIT", 20))
 # ============================================================
 # 會員額度（額度日＝台灣下午 4 點到隔天下午 4 點，和 Gemini 每日額度同步重置）
 # ============================================================
+_SPOT_RATE_LOCK = threading.Lock()
+
+
+def _spot_rate_test(workers: int, gap: float, code: str, days: int, log) -> None:
+    """管理員「分點測速」：在 Railway 實際 IP 上測富邦 zco 並行抓取，只讀網頁、不寫資料庫。"""
+    from collections import Counter
+    from concurrent.futures import ThreadPoolExecutor
+    from datetime import date, timedelta
+    try:
+        dates = [d.strftime("%Y-%m-%d") for d in (date.today() - timedelta(days=i) for i in range(1, days * 2))
+                 if d.weekday() < 5][:days]
+        stats, lock, began = Counter(), threading.Lock(), time.time()
+        slowest = [0.0]
+        with spot_chip.open_source() as fetch:
+            def one(day: str) -> None:
+                t0 = time.time()
+                try:
+                    status = spot_chip.validate_spot_snapshot(fetch(code, day), code, day)[0]
+                except Exception as exc:
+                    status = "exception:" + type(exc).__name__
+                with lock:
+                    stats[status] += 1
+                    slowest[0] = max(slowest[0], time.time() - t0)
+                time.sleep(gap)
+            with ThreadPoolExecutor(workers) as pool:
+                list(pool.map(one, dates))
+        spent = time.time() - began
+        log(f"📶 分點測速｜連線 {workers}｜間隔 {gap}｜{code}｜{len(dates)} 日｜{spent:.1f} 秒｜"
+            f"{len(dates) / spent:.2f} 次/秒｜最慢一頁 {slowest[0]:.1f} 秒｜{dict(stats)}")
+    except Exception as exc:
+        log(f"📶 分點測速失敗｜{type(exc).__name__}: {exc}")
+    finally:
+        _SPOT_RATE_LOCK.release()
+
+
 QUOTA_COMMAND_NAME = os.getenv("DISCORD_AI_QUOTA_COMMAND", "額度").strip() or "額度"
 USER_AI_DAILY_LIMIT = max(0, tools._env_int("DISCORD_AI_USER_DAILY_LIMIT", 3))          # 每人每額度日 AI 解讀次數
 USER_PLAIN_DAILY_LIMIT = max(0, tools._env_int("DISCORD_AI_USER_PLAIN_LIMIT", 30))      # 不用 AI 的題目
@@ -5780,6 +5815,21 @@ class AceQueryEngine:
             threading.Thread(target=job, name="ace-market-sync", daemon=True).start()
             return AnswerResult(text="已開始在背景更新全市場日K底庫（每個交易日 2 個請求）。完成後可用「系統狀態」查看。",
                                 route="admin_market_sync", gemini_calls=0, elapsed=time.perf_counter()-started, cacheable=False)
+        rate_cmd = re.match(r"^分點測速(?:連線=?(\d+))?(?:間隔=?([\d.]+))?(?:代號=?(\w+))?(?:天數=?(\d+))?$", compact)
+        if rate_cmd:
+            # 富邦 zco 並行抓取測速（只讀網頁、不寫資料庫），結果寫 Log：/ace 分點測速 連線=12 間隔=0.2 代號=3231 天數=250
+            workers = min(24, max(1, int(rate_cmd.group(1) or 1)))
+            gap = min(5.0, max(0.0, float(rate_cmd.group(2) or 0.2)))
+            code = rate_cmd.group(3) or "2454"
+            days = min(400, max(5, int(rate_cmd.group(4) or 250)))
+            if not _SPOT_RATE_LOCK.acquire(blocking=False):
+                return AnswerResult(text="上一輪分點測速還在跑，請等它結束（看 Log「分點測速」）。", route="admin_spot_rate",
+                                    gemini_calls=0, elapsed=time.perf_counter() - started, cacheable=False)
+            threading.Thread(target=_spot_rate_test, args=(workers, gap, code, days, self.log),
+                             name="ace-spot-rate", daemon=True).start()
+            return AnswerResult(text=f"已開始分點測速：連線 {workers}｜間隔 {gap} 秒｜{code}｜{days} 個平日。"
+                                     "結果寫在 Railway Log（搜尋「分點測速」）。",
+                                route="admin_spot_rate", gemini_calls=0, elapsed=time.perf_counter() - started, cacheable=False)
         if compact in ("統計診斷", "會員統計診斷"):
             return AnswerResult(text=member_usage_stats.diagnose(), route="admin_stats_diag", gemini_calls=0,
                                 elapsed=time.perf_counter() - started, cacheable=False, as_text=True)
