@@ -20,6 +20,12 @@ on:
         default: ""
         type: string
 
+      today_first:
+        description: "被 MoneyDJ 限流時勾選：今日優先（快很多，但會漏今天才首次出現的新組合）"
+        required: false
+        default: false
+        type: boolean
+
   # 測試期間停用排程，只保留 workflow_dispatch。
 
 
@@ -68,7 +74,8 @@ jobs:
       # 完整預篩：API4 掃全部今日有效權證（約 4.1 萬次）→ 只查今天真有成交的組合，
       # 網路約 48 分鐘，比今日優先多約 20 分鐘，但完整。
       # log 會印「🆕 今日新組合：N 組」＝今日優先每天會漏掉的量，可據此決定要不要切回 1。
-      MONEYDJ_DAILY_TODAY_FIRST: "0"
+      # 預設 0；手動執行時勾選 today_first 才切成 1，只影響那一次。
+      MONEYDJ_DAILY_TODAY_FIRST: ${{ github.event.inputs.today_first == 'true' && '1' || '0' }}
 
       # 第一次先設 0：只查已知組合，幾分鐘跑完。
       # 確認資料正確且穩定後，再改成 8000 打開新組合探索。
