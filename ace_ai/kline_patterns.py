@@ -812,7 +812,10 @@ def user_triangle(df: pd.DataFrame, atr_prev, end: int) -> Optional[Dict[str, An
         return None if g is None else {"s": float(s), "k": float(k), "a": (int(anchor), int(j)), "g": int(g)}
 
     # 起點只用主要轉折；畫線時看之後「所有 K 棒」的外緣（2421 的 09/22 小高點也要壓到）
-    uppers = [u for h in highs if h < end - 5 for u in [build(H, h, list(range(h + 3, end)), True)]
+    # 起點影線頂、實體頂兩種都試（2421 手繪上緣從 09/01 實體頂畫起）
+    uppers = [u for h in highs if h < end - 5 for P0 in (H, top)
+              for later in (list(range(h + 3, end)), [i for i in highs if i > h + 2])   # 包絡線＋只連主要高點兩種
+              for u in [build(P0, h, later, True)]
               if u and (u["s"] <= 0 or flat(u))]
     uppers += _gap_uppers(H, L, C, A, lo, end)
     lowers = [d for l in lows if l < end - 5 for d in [build(L, l, list(range(l + 3, end)), False)]
@@ -820,11 +823,12 @@ def user_triangle(df: pd.DataFrame, atr_prev, end: int) -> Optional[Dict[str, An
     best = None
     for u in uppers:
         for d in lowers:
-            width = u["s"] * end + u["k"] - (d["s"] * end + d["k"])
-            if width < TRI_MIN_WIDTH * a_ref:
-                continue
+            up_now, dn_now = u["s"] * end + u["k"], d["s"] * end + d["k"]
+            broke = C[end] > up_now + BREAK * A[end] or C[end] < dn_now - BREAK * A[end]
+            if up_now - dn_now < (0 if broke else TRI_MIN_WIDTH * a_ref):
+                continue                                   # 今天沒突破時開口至少 0.5 ATR；今天收盤突破（2421）可以接近尖端
             if not (flat(u) and flat(d)):
-                if u["s"] >= d["s"] or (d["k"] - u["k"]) / (u["s"] - d["s"]) < end + TRI_MIN_APEX:
+                if u["s"] >= d["s"] or (d["k"] - u["k"]) / (u["s"] - d["s"]) < end + (0 if broke else TRI_MIN_APEX):
                     continue
             start = max(u["a"][0], d["a"][0])
             if abs(u["a"][0] - d["a"][0]) > 120:

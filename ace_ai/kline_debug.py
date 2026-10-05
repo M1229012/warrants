@@ -105,7 +105,8 @@ def line_specs(data: dict) -> list[dict]:
             lines.append({"label": label, "coef": triangle[edge],
                           "start": anchors[0], "fit_end": anchors[-1], "stop": last,
                           "anchors": anchors, "color": color, "historical": False})
-    elif formation:
+    elif formation and not (historical and formation["upper"][0] * formation["lower"][0] > 0):
+        # 10-06：舊算法的歷史線若上下同方向（楔形／通道）不畫，避免 2421 那種離譜的灰線
         stop = min(last, formation.get("end_day", formation.get("inv_day", last)))
         for edge, label, color in (("upper", "上緣", "#C76C00"), ("lower", "下緣", "#1478B5")):
             lines.append({"label": label + ("（歷史）" if historical else ""),
