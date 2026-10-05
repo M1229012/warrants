@@ -9,7 +9,7 @@ ENV PYTHONUNBUFFERED=1 \
     MPLBACKEND=Agg \
     MPLCONFIGDIR=/app/.cache/matplotlib
 
-RUN apt-get update && apt-get install -y --no-install-recommends fonts-noto-cjk \
+RUN apt-get update && apt-get install -y --no-install-recommends fonts-noto-cjk fonts-noto-color-emoji \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

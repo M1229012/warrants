@@ -6844,12 +6844,23 @@ def text_card_title(text: str) -> str:
     return first[:28] or "艾斯助手"
 
 
+EMOJI_RE = re.compile(r"[\U0001F000-\U0001FAFF☀-➿⬀-⯿️‍⃣]")
+
+
+def stats_name(user) -> str:
+    """統計排行用的名稱：顯示名稱去掉 emoji 後沒有字（例如「🤩」），改用 Discord 帳號名稱，才認得出是誰。"""
+    shown = getattr(user, "display_name", "") or getattr(user, "global_name", "") or ""
+    handle = getattr(user, "name", "") or ""
+    if EMOJI_RE.sub("", shown).strip():
+        return shown
+    return f"{shown} @{handle}".strip() if handle else shown
+
+
 def text_to_card(text: str) -> Dict[str, Any]:
     """純文字回覆（統計、狀態、錯誤紀錄…）轉成研究筆記風格的圖卡：
     第一行＝標題、第二行若是說明（統計起算…）＝徽章；「項目：數值」連續行＝兩欄表；「1. 名稱：N 題」＝排行表；
     「xxx：」結尾＝小標；其他＝段落。不改文字內容，只換排版。"""
-    lines = [re.sub(r"[*`#]", "", line).strip() for line in str(text or "").splitlines()]
-    lines = [line for line in lines]
+    lines = [re.sub(r"[*`#]", "", line).strip() for line in str(text or "").splitlines()]   # emoji 由圖卡用彩色字型畫
     title = next((line for line in lines if line), "艾斯助手")
     rest = lines[lines.index(title) + 1:] if title in lines else []
     sections: List[Dict[str, Any]] = []
@@ -7873,13 +7884,13 @@ def run_discord_bot(config: BotConfig) -> None:
             try:
                 summary, attachment_data = await asyncio.to_thread(member_usage_stats.report, question,
                                                                    '*', excluded,   # 管理員查詢：所有伺服器合計（10-04）
-                                                                   {m.id: (getattr(m, 'display_name', '') or getattr(m, 'name', ''))
+                                                                   {m.id: stats_name(m)
                                                                     for g in getattr(client, 'guilds', ()) for m in getattr(g, 'members', ())})
                 # 沒開 members intent 時成員名單是空的：排名裡的 ID 直接向 Discord 查名字（只查前幾名，10-04）
                 for uid in dict.fromkeys(re.findall(r'ID (\d{15,20})', summary)):
                     try:
                         user = client.get_user(int(uid)) or await client.fetch_user(int(uid))
-                        name = getattr(user, 'global_name', None) or getattr(user, 'name', '')
+                        name = stats_name(user)
                         if name:
                             summary = summary.replace(f'ID {uid}', name)
                     except Exception:
