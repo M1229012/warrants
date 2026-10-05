@@ -639,6 +639,8 @@ def levels_break(df: pd.DataFrame, piv: List[Dict], atr_prev, today: int) -> Dic
 
 # ---------------------------------------------------------------- §4b 使用者畫法三角（09-30 使用者手繪 40+ 張歸納）
 TRI_DAYS, TRI_TOUCH, TRI_RECENT = int(_env("TRI_DAYS", 180)), _env("TRI_TOUCH", 0.3), int(_env("TRI_RECENT", 20))
+TRI_MIN_WIDTH, TRI_MIN_APEX = _env("TRI_MIN_WIDTH", 1.0), int(_env("TRI_MIN_APEX", 10))
+TRI_DN_TOUCHES = int(_env("TRI_DN_TOUCHES", 2))   # 10-06：使用者手繪下緣多為「起漲點＋最近低點」兩次
 TRI_UP_POKE, TRI_DN_POKE, TRI_POKES, TRI_FLAT = _env("TRI_UP_POKE", 2.0), _env("TRI_DN_POKE", 1.5), int(_env("TRI_POKES", 3)), _env("TRI_FLAT", 1.0)
 
 
@@ -671,7 +673,7 @@ def _tri_lines(H, L, O, C, A, upper: bool, lo: int, end: int, first: Optional[se
                 for h in hit:
                     groups += h - last >= 3
                     last = h
-                if groups < (2 if upper else 3) or hit[-1] < end - TRI_RECENT:
+                if groups < (2 if upper else TRI_DN_TOUCHES) or hit[-1] < end - TRI_RECENT:
                     continue
                 out.append({"s": float(s), "k": float(k), "a": (int(i), int(j)), "g": int(groups)})
     return out
@@ -734,9 +736,11 @@ def user_triangle(df: pd.DataFrame, atr_prev, end: int) -> Optional[Dict[str, An
         for d in _tri_lines(H, L, O, C, A, False, lo, end, firsts):
             if d["s"] < 0 and not flat(d):
                 continue                                   # 下緣往下＝下降通道，不是三角
-            if u["s"] * end + u["k"] <= d["s"] * end + d["k"]:
-                continue
+            if u["s"] * end + u["k"] - (d["s"] * end + d["k"]) < TRI_MIN_WIDTH * a_ref:
+                continue                                   # 10-06：今天兩線開口至少 1 ATR（使用者手繪的三角都還沒收到頂點）
             if not (flat(u) and flat(d)):
+                if u["s"] < d["s"] and (d["k"] - u["k"]) / (u["s"] - d["s"]) < end + TRI_MIN_APEX:
+                    continue                               # 交點太近＝已收斂到尖端
                 if u["s"] >= d["s"]:
                     continue                               # 不收斂（同方向平行）
                 if (d["k"] - u["k"]) / (u["s"] - d["s"]) > end + 80:
