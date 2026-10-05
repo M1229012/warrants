@@ -38,6 +38,15 @@ def parse_code(question: str) -> str:
     return next(iter(codes))
 
 
+def parse_codes(question: str, limit: int = 10) -> list[str]:
+    """一次驗證多檔（10-06）：「型態驗證 2344 1608 2421」依輸入順序、最多 limit 檔；只有一檔時沿用 parse_code。"""
+    q=str(question or '').strip()
+    found=list(dict.fromkeys(c.upper() for c in re.findall(r'(?<![0-9A-Za-z])(?:[0-9]{4,6}[A-Za-z]?|TAIEX|TPEX)(?![0-9A-Za-z])',q,re.I)))
+    if len(found)<=1:return [parse_code(q)]
+    if not is_request(q):raise ValueError('請說：型態驗證 2344 1608（一次最多10檔）')
+    return found[:limit]
+
+
 def load_panel(code: str) -> dict[str, Any]:
     """僅管理員路由呼叫；沿用既有行情與公司行動入口。"""
     import warrant_ai_tools as tools

@@ -677,46 +677,87 @@ def _tri_lines(H, L, O, C, A, upper: bool, lo: int, end: int, first: Optional[se
     return out
 
 
+def _gap_uppers(H, L, C, A, lo: int, end: int) -> List[Dict[str, Any]]:
+    """未回補的向下跳空缺口＝壓力（3715 手繪）：缺口下緣畫水平上緣，之後高點碰到缺口區 ≥2 次、最近 20 日碰過。"""
+    out = []
+    for i in range(max(lo, 1), end - 5):
+        if H[i] >= L[i - 1] - 0.3 * A[i]:                  # 缺口至少 0.3 ATR
+            continue
+        edge, ceil = float(H[i]), float(L[i - 1])
+        after = np.arange(i + 1, end)
+        if (C[after] > ceil).any():
+            continue                                        # 收盤站上缺口上緣＝已回補
+        hit = after[H[after] >= edge - TRI_TOUCH * A[after]]
+        groups, last = 0, -99
+        for h in hit:
+            groups += h - last >= 3
+            last = h
+        if groups >= 2 and hit[-1] >= end - TRI_RECENT:
+            out.append({"s": 0.0, "k": edge, "a": (int(i), int(hit[-1])), "g": int(groups), "gap": (edge, ceil)})
+    return out
+
+
 def user_triangle(df: pd.DataFrame, atr_prev, end: int) -> Optional[Dict[str, Any]]:
-    """下緣＝起漲點→回檔低點的長上升支撐（≥3 次），上緣＝下緣起點後最高峰起畫（≥2 次，不可比下緣陡）。"""
+    """10-06 通用版（使用者手繪 7 檔歸納）：
+    上緣＝區間最高的前 3 個轉折高點起畫、往下或接近水平（≥2 次）；或未回補向下缺口的下緣（水平）。
+    下緣＝上緣高點之前那波的起漲點，或高點之後的最低點起畫、往上或接近水平（≥3 次）。
+    兩線要收斂（交點在 80 日內）；同方向（楔形、通道）不算三角。先比型態跨越長度，再比接觸次數。"""
     H, L, O, C = (df[k].to_numpy(dtype=float) for k in ("High", "Low", "Open", "Close"))
     A = np.where(np.isnan(atr_prev), np.nanmedian(atr_prev), atr_prev)
     lo = max(21, end - TRI_DAYS)
     if end - lo < 30:
         return None
-    best = None
     a_ref = float(np.nanmedian(A[end - 19:end + 1]))
     flat = lambda l: abs(l["s"]) * (end - l["a"][0]) <= TRI_FLAT * a_ref
-    rise = int(lo + np.argmin(L[lo:end]))                 # 起漲點＝區間最低點
-    for d in _tri_lines(H, L, O, C, A, False, lo, end):
-        if d["s"] < 0 and not flat(d):
-            continue                                       # 10-06：下緣往下斜＝下降通道，不是三角
-        seg = np.arange(d["a"][0], end)
-        peaks = {int(seg[np.argmax(H[seg])]), int(seg[np.argmax(np.maximum(O, C)[seg])])}
-        pre = np.arange(max(lo, d["a"][0] - 40), d["a"][0] + 1)
-        peaks.add(int(pre[np.argmax(H[pre])]))             # 10-06：上緣也可從起漲點前的起跌高點畫起（使用者手繪）
-        top = int(seg[np.argmax(H[seg])])                 # 起漲點之後的整理區最高峰
-        for u in _tri_lines(H, L, O, C, A, True, d["a"][0], end, peaks):
-            if u["s"] > d["s"] * 0.5 or u["s"] * end + u["k"] <= d["s"] * end + d["k"]:
+    piv = [i for i in range(lo + 2, end - 4) if H[i] == H[i - 2:i + 3].max()]
+    tops = set(sorted(piv, key=lambda i: -H[i])[:6])
+    near = [i for i in piv if i >= end - 60]
+    if near:
+        tops.add(max(near, key=lambda i: H[i]))            # 最近 60 日的最高點一定要試（4977：5 月高點較高但不是這段整理）
+    uppers = [u for u in _tri_lines(H, L, O, C, A, True, lo, end, tops) if u["s"] <= 0 or flat(u)]
+    best = None
+    for u in uppers + _gap_uppers(H, L, C, A, lo, end):   # 缺口（≥0.3 ATR、未回補）和斜線一起比長度（3715）
+        p = u["a"][0]
+        firsts = set()
+        # 起漲點：漲到這個高點之前 40 日內的轉折低點都試（1608 是跳空當天的低點，不一定是最低點）
+        firsts.update(i for i in range(max(lo + 2, p - 40), p) if L[i] <= L[i - 1:i + 3].min())   # 只看右側：跳空當天低點也算
+        if end - 5 - p >= 3:
+            firsts.add(int(p + 1 + np.argmin(L[p + 1:end - 5])))              # 高點之後的最低點
+        if not firsts:
+            continue
+        # 上緣要經過「高點之後最低點」之後的整理區最高峰（2344 要過 H8；4576 要過 09/07 高點）
+        trough = p + 1 + int(np.argmin(L[p + 1:end])) if end - p > 2 else end
+        later = np.arange(trough + 1, end)
+        pk = int(later[np.argmax(H[later])]) if len(later) else -1
+        if pk >= 0 and not u.get("gap") and u["s"] * pk + u["k"] - H[pk] > TRI_TOUCH * A[pk]:   # 線浮在最高峰上方＝沒壓到整理區（影線刺穿可）
+            continue
+        for d in _tri_lines(H, L, O, C, A, False, lo, end, firsts):
+            if d["s"] < 0 and not flat(d):
+                continue                                   # 下緣往下＝下降通道，不是三角
+            if u["s"] * end + u["k"] <= d["s"] * end + d["k"]:
                 continue
-            if abs(u["s"] * top + u["k"] - H[top]) > TRI_TOUCH * A[top]:
-                continue                                   # 10-06：上緣一定要經過最高峰（2344 要過 H8、H9、H10）
-            # 從起漲點起畫的下緣優先，其次才比接觸次數與長度
-            key = (abs(d["a"][0] - rise) <= 2, d["g"] + u["g"], end - min(d["a"][0], u["a"][0]))
+            if not (flat(u) and flat(d)):
+                if u["s"] >= d["s"]:
+                    continue                               # 不收斂（同方向平行）
+                if (d["k"] - u["k"]) / (u["s"] - d["s"]) > end + 80:
+                    continue                               # 交點太遠＝近似平行通道
+            key = ((end - u["a"][0]) + (end - d["a"][0]), u["g"] + d["g"])   # 兩條線都越長越好（人眼畫法）
             if best is None or key > best[0]:
                 best = (key, u, d)
     if not best:
         return None
     _, u, d = best
-    kind = ("箱型整理" if flat(u) and flat(d) else "上升三角" if flat(u) else "三角收斂" if u["s"] < 0 else "上升楔形")
+    kind = ("箱型整理" if flat(u) and flat(d) else "上升三角" if flat(u) else "下降三角" if flat(d) else "三角收斂")
     up, dn = u["s"] * end + u["k"], d["s"] * end + d["k"]
     state = ("收盤向上突破上緣" if C[end] > up + BREAK * A[end] else "收盤向下跌破下緣" if C[end] < dn - BREAK * A[end]
              else "位於型態內")
     start = df.index[min(u["a"][0], d["a"][0])]
     text = (f"{_d(start)} 起形成{kind}，最新收盤 {_p(C[end])}，{state}（上緣 {_p(up)}、下緣 {_p(dn)}；"
             f"上緣接觸 {u['g']} 次、下緣 {d['g']} 次）")
+    if u.get("gap"):
+        text += f"；上緣為 {_d(df.index[u['a'][0]])} 未回補缺口 {_p(u['gap'][0])}～{_p(u['gap'][1])}"
     return {"kind": kind, "upper": (u["s"], u["k"]), "lower": (d["s"], d["k"]), "anchors": {"upper": u["a"], "lower": d["a"]},
-            "state": state, "text": text}
+            "state": state, "text": text, "gap": u.get("gap")}
 
 
 def detect(df: pd.DataFrame, events: Optional[Dict[str, Any]] = None, provisional_today: bool = False,
@@ -837,7 +878,10 @@ def detect(df: pd.DataFrame, events: Optional[Dict[str, Any]] = None, provisiona
     flag_text += flags.get("F2") or []
     if f3_recent or (ev and f3_window(ev["bday"], 20)) or f3_window(today, 5):
         flag_text.append("股數基準變動，量比可比性受限")
-    tri = None if ev else user_triangle(adj, atr_prev, last_official)   # 進行中的突破事件用固定線追蹤（時間正確），不覆蓋
+    old = ev or cur
+    # 10-06：舊算法的線收斂（上緣不往上、下緣不往下）就保留它的突破追蹤；同方向（楔形、通道）才改用使用者畫法三角
+    same_dir = bool(old) and (old["upper"][0] > 0 and old["lower"][0] > 0 or old["upper"][0] < 0 and old["lower"][0] < 0)
+    tri = None if ev and not same_dir else user_triangle(adj, atr_prev, last_official)
     if tri:     # §4b 使用者畫法三角優先：取代舊畫線型態的描述，避免兩套線互相矛盾
         old = {"箱型整理", "上升三角", "下降三角", "對稱三角收斂", "上升楔形", "下降楔形", "上升通道", "下降通道"}
         summary = [x for x in summary if "起形成" not in x and "原上緣" not in x and "原下緣" not in x]
