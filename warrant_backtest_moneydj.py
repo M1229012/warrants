@@ -27660,6 +27660,94 @@ def _moneydj_prescan_traded_only_filter(scan_warrants, target_dt, scan_one):
     return keep
 
 
+# API4 預篩斷點續跑：
+# 預篩一次要打 4 萬多次 API4、約 1 小時，舊版結果只放記憶體，
+# 跑到復原輪被限流、取消或失敗，整段結果就消失，重跑得從頭掃。
+# 現在每掃 N 檔就把「已成功的權證 → 候選組合」寫進快取，
+# 重跑時同一個目標日、同一組分點、同一個掃描區間直接沿用，只補沒掃到和失敗的。
+# Actions 的 cache save 步驟是 if: always()，取消時也會存，所以斷點能跨 run 接續。
+# 設 MONEYDJ_PRESCAN_CHECKPOINT_ENABLED=0 可關閉。
+MONEYDJ_PRESCAN_CHECKPOINT_ENABLED = os.getenv(
+    "MONEYDJ_PRESCAN_CHECKPOINT_ENABLED", "1"
+).strip().lower() not in ("0", "false", "no")
+MONEYDJ_PRESCAN_CHECKPOINT_EVERY = max(
+    int(os.getenv("MONEYDJ_PRESCAN_CHECKPOINT_EVERY", "1000")),
+    100,
+)
+# 斷點超過這個時數就不沿用：MoneyDJ 當日資料可能還在補，太舊的結果不可信。
+MONEYDJ_PRESCAN_CHECKPOINT_MAX_AGE_HOURS = max(
+    float(os.getenv("MONEYDJ_PRESCAN_CHECKPOINT_MAX_AGE_HOURS", "12")),
+    0.5,
+)
+
+
+def _prescan_checkpoint_path():
+    return os.path.join(CACHE_DIR, "prescan_checkpoint.json")
+
+
+def _prescan_checkpoint_signature(start_s, end_s, exact_target_date, code_map):
+    """同一目標日、同一掃描區間、同一組分點才可沿用斷點。"""
+    brokers = sorted(str(info[2]) for info in code_map.values())
+    return f"{start_s}|{end_s}|{int(bool(exact_target_date))}|{','.join(brokers)}"
+
+
+def _load_prescan_checkpoint(signature):
+    """回傳 {權證代號: (latest_date 字串, [候選 tuple, ...])}；不符或過期回傳空 dict。"""
+    if not (USE_CACHE and MONEYDJ_PRESCAN_CHECKPOINT_ENABLED):
+        return {}
+    path = _prescan_checkpoint_path()
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if data.get("signature") != signature:
+            print("  ℹ️ API4 預篩斷點：條件不同（目標日／分點／區間），不沿用，從頭掃描。")
+            return {}
+        saved_at = datetime.strptime(data.get("saved_at", ""), "%Y-%m-%d %H:%M:%S")
+        age_hours = (datetime.now() - saved_at).total_seconds() / 3600
+        if age_hours > MONEYDJ_PRESCAN_CHECKPOINT_MAX_AGE_HOURS:
+            print(
+                f"  ℹ️ API4 預篩斷點：已存 {age_hours:.1f} 小時"
+                f"（門檻 {MONEYDJ_PRESCAN_CHECKPOINT_MAX_AGE_HOURS:g} 小時），不沿用。"
+            )
+            return {}
+        done = {
+            code: (entry[0] or "", [tuple(c) for c in entry[1]])
+            for code, entry in (data.get("done") or {}).items()
+        }
+        print(
+            f"  ♻️ API4 預篩斷點續跑：沿用 {len(done):,} 檔已完成結果"
+            f"｜存檔時間 {data.get('saved_at')}（{age_hours:.1f} 小時前）"
+        )
+        return done
+    except Exception as exc:
+        print(f"  ⚠️ API4 預篩斷點讀取失敗，從頭掃描：{type(exc).__name__}: {exc}")
+        return {}
+
+
+def _save_prescan_checkpoint(signature, done):
+    if not (USE_CACHE and MONEYDJ_PRESCAN_CHECKPOINT_ENABLED):
+        return
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        path = _prescan_checkpoint_path()
+        payload = {
+            "signature": signature,
+            "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "done": {
+                code: [latest, [list(c) for c in rows]]
+                for code, (latest, rows) in done.items()
+            },
+        }
+        tmp_path = f"{path}.tmp.{os.getpid()}"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, separators=(",", ":"))
+        os.replace(tmp_path, path)
+    except Exception as exc:
+        print(f"  ⚠️ API4 預篩斷點寫入失敗：{type(exc).__name__}: {exc}")
+
+
 def _moneydj_scan_candidates(
     warrants,
     broker_map,
@@ -27787,10 +27875,56 @@ def _moneydj_scan_candidates(
     candidates = {}
     latest_market_date = None
     failed_warrants = []
-    with ThreadPoolExecutor(max_workers=min(MONEYDJ_PRESCAN_WORKERS, max(len(scan_warrants), 1))) as executor:
+
+    # 斷點續跑：已成功的權證直接沿用，不再打 API4。
+    checkpoint_signature = _prescan_checkpoint_signature(start_s, end_s, exact_target_date, code_map)
+    checkpoint_done = _load_prescan_checkpoint(checkpoint_signature)
+    checkpoint_dirty = 0
+
+    def record_success(warrant, rows, latest_date):
+        nonlocal latest_market_date, checkpoint_dirty
+        if latest_date and (latest_market_date is None or latest_date > latest_market_date):
+            latest_market_date = latest_date
+        for candidate in rows:
+            candidates[(candidate[0], normalize_broker_code_for_compare(candidate[6]))] = candidate
+        code = _normalize_warrant_code_for_identity(warrant.get("代號", ""))
+        if code:
+            checkpoint_done[code] = (
+                latest_date.strftime("%Y/%m/%d") if latest_date else "",
+                list(rows),
+            )
+            checkpoint_dirty += 1
+            if checkpoint_dirty >= MONEYDJ_PRESCAN_CHECKPOINT_EVERY:
+                _save_prescan_checkpoint(checkpoint_signature, checkpoint_done)
+                checkpoint_dirty = 0
+
+    if checkpoint_done:
+        pending_warrants = []
+        for warrant in scan_warrants:
+            code = _normalize_warrant_code_for_identity(warrant.get("代號", ""))
+            entry = checkpoint_done.get(code)
+            if entry is None:
+                pending_warrants.append(warrant)
+                continue
+            MONEYDJ_PRESCAN_SUCCESSFUL_REQUESTS += 1
+            latest_saved = parse_date(entry[0]) if entry[0] else None
+            if latest_saved and (latest_market_date is None or latest_saved > latest_market_date):
+                latest_market_date = latest_saved
+            for candidate in entry[1]:
+                candidates[(candidate[0], normalize_broker_code_for_compare(candidate[6]))] = candidate
+        if len(pending_warrants) < len(scan_warrants):
+            _MONEYDJ_SOURCE_REACHABLE = True
+        print(
+            f"  ♻️ 本次只需掃描 {len(pending_warrants):,}/{len(scan_warrants):,} 檔"
+            f"｜沿用候選 {len(candidates):,} 組"
+        )
+    else:
+        pending_warrants = scan_warrants
+
+    with ThreadPoolExecutor(max_workers=min(MONEYDJ_PRESCAN_WORKERS, max(len(pending_warrants), 1))) as executor:
         futures = {
             executor.submit(scan_one, warrant): warrant
-            for warrant in scan_warrants
+            for warrant in pending_warrants
         }
         for idx, future in enumerate(as_completed(futures), start=1):
             warrant = futures[future]
@@ -27801,15 +27935,14 @@ def _moneydj_scan_candidates(
             if ok:
                 MONEYDJ_PRESCAN_SUCCESSFUL_REQUESTS += 1
                 _MONEYDJ_SOURCE_REACHABLE = True
+                record_success(warrant, rows, latest_date)
             else:
                 # 失敗的權證一定要記名：舊版直接丟棄，等於當天這幾檔籌碼無聲消失。
                 failed_warrants.append(warrant)
-            if latest_date and (latest_market_date is None or latest_date > latest_market_date):
-                latest_market_date = latest_date
-            for candidate in rows:
-                candidates[(candidate[0], normalize_broker_code_for_compare(candidate[6]))] = candidate
             if idx % 1000 == 0:
-                print(f"  [{idx:,}/{len(scan_warrants):,}] MoneyDJ API4 預篩中｜候選 {len(candidates):,} 組")
+                print(f"  [{idx:,}/{len(pending_warrants):,}] MoneyDJ API4 預篩中｜候選 {len(candidates):,} 組")
+    _save_prescan_checkpoint(checkpoint_signature, checkpoint_done)
+    checkpoint_dirty = 0
 
     # 高併發下的暫時性失敗改用低併發復原輪重試，與 API5 同等級的補救。
     for recovery_round in range(1, MONEYDJ_PRESCAN_RECOVERY_ROUNDS + 1):
@@ -27842,10 +27975,9 @@ def _moneydj_scan_candidates(
                     continue
                 MONEYDJ_PRESCAN_SUCCESSFUL_REQUESTS += 1
                 _MONEYDJ_SOURCE_REACHABLE = True
-                if latest_date and (latest_market_date is None or latest_date > latest_market_date):
-                    latest_market_date = latest_date
-                for candidate in rows:
-                    candidates[(candidate[0], normalize_broker_code_for_compare(candidate[6]))] = candidate
+                record_success(warrant, rows, latest_date)
+        _save_prescan_checkpoint(checkpoint_signature, checkpoint_done)
+        checkpoint_dirty = 0
         recovered = len(failed_warrants) - len(still_failed)
         print(
             f"    {'✅' if recovered else '⚠️'} 本輪復原 {recovered:,} 檔｜"
