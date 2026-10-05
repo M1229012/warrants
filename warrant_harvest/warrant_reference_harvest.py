@@ -64,7 +64,7 @@ for _s in (sys.stdout, sys.stderr):
 # 三支抓取程式與 workflow 共用同一個版本號，workflow 開跑前會比對。
 # 2026-09-17 發生過只更新了一部分檔案、新舊混跑，log 完全看不出來。
 # 改任何一支都要一起升版號。
-HARVEST_BUILD = "2026-09-18.1"
+HARVEST_BUILD = "2026-09-18.2"
 
 META_STORE_PATH = os.path.join(STORE_DIR, "warrant_meta_store.parquet")
 OHLCV_DIR = os.path.join(STORE_DIR, "ohlcv")
@@ -385,13 +385,23 @@ def fetch_ohlcv_tpex(target_dt):
     return coerce_numeric(pd.DataFrame(rows, columns=OHLCV_COLUMNS), NUMERIC_OHLCV_COLUMNS), ""
 
 
-def _existing_dates(year):
-    """只讀日期這一欄，而且用 Arrow 讀：745 萬列的字串欄轉成 pandas 物件很吃記憶體。"""
+def _existing_markets(year):
+    """
+    回傳 ({日期: {已有的市場}}, 總列數)。
+
+    以（日期, 市場）為單位，而不是只看日期：2026-09-18 發生過某段期間只抓到 TPEx，
+    TWSE 整段回空，只看日期的話那些天會被當成「已完成」，永遠不會再補。
+    用 Arrow 分組，745 萬列只回幾百組鍵，不必把字串欄轉成 pandas 物件。
+    """
     path = _ohlcv_path(year)
     if not os.path.exists(path):
-        return set(), 0
-    table = pq.read_table(path, columns=["日期"])
-    return set(pc.unique(table["日期"]).to_pylist()), table.num_rows
+        return {}, 0
+    table = pq.read_table(path, columns=["日期", "市場"])
+    pairs = table.group_by(["日期", "市場"]).aggregate([]).to_pylist()
+    present = {}
+    for row in pairs:
+        present.setdefault(row["日期"], set()).add(row["市場"])
+    return present, table.num_rows
 
 
 def append_ohlcv_days(path, incoming, run_stamp=None):
@@ -399,7 +409,7 @@ def append_ohlcv_days(path, incoming, run_stamp=None):
     把新的交易日附加到年檔，不做逐列鍵比對。
 
     為什麼不用 merge_frames：OHLCV 的一列是「某代號某日的成交」，事後不會變。
-    cmd_ohlcv 的待抓清單本來就排除了既有日期，新資料與既有資料不可能撞鍵，
+    cmd_ohlcv 的待抓清單本來就排除了既有的（日期, 市場），新資料與既有資料不可能撞鍵，
     合併在這裡等於白做。實測（2026-09-17，真實資料 293 萬列）merge_frames 峰值多用
     2.57 GB、51 秒，外推到 2026 年檔 745 萬列約 6.5 GB、2.2 分鐘 ——
     每天只補 4.6 萬列卻整年重讀重寫，到 12 月會逼近 10 GB。
@@ -419,9 +429,15 @@ def append_ohlcv_days(path, incoming, run_stamp=None):
         return 0, table.num_rows
 
     existing = pq.read_table(path)
-    # 安全閥：萬一上游日期判斷出錯，已經存在的日期一律不重複附加。
-    existing_dates = set(pc.unique(existing["日期"]).to_pylist())
-    incoming = incoming[~incoming["日期"].isin(existing_dates)]
+    # 安全閥：已經存在的（日期, 市場）一律不重複附加；
+    # 同一天缺的那個市場可以補進來。
+    pairs = existing.select(["日期", "市場"]).group_by(["日期", "市場"]).aggregate([]).to_pylist()
+    existing_pairs = {(row["日期"], row["市場"]) for row in pairs}
+    keep = [
+        (date, market) not in existing_pairs
+        for date, market in zip(incoming["日期"], incoming["市場"])
+    ]
+    incoming = incoming[keep]
     if incoming.empty:
         return existing.num_rows, existing.num_rows
 
@@ -448,6 +464,30 @@ def _atomic_write_table(table, path):
     os.replace(tmp, path)
 
 
+MARKETS = ("TWSE", "TPEx")
+# TWSE 對同一 IP 的請求頻率很敏感，太密會回「沒有資料」而不是錯誤。
+# 2026-09-18 在 Actions 上實際發生：2025/06/04～12/17 共 136 天 TWSE 全部回空，
+# 當時兩個市場共用 0.6 秒間隔，TWSE 每 1～2 秒就被打一次。
+TWSE_MIN_INTERVAL = float(os.getenv("TWSE_MIN_INTERVAL_SECONDS", "3.0"))
+# TWSE 連續這麼多天「回空但 TPEx 有資料」就先停一下，等對方解除限制。
+TWSE_SOFT_FAIL_PAUSE_AFTER = int(os.getenv("TWSE_SOFT_FAIL_PAUSE_AFTER", "5"))
+TWSE_SOFT_FAIL_PAUSE_SECONDS = float(os.getenv("TWSE_SOFT_FAIL_PAUSE_SECONDS", "90"))
+
+_LAST_CALL = {"TWSE": 0.0}
+
+
+def _paced_fetch(market, day):
+    if market == "TWSE":
+        wait = TWSE_MIN_INTERVAL - (time.monotonic() - _LAST_CALL["TWSE"])
+        if wait > 0:
+            time.sleep(wait)
+        _LAST_CALL["TWSE"] = time.monotonic()
+        return fetch_ohlcv_twse(day)
+    result = fetch_ohlcv_tpex(day)
+    time.sleep(REQUEST_SLEEP)
+    return result
+
+
 def cmd_ohlcv(args):
     if args.recent:
         end_dt = datetime.today()
@@ -458,69 +498,100 @@ def cmd_ohlcv(args):
 
     print("=" * 74)
     print(f"📈 全市場 OHLCV｜{start_dt:%Y/%m/%d} ~ {end_dt:%Y/%m/%d}｜程式版本 {HARVEST_BUILD}")
-    print("   已抓過的日期會自動跳過，中斷後直接重跑即可續抓。")
+    print("   以「每天 × 每個市場」為單位確認：缺哪個市場就只補哪個，已完整的日子自動跳過。")
     print("=" * 74)
 
     known_closed = load_no_trading_dates()
     newly_closed = set()
     confirm_before = (datetime.today() - timedelta(days=NO_TRADING_CONFIRM_DAYS)).date()
+    soft_fail_streak = 0
 
     # 一次處理一年，避免把好幾年的資料同時攤在記憶體裡，
     # 也讓每個 parquet 檔維持在可以當 Release asset 上傳的大小。
     for year in range(start_dt.year, end_dt.year + 1):
         year_start = max(start_dt, datetime(year, 1, 1))
         year_end = min(end_dt, datetime(year, 12, 31))
-        done, previous_rows = _existing_dates(year)
+        present, previous_rows = _existing_markets(year)
 
         pending = []
         skipped_closed = 0
+        partial_days = 0
         cursor = year_start
         while cursor <= year_end:
             key = cursor.strftime("%Y/%m/%d")
-            if cursor.weekday() < 5 and key not in done:
+            have = present.get(key, set())
+            if cursor.weekday() < 5 and not set(MARKETS) <= have:
                 if key in known_closed:
                     skipped_closed += 1
                 else:
-                    pending.append(cursor)
+                    pending.append((cursor, [m for m in MARKETS if m not in have]))
+                    if have:
+                        partial_days += 1
             cursor += timedelta(days=1)
 
-        closed_note = f"｜已知休市略過 {skipped_closed} 天" if skipped_closed else ""
-        print(f"\n  ── {year} ──  既有 {previous_rows:,} 列／{len(done)} 天"
-              f"｜待抓 {len(pending)} 天{closed_note}")
+        notes = []
+        if partial_days:
+            notes.append(f"其中 {partial_days} 天只缺單一市場（補抓）")
+        if skipped_closed:
+            notes.append(f"已知休市略過 {skipped_closed} 天")
+        note_text = ("｜" + "｜".join(notes)) if notes else ""
+        print(f"\n  ── {year} ──  既有 {previous_rows:,} 列／完整 "
+              f"{sum(1 for v in present.values() if set(MARKETS) <= v)} 天"
+              f"｜待抓 {len(pending)} 天{note_text}")
         if not pending:
             continue
 
         collected = []
         failures = []
-        for i, day in enumerate(pending, start=1):
-            frames = []
-            had_error = False
-            for label, fetcher in (("TWSE", fetch_ohlcv_twse), ("TPEx", fetch_ohlcv_tpex)):
-                df, error = fetcher(day)
+        for i, (day, missing_markets) in enumerate(pending, start=1):
+            key = day.strftime("%Y/%m/%d")
+            results = {m: _paced_fetch(m, day) for m in missing_markets}
+            other_market_has_rows = bool(present.get(key)) or any(
+                not df.empty for df, _ in results.values()
+            )
+
+            for market, (df, error) in results.items():
                 if error:
-                    had_error = True
-                    failures.append(f"{day:%Y/%m/%d} {label} {error}")
+                    failures.append(f"{key} {market} {error}")
                 elif not df.empty:
-                    frames.append(df)
-                time.sleep(REQUEST_SLEEP)
-            if frames:
-                collected.append(pd.concat(frames, ignore_index=True))
-            elif not had_error and day.date() <= confirm_before:
+                    collected.append(df)
+                    if market == "TWSE":
+                        soft_fail_streak = 0
+                elif other_market_has_rows:
+                    # 另一個市場這天有交易，這個市場卻回空：不可能是休市，
+                    # 是對方拒絕或限流。記成失敗、這天不算完成，下次會重抓這個市場。
+                    failures.append(f"{key} {market} 回空但另一市場有資料（疑似限流）")
+                    if market == "TWSE":
+                        soft_fail_streak += 1
+
+            if (
+                all(df.empty and not error for df, error in results.values())
+                and not present.get(key)
+                and day.date() <= confirm_before
+            ):
                 # 兩個市場都正常回應、都沒有資料、而且不是最近幾天 → 休市
-                newly_closed.add(day.strftime("%Y/%m/%d"))
+                newly_closed.add(key)
+
+            if soft_fail_streak >= TWSE_SOFT_FAIL_PAUSE_AFTER:
+                print(f"    ⏸️ TWSE 連續 {soft_fail_streak} 天回空，暫停 "
+                      f"{TWSE_SOFT_FAIL_PAUSE_SECONDS:.0f} 秒等限制解除", flush=True)
+                time.sleep(TWSE_SOFT_FAIL_PAUSE_SECONDS)
+                soft_fail_streak = 0
+
             if i % 20 == 0 or i == len(pending):
                 total = sum(len(f) for f in collected)
-                print(f"    {i}/{len(pending)} 天｜已收集 {total:,} 列", flush=True)
+                print(f"    {i}/{len(pending)} 天｜已收集 {total:,} 列｜失敗 {len(failures)}",
+                      flush=True)
 
-        if not collected:
-            print("    ⏭ 這一年沒有收到任何資料（可能全是休市日）")
-            continue
-
-        incoming = pd.concat(collected, ignore_index=True)
-        before, after = append_ohlcv_days(_ohlcv_path(year), incoming)
-        print(f"    ✅ {before:,} → {after:,} 列（新增 {after - before:,}）")
+        if collected:
+            incoming = pd.concat(collected, ignore_index=True)
+            before, after = append_ohlcv_days(_ohlcv_path(year), incoming)
+            print(f"    ✅ {before:,} → {after:,} 列（新增 {after - before:,}）")
+        else:
+            print("    ⏭ 這一年沒有收到任何新資料")
         if failures:
-            print(f"    ⚠️ {len(failures)} 次抓取失敗（重跑會自動補）：{failures[:3]}")
+            print(f"    ⚠️ {len(failures)} 個（日期×市場）沒抓到，這些日子不算完成，"
+                  f"下次會自動重抓：{failures[:3]}")
 
     if newly_closed:
         save_no_trading_dates(known_closed | newly_closed)
@@ -569,11 +640,16 @@ def cmd_report(args):
                 continue
             path = os.path.join(OHLCV_DIR, name)
             # 用 Arrow 算：2024 年檔 1,184 萬列，兩個字串欄讀進 pandas 要好幾 GB。
-            table = pq.read_table(path, columns=["日期", "代號"])
+            table = pq.read_table(path, columns=["日期", "代號", "市場"])
             size = os.path.getsize(path) / 1024 / 1024
+            pairs = table.select(["日期", "市場"]).group_by(["日期", "市場"]).aggregate([]).to_pylist()
+            days_by_market = {m: sum(1 for r in pairs if r["市場"] == m) for m in MARKETS}
+            market_text = "｜".join(f"{m} {n} 天" for m, n in days_by_market.items())
             print(f"    {name}｜{table.num_rows:,} 列"
-                  f"｜{pc.count_distinct(table['日期']).as_py()} 個交易日"
+                  f"｜{pc.count_distinct(table['日期']).as_py()} 個交易日（{market_text}）"
                   f"｜{pc.count_distinct(table['代號']).as_py():,} 檔｜{size:,.1f} MB")
+            if len(set(days_by_market.values())) > 1:
+                print("      ⚠️ 兩個市場的天數不一致：有日子只抓到其中一個市場，下次執行會自動補齊")
             del table
         closed = load_no_trading_dates()
         if closed:

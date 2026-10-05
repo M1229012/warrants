@@ -80,10 +80,10 @@ for _s in (sys.stdout, sys.stderr):
         pass
 
 
-# 實測 MoneyDJ 分點資料最早只到這一天（2026-09-16，多檔不同權證的 API6 序列同時從這天開始）。
 # 三支抓取程式與 workflow 共用同一個版本號，workflow 開跑前會比對。改任何一支都要一起升。
-HARVEST_BUILD = "2026-09-18.1"
+HARVEST_BUILD = "2026-09-18.2"
 
+# 實測 MoneyDJ 分點資料最早只到這一天（2026-09-16，多檔不同權證的 API6 序列同時從這天開始）。
 MONEYDJ_FLOOR = os.getenv("BACKFILL_FLOOR_DATE", "2023/09/11")
 MAX_ATTEMPTS = max(int(os.getenv("BACKFILL_MAX_ATTEMPTS", "3")), 1)
 # API4 還沒掃完時，這一輪預算給 API4 的比例；剩下的給 API6。

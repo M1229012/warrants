@@ -52,7 +52,7 @@ for _s in (sys.stdout, sys.stderr):
 # ══════════════════════════════════════════════════════════════════════
 
 # 三支抓取程式與 workflow 共用同一個版本號，workflow 開跑前會比對。改任何一支都要一起升。
-HARVEST_BUILD = "2026-09-18.1"
+HARVEST_BUILD = "2026-09-18.2"
 
 DEFAULT_OUTPUT_DIR = (
     "output"
