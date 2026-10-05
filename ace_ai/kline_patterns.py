@@ -695,9 +695,12 @@ def user_triangle(df: pd.DataFrame, atr_prev, end: int) -> Optional[Dict[str, An
         peaks = {int(seg[np.argmax(H[seg])]), int(seg[np.argmax(np.maximum(O, C)[seg])])}
         pre = np.arange(max(lo, d["a"][0] - 40), d["a"][0] + 1)
         peaks.add(int(pre[np.argmax(H[pre])]))             # 10-06：上緣也可從起漲點前的起跌高點畫起（使用者手繪）
+        top = int(seg[np.argmax(H[seg])])                 # 起漲點之後的整理區最高峰
         for u in _tri_lines(H, L, O, C, A, True, d["a"][0], end, peaks):
             if u["s"] > d["s"] * 0.5 or u["s"] * end + u["k"] <= d["s"] * end + d["k"]:
                 continue
+            if abs(u["s"] * top + u["k"] - H[top]) > TRI_TOUCH * A[top]:
+                continue                                   # 10-06：上緣一定要經過最高峰（2344 要過 H8、H9、H10）
             # 從起漲點起畫的下緣優先，其次才比接觸次數與長度
             key = (abs(d["a"][0] - rise) <= 2, d["g"] + u["g"], end - min(d["a"][0], u["a"][0]))
             if best is None or key > best[0]:
