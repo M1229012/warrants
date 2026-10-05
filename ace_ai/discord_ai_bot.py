@@ -7056,6 +7056,62 @@ class AceQueryEngine:
 # ============================================================
 
 _LATE_IMAGE_TASKS = set()
+# 只有這些回覆維持純文字（草稿要能直接複製）；其他回覆一律畫成圖卡
+COPY_TEXT_ROUTES = {"weekly_draft", "weekly_draft_revision", "weekly_manual_draft", "weekly_draft_show"}
+
+
+def text_card_title(text: str) -> str:
+    """純文字回覆轉圖卡時的標題：取第一行（去掉粗體符號與前後空白），太長截斷。"""
+    first = next((line for line in str(text or "").splitlines() if line.strip()), "艾斯助手")
+    first = re.sub(r"[*_`#]", "", first).strip()
+    return first[:28] or "艾斯助手"
+
+
+def text_to_card(text: str) -> Dict[str, Any]:
+    """純文字回覆（統計、狀態、錯誤紀錄…）轉成研究筆記風格的圖卡：
+    第一行＝標題、第二行若是說明（統計起算…）＝徽章；「項目：數值」連續行＝兩欄表；「1. 名稱：N 題」＝排行表；
+    「xxx：」結尾＝小標；其他＝段落。不改文字內容，只換排版。"""
+    lines = [re.sub(r"[*`#]", "", line).strip() for line in str(text or "").splitlines()]
+    lines = [line for line in lines]
+    title = next((line for line in lines if line), "艾斯助手")
+    rest = lines[lines.index(title) + 1:] if title in lines else []
+    sections: List[Dict[str, Any]] = []
+    if rest and rest[0].startswith(("統計起算", "資料時間", "期間", "更新")):
+        sections.append({"type": "badge", "text": rest.pop(0)})
+    pairs: List[List[str]] = []
+    ranks: List[List[str]] = []
+
+    def flush() -> None:
+        if pairs:
+            sections.append({"type": "table", "columns": ["項目", "數值"], "widths": (0.42, 0.58), "rows": list(pairs)})
+            pairs.clear()
+        if ranks:
+            sections.append({"type": "table", "columns": ["名次", "名稱", "數量"], "widths": (0.12, 0.58, 0.30), "rows": list(ranks)})
+            ranks.clear()
+
+    for line in rest:
+        rank = re.match(r"^(\d+)[.、]\s*(.*?)[：:]\s*(.+)$", line)
+        pair = re.match(r"^([^：:]{1,24})[：:]\s*(.+)$", line)
+        if not line:
+            flush()
+        elif rank:
+            if pairs:
+                flush()
+            ranks.append([rank.group(1), rank.group(2) or "（未命名）", rank.group(3)])
+        elif line.endswith(("：", ":")):
+            flush()
+            sections.append({"type": "heading", "text": line.rstrip("：:")})
+        elif pair and not line.startswith(("※", "-", "•")):
+            if ranks:
+                flush()
+            pairs.append([pair.group(1).strip(), pair.group(2).strip()])
+        else:
+            flush()
+            sections.append({"type": "paragraph", "text": line})
+    flush()
+    if not sections:
+        sections.append({"type": "paragraph", "text": title})
+    return {"branch": title[:40], "tags": [], "label": "", "clean_display": True, "sections": sections}
 
 
 async def replace_late_ai_image(engine, original, target, make_files, no_mentions):
@@ -7895,10 +7951,15 @@ def run_discord_bot(config: BotConfig) -> None:
             for file in files:
                 file.close()
 
-    async def interaction_text(interaction, text: str, *, ephemeral=False, followup=False):
-        """草稿與維護指令用純文字回覆；太長時自動分段，方便直接複製。followup＝原回覆已刪，改用 followup 送。"""
+    async def interaction_text(interaction, text: str, *, ephemeral=False, followup=False, copy=False):
+        """所有回覆都用圖卡（10-05 使用者要求，管理員指令也一樣）；只有草稿（copy=True）用純文字，
+        太長時自動分段、方便直接複製。followup＝原回覆已刪，改用 followup 送。"""
         if not interaction.response.is_done():
             await interaction.response.defer(thinking=True, ephemeral=ephemeral)
+        if not copy:
+            return await interaction_image(interaction, text_card_title(text), text,
+                                           [{"branch_card": text_to_card(text), "hide_text": True}],
+                                           ephemeral=ephemeral, followup=followup)
         chunks = split_discord_message(text or "（沒有內容）", 1900)
         if followup:
             await interaction.followup.send(content=chunks[0], ephemeral=ephemeral, allowed_mentions=no_mentions)
@@ -8037,7 +8098,7 @@ def run_discord_bot(config: BotConfig) -> None:
             if not access.admin_mode or demo:
                 await interaction_text(interaction, '會員使用統計僅限管理員透過 /ace 查詢。', ephemeral=True)
                 return
-            await interaction.response.defer(thinking=True, ephemeral=True)
+            await interaction.response.defer(thinking=True, ephemeral=False)
             excluded = set(config.superuser_ids)
             excluded.update(m.id for m in getattr(interaction.guild, 'members', ())
                             if getattr(m, 'bot', False) or access_policy.UserEntitlement.from_member(m, config.superuser_ids).admin)
@@ -8055,13 +8116,13 @@ def run_discord_bot(config: BotConfig) -> None:
                             summary = summary.replace(f'ID {uid}', name)
                     except Exception:
                         pass
-                await interaction_text(interaction, summary, ephemeral=True)
+                await interaction_text(interaction, summary, ephemeral=False)
                 if attachment_data is not None:
                     with discord.File(io.BytesIO(attachment_data), filename='stock-questions.csv' if stats_command.kind in ('股票詢問統計','熱門股票') else 'member-usage.csv') as stats_file:
                         await interaction.followup.send(file=stats_file, ephemeral=True, allowed_mentions=no_mentions)
             except Exception as exc:
                 print(f'會員統計查詢失敗：{type(exc).__name__}: {exc}', flush=True)
-                await interaction_text(interaction, '統計讀取失敗，請稍後再試。', ephemeral=True)
+                await interaction_text(interaction, '統計讀取失敗，請稍後再試。', ephemeral=False)
             return
         original_entitlement = access.entitlement
         access = narrow_by_channel(config, access, getattr(interaction, "channel", None))
@@ -8080,12 +8141,12 @@ def run_discord_bot(config: BotConfig) -> None:
         # 其他失敗類與管理類回覆在結果出來後改成只有本人看得到。
         ephemeral = bool(config.ephemeral or (access.entry == "ace" and not demo and (_ADMIN_PRIVATE_RE.search(question) or kline_debug.is_request(question))))
 
-        async def send_private(title, text, panels=None, as_text=False):
+        async def send_private(title, text, panels=None, as_text=False, copy=False):
             followup = not ephemeral and interaction.response.is_done()
             if followup:
                 await interaction.delete_original_response()
             if as_text:
-                return await interaction_text(interaction, text, ephemeral=True, followup=followup)
+                return await interaction_text(interaction, text, ephemeral=True, followup=followup, copy=copy)
             else:
                 return await interaction_image(interaction, title, text, panels, ephemeral=True, followup=followup)
         state = guard.enter(user_id)
@@ -8152,9 +8213,11 @@ def run_discord_bot(config: BotConfig) -> None:
             render_seconds.set(0.0)
             sent = None
             if not ephemeral and not is_public_answer(result):
-                sent = await send_private(image_question, with_context_note(result), result.panels, result.as_text)
+                sent = await send_private(image_question, with_context_note(result), result.panels, result.as_text,
+                                          copy=result.route in COPY_TEXT_ROUTES)
             elif result.as_text:
-                await interaction_text(interaction, with_context_note(result), ephemeral=ephemeral)
+                await interaction_text(interaction, with_context_note(result), ephemeral=ephemeral,
+                                       copy=result.route in COPY_TEXT_ROUTES)
             else:
                 sent = await interaction_image(interaction, image_question, with_context_note(result), panels_with_context(result), ephemeral=ephemeral,
                                         weekly=result.weekly if result.layout == "weekly_pick" else None)
