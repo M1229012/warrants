@@ -639,7 +639,8 @@ def levels_break(df: pd.DataFrame, piv: List[Dict], atr_prev, today: int) -> Dic
 
 # ---------------------------------------------------------------- §4b 使用者畫法三角（09-30 使用者手繪 40+ 張歸納）
 TRI_DAYS, TRI_TOUCH, TRI_RECENT = int(_env("TRI_DAYS", 180)), _env("TRI_TOUCH", 0.3), int(_env("TRI_RECENT", 20))
-TRI_MIN_WIDTH, TRI_MIN_APEX = _env("TRI_MIN_WIDTH", 1.0), int(_env("TRI_MIN_APEX", 10))
+TRI_MIN_WIDTH, TRI_MIN_APEX = _env("TRI_MIN_WIDTH", 0.5), int(_env("TRI_MIN_APEX", 5))
+TRI_UP_RECENT = int(_env("TRI_UP_RECENT", 20))   # 上緣最近一次接觸要在 20 日內（試過 10 日會丟掉 2467 的長上緣）
 TRI_DN_TOUCHES = int(_env("TRI_DN_TOUCHES", 2))   # 10-06：使用者手繪下緣多為「起漲點＋最近低點」兩次
 TRI_UP_POKE, TRI_DN_POKE, TRI_POKES, TRI_FLAT = _env("TRI_UP_POKE", 2.0), _env("TRI_DN_POKE", 1.5), int(_env("TRI_POKES", 3)), _env("TRI_FLAT", 1.0)
 
@@ -673,7 +674,7 @@ def _tri_lines(H, L, O, C, A, upper: bool, lo: int, end: int, first: Optional[se
                 for h in hit:
                     groups += h - last >= 3
                     last = h
-                if groups < (2 if upper else TRI_DN_TOUCHES) or hit[-1] < end - TRI_RECENT:
+                if groups < (2 if upper else TRI_DN_TOUCHES) or hit[-1] < end - (TRI_UP_RECENT if upper else TRI_RECENT):
                     continue
                 out.append({"s": float(s), "k": float(k), "a": (int(i), int(j)), "g": int(groups)})
     return out
@@ -699,11 +700,67 @@ def _gap_uppers(H, L, C, A, lo: int, end: int) -> List[Dict[str, Any]]:
     return out
 
 
+TRI_ZIGZAG = _env("TRI_ZIGZAG", 1.5)        # 主要轉折：高低點來回幅度 ≥ 1.5 ATR 才算（濾掉小雜訊）
+
+
+def _zigzag(H, L, A, lo: int, end: int, k: float) -> List[Tuple[int, str]]:
+    """ATR ZigZag：回傳主要轉折 [(index, 'H'/'L')]，最後一個是進行中的末端（未確認）。"""
+    pts: List[Tuple[int, str]] = []
+    hi = lw = lo
+    mode, cand = 0, lo
+    for i in range(lo + 1, end + 1):
+        th = k * A[i]
+        if mode == 0:
+            hi = i if H[i] >= H[hi] else hi
+            lw = i if L[i] <= L[lw] else lw
+            if H[hi] - L[lw] >= th:
+                if hi > lw:
+                    pts.append((lw, "L")); mode, cand = 1, hi
+                else:
+                    pts.append((hi, "H")); mode, cand = -1, lw
+        elif mode == 1:
+            if H[i] >= H[cand]:
+                cand = i
+            elif H[cand] - L[i] >= th:
+                pts.append((cand, "H")); mode, cand = -1, i
+        else:
+            if L[i] <= L[cand]:
+                cand = i
+            elif H[i] - L[cand] >= th:
+                pts.append((cand, "L")); mode, cand = 1, i
+    if mode:
+        pts.append((cand, "H" if mode == 1 else "L"))
+    return pts
+
+
+def _hull_ray(P, B, anchor: int, later: List[int], upper: bool) -> Optional[Tuple[float, float, int]]:
+    """從錨點畫一條讓之後所有主要轉折都在線的同一側的線（上緣：全部在線下；下緣：全部在線上）＝人眼沿頂點／底點畫的線。"""
+    best = None
+    for j in later:
+        if j - anchor < 3:
+            continue
+        s = (B[j] - P[anchor]) / (j - anchor)          # 起點用影線極值、之後用實體（長影線可刺穿，人眼畫法）
+        if best is None or (s > best[0] if upper else s < best[0]):
+            best = (s, P[anchor] - s * anchor, j)
+    return best
+
+
+def _line_touches(P, A, s: float, k: float, start: int, end: int) -> Tuple[int, int]:
+    """接觸＝影線距線 ≤ TRI_TOUCH ATR，3 日內合併；回傳 (次數, 最後接觸 index)。"""
+    x = np.arange(start, end + 1)
+    hit = x[np.abs(P[x] - (s * x + k)) <= TRI_TOUCH * A[x]]
+    groups, last = 0, -99
+    for h in hit:
+        groups += h - last >= 3
+        last = h
+    return groups, (int(hit[-1]) if len(hit) else -1)
+
+
 def user_triangle(df: pd.DataFrame, atr_prev, end: int) -> Optional[Dict[str, Any]]:
-    """10-06 通用版（使用者手繪 7 檔歸納）：
-    上緣＝區間最高的前 3 個轉折高點起畫、往下或接近水平（≥2 次）；或未回補向下缺口的下緣（水平）。
-    下緣＝上緣高點之前那波的起漲點，或高點之後的最低點起畫、往上或接近水平（≥3 次）。
-    兩線要收斂（交點在 80 日內）；同方向（楔形、通道）不算三角。先比型態跨越長度，再比接觸次數。"""
+    """10-06 技術分析版三角（使用者手繪 7 檔驗證）：
+    1) ATR ZigZag 找主要高低點；2) 從每個主要高點畫「之後所有主要高點都在線下」的上緣、從每個主要低點畫
+    「之後所有主要低點都在線上」的下緣（或未回補向下缺口當水平上緣）；3) 上緣不往上、下緣不往下、兩線收斂、
+    收盤沒有實質穿越、今天仍有開口；4) 選接觸最多、跨越最長的一組。"""
     H, L, O, C = (df[k].to_numpy(dtype=float) for k in ("High", "Low", "Open", "Close"))
     A = np.where(np.isnan(atr_prev), np.nanmedian(atr_prev), atr_prev)
     lo = max(21, end - TRI_DAYS)
@@ -711,41 +768,68 @@ def user_triangle(df: pd.DataFrame, atr_prev, end: int) -> Optional[Dict[str, An
         return None
     a_ref = float(np.nanmedian(A[end - 19:end + 1]))
     flat = lambda l: abs(l["s"]) * (end - l["a"][0]) <= TRI_FLAT * a_ref
-    piv = [i for i in range(lo + 2, end - 4) if H[i] == H[i - 2:i + 3].max()]
-    tops = set(sorted(piv, key=lambda i: -H[i])[:6])
-    near = [i for i in piv if i >= end - 60]
-    if near:
-        tops.add(max(near, key=lambda i: H[i]))            # 最近 60 日的最高點一定要試（4977：5 月高點較高但不是這段整理）
-    uppers = [u for u in _tri_lines(H, L, O, C, A, True, lo, end, tops) if u["s"] <= 0 or flat(u)]
+    piv = _zigzag(H, L, A, lo, end, TRI_ZIGZAG)
+    piv = piv[:-1]                                         # 最後一個是進行中的末端（可能就是今天），不拿來畫線
+    highs = [i for i, t in piv if t == "H"]
+    lows = [i for i, t in piv if t == "L"]
+    x_all = np.arange(end + 1)
+
+    top, bot = np.maximum(O, C), np.minimum(O, C)
+
+    def check(P, B, anchor, s, k, upper):
+        x = x_all[anchor:end]
+        sg = 1 if upper else -1
+        if ((C[x] - (s * x + k)) * sg > 0.5 * A[x]).any():
+            return None                                    # 收盤實質穿越（今天另判突破）
+        poke = (P[x] - (s * x + k)) * sg
+        pk_days = x[poke > TRI_TOUCH * A[x]]
+        pk_groups = int(np.sum(np.diff(pk_days) >= 3) + 1) if len(pk_days) else 0   # 連續 3 日內的刺穿算同一次
+        if (poke > (TRI_UP_POKE if upper else TRI_DN_POKE) * A[x]).any() or pk_groups > TRI_POKES:
+            return None                                    # 影線刺穿太深或太多次
+        if upper and end - anchor > 6:
+            # 線不可浮在「起點之後的低點」之後那段整理區最高峰上方（2344 要壓到 H8）
+            trough = anchor + 1 + int(np.argmin(L[anchor + 1:end]))
+            seg = np.arange(trough + 1, end)
+            if len(seg):
+                pk = int(seg[np.argmax(H[seg])])
+                if s * pk + k - H[pk] > TRI_TOUCH * A[pk]:
+                    return None
+        g1, l1 = _line_touches(P, A, s, k, anchor, end)
+        g2, l2 = _line_touches(B, A, s, k, anchor, end)
+        g, last = max(g1, g2), max(l1, l2)
+        if g < 2 or last < end - TRI_RECENT:
+            return None
+        return g
+
+    def build(P, anchor, later, upper):
+        """包絡線：從主要轉折起點畫一條讓之後所有 K 棒（上緣看實體頂、下緣看影線低）都在線同一側的線。"""
+        B = top if upper else L                           # 上緣讓長上影線刺穿（用實體）；下緣貼影線低點
+        ray = _hull_ray(P, B, anchor, later, upper)
+        if ray is None:
+            return None
+        s, k, j = ray
+        g = check(P, B, anchor, s, k, upper)
+        return None if g is None else {"s": float(s), "k": float(k), "a": (int(anchor), int(j)), "g": int(g)}
+
+    # 起點只用主要轉折；畫線時看之後「所有 K 棒」的外緣（2421 的 09/22 小高點也要壓到）
+    uppers = [u for h in highs if h < end - 5 for u in [build(H, h, list(range(h + 3, end)), True)]
+              if u and (u["s"] <= 0 or flat(u))]
+    uppers += _gap_uppers(H, L, C, A, lo, end)
+    lowers = [d for l in lows if l < end - 5 for d in [build(L, l, list(range(l + 3, end)), False)]
+              if d and d["s"] >= -0.002 * a_ref]
     best = None
-    for u in uppers + _gap_uppers(H, L, C, A, lo, end):   # 缺口（≥0.3 ATR、未回補）和斜線一起比長度（3715）
-        p = u["a"][0]
-        firsts = set()
-        # 起漲點：漲到這個高點之前 40 日內的轉折低點都試（1608 是跳空當天的低點，不一定是最低點）
-        firsts.update(i for i in range(max(lo + 2, p - 40), p) if L[i] <= L[i - 1:i + 3].min())   # 只看右側：跳空當天低點也算
-        if end - 5 - p >= 3:
-            firsts.add(int(p + 1 + np.argmin(L[p + 1:end - 5])))              # 高點之後的最低點
-        if not firsts:
-            continue
-        # 上緣要經過「高點之後最低點」之後的整理區最高峰（2344 要過 H8；4576 要過 09/07 高點）
-        trough = p + 1 + int(np.argmin(L[p + 1:end])) if end - p > 2 else end
-        later = np.arange(trough + 1, end)
-        pk = int(later[np.argmax(H[later])]) if len(later) else -1
-        if pk >= 0 and not u.get("gap") and u["s"] * pk + u["k"] - H[pk] > TRI_TOUCH * A[pk]:   # 線浮在最高峰上方＝沒壓到整理區（影線刺穿可）
-            continue
-        for d in _tri_lines(H, L, O, C, A, False, lo, end, firsts):
-            if d["s"] < 0 and not flat(d):
-                continue                                   # 下緣往下＝下降通道，不是三角
-            if u["s"] * end + u["k"] - (d["s"] * end + d["k"]) < TRI_MIN_WIDTH * a_ref:
-                continue                                   # 10-06：今天兩線開口至少 1 ATR（使用者手繪的三角都還沒收到頂點）
+    for u in uppers:
+        for d in lowers:
+            width = u["s"] * end + u["k"] - (d["s"] * end + d["k"])
+            if width < TRI_MIN_WIDTH * a_ref:
+                continue
             if not (flat(u) and flat(d)):
-                if u["s"] < d["s"] and (d["k"] - u["k"]) / (u["s"] - d["s"]) < end + TRI_MIN_APEX:
-                    continue                               # 交點太近＝已收斂到尖端
-                if u["s"] >= d["s"]:
-                    continue                               # 不收斂（同方向平行）
-                if (d["k"] - u["k"]) / (u["s"] - d["s"]) > end + 80:
-                    continue                               # 交點太遠＝近似平行通道
-            key = ((end - u["a"][0]) + (end - d["a"][0]), u["g"] + d["g"])   # 兩條線都越長越好（人眼畫法）
+                if u["s"] >= d["s"] or (d["k"] - u["k"]) / (u["s"] - d["s"]) < end + TRI_MIN_APEX:
+                    continue
+            start = max(u["a"][0], d["a"][0])
+            if abs(u["a"][0] - d["a"][0]) > 120:
+                continue                                   # 兩條邊起點差太遠＝不是同一段整理
+            key = ((end - u["a"][0]) + (end - d["a"][0]), u["g"] + d["g"])   # 先比兩邊長度（主要結構），再比接觸次數
             if best is None or key > best[0]:
                 best = (key, u, d)
     if not best:
