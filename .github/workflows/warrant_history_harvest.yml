@@ -93,7 +93,7 @@ jobs:
           for f in warrant_harvest/warrant_backfill.py \
                    warrant_harvest/warrant_history_store.py \
                    warrant_harvest/warrant_reference_harvest.py \
-                   warrant_analysis/broker_quality_diagnostics.py; do
+                   warrant_harvest/broker_quality_diagnostics.py; do
             v=$(sed -n 's/^HARVEST_BUILD = "\([^"]*\)".*/\1/p' "$f" | head -1)
             if [ "$v" = "$HARVEST_BUILD" ]; then
               echo "  ✅ $f  $v"
@@ -295,7 +295,7 @@ jobs:
       - name: 產出分點勝率報表
         if: ${{ always() && steps.restore.outcome == 'success' }}
         continue-on-error: true
-        run: python warrant_analysis/broker_quality_diagnostics.py --excel
+        run: python warrant_harvest/broker_quality_diagnostics.py --excel
 
       - name: 上傳前檢查（累積庫不可以比還原時少）
         id: guard
