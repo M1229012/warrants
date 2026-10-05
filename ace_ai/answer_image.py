@@ -82,10 +82,67 @@ def font(size: int, bold: bool = False):
 
 def clean(text: str) -> str:
     text = str(text).replace('🥇', '01 ').replace('🥈', '02 ').replace('🥉', '03 ')
-    text = re.sub(r'[\U0001F000-\U0001FAFF\uFE0F\u20E3\u200D]', '', text)
+    text = re.sub(r'[\U0001F000-\U0001FAFF\u2600-\u27BF\u2B00-\u2BFF\uFE0F\u200D\u20E3]', '', text)   # 含 ☀ 等雜項符號（字型沒有，會變方框）
     text = re.sub(r'[❓✅⚠❌📊]', '', text)
     text = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'\1（\2）', text)
     return text.replace('**', '').replace('`', '').strip()
+
+
+# 彩色 emoji（10-05）：中文字型沒有 emoji 會畫成方框。Docker 安裝 fonts-noto-color-emoji，
+# 本機 Windows 用 Segoe UI Emoji；兩者都沒有時把 emoji 拿掉（不畫方框）。
+_EMOJI_SEQ_RE = re.compile('(?:[\U0001F000-\U0001FAFF\u2600-\u27BF\u2B00-\u2BFF]\uFE0F?'
+                           '(?:\u200D[\U0001F000-\U0001FAFF\u2600-\u27BF]\uFE0F?)*)')
+_EMOJI_FONT_PATHS = (os.getenv('DISCORD_AI_EMOJI_FONT', ''),
+                     '/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf',
+                     'C:/Windows/Fonts/seguiemj.ttf')
+
+
+@lru_cache(maxsize=1)
+def _emoji_font():
+    for path in _EMOJI_FONT_PATHS:
+        if path and os.path.exists(path):
+            try:
+                return ImageFont.truetype(path, 109)   # NotoColorEmoji 是點陣字，只能用 109
+            except Exception:
+                continue
+    return None
+
+
+@lru_cache(maxsize=256)
+def _emoji_tile(seq: str, size: int):
+    face = _emoji_font()
+    if face is None:
+        return None
+    canvas = Image.new('RGBA', (180, 180), (0, 0, 0, 0))
+    ImageDraw.Draw(canvas).text((20, 20), seq, font=face, embedded_color=True)
+    box = canvas.getbbox()
+    if not box:
+        return None
+    tile = canvas.crop(box)
+    scale = size / max(tile.size)
+    return tile.resize((max(1, round(tile.width * scale)), max(1, round(tile.height * scale))), Image.LANCZOS)
+
+
+def draw_text_emoji(draw, xy, text, face, fill, anchor='lm') -> None:
+    """和 draw.text 一樣（只支援 lm／rm 對齊），但 emoji 用彩色字型畫；沒有 emoji 時直接走 draw.text。"""
+    text = str(text)
+    if not _EMOJI_SEQ_RE.search(text):
+        draw.text(xy, text, font=face, fill=fill, anchor=anchor)
+        return
+    size = round(getattr(face, 'size', 22) * 1.05)
+    parts = [p for p in re.split('(' + _EMOJI_SEQ_RE.pattern + ')', text) if p]
+    tiles = {p: _emoji_tile(p, size) for p in parts if _EMOJI_SEQ_RE.fullmatch(p)}
+    widths = [(tiles[p].width + 2 if tiles.get(p) else 0) if p in tiles else face.getlength(p) for p in parts]
+    x = xy[0] if anchor[0] == 'l' else xy[0] - sum(widths)
+    image = getattr(draw, '_image', None)
+    for part, w in zip(parts, widths):
+        if part in tiles:
+            tile = tiles[part]
+            if tile is not None and image is not None:
+                image.paste(tile, (round(x + 1), round(xy[1] - tile.height / 2)), tile)
+        else:
+            draw.text((x, xy[1]), part, font=face, fill=fill, anchor='lm')
+        x += w
 
 
 _WRAP_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9.,%+\-/_:~]*|\s+|.", re.S)
@@ -2762,8 +2819,8 @@ def _branch_section(draw, x0: float, x1: float, y: float, section: dict, dry: bo
                     color = MUTED if columns[c] == '目前動向' else _tone_color(cell, 'auto') if columns[c] in signed else (ACCENT if columns[c] in accent else INK)
                     top = ry + height / 2 - (len(lines) - 1) * 14
                     for i, line in enumerate(lines):
-                        draw.text((cx, top + i * 28), line, font=font(size, strong),
-                                  fill=color, anchor='lm' if c == 0 else 'rm')
+                        draw_text_emoji(draw, (cx, top + i * 28), line, font(size, strong),
+                                        color, 'lm' if c == 0 else 'rm')
                 badge = str(row_badges[r]) if r < len(row_badges) else ''
                 if badge and cells:
                     lines, size, strong = cells[0]
