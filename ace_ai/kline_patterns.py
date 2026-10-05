@@ -685,20 +685,26 @@ def user_triangle(df: pd.DataFrame, atr_prev, end: int) -> Optional[Dict[str, An
     if end - lo < 30:
         return None
     best = None
+    a_ref = float(np.nanmedian(A[end - 19:end + 1]))
+    flat = lambda l: abs(l["s"]) * (end - l["a"][0]) <= TRI_FLAT * a_ref
+    rise = int(lo + np.argmin(L[lo:end]))                 # 起漲點＝區間最低點
     for d in _tri_lines(H, L, O, C, A, False, lo, end):
+        if d["s"] < 0 and not flat(d):
+            continue                                       # 10-06：下緣往下斜＝下降通道，不是三角
         seg = np.arange(d["a"][0], end)
         peaks = {int(seg[np.argmax(H[seg])]), int(seg[np.argmax(np.maximum(O, C)[seg])])}
+        pre = np.arange(max(lo, d["a"][0] - 40), d["a"][0] + 1)
+        peaks.add(int(pre[np.argmax(H[pre])]))             # 10-06：上緣也可從起漲點前的起跌高點畫起（使用者手繪）
         for u in _tri_lines(H, L, O, C, A, True, d["a"][0], end, peaks):
             if u["s"] > d["s"] * 0.5 or u["s"] * end + u["k"] <= d["s"] * end + d["k"]:
                 continue
-            key = (d["g"] + u["g"], end - d["a"][0])
+            # 從起漲點起畫的下緣優先，其次才比接觸次數與長度
+            key = (abs(d["a"][0] - rise) <= 2, d["g"] + u["g"], end - min(d["a"][0], u["a"][0]))
             if best is None or key > best[0]:
                 best = (key, u, d)
     if not best:
         return None
     _, u, d = best
-    a_ref = float(np.nanmedian(A[end - 19:end + 1]))
-    flat = lambda l: abs(l["s"]) * (end - l["a"][0]) <= TRI_FLAT * a_ref
     kind = ("箱型整理" if flat(u) and flat(d) else "上升三角" if flat(u) else "三角收斂" if u["s"] < 0 else "上升楔形")
     up, dn = u["s"] * end + u["k"], d["s"] * end + d["k"]
     state = ("收盤向上突破上緣" if C[end] > up + BREAK * A[end] else "收盤向下跌破下緣" if C[end] < dn - BREAK * A[end]
