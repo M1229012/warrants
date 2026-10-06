@@ -640,7 +640,8 @@ def levels_break(df: pd.DataFrame, piv: List[Dict], atr_prev, today: int) -> Dic
 # ---------------------------------------------------------------- §4b 使用者畫法三角（09-30 使用者手繪 40+ 張歸納）
 TRI_DAYS, TRI_TOUCH, TRI_RECENT = int(_env("TRI_DAYS", 180)), _env("TRI_TOUCH", 0.3), int(_env("TRI_RECENT", 20))
 TRI_MIN_WIDTH, TRI_MIN_APEX = _env("TRI_MIN_WIDTH", 0.5), int(_env("TRI_MIN_APEX", 5))
-TRI_UP_RECENT = int(_env("TRI_UP_RECENT", 20))   # 上緣最近一次接觸要在 20 日內（試過 10 日會丟掉 2467 的長上緣）
+TRI_UP_RECENT = int(_env("TRI_UP_RECENT", 20))
+TRI_APEX_POS = _env("TRI_APEX_POS", 0.9)   # 走到型態長度 9 成還沒突破＝不是三角（4576 手繪約 9 成）   # 上緣最近一次接觸要在 20 日內（試過 10 日會丟掉 2467 的長上緣）
 TRI_DN_TOUCHES = int(_env("TRI_DN_TOUCHES", 2))   # 10-06：使用者手繪下緣多為「起漲點＋最近低點」兩次
 TRI_UP_POKE, TRI_DN_POKE, TRI_POKES, TRI_FLAT = _env("TRI_UP_POKE", 2.0), _env("TRI_DN_POKE", 1.5), int(_env("TRI_POKES", 3)), _env("TRI_FLAT", 1.0)
 
@@ -769,6 +770,7 @@ def user_triangle(df: pd.DataFrame, atr_prev, end: int) -> Optional[Dict[str, An
     a_ref = float(np.nanmedian(A[end - 19:end + 1]))
     flat = lambda l: abs(l["s"]) * (end - l["a"][0]) <= TRI_FLAT * a_ref
     piv = _zigzag(H, L, A, lo, end, TRI_ZIGZAG)
+    piv_all = list(piv)                                    # 含進行中的末端：用來檢查來回震盪
     piv = piv[:-1]                                         # 最後一個是進行中的末端（可能就是今天），不拿來畫線
     highs = [i for i, t in piv if t == "H"]
     lows = [i for i, t in piv if t == "L"]
@@ -830,16 +832,40 @@ def user_triangle(df: pd.DataFrame, atr_prev, end: int) -> Optional[Dict[str, An
             if not (flat(u) and flat(d)):
                 if u["s"] >= d["s"] or (d["k"] - u["k"]) / (u["s"] - d["s"]) < end + (0 if broke else TRI_MIN_APEX):
                     continue
-            start = max(u["a"][0], d["a"][0])
             if abs(u["a"][0] - d["a"][0]) > 120:
                 continue                                   # 兩條邊起點差太遠＝不是同一段整理
+            first = min(u["a"][0], d["a"][0])
+            if end - first < 15:
+                continue                                   # 型態至少 15 個交易日
+            if min(end - u["a"][0], end - d["a"][0]) < 0.4 * (end - first):
+                continue                                   # 兩條線都要涵蓋型態 4 成以上（2412 下緣只有最近 7 天）
+            if u["s"] > 0 and u["s"] * (end - u["a"][0]) > 0.25 * a_ref:
+                continue                                   # 上緣往上超過 0.5 ATR＝不是水平（2412、2603 那種）
+            # 三角定義：主要高低點在兩線之間來回（高→低→高→低），兩條線各被主要轉折碰到至少 2 次
+            seq = []
+            for i, t in piv_all:
+                if i < first:
+                    continue
+                near_up = (H[i] >= u["k"] - 0.5 * A[i]) if u.get("gap") else                     min(abs(u["s"] * i + u["k"] - H[i]), abs(u["s"] * i + u["k"] - top[i])) <= 0.5 * A[i]
+                if t == "H" and near_up:                   # 缺口上緣：高點進到缺口區就算碰到
+                    seq.append("H")
+                elif t == "L" and abs(d["s"] * i + d["k"] - L[i]) <= 0.5 * A[i]:
+                    seq.append("L")
+            turns = sum(1 for a1, a2 in zip(seq, seq[1:]) if a1 != a2)
+            if seq.count("H") < 2 or seq.count("L") < 2 or turns < 3:
+                continue                                   # 沒有來回震盪（3008 急漲後回檔一段不算三角）
+            if not (flat(u) and flat(d)):
+                apex = (d["k"] - u["k"]) / (u["s"] - d["s"])
+                if (end - first) / max(apex - first, 1e-9) > (0.95 if broke else TRI_APEX_POS):
+                    continue                               # 已走到尖端附近還沒出方向＝不是三角（通常 2/3～3/4 就會突破）
             key = ((end - u["a"][0]) + (end - d["a"][0]), u["g"] + d["g"])   # 先比兩邊長度（主要結構），再比接觸次數
             if best is None or key > best[0]:
                 best = (key, u, d)
     if not best:
         return None
     _, u, d = best
-    kind = ("箱型整理" if flat(u) and flat(d) else "上升三角" if flat(u) else "下降三角" if flat(d) else "三角收斂")
+    level = lambda l: abs(l["s"]) * (end - l["a"][0]) <= 0.5 * a_ref   # 命名用：整段高低差 ≤0.5 ATR 才叫水平（4576 降 1 ATR 不算）
+    kind = ("箱型整理" if level(u) and level(d) else "上升三角" if level(u) else "下降三角" if level(d) else "三角收斂")
     up, dn = u["s"] * end + u["k"], d["s"] * end + d["k"]
     state = ("收盤向上突破上緣" if C[end] > up + BREAK * A[end] else "收盤向下跌破下緣" if C[end] < dn - BREAK * A[end]
              else "位於型態內")
