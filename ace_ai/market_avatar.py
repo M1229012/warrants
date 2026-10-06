@@ -114,7 +114,7 @@ class AvatarController:
                     return
             quote = None
             if status != "closed":
-                if tools.closed_quotes_only():
+                if tools.closed_quotes_only() and tools.finmind_background_allowed():   # 10-06：FinMind 額度不足改用證交所報價
                     frame = tools._load_index_bundle("TAIEX")["closed_df"]
                     if len(frame) < 2:
                         raise ValueError("TAIEX closing history missing; keep avatar")
