@@ -726,17 +726,17 @@ def _tri_line(P, B, Q, C, A, s: float, k: float, i0: int, last: int, sg: int, re
     if reacted < 1:
         return None
     mj = [m for m in majors if i0 <= m <= stop]
-    if any(m > i0 + 2 and (B[m] - (s * m + k)) * sg > TRI_MAJOR_POKE * ref and m not in bad for m in mj):
+    if any(m > i0 + 3 and (B[m] - (s * m + k)) * sg > TRI_MAJOR_POKE * ref and m not in bad for m in mj):
         return None                               # 主要轉折實體刺穿線（2467 H7、H10）＝線畫錯；影線刺穿（6173 H9）或 2 天內收回的假突破（3715 H7）可以
     near = lambda m: (P[m] - (s * m + k)) * sg >= -TRI_TOUCH * ref and (B[m] - (s * m + k)) * sg <= TRI_TOUCH * ref
     turns = set(_tri_turns(P, sg, i0, stop))
     return {"s": float(s), "k": float(k), "a": [g[0] for g in groups], "score": reacted + 0.5 * pending,
             "density": len(touches), "peaks": sum(1 for g in groups if turns.intersection(g)),
             "brk": r0 if r0 <= last else None,
-            "mtouch": sum(1 for m in majors if i0 - 2 <= m <= stop and near(m)),   # 起點前 2 天的主要轉折也算（2421 從 H9 隔天起畫）
+            "mtouch": sum(1 for m in majors if i0 - 3 <= m <= stop and near(m)),   # 起點前後 3 根的主要轉折也算
             # 主要轉折：碰到的加分、影線穿出線外的扣分（線要畫在主要高點之上，2467 紅線 H5→H7→H10）
             "major": sum(1 for m in mj if near(m))
-            - sum(1 for m in mj if m > i0 + 2 and m not in bad and (P[m] - (s * m + k)) * sg > TRI_MAJOR_POKE * ref)}
+            - sum(1 for m in mj if m > i0 + 3 and m not in bad and (P[m] - (s * m + k)) * sg > TRI_MAJOR_POKE * ref)}
 
 
 def _tri_lines(P, B, Q, C, A, lo: int, last: int, sg: int, ref: float, majors=()) -> List[Dict[str, Any]]:
@@ -744,9 +744,12 @@ def _tri_lines(P, B, Q, C, A, lo: int, last: int, sg: int, ref: float, majors=()
     anchors = sorted(set(_tri_turns(P, sg, lo, last)) | {m for m in majors if lo <= m <= last - TRI_PIVOT})   # 圖上標的主要轉折也可當畫線點（2421 H10）
     # 畫線點：影線頂、實體頂（開收盤），以及實體頂往內 0.4 ATR（有一點誤差沒關係；2421 紅線從 H9 實體略下方起畫）
     pts = [(t, float(v)) for t in anchors for v in {P[t], B[t], B[t] - sg * TRI_TOUCH * ref}]
+    # 起點可在主要轉折前後 3 根內（使用者實看：起點不一定剛好在轉折上，2344 H5 前、4977 H2 附近、2421 H9 前）
+    near_m = sorted({t for m in majors for t in range(m - 3, m + 4) if lo <= t <= last - TRI_PIVOT} - set(anchors))
+    starts = sorted(pts + [(t, float(v)) for t in near_m for v in {P[t], B[t]}])
     out = []
-    for i, (x1, y1) in enumerate(pts):
-        for x2, y2 in pts[i + 1:]:
+    for x1, y1 in starts:
+        for x2, y2 in pts:
             if x2 - x1 < 3:
                 continue                          # 兩個轉折至少隔 3 天（2421 紅線：H9 實體頂→H10 只隔 4 天）
             s = (y2 - y1) / (x2 - x1)
