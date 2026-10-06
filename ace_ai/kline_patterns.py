@@ -681,6 +681,20 @@ def _tri_lines(H, L, O, C, A, upper: bool, lo: int, end: int, first: Optional[se
     return out
 
 
+TRI_SCALES = (_env("TRI_ZIGZAG", 1.5), 1.0, 2.5)   # 10-06：預設尺度判不到時換尺度（小一點抓短三角、大一點抓長三角）
+
+
+def user_triangle(df: pd.DataFrame, atr_prev, end: int) -> Optional[Dict[str, Any]]:
+    for zz in TRI_SCALES:
+        t = _triangle_at(df, atr_prev, end, zz)
+        if t:
+            t["scale"] = zz
+            if zz != TRI_SCALES[0]:
+                t["text"] += f"（轉折尺度 {zz:g} ATR）"
+            return t
+    return None
+
+
 def _gap_uppers(H, L, C, A, lo: int, end: int) -> List[Dict[str, Any]]:
     """未回補的向下跳空缺口＝壓力（3715 手繪）：缺口下緣畫水平上緣，之後高點碰到缺口區 ≥2 次、最近 20 日碰過。"""
     out = []
@@ -757,7 +771,7 @@ def _line_touches(P, A, s: float, k: float, start: int, end: int) -> Tuple[int, 
     return groups, (int(hit[-1]) if len(hit) else -1)
 
 
-def user_triangle(df: pd.DataFrame, atr_prev, end: int) -> Optional[Dict[str, Any]]:
+def _triangle_at(df: pd.DataFrame, atr_prev, end: int, zz: float) -> Optional[Dict[str, Any]]:
     """10-06 技術分析版三角（使用者手繪 7 檔驗證）：
     1) ATR ZigZag 找主要高低點；2) 從每個主要高點畫「之後所有主要高點都在線下」的上緣、從每個主要低點畫
     「之後所有主要低點都在線上」的下緣（或未回補向下缺口當水平上緣）；3) 上緣不往上、下緣不往下、兩線收斂、
@@ -769,7 +783,7 @@ def user_triangle(df: pd.DataFrame, atr_prev, end: int) -> Optional[Dict[str, An
         return None
     a_ref = float(np.nanmedian(A[end - 19:end + 1]))
     flat = lambda l: abs(l["s"]) * (end - l["a"][0]) <= TRI_FLAT * a_ref
-    piv = _zigzag(H, L, A, lo, end, TRI_ZIGZAG)
+    piv = _zigzag(H, L, A, lo, end, zz)
     piv_all = list(piv)                                    # 含進行中的末端：用來檢查來回震盪
     piv = piv[:-1]                                         # 最後一個是進行中的末端（可能就是今天），不拿來畫線
     highs = [i for i, t in piv if t == "H"]
@@ -803,9 +817,9 @@ def user_triangle(df: pd.DataFrame, atr_prev, end: int) -> Optional[Dict[str, An
             return None
         return g
 
-    def build(P, anchor, later, upper):
-        """包絡線：從主要轉折起點畫一條讓之後所有 K 棒（上緣看實體頂、下緣看影線低）都在線同一側的線。"""
-        B = top if upper else L                           # 上緣讓長上影線刺穿（用實體）；下緣貼影線低點
+    def build(P, anchor, later, upper, B=None):
+        """包絡線：從主要轉折起點畫一條讓之後所有 K 棒（上緣看實體頂、下緣看影線低或實體低）都在線同一側的線。"""
+        B = (top if upper else L) if B is None else B     # 上緣讓長上影線刺穿（用實體）
         ray = _hull_ray(P, B, anchor, later, upper)
         if ray is None:
             return None
@@ -820,7 +834,10 @@ def user_triangle(df: pd.DataFrame, atr_prev, end: int) -> Optional[Dict[str, An
               for u in [build(P0, h, later, True)]
               if u and (u["s"] <= 0 or flat(u))]
     uppers += _gap_uppers(H, L, C, A, lo, end)
-    lowers = [d for l in lows if l < end - 5 for d in [build(L, l, list(range(l + 3, end)), False)]
+    # 下緣：影線低／實體低兩種外緣，加上「只連主要低點」（2603 下緣 L7→最近實體低；2317 L6→L7→L8）
+    lowers = [d for l in lows if l < end - 5 for B0 in (L, bot)
+              for later in (list(range(l + 3, end)), [i for i in lows if i > l + 2])
+              for d in [build(L, l, later, False, B0)]
               if d and d["s"] >= -0.002 * a_ref]
     best = None
     for u in uppers:
@@ -832,11 +849,13 @@ def user_triangle(df: pd.DataFrame, atr_prev, end: int) -> Optional[Dict[str, An
             if not (flat(u) and flat(d)):
                 if u["s"] >= d["s"] or (d["k"] - u["k"]) / (u["s"] - d["s"]) < end + (0 if broke else TRI_MIN_APEX):
                     continue
-            if abs(u["a"][0] - d["a"][0]) > 120:
-                continue                                   # 兩條邊起點差太遠＝不是同一段整理
+            if abs(u["a"][0] - d["a"][0]) > 120 or u["a"][0] - d["a"][0] > 25:
+                continue                                   # 起點差太遠，或下緣起點比上緣早 25 日以上（2603 那是整段上漲趨勢線）
             first = min(u["a"][0], d["a"][0])
             if end - first < 15:
                 continue                                   # 型態至少 15 個交易日
+            if max(abs(u["s"]), abs(d["s"])) > 0.2 * a_ref:
+                continue                                   # 線太陡（每日 >0.2 ATR）＝急漲急跌的趨勢線，不是整理（2303）
             if min(end - u["a"][0], end - d["a"][0]) < 0.4 * (end - first):
                 continue                                   # 兩條線都要涵蓋型態 4 成以上（2412 下緣只有最近 7 天）
             if u["s"] > 0 and u["s"] * (end - u["a"][0]) > 0.25 * a_ref:
@@ -852,7 +871,8 @@ def user_triangle(df: pd.DataFrame, atr_prev, end: int) -> Optional[Dict[str, An
                 elif t == "L" and abs(d["s"] * i + d["k"] - L[i]) <= 0.5 * A[i]:
                     seq.append("L")
             turns = sum(1 for a1, a2 in zip(seq, seq[1:]) if a1 != a2)
-            if seq.count("H") < 2 or seq.count("L") < 2 or turns < 3:
+            need = 3 if zz < 1.5 else 2                    # 小尺度較敏感：上下緣各要 3 個主要轉折（3008 回檔不算）
+            if seq.count("H") < need or seq.count("L") < need or turns < 3:
                 continue                                   # 沒有來回震盪（3008 急漲後回檔一段不算三角）
             if not (flat(u) and flat(d)):
                 apex = (d["k"] - u["k"]) / (u["s"] - d["s"])

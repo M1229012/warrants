@@ -78,8 +78,12 @@ def build_panel(frame: pd.DataFrame, events: dict | None, code: str, name: str =
              **{k: float(row[k]) for k in ("Open", "High", "Low", "Close")},
              "Volume": float(row.get("Volume", 0)) if pd.notna(row.get("Volume", 0)) else 0.0}
             for day, row in used.iterrows()]
+    start = max(0, len(bars) - kline_patterns.SEARCH_DAYS)
+    tri = result.get("triangle")
+    if tri:   # 10-06：三角起點比 60 根更早（換尺度、長三角）時，顯示範圍跟著延伸，看得到抓了哪些點
+        start = max(0, min([start] + [int(a[0]) - 5 for a in tri["anchors"].values()]))
     return {"kline_debug": {"stock_code": code, "stock_name": name, "bars": bars,
-                            "display_start": max(0, len(bars) - kline_patterns.SEARCH_DAYS),
+                            "display_start": start,
                             "last_official": snapshot["last_official"], "pivots": result["pivots"],
                             "triangle": result.get("triangle"),
                             "formation": result.get("formation"), "ended": result.get("ended"),
