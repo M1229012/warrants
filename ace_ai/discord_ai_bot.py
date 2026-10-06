@@ -3906,6 +3906,7 @@ class AnswerResult:
     followups: List["AnswerResult"] = field(default_factory=list)   # 「兩種一起看」：第二張圖（權證分點籌碼）
     denial_followups: List[str] = field(default_factory=list)       # 「兩種一起看」但缺一邊權限：另送鎖定卡（SPOT／WARRANT）
     late_ai: Optional[Dict[str, Any]] = field(default=None, repr=False, compare=False)
+    spot_refresh: Optional[Dict[str, Any]] = field(default=None, repr=False, compare=False)   # 籌碼補完自動換圖
     timings: Dict[str, float] = field(default_factory=dict)          # 各階段耗時（PERF log 用）
 
 
@@ -5259,6 +5260,20 @@ class AceQueryEngine:
         self.log(f"現股籌碼解讀｜{code}｜Gemini {stats.gemini_calls} 次｜成功={bool(ai_card)}")
         full = ((mode == "latest" or report.get("available_days", 0) >= report.get("requested_days", spot_chip.REQUESTED_DAYS))
                 and not (report.get("progress") or {}).get("background"))
+        fut = None if full or simulation else spot_chip.background_future(code)
+        if fut is not None:
+            # 10-06：資料還在背景補：圖上註明，補完後重算並換掉原訊息的圖（會員不用重問）
+            note = (f"歷史資料補齊中（已確認 {report.get('available_days')}／{report.get('requested_days')} 日），"
+                    "約 1 分鐘內自動更新本圖")
+            panels = [dict(p) for p in result.panels]
+            for p in panels:
+                if p.get("branch_card"):
+                    p["branch_card"] = dict(p["branch_card"], sections=[{"type": "badge", "text": note}]
+                                            + list(p["branch_card"].get("sections") or []))
+                    break
+            result = replace(result, panels=panels, late_ai=None, spot_refresh=dict(
+                future=fut, expires=time.monotonic() + SPOT_REFRESH_SECONDS,
+                rerun=lambda: self._rerun_spot(parsed, question, access)))
         if full and not simulation and result.cacheable:
             # build_report 已讀過整個窗口的狀態，直接用（原本這裡逐日各查一次 DB）
             complete_now = (list(report["complete_all"]) if "complete_all" in report else
@@ -5269,6 +5284,15 @@ class AceQueryEngine:
                 f"spot|{code}|{mode}|{complete_now[-1] if complete_now else ''}|{len(complete_now)}|q={stock_banter.answer_question_key(question)}"), result,
                 self.config.answer_cache_seconds)
         return result
+
+    def _rerun_spot(self, parsed, question, access):
+        """背景補完後重算同一題的籌碼圖（同一會員身分；不扣會員次數、不再掛換圖）。"""
+        self._request_local.access = access
+        try:
+            result = self._answer_spot(parsed, question, time.perf_counter())
+        finally:
+            self._request_local.access = None
+        return replace(result, spot_refresh=None, late_ai=None)
 
     def _answer_spot_branch(self, code: str, name: str, branch: str, question: str, started: float) -> AnswerResult:
         """指定分點的現股明細：K 線下方畫該分點每日買賣超柱＋累積線，最下方簡短 AI 解讀（1 次 Gemini）。"""
@@ -6928,7 +6952,39 @@ async def replace_late_ai_image(engine, original, target, make_files, no_mention
     return False
 
 
+SPOT_REFRESH_SECONDS = 14 * 60   # Discord 互動回覆 15 分鐘內才能編輯
+
+
+async def replace_spot_image(engine, original, target, make_files, no_mentions):
+    """籌碼背景補完後重算並覆蓋原訊息的圖（只編輯原訊息、不另發通知、不扣次數）。"""
+    job = original.spot_refresh
+    files = []
+    try:
+        remaining = job["expires"] - time.monotonic()
+        await asyncio.wait_for(asyncio.shield(asyncio.wrap_future(job["future"])), timeout=max(1, remaining))
+        completed = await asyncio.to_thread(job["rerun"])
+        if completed is None or time.monotonic() >= job["expires"]:
+            return False
+        files = await make_files(completed)
+        await target.edit(content=None, attachments=files, allowed_mentions=no_mentions)
+        engine.log(f"籌碼補完換圖完成｜request_id={original.request_id}｜已覆蓋原訊息")
+        return True
+    except asyncio.TimeoutError:
+        engine.log(f"籌碼補完換圖停止｜request_id={original.request_id}｜補資料超過可編輯時間")
+    except Exception as exc:
+        engine.log(f"籌碼補完換圖略過｜request_id={original.request_id}｜{type(exc).__name__}: {exc}")
+    finally:
+        for file in files:
+            file.close()
+    return False
+
+
 def schedule_late_ai_image(engine, original, target, make_files, no_mentions):
+    if getattr(original, "spot_refresh", None) and target is not None:
+        task = asyncio.create_task(replace_spot_image(engine, original, target, make_files, no_mentions))
+        _LATE_IMAGE_TASKS.add(task)
+        task.add_done_callback(_LATE_IMAGE_TASKS.discard)
+        return task
     if not original.late_ai or target is None:return None
     task=asyncio.create_task(replace_late_ai_image(engine,original,target,make_files,no_mentions))
     _LATE_IMAGE_TASKS.add(task)

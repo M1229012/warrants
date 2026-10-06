@@ -14,7 +14,7 @@ import re
 import threading
 import time
 from collections import defaultdict, deque
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FuturesTimeout
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
@@ -43,7 +43,8 @@ QUICK_BUDGET = float(os.getenv("DISCORD_AI_SPOT_QUICK_BUDGET", "8") or 8)
 # 一般現股籌碼題（full／latest）同步階段只確保最近完整日，總時間上限；70 日歷史一律交給背景
 SYNC_BUDGET = float(os.getenv("DISCORD_AI_SPOT_SYNC_BUDGET", "10") or 10)
 # 單頁讀取逾時（秒）：來源很慢時不要一頁等 20 秒
-HTTP_READ_TIMEOUT = float(os.getenv("DISCORD_AI_SPOT_HTTP_TIMEOUT", "10") or 10)
+# 10-06：12 條連線時 6～12% 頁面卡滿 10 秒；正常頁 0.5～2 秒，改 4 秒逾時＋重抓
+HTTP_READ_TIMEOUT = float(os.getenv("DISCORD_AI_SPOT_HTTP_TIMEOUT", "4") or 4)
 # 背景補資料排隊上限（排隊中＋執行中的股票數）；滿了這次就不排，下次有人查再試
 MAX_PENDING_BACKFILLS = max(1, int(os.getenv("DISCORD_AI_SPOT_MAX_PENDING_BACKFILLS", "24") or 24))
 # 來源連續失敗幾次就停止本輪，並讓新的抓取暫停 SOURCE_COOLDOWN 秒（已在 DB 的資料照常回答）
@@ -169,6 +170,14 @@ def note_fetch_health(batch, *, failed=False, complete=False, code=''):
 
 _BACKGROUND: set = set()
 _BACKGROUND_GUARD = threading.Lock()
+_BACKGROUND_DONE: Dict[str, Future] = {}   # 10-06：背景補完通知（籌碼圖補完自動換圖用）
+
+
+def background_future(stock_code: str) -> Optional[Future]:
+    """這一檔正在背景補資料時，回傳補完會完成的 Future；沒有在補就回 None。"""
+    with _BACKGROUND_GUARD:
+        fut = _BACKGROUND_DONE.get(str(stock_code))
+    return fut if fut is not None and not fut.done() else None
 _STOCK_LOCKS: Dict[str, threading.Lock] = {}
 _STOCK_LOCKS_GUARD = threading.Lock()
 _SOURCE_STATE = {"down_until": 0.0, "fails": 0}
@@ -746,6 +755,7 @@ def continue_in_background(stock_code: str, dates: Sequence[str], latest_date: s
         if code in _BACKGROUND or len(_BACKGROUND) >= MAX_PENDING_BACKFILLS:
             return False
         _BACKGROUND.add(code)
+        done = _BACKGROUND_DONE[code] = Future()
 
     def run() -> None:
         try:
@@ -757,12 +767,14 @@ def continue_in_background(stock_code: str, dates: Sequence[str], latest_date: s
         finally:
             with _BACKGROUND_GUARD:
                 _BACKGROUND.discard(code)
+            done.set_result(True)
 
     try:
         _background_pool().submit(run)
     except RuntimeError:   # 行程關閉中
         with _BACKGROUND_GUARD:
             _BACKGROUND.discard(code)
+        done.set_result(False)
         return False
     return True
 
