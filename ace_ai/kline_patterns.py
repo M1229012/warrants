@@ -656,22 +656,22 @@ TRI_TOUCH = _env("TRI_TOUCH", 0.4)          # 碰線：影線高低點或實體�
 TRI_OUT = _env("TRI_OUT", 0.15)             # 收盤穿出線 0.15 ATR 以上＝穿出
 TRI_OUT_MAX = _env("TRI_OUT_MAX", 1.0)      # 收盤穿出超過 1 ATR＝線被破
 TRI_POKE_MAX = _env("TRI_POKE_MAX", 2.0)    # 影線刺穿超過 2 ATR＝線被破
-TRI_BACK = int(_env("TRI_BACK", 5))         # 收盤小幅穿出（≤1 ATR）5 天內收回＝假突破；超過＝線被破
+TRI_BACK = int(_env("TRI_BACK", 2))         # 收盤小幅穿出（≤1 ATR）2 天內收回＝假突破（紅K突破隔天黑K灌下來）；超過＝線被破
 TRI_BREAK_RECENT = int(_env("TRI_BREAK_RECENT", 5))   # 最近 5 天內才收在線外＝型態剛突破（標突破日）
 TRI_REACT = _env("TRI_REACT", 1.0)          # 碰線後 5 日內離開線 1 ATR＝有支撐／壓力反應
 TRI_RECENT = int(_env("TRI_RECENT", 25))    # 兩條線最近 25 日內都要碰過
 TRI_TIP = _env("TRI_TIP", 0.15)             # 還在型態內：兩線寬度至少剩起點的 15%（2421 約 16% 使用者認可、2344 舊線 14% 否決；三角會在尖端前表態，收到尖端＝畫錯）
-TRI_TIP_BREAK = _env("TRI_TIP_BREAK", 0.15)  # 已突破（今天或最近幾天）：突破前寬度也要剩 15%（6173 選到 H9 長上影往下斜、剩 12% 不對）
+TRI_TIP_BREAK = _env("TRI_TIP_BREAK", 0.08)  # 已突破（今天或最近幾天）：突破前寬度至少剩 8%（2421 約 9.6% 處突破，使用者確認是三角）
 TRI_NARROW = _env("TRI_NARROW", 0.65)       # 寬度要收窄到起點的 65% 以下才算收斂
 TRI_FLAT = _env("TRI_FLAT", 1.0)
-TRI_MAJOR_POKE = _env("TRI_MAJOR_POKE", 0.4)   # 起點之後的主要轉折（圖上 H／L）實體不可刺穿線超過 0.4 ATR（2467 H7、H10 實體刺穿＝線畫錯）
+TRI_MAJOR_POKE = _env("TRI_MAJOR_POKE", 0.4)   # 起點之後的主要轉折（圖上 H／L）實體刺穿 >0.4 ATR＝線作廢、影線刺穿 >0.4 ATR＝扣分（2467 H7、H10）
 TRI_MIN_HEIGHT = _env("TRI_MIN_HEIGHT", 3.0)   # 共同起點寬度至少 3 ATR：太扁平的不是三角（1608 使用者否決）
 
 
 def _tri_turns(P, sg: int, lo: int, last: int) -> List[int]:
-    """轉折點：前後 TRI_PIVOT 日內最高（sg=1）／最低（sg=-1）的 K 棒（只看到 last 為止）。"""
+    """轉折點：前後 TRI_PIVOT 日內最高（sg=1）／最低（sg=-1）的 K 棒；右邊要有 TRI_PIVOT 天確認（3008 第二高點還沒形成不算）。"""
     w = TRI_PIVOT
-    return [t for t in range(lo, last + 1) if P[t] * sg >= (P[max(0, t - w):min(last, t + w) + 1] * sg).max()]
+    return [t for t in range(lo, last - w + 1) if P[t] * sg >= (P[max(0, t - w):t + w + 1] * sg).max()]
 
 
 def _tri_line(P, B, Q, C, A, s: float, k: float, i0: int, last: int, sg: int, ref: float, majors=()) -> Optional[Dict[str, Any]]:
@@ -726,23 +726,29 @@ def _tri_line(P, B, Q, C, A, s: float, k: float, i0: int, last: int, sg: int, re
     if reacted < 1:
         return None
     mj = [m for m in majors if i0 <= m <= stop]
-    if any(m > i0 + 2 and (B[m] - (s * m + k)) * sg > TRI_MAJOR_POKE * ref for m in mj):
-        return None                               # 主要轉折的實體刺穿線（2467 H7、H10）＝線畫錯；只有影線刺穿可以（6173 H9）
+    if any(m > i0 + 2 and (B[m] - (s * m + k)) * sg > TRI_MAJOR_POKE * ref and m not in bad for m in mj):
+        return None                               # 主要轉折實體刺穿線（2467 H7、H10）＝線畫錯；影線刺穿（6173 H9）或 2 天內收回的假突破（3715 H7）可以
     near = lambda m: (P[m] - (s * m + k)) * sg >= -TRI_TOUCH * ref and (B[m] - (s * m + k)) * sg <= TRI_TOUCH * ref
     turns = set(_tri_turns(P, sg, i0, stop))
     return {"s": float(s), "k": float(k), "a": [g[0] for g in groups], "score": reacted + 0.5 * pending,
             "density": len(touches), "peaks": sum(1 for g in groups if turns.intersection(g)),
-            "brk": r0 if r0 <= last else None, "major": sum(1 for m in mj if near(m))}
+            "brk": r0 if r0 <= last else None,
+            "mtouch": sum(1 for m in majors if i0 - 2 <= m <= stop and near(m)),   # 起點前 2 天的主要轉折也算（2421 從 H9 隔天起畫）
+            # 主要轉折：碰到的加分、影線穿出線外的扣分（線要畫在主要高點之上，2467 紅線 H5→H7→H10）
+            "major": sum(1 for m in mj if near(m))
+            - sum(1 for m in mj if m > i0 + 2 and m not in bad and (P[m] - (s * m + k)) * sg > TRI_MAJOR_POKE * ref)}
 
 
 def _tri_lines(P, B, Q, C, A, lo: int, last: int, sg: int, ref: float, majors=()) -> List[Dict[str, Any]]:
     """兩個轉折點（影線或實體邊）連成候選趨勢線，逐條驗證；回傳去重後的好線（頂點碰最多者優先）。"""
-    pts = [(t, float(v)) for t in _tri_turns(P, sg, lo, last) for v in {P[t], B[t]}]
+    anchors = sorted(set(_tri_turns(P, sg, lo, last)) | {m for m in majors if lo <= m <= last - TRI_PIVOT})   # 圖上標的主要轉折也可當畫線點（2421 H10）
+    # 畫線點：影線頂、實體頂（開收盤），以及實體頂往內 0.4 ATR（有一點誤差沒關係；2421 紅線從 H9 實體略下方起畫）
+    pts = [(t, float(v)) for t in anchors for v in {P[t], B[t], B[t] - sg * TRI_TOUCH * ref}]
     out = []
     for i, (x1, y1) in enumerate(pts):
         for x2, y2 in pts[i + 1:]:
-            if x2 - x1 < 5:
-                continue
+            if x2 - x1 < 3:
+                continue                          # 兩個轉折至少隔 3 天（2421 紅線：H9 實體頂→H10 只隔 4 天）
             s = (y2 - y1) / (x2 - x1)
             if s * sg > 0.3 * ref / 60 or abs(s) > (0.12 if sg > 0 else 0.2) * ref:
                 continue                          # 上緣不往上、下緣不往下（容忍 0.3 ATR／60 日）；上緣下斜每日 ≤0.12 ATR（艾斯範例 ≤0.06、2421 約 0.1；3008 急漲後回檔 0.16 不算），下緣可較陡
@@ -777,13 +783,16 @@ def user_triangle(df: pd.DataFrame, atr_prev, end: int) -> Optional[Dict[str, An
     # 像人畫線：上下緣各自先選最成立的線（碰觸數與最多者差 1 次內），再看這兩條是不是三角；
     # 不從較差的線裡硬湊（箱型最好的兩條是水平線，不能改拿兩條斜切進價格的線湊成三角）
     # 候選：主要轉折與碰線數都與最好的線差 1 以內（最好的線若已被反向跌破／突破，次好的線仍可入選，2421）
-    tier = lambda ls: [x for x in ls if x["major"] >= ls[0]["major"] - 1 and len(x["a"]) >= max(len(y["a"]) for y in ls) - 1] if ls else []
+    def tier(ls):   # 最好的一群；未突破的線另取自己最好的一群（最好的線已被反向跌破時，未破的線仍可入選，2421）
+        good = lambda x, grp: x["major"] >= grp[0]["major"] - 1 and len(x["a"]) >= max(len(y["a"]) for y in grp) - 1
+        alive = [x for x in ls if x["brk"] is None]
+        return [x for x in ls if good(x, ls) or (x["brk"] is None and good(x, alive))] if ls else []
     ups, dns = tier(ups), tier(dns)
     best = None
     for u in ups:
         for d in dns:
-            if u["brk"] is not None and d["brk"] is not None:
-                continue
+            if u["brk"] is not None and d["brk"] is not None or min(u["mtouch"], d["mtouch"]) < 2:
+                continue                          # 上下緣各要碰到 2 個主要轉折（3008：第二個高點還沒形成）
             ev = (u["brk"] if u["brk"] is not None else d["brk"] if d["brk"] is not None else last + 1) - 1
             if any(t > ev for t in u["a"] + d["a"]):
                 continue                          # 另一條線的碰觸不可在突破之後
@@ -792,12 +801,15 @@ def user_triangle(df: pd.DataFrame, atr_prev, end: int) -> Optional[Dict[str, An
                 continue                          # 型態至少 15 日、兩線合計至少 5 次碰線
             w0 = (u["s"] - d["s"]) * s1 + u["k"] - d["k"]
             w1 = (u["s"] - d["s"]) * ev + u["k"] - d["k"]
+            if (u["s"] - d["s"]) * end + u["k"] - d["k"] <= 0:
+                continue                          # 兩線在今天之前就交叉＝畫錯（3715）
             broke = ev < last or C[end] > u["s"] * end + u["k"] + BREAK * A[end] or C[end] < d["s"] * end + d["k"] - BREAK * A[end]
             if w0 < TRI_MIN_HEIGHT * ref or w1 < (TRI_TIP_BREAK if broke else TRI_TIP) * w0 or w1 > TRI_NARROW * w0:
                 continue                          # 不可太扁；要明顯收窄，但不可已收到尖端
             seq = sorted([(t, "U") for t in u["a"]] + [(t, "D") for t in d["a"]])
-            if sum(1 for x, y in zip(seq, seq[1:]) if x[1] != y[1]) < 3:
-                continue                          # 價格要在兩線間來回
+            sw = sum(1 for x, y in zip(seq, seq[1:]) if x[1] != y[1])
+            if sw < 2 or sw == 2 and len(seq) < 6:
+                continue                          # 價格要在兩線間來回 3 次；只來回 2 次要合計碰 6 次以上（2421 是、2412 不是）
             # 主要轉折、碰線次數、頂點、反應、碰線 K 棒數都相同時，選開口較大的一組（三角通常在尖端前表態）
             key = (u["major"] + d["major"], len(u["a"]) + len(d["a"]), u["peaks"] + d["peaks"], u["score"] + d["score"],
                    u["density"] + d["density"], round(w1 / w0, 2))
