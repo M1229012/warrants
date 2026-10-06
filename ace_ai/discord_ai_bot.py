@@ -1068,8 +1068,9 @@ def futures_card(data: Dict[str, Any], question: str = "", retail: Optional[Dict
 
 
 def branch_stock_events_card(data: Dict[str, Any], numbers: Optional[Dict[str, int]] = None,
-                             chart_bars: int = 0) -> Optional[Dict[str, Any]]:
+                             chart_bars: int = 0, compact: bool = False) -> Optional[Dict[str, Any]]:
     """某分點在某檔股票的全部 A～E 事件（不限 K 線 70 日）：新到舊，每筆列金額、權證、狀態。
+    compact＝一次問多個分點：一列數字＋最近 3 筆、權證只列 1 檔，避免圖片太長。
     numbers＝{事件日: K 線上的編號}：K 線範圍內的事件在前面加上和圖上相同的圈號。"""
     numbers = numbers or {}
     events = list(reversed(data.get("all_events") or []))
@@ -1090,9 +1091,10 @@ def branch_stock_events_card(data: Dict[str, Any], numbers: Optional[Dict[str, i
     if data.get("avg_holding_days") is not None:
         tiles.append({"label": "平均持有", "value": f"{float(data['avg_holding_days']):.0f} 天", "tone": "ink"})
     rows = []
-    for e in events:
+    for e in events[:3] if compact else events:
         warrants = e.get("warrants") or []
-        warrant_text = "、".join(warrants[:3]) + (f" 等 {len(warrants)} 檔" if len(warrants) > 3 else "")
+        keep = 1 if compact else 3
+        warrant_text = "、".join(warrants[:keep]) + (f" 等 {len(warrants)} 檔" if len(warrants) > keep else "")
         state = str(e.get("state") or "")
         if state.startswith("出清") and e.get("result_return_pct") is not None:
             state += f"（{float(e['result_return_pct']):+.1f}%）"
@@ -1101,6 +1103,11 @@ def branch_stock_events_card(data: Dict[str, Any], numbers: Optional[Dict[str, i
         rows.append({"lead": f"{mark}{e.get('date', '')}｜{e.get('event', '')}",
                      "parts": [p for p in (str(e.get("buy_amount_text") or ""), warrant_text, state) if p]})
     name = f"{data.get('stock_name', '')}（{data.get('stock_code', '')}）"
+    if compact:
+        brief = [tiles[0], dict(tiles[1]), tiles[3]]
+        return {"branch": f"{data.get('branch', '')}｜{name}",
+                "tags": [f"最近 {len(rows)} 筆" if total > len(rows) else "全部 A～E 事件"], "label": "權證分點",
+                "sections": [{"type": "tiles", "items": brief}, {"type": "rows", "items": rows}]}
     return {"branch": f"{data.get('branch', '')}｜{name}", "tags": ["全部 A～E 事件"], "label": "權證分點", "sections": [
         {"type": "tiles", "items": tiles[:3]},
         {"type": "tiles", "items": tiles[3:]},
@@ -6468,8 +6475,10 @@ class AceQueryEngine:
             for mark in answer_image._mark_events(chart_panel) if chart_panel else []:
                 if mark.get("no") and mark.get("buy_date"):
                     numbers.setdefault(str(mark["buy_date"]), int(mark["no"]))
-            for history in [r.data for r in results if r.ok and r.name == "get_branch_stock_history" and r.data]:
-                card = branch_stock_events_card(history, numbers, len((chart_panel or {}).get("bars") or []))
+            histories = [r.data for r in results if r.ok and r.name == "get_branch_stock_history" and r.data]
+            for history in histories:
+                card = branch_stock_events_card(history, numbers, len((chart_panel or {}).get("bars") or []),
+                                                compact=len(histories) > 1)   # 多分點：精簡卡，圖片不要太長
                 if card:   # 一個分點一張卡；保留清單排版，不關掉原計畫的 AI
                     panels.append({"branch_card": card, "hide_text": not plan.need_final_llm})
                     if chart_panel:
@@ -6757,6 +6766,10 @@ class AceQueryEngine:
                 return text
             pruned, removed = prune_ungrounded_sentences(text, payload, facts)
             removed_all.extend(removed)
+            if pruned and removed:
+                # 刪句後條列重新編號（「1.…3.…」→「1.…2.…」）；小數（1.6 倍）後面接數字不會被當成編號
+                count = iter(range(1, 100))
+                pruned = re.sub(r"(?<![\d.])\d{1,2}\.(?=\D)", lambda m: f"{next(count)}.", pruned)
             return pruned.strip() if pruned and not facts.check(pruned) else ""
 
         card = dict(card)

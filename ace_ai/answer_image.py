@@ -2389,6 +2389,9 @@ def _answer_emphasis(text: str) -> tuple:
     first = re.match(r'.*?[。！？!?][」』”"]?', text, re.S)
     if first and len(first.group()) <= 80:
         return first.group(), text[first.end():].strip()
+    cut = max(text.rfind(c, 0, 80) for c in '，；、')     # 第一句太長：切在 80 字內最後一個逗號，標題不能整個消失
+    if cut >= 15:
+        return text[:cut] + '。', text[cut + 1:].strip()
     return '', text
 
 
