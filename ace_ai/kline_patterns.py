@@ -356,7 +356,7 @@ def _event_status(ev: Dict, day: int, c, h, l, official: bool) -> Tuple[str, Lis
 
 
 # ---------------------------------------------------------------- §6 趨勢
-def trend(piv: List[Dict], c, ma20, atr_prev, day: int) -> Optional[Dict[str, Any]]:
+def trend(piv: List[Dict], c, ma20, atr_prev, day: int, ohlc=None) -> Optional[Dict[str, Any]]:
     atr = atr_prev[day]
     if np.isnan(atr) or day < 6 or np.isnan(ma20[day]) or np.isnan(ma20[day - 5]):
         return None
@@ -370,21 +370,28 @@ def trend(piv: List[Dict], c, ma20, atr_prev, day: int) -> Optional[Dict[str, An
     if not (up or down):
         return None
     base = ls if up else hs
-    line = _at(_line(base[0], base[1]), day)
+    coef = _line(base[0], base[1])
+    if ohlc is not None:     # 10-06：趨勢線跟三角線同一套品質（碰線要回測、有反應、≥3 次）；只連兩點不算線
+        H, L, O = ohlc
+        A = np.where(np.isnan(atr_prev), np.nanmedian(atr_prev), atr_prev)
+        P, B, Q = (L, np.minimum(O, c), H) if up else (H, np.maximum(O, c), L)
+        if _tri_line(P, B, Q, c, A, coef[0], coef[1], int(base[0]["idx"]), day - 1, -1 if up else 1, float(A[day - 1])) is None:
+            coef = None
+    line = _at(coef, day) if coef else None
     m = BREAK * atr
     kind = "上升趨勢" if up else "下降趨勢"
     notes = []
-    if up and c[day] < line - m:
+    if line is not None and up and c[day] < line - m:
         notes.append("跌破上升趨勢線")
-    if down and c[day] > line + m:
+    if line is not None and down and c[day] > line + m:
         notes.append("站上下降趨勢線")
     if up and c[day] < ls[1]["price"] - m:
         notes.append("原上升結構受破壞")
     if down and c[day] > hs[1]["price"] + m:
         notes.append("原下降結構受破壞")
-    text = f"{kind}（轉折高低點{'墊高' if up else '降低'}），趨勢線約 {_p(line)}" + ("；" + "、".join(notes) if notes else "")
-    return {"kind": kind, "line": _p(line), "notes": notes, "text": text,
-            "line_coefficients": _line(base[0], base[1]), "points": [dict(p) for p in base]}
+    text = f"{kind}（轉折高低點{'墊高' if up else '降低'}）" + (f"，趨勢線約 {_p(line)}" if line is not None else "")         + ("；" + "、".join(notes) if notes else "")
+    return {"kind": kind, "line": _p(line) if line is not None else None, "notes": notes, "text": text,
+            "line_coefficients": coef, "points": [dict(p) for p in base]}
 
 
 # ---------------------------------------------------------------- §7 缺口
@@ -556,9 +563,9 @@ def trend_observation(tr: Optional[Dict], closes, atr_prev, day: int, provisiona
     sign = 1 if tr["kind"] == "上升趨勢" else -1
     close, margin = closes[day], BREAK * atr_prev[day]
     last_pivot = tr["points"][-1]["price"]
-    line = _at(tr["line_coefficients"], day)
+    line = _at(tr["line_coefficients"], day) if tr.get("line_coefficients") else None
     status = ("broken" if (close - last_pivot) * sign < -margin else
-              "line_crossed" if (close - line) * sign < -margin else "intact")
+              "line_crossed" if line is not None and (close - line) * sign < -margin else "intact")
     return {"kind": tr["kind"], "state": status, "is_provisional": provisional}
 
 
@@ -649,6 +656,7 @@ TRI_RECENT = int(_env("TRI_RECENT", 25))    # 兩條線最近 25 日內都要碰
 TRI_TIP = _env("TRI_TIP", 0.2)              # 昨天兩線寬度至少剩起點的 2 成：三角會在尖端前表態，收到尖端＝畫錯
 TRI_NARROW = _env("TRI_NARROW", 0.65)       # 寬度要收窄到起點的 65% 以下才算收斂
 TRI_FLAT = _env("TRI_FLAT", 1.0)
+TRI_MIN_HEIGHT = _env("TRI_MIN_HEIGHT", 3.0)   # 共同起點寬度至少 3 ATR：太扁平的不是三角（1608 使用者否決）
 TRI_CANDIDATES = int(_env("TRI_CANDIDATES", 600))
 
 
@@ -689,8 +697,10 @@ def _tri_line(P, B, Q, C, A, s: float, k: float, i0: int, last: int, sg: int, re
             reacted += 1
     if reacted < 2:
         return None
+    # 頂點＝前後 3 日內最高（上緣）／最低（下緣）的 K 棒；有頂點能連出好線就以頂點為主（使用者 10-06）
+    peak = lambda t: float(P[t]) * sg >= float((P[max(0, t - 3):min(last, t + 3) + 1] * sg).max())
     return {"s": float(s), "k": float(k), "a": [g[0] for g in groups], "score": reacted + 0.5 * pending,
-            "density": len(touches)}
+            "density": len(touches), "peaks": sum(1 for g in groups if any(peak(t) for t in g))}
 
 
 def _tri_lines(P, B, Q, C, A, lo: int, last: int, sg: int, ref: float) -> List[Dict[str, Any]]:
@@ -724,7 +734,7 @@ def _tri_lines(P, B, Q, C, A, lo: int, last: int, sg: int, ref: float) -> List[D
         r = _tri_line(P, B, Q, C, A, s[n], k[n], int(st[n]), last, sg, ref)
         if r:
             out.append(r)
-    out.sort(key=lambda r: (-r["score"], -r["density"], r["a"][0]))
+    out.sort(key=lambda r: (-r["peaks"], -r["score"], -r["density"], r["a"][0]))
     uniq: List[Dict[str, Any]] = []
     for r in out:
         if all(abs(r["s"] - u["s"]) > 0.02 * ref or abs((r["s"] - u["s"]) * last + r["k"] - u["k"]) > 0.2 * ref for u in uniq):
@@ -754,12 +764,12 @@ def user_triangle(df: pd.DataFrame, atr_prev, end: int) -> Optional[Dict[str, An
                 continue                          # 兩條線要描述同一段整理：共同區間內各碰 2 次以上
             w0 = (u["s"] - d["s"]) * s1 + u["k"] - d["k"]
             w1 = (u["s"] - d["s"]) * last + u["k"] - d["k"]
-            if w1 < TRI_TIP * w0 or w1 > TRI_NARROW * w0:
-                continue                          # 要明顯收窄，但不可已收到尖端
+            if w0 < TRI_MIN_HEIGHT * ref or w1 < TRI_TIP * w0 or w1 > TRI_NARROW * w0:
+                continue                          # 不可太扁；要明顯收窄，但不可已收到尖端
             seq = sorted([(t, "U") for t in u["a"]] + [(t, "D") for t in d["a"]])
             if sum(1 for x, y in zip(seq, seq[1:]) if x[1] != y[1]) < 3:
                 continue                          # 價格要在兩線間來回
-            key = (u["score"] + d["score"], u["density"] + d["density"])
+            key = (u["peaks"] + d["peaks"], u["score"] + d["score"], u["density"] + d["density"])
             if best is None or key > best[0]:
                 best = (key, u, d)
     if not best:
@@ -878,10 +888,11 @@ def detect(df: pd.DataFrame, events: Optional[Dict[str, Any]] = None, provisiona
         names.append(cur["kind"])
         levels += [f"{cur['kind']}上緣 {_p(up)}（上方候選壓力）", f"{cur['kind']}下緣 {_p(dn)}（下方候選支撐）"]
 
-    tr = trend(piv, c, ma20, atr_prev, last_official)
+    tr = trend(piv, c, ma20, atr_prev, last_official, (h, l, adj["Open"].to_numpy(dtype=float)))
     if tr:
         summary.insert(0, tr["text"])
         names.append(tr["kind"])
+    if tr and tr["line"] is not None:
         levels.append(f"趨勢線 {tr['line']}（{'下方候選支撐' if tr['line'] < c[today] else '上方候選壓力'}）")
     gp = gaps(adj, atr_prev, last_official, set(flags.get("F2_days") or []))
     summary += gp["text"]
