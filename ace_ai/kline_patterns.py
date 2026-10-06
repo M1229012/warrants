@@ -872,12 +872,12 @@ def _triangle_at(df: pd.DataFrame, atr_prev, end: int, zz: float) -> Optional[Di
                     seq.append("L")
             turns = sum(1 for a1, a2 in zip(seq, seq[1:]) if a1 != a2)
             need = 3 if zz < 1.5 else 2                    # 小尺度較敏感：上下緣各要 3 個主要轉折（3008 回檔不算）
-            if seq.count("H") < need or seq.count("L") < need or turns < 3:
+            if seq.count("H") < need or seq.count("L") < need or turns < 3 or len(seq) < 5:   # 三角至少 5 個轉折碰線
                 continue                                   # 沒有來回震盪（3008 急漲後回檔一段不算三角）
             if not (flat(u) and flat(d)):
                 apex = (d["k"] - u["k"]) / (u["s"] - d["s"])
-                if (end - first) / max(apex - first, 1e-9) > (0.95 if broke else TRI_APEX_POS):
-                    continue                               # 已走到尖端附近還沒出方向＝不是三角（通常 2/3～3/4 就會突破）
+                if (end - first) / max(apex - first, 1e-9) > (0.8 if broke else TRI_APEX_POS):
+                    continue                               # 型態內 9 成內有效；今天突破要在 8 成前（收到尖端才突破可信度低，1608）
             key = ((end - u["a"][0]) + (end - d["a"][0]), u["g"] + d["g"])   # 先比兩邊長度（主要結構），再比接觸次數
             if best is None or key > best[0]:
                 best = (key, u, d)
