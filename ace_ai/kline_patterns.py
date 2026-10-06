@@ -645,33 +645,51 @@ def levels_break(df: pd.DataFrame, piv: List[Dict], atr_prev, today: int) -> Dic
 
 
 # ---------------------------------------------------------------- §4b 三角（10-06 改照股市艾斯畫法，18 張範例歸納）
-# 線＝「碰最多次、碰了真的有反應」的那條，不必經過最高／最低點；影線或短暫收盤穿出後收回都算碰線。
+# 三角＝上下兩條趨勢線往同一點聚合，通常在尖端前就表態。趨勢線照正規畫法：
+# 起點與第二點都是轉折點（前後 3 日內最高／最低的 K 棒，取影線或實體邊）；線被破就失效（收盤穿出 >1 ATR、
+# 或連續 3 天收在線外）；短暫穿出隔天就收回才算假突破。同樣合格的線，選碰到最多頂點、碰了有反應的那條。
 # 線用前一交易日為止的資料決定，今天只判斷突破／跌破／仍在型態內。畫不出來就不畫。
 TRI_DAYS = int(_env("TRI_DAYS", 150))       # 往回找幾根
+TRI_PIVOT = int(_env("TRI_PIVOT", 3))       # 轉折點＝前後 3 日內最高／最低
 TRI_TOUCH = _env("TRI_TOUCH", 0.3)          # 碰線：影線或實體距線 0.3 ATR 內
 TRI_OUT = _env("TRI_OUT", 0.15)             # 收盤穿出線 0.15 ATR 以上＝穿出
-TRI_BACK = int(_env("TRI_BACK", 5))         # 穿出後 5 日內收回＝假突破（算碰線）；沒收回＝線失效
+TRI_OUT_MAX = _env("TRI_OUT_MAX", 1.0)      # 收盤穿出超過 1 ATR＝線被破
+TRI_POKE_MAX = _env("TRI_POKE_MAX", 2.0)    # 影線刺穿超過 2 ATR＝線被破
+TRI_BACK = int(_env("TRI_BACK", 2))         # 最多連續 2 天收在線外（之後要收回）；第 3 天還在外＝線被破
 TRI_REACT = _env("TRI_REACT", 1.0)          # 碰線後 5 日內離開線 1 ATR＝有支撐／壓力反應
 TRI_RECENT = int(_env("TRI_RECENT", 25))    # 兩條線最近 25 日內都要碰過
 TRI_TIP = _env("TRI_TIP", 0.2)              # 昨天兩線寬度至少剩起點的 2 成：三角會在尖端前表態，收到尖端＝畫錯
 TRI_NARROW = _env("TRI_NARROW", 0.65)       # 寬度要收窄到起點的 65% 以下才算收斂
 TRI_FLAT = _env("TRI_FLAT", 1.0)
 TRI_MIN_HEIGHT = _env("TRI_MIN_HEIGHT", 3.0)   # 共同起點寬度至少 3 ATR：太扁平的不是三角（1608 使用者否決）
-TRI_CANDIDATES = int(_env("TRI_CANDIDATES", 600))
+
+
+def _tri_turns(P, sg: int, lo: int, last: int) -> List[int]:
+    """轉折點：前後 TRI_PIVOT 日內最高（sg=1）／最低（sg=-1）的 K 棒（只看到 last 為止）。"""
+    w = TRI_PIVOT
+    return [t for t in range(lo, last + 1) if P[t] * sg >= (P[max(0, t - w):min(last, t + w) + 1] * sg).max()]
 
 
 def _tri_line(P, B, Q, C, A, s: float, k: float, i0: int, last: int, sg: int, ref: float) -> Optional[Dict[str, Any]]:
-    """評一條候選線。sg=1 上緣（P=高、B=實體頂、Q=低）、-1 下緣（P=低、B=實體底、Q=高）。None＝線失效。"""
-    touches, fake_days = [], []
+    """評一條趨勢線（i0＝起點轉折）。sg=1 上緣（P=高、B=實體頂、Q=低）、-1 下緣（P=低、B=實體底、Q=高）。None＝線被破或品質不足。"""
+    touches, run, fakes = [], 0, 0
     for t in range(i0, last + 1):
         y = s * t + k
-        if (C[t] - y) * sg > TRI_OUT * ref:
-            if not any((C[j] - (s * j + k)) * sg <= 0 for j in range(t + 1, min(t + 1 + TRI_BACK, last + 1))):
-                return None                       # 5 日內沒收回（或昨天剛穿出）＝真突破，不是整理線
-            fake_days.append(t)
+        if (P[t] - y) * sg > TRI_POKE_MAX * ref:
+            return None                           # 影線刺穿太深
+        out = (C[t] - y) * sg
+        if out > TRI_OUT * ref:
+            run += 1
+            if out > TRI_OUT_MAX * ref or run > TRI_BACK:
+                return None                       # 收盤穿出太多或連續收在線外＝線被破（2421 H9、4576 L6）
+            fakes += run == 1
             touches.append(t)
-        elif (P[t] - y) * sg >= -TRI_TOUCH * ref and (B[t] - y) * sg <= TRI_TOUCH * ref:
-            touches.append(t)
+        else:
+            run = 0
+            if (P[t] - y) * sg >= -TRI_TOUCH * ref and (B[t] - y) * sg <= TRI_TOUCH * ref:
+                touches.append(t)
+    if run:
+        return None                               # 昨天還收在線外：已突破，不當整理線
     groups: List[List[int]] = []
     for t in touches:                             # 3 日內連續碰線算一次
         if groups and t - groups[-1][-1] <= 3:
@@ -681,10 +699,9 @@ def _tri_line(P, B, Q, C, A, s: float, k: float, i0: int, last: int, sg: int, re
 
     def tested(t: int) -> bool:                   # 回測：前 5 日價格在線內側 ≥0.6 ATR；急漲急跌途中擦到不算
         prev = C[max(0, t - 5):t]
-        return len(prev) > 0 and float(((s * t + k - prev) * sg).max()) >= 0.6 * A[t]
+        return t == i0 or len(prev) > 0 and float(((s * t + k - prev) * sg).max()) >= 0.6 * A[t]
 
     groups = [g for g in groups if any(tested(t) for t in g)]
-    fakes = int(sum(1 for i, t in enumerate(fake_days) if i == 0 or t - fake_days[i - 1] > 1))
     if len(groups) < 3 or fakes > max(2, len(groups) // 2) or last - groups[-1][-1] > TRI_RECENT:
         return None
     reacted = pending = 0
@@ -697,43 +714,25 @@ def _tri_line(P, B, Q, C, A, s: float, k: float, i0: int, last: int, sg: int, re
             reacted += 1
     if reacted < 2:
         return None
-    # 頂點＝前後 3 日內最高（上緣）／最低（下緣）的 K 棒；有頂點能連出好線就以頂點為主（使用者 10-06）
-    peak = lambda t: float(P[t]) * sg >= float((P[max(0, t - 3):min(last, t + 3) + 1] * sg).max())
+    turns = set(_tri_turns(P, sg, i0, last))
     return {"s": float(s), "k": float(k), "a": [g[0] for g in groups], "score": reacted + 0.5 * pending,
-            "density": len(touches), "peaks": sum(1 for g in groups if any(peak(t) for t in g))}
+            "density": len(touches), "peaks": sum(1 for g in groups if turns.intersection(g))}
 
 
 def _tri_lines(P, B, Q, C, A, lo: int, last: int, sg: int, ref: float) -> List[Dict[str, Any]]:
-    """任兩根 K 棒（影線或實體）連成候選線，先用向量粗篩，再逐條評分；回傳去重後的好線。"""
-    idx = np.arange(lo, last + 1)
-    xi = np.concatenate([idx, idx])
-    yv = np.concatenate([P[idx], B[idx]])
-    I, J = np.triu_indices(len(xi), 1)
-    keep = xi[J] - xi[I] >= 5
-    I, J = I[keep], J[keep]
-    s = (yv[J] - yv[I]) / (xi[J] - xi[I])
-    k = yv[I] - s * xi[I]
-    st = xi[I]
-    # 上緣不往上、下緣不往下（容忍 0.3 ATR／60 日）；上緣下斜要平緩（3008 急漲後回檔），下緣可較陡
-    ok = (s * sg <= 0.3 * ref / 60) & (np.abs(s) <= (0.08 if sg > 0 else 0.2) * ref)
-    s, k, st = s[ok], k[ok], st[ok]
-    quick = np.full(len(s), -1, dtype=int)
-    for c0 in range(0, len(s), 4000):            # 分批算，避免一次開大陣列吃記憶體
-        sl = slice(c0, c0 + 4000)
-        y = s[sl, None] * idx[None, :] + k[sl, None]
-        after = idx[None, :] >= st[sl, None]
-        near = (np.abs(P[idx][None, :] - y) <= TRI_TOUCH * ref) & after
-        q = near.sum(1)
-        q[(((C[idx][None, :] - y) * sg > TRI_OUT * ref) & after).sum(1) > 12] = -1
-        q[~near[:, -TRI_RECENT:].any(1)] = -1
-        quick[sl] = q
+    """兩個轉折點（影線或實體邊）連成候選趨勢線，逐條驗證；回傳去重後的好線（頂點碰最多者優先）。"""
+    pts = [(t, float(v)) for t in _tri_turns(P, sg, lo, last) for v in {P[t], B[t]}]
     out = []
-    for n in np.argsort(-quick, kind="stable")[:TRI_CANDIDATES]:
-        if quick[n] < 0:
-            break
-        r = _tri_line(P, B, Q, C, A, s[n], k[n], int(st[n]), last, sg, ref)
-        if r:
-            out.append(r)
+    for i, (x1, y1) in enumerate(pts):
+        for x2, y2 in pts[i + 1:]:
+            if x2 - x1 < 5:
+                continue
+            s = (y2 - y1) / (x2 - x1)
+            if s * sg > 0.3 * ref / 60 or abs(s) > 0.2 * ref:
+                continue                          # 上緣不往上、下緣不往下（容忍 0.3 ATR／60 日）；太陡＝急漲急跌
+            r = _tri_line(P, B, Q, C, A, s, y1 - s * x1, x1, last, sg, ref)
+            if r:
+                out.append(r)
     out.sort(key=lambda r: (-r["peaks"], -r["score"], -r["density"], r["a"][0]))
     uniq: List[Dict[str, Any]] = []
     for r in out:
