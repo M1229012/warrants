@@ -5041,6 +5041,8 @@ class AceQueryEngine:
                            cache_hit=True, context_note=note)
 
         self._request_local.spot_partial = False
+        self._request_local.spot_code = ""
+        spot_chip.pending_reset()
         priority = self._is_priority(self._access())       # 管理員：不排隊、不佔名額
         with self._queue_lock:
             shared = self._inflight.get(key)
@@ -5075,6 +5077,26 @@ class AceQueryEngine:
                     self._pending -= 1
                 self._inflight.pop(key, None)
         self._bind_late_cache(result, key, not getattr(self._request_local, "spot_partial", False))
+        # 10-06：這一題用到的現股資料只要還在背景補（籌碼、型態＋籌碼、指定分點…所有問法），補完就整題重算換圖
+        waits = [f for f in (spot_chip.background_future(c) for c in spot_chip.pending_codes()) if f is not None]
+        fut = None
+        if waits and result.spot_refresh is None:
+            fut = Future()
+            left = [len(waits)]
+            def _one_done(_f, lock=threading.Lock()):
+                with lock:
+                    left[0] -= 1
+                    if left[0] == 0 and not fut.done():
+                        fut.set_result(True)
+            for f in waits:
+                f.add_done_callback(_one_done)
+        if fut is not None and result.panels and not (self._access() and self._access().simulation):
+            # 10-06：型態＋籌碼整合頁的籌碼還在背景補：補完後整題重算、換掉原訊息的圖
+            import copy
+            access, frozen = self._access(), copy.deepcopy(parsed)
+            result = replace(result, late_ai=None, spot_refresh=dict(
+                future=fut, expires=time.monotonic() + SPOT_REFRESH_SECONDS,
+                rerun=lambda: self._rerun_question(effective, frozen, access)))
         # 只快取「資料全部成功、且 Gemini 沒有失敗」的回答，避免限流或逾時訊息被重複送出。
         # 現股歷史還沒補完的整合頁不快取：背景補完後下一題要看到完整 70 日，不能拿到舊的 1/70
         if (result.cacheable and not (self._access() and self._access().simulation)
@@ -5147,6 +5169,7 @@ class AceQueryEngine:
             # quick：只等最近完整日幾秒，70 日歷史交給背景補；圖上標「歷史 x / 70」，不讓整合頁卡 20～60 秒
             report = spot_chip.build_report(code, "quick")
             self._spot_timing(report)
+            self._request_local.spot_code = code
             self._request_local.spot_partial = (report.get("available_days", 0) < report.get("requested_days", spot_chip.REQUESTED_DAYS)
                                                 or bool((report.get("progress") or {}).get("background")))
         except Exception as exc:
@@ -5156,7 +5179,11 @@ class AceQueryEngine:
             card = spot_chip.message_card("籌碼重點", "現股分點資料建置中",
                                           f"已建立 {report.get('available_days', 0)} / {report.get('requested_days', 70)} 個交易日，稍後再問即可看到。")
             return {"branch_card": card, "hide_text": False}, None
-        return ({"branch_card": spot_chip.summary_card(report), "hide_text": False,
+        card = spot_chip.summary_card(report)
+        if self._request_local.spot_partial and spot_chip.background_future(code) is not None and isinstance(card, dict):
+            card = dict(card, sections=[{"type": "badge", "text": f"歷史資料補齊中（已確認 {report.get('available_days')}／{report.get('requested_days')} 日），約 1 分鐘內自動更新本圖"}]
+                        + list(card.get("sections") or []))
+        return ({"branch_card": card, "hide_text": False,
                  "footer_suffix": "現股分點為每日前段分點近似統計"}, spot_chip.summary_payload(report))
 
     def _answer_warrant_chip(self, parsed: ParsedQuestion, question: str, started: float) -> AnswerResult:
@@ -5284,6 +5311,17 @@ class AceQueryEngine:
                 f"spot|{code}|{mode}|{complete_now[-1] if complete_now else ''}|{len(complete_now)}|q={stock_banter.answer_question_key(question)}"), result,
                 self.config.answer_cache_seconds)
         return result
+
+    def _rerun_question(self, question, parsed, access):
+        """背景補完後整題重算（同一會員身分；不扣次數、不讀寫回答快取、不再掛換圖）。"""
+        import copy
+        self._request_local.access = access
+        self._request_local.spot_partial = False
+        try:
+            result = self._answer_uncached(question, time.perf_counter(), copy.deepcopy(parsed))
+        finally:
+            self._request_local.access = None
+        return replace(result, spot_refresh=None, late_ai=None)
 
     def _rerun_spot(self, parsed, question, access):
         """背景補完後重算同一題的籌碼圖（同一會員身分；不扣會員次數、不再掛換圖）。"""

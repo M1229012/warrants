@@ -173,6 +173,23 @@ _BACKGROUND_GUARD = threading.Lock()
 _BACKGROUND_DONE: Dict[str, Future] = {}   # 10-06：背景補完通知（籌碼圖補完自動換圖用）
 
 
+_PENDING = threading.local()   # 這一題（同一執行緒）用到、還在背景補資料的股票
+
+
+def pending_reset() -> None:
+    _PENDING.codes = []
+
+
+def pending_codes() -> List[str]:
+    return list(getattr(_PENDING, "codes", []) or [])
+
+
+def _note_pending(code: str) -> None:
+    codes = getattr(_PENDING, "codes", None)
+    if codes is not None and code not in codes and background_future(code) is not None:
+        codes.append(code)
+
+
 def background_future(stock_code: str) -> Optional[Future]:
     """這一檔正在背景補資料時，回傳補完會完成的 Future；沒有在補就回 None。"""
     with _BACKGROUND_GUARD:
@@ -1007,6 +1024,8 @@ def build_report(stock_code: str, mode: str = "full", now: Optional[datetime] = 
     elif today_state == "today_ready" and latest and latest != today:
         report["date_note"] = "今日分點資料尚未更新・目前顯示最近完整交易日"
     report["complete_all"] = complete   # 整個候選窗口的完整日（呼叫端算快取鍵用，不必再查 DB）
+    if progress.get("remaining"):
+        _note_pending(stock_code)   # 10-06：回答完要等這檔補完再換圖（所有問法通用）
     if today_state in ("intraday", "today_ready") and latest != today:
         remember_for_today(stock_code, now)   # 今天資料還沒出來時被查過：資料一出來就先抓
     report["timing"] = {"spot_prepare": round(t_prepared - t0, 3), "spot_fetch": round(t_fetched - t_prepared, 3),
