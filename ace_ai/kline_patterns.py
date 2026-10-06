@@ -375,7 +375,8 @@ def trend(piv: List[Dict], c, ma20, atr_prev, day: int, ohlc=None) -> Optional[D
         H, L, O = ohlc
         A = np.where(np.isnan(atr_prev), np.nanmedian(atr_prev), atr_prev)
         P, B, Q = (L, np.minimum(O, c), H) if up else (H, np.maximum(O, c), L)
-        if _tri_line(P, B, Q, c, A, coef[0], coef[1], int(base[0]["idx"]), day - 1, -1 if up else 1, float(A[day - 1])) is None:
+        q = _tri_line(P, B, Q, c, A, coef[0], coef[1], int(base[0]["idx"]), day - 1, -1 if up else 1, float(A[day - 1]))
+        if q is None or len(q["a"]) < 3 or q["brk"] is not None:
             coef = None
     line = _at(coef, day) if coef else None
     m = BREAK * atr
@@ -651,14 +652,16 @@ def levels_break(df: pd.DataFrame, piv: List[Dict], atr_prev, today: int) -> Dic
 # 線用前一交易日為止的資料決定，今天只判斷突破／跌破／仍在型態內。畫不出來就不畫。
 TRI_DAYS = int(_env("TRI_DAYS", 150))       # 往回找幾根
 TRI_PIVOT = int(_env("TRI_PIVOT", 3))       # 轉折點＝前後 3 日內最高／最低
-TRI_TOUCH = _env("TRI_TOUCH", 0.3)          # 碰線：影線或實體距線 0.3 ATR 內
+TRI_TOUCH = _env("TRI_TOUCH", 0.4)          # 碰線：影線高低點或實體（開收盤）距線 0.4 ATR 內，有一點誤差沒關係
 TRI_OUT = _env("TRI_OUT", 0.15)             # 收盤穿出線 0.15 ATR 以上＝穿出
 TRI_OUT_MAX = _env("TRI_OUT_MAX", 1.0)      # 收盤穿出超過 1 ATR＝線被破
 TRI_POKE_MAX = _env("TRI_POKE_MAX", 2.0)    # 影線刺穿超過 2 ATR＝線被破
-TRI_BACK = int(_env("TRI_BACK", 2))         # 最多連續 2 天收在線外（之後要收回）；第 3 天還在外＝線被破
+TRI_BACK = int(_env("TRI_BACK", 5))         # 收盤小幅穿出（≤1 ATR）5 天內收回＝假突破；超過＝線被破
+TRI_BREAK_RECENT = int(_env("TRI_BREAK_RECENT", 5))   # 最近 5 天內才收在線外＝型態剛突破（標突破日）
 TRI_REACT = _env("TRI_REACT", 1.0)          # 碰線後 5 日內離開線 1 ATR＝有支撐／壓力反應
 TRI_RECENT = int(_env("TRI_RECENT", 25))    # 兩條線最近 25 日內都要碰過
-TRI_TIP = _env("TRI_TIP", 0.2)              # 昨天兩線寬度至少剩起點的 2 成：三角會在尖端前表態，收到尖端＝畫錯
+TRI_TIP = _env("TRI_TIP", 0.15)             # 還在型態內：兩線寬度至少剩起點的 15%（2421 約 16% 使用者認可、2344 舊線 14% 否決；三角會在尖端前表態，收到尖端＝畫錯）
+TRI_TIP_BREAK = _env("TRI_TIP_BREAK", 0.15)  # 已突破（今天或最近幾天）：突破前寬度也要剩 15%（6173 選到 H9 長上影往下斜、剩 12% 不對）
 TRI_NARROW = _env("TRI_NARROW", 0.65)       # 寬度要收窄到起點的 65% 以下才算收斂
 TRI_FLAT = _env("TRI_FLAT", 1.0)
 TRI_MIN_HEIGHT = _env("TRI_MIN_HEIGHT", 3.0)   # 共同起點寬度至少 3 ATR：太扁平的不是三角（1608 使用者否決）
@@ -671,25 +674,31 @@ def _tri_turns(P, sg: int, lo: int, last: int) -> List[int]:
 
 
 def _tri_line(P, B, Q, C, A, s: float, k: float, i0: int, last: int, sg: int, ref: float) -> Optional[Dict[str, Any]]:
-    """評一條趨勢線（i0＝起點轉折）。sg=1 上緣（P=高、B=實體頂、Q=低）、-1 下緣（P=低、B=實體底、Q=高）。None＝線被破或品質不足。"""
-    touches, run, fakes = [], 0, 0
-    for t in range(i0, last + 1):
+    """評一條趨勢線（i0＝起點轉折）。sg=1 上緣（P=高、B=實體頂、Q=低）、-1 下緣（P=低、B=實體底、Q=高）。
+    最近 TRI_BREAK_RECENT 日內才收在線外＝型態剛突破（brk＝突破日），線只驗到突破前一天。None＝線被破或品質不足。"""
+    out = lambda t: (C[t] - (s * t + k)) * sg
+    r0 = last + 1
+    while r0 - 1 > i0 and out(r0 - 1) > TRI_OUT * ref:
+        r0 -= 1
+    if r0 <= last and last - r0 + 1 > TRI_BREAK_RECENT:
+        return None                               # 早就突破，型態已結束
+    stop = r0 - 1                                 # 驗線到突破前一天
+    touches, run, bad = [], 0, []
+    for t in range(i0, stop + 1):
         y = s * t + k
         if (P[t] - y) * sg > TRI_POKE_MAX * ref:
             return None                           # 影線刺穿太深
-        out = (C[t] - y) * sg
-        if out > TRI_OUT * ref:
+        o = out(t)
+        if o > TRI_OUT * ref:
             run += 1
-            if out > TRI_OUT_MAX * ref or run > TRI_BACK:
-                return None                       # 收盤穿出太多或連續收在線外＝線被破（2421 H9、4576 L6）
-            fakes += run == 1
+            if o > TRI_OUT_MAX * ref or run > TRI_BACK:
+                return None                       # 收盤穿出太多或太久沒收回＝線被破（2421 H9、4576 L6）
+            bad.append(t)                         # 收盤穿出（假突破）；影線刺穿不算（艾斯的線常讓上影線穿出）
             touches.append(t)
         else:
             run = 0
             if (P[t] - y) * sg >= -TRI_TOUCH * ref and (B[t] - y) * sg <= TRI_TOUCH * ref:
                 touches.append(t)
-    if run:
-        return None                               # 昨天還收在線外：已突破，不當整理線
     groups: List[List[int]] = []
     for t in touches:                             # 3 日內連續碰線算一次
         if groups and t - groups[-1][-1] <= 3:
@@ -702,21 +711,23 @@ def _tri_line(P, B, Q, C, A, s: float, k: float, i0: int, last: int, sg: int, re
         return t == i0 or len(prev) > 0 and float(((s * t + k - prev) * sg).max()) >= 0.6 * A[t]
 
     groups = [g for g in groups if any(tested(t) for t in g)]
-    if len(groups) < 3 or fakes > max(2, len(groups) // 2) or last - groups[-1][-1] > TRI_RECENT:
-        return None
+    pokes = sum(1 for i, t in enumerate(bad) if i == 0 or t - bad[i - 1] > 3)
+    if len(groups) < 2 or pokes > 2 or stop - groups[-1][-1] > TRI_RECENT:
+        return None                               # 收盤穿出線外（假突破）最多 2 段；多了＝線一直被破
     reacted = pending = 0
     for g in groups:
         e = g[-1]
-        nxt = np.arange(e + 1, min(e + 6, last + 1))
+        nxt = np.arange(e + 1, min(e + 6, stop + 1))
         if len(nxt) < 3:
             pending += 1
         elif float(((s * e + k - Q[nxt]) * sg).max()) >= TRI_REACT * ref:
             reacted += 1
-    if reacted < 2:
+    if reacted < 1:
         return None
-    turns = set(_tri_turns(P, sg, i0, last))
+    turns = set(_tri_turns(P, sg, i0, stop))
     return {"s": float(s), "k": float(k), "a": [g[0] for g in groups], "score": reacted + 0.5 * pending,
-            "density": len(touches), "peaks": sum(1 for g in groups if turns.intersection(g))}
+            "density": len(touches), "peaks": sum(1 for g in groups if turns.intersection(g)),
+            "brk": r0 if r0 <= last else None}
 
 
 def _tri_lines(P, B, Q, C, A, lo: int, last: int, sg: int, ref: float) -> List[Dict[str, Any]]:
@@ -728,12 +739,12 @@ def _tri_lines(P, B, Q, C, A, lo: int, last: int, sg: int, ref: float) -> List[D
             if x2 - x1 < 5:
                 continue
             s = (y2 - y1) / (x2 - x1)
-            if s * sg > 0.3 * ref / 60 or abs(s) > 0.2 * ref:
-                continue                          # 上緣不往上、下緣不往下（容忍 0.3 ATR／60 日）；太陡＝急漲急跌
+            if s * sg > 0.3 * ref / 60 or abs(s) > (0.12 if sg > 0 else 0.2) * ref:
+                continue                          # 上緣不往上、下緣不往下（容忍 0.3 ATR／60 日）；上緣下斜每日 ≤0.12 ATR（艾斯範例 ≤0.06、2421 約 0.1；3008 急漲後回檔 0.16 不算），下緣可較陡
             r = _tri_line(P, B, Q, C, A, s, y1 - s * x1, x1, last, sg, ref)
             if r:
                 out.append(r)
-    out.sort(key=lambda r: (-r["peaks"], -r["score"], -r["density"], r["a"][0]))
+    out.sort(key=lambda r: (-len(r["a"]), -r["peaks"], -r["score"], -r["density"], r["a"][0]))   # 碰最多次的線最成立
     uniq: List[Dict[str, Any]] = []
     for r in out:
         if all(abs(r["s"] - u["s"]) > 0.02 * ref or abs((r["s"] - u["s"]) * last + r["k"] - u["k"]) > 0.2 * ref for u in uniq):
@@ -744,7 +755,8 @@ def _tri_lines(P, B, Q, C, A, lo: int, last: int, sg: int, ref: float) -> List[D
 
 
 def user_triangle(df: pd.DataFrame, atr_prev, end: int) -> Optional[Dict[str, Any]]:
-    """end＝今天（最後一根正式 K）。線只用 end-1 以前決定；找不到合格的一組就回傳 None（不硬畫）。"""
+    """end＝今天（最後一根正式 K）。線只用 end-1 以前決定；找不到合格的一組就回傳 None（不硬畫）。
+    最近幾天才突破的三角仍算（標突破日），型態檢查只看到突破前一天。"""
     H, L, O, C = (df[k].to_numpy(dtype=float) for k in ("High", "Low", "Open", "Close"))
     A = np.where(np.isnan(atr_prev), np.nanmedian(atr_prev), atr_prev)
     last = end - 1
@@ -755,46 +767,74 @@ def user_triangle(df: pd.DataFrame, atr_prev, end: int) -> Optional[Dict[str, An
     top, bot = np.maximum(O, C), np.minimum(O, C)
     ups = _tri_lines(H, top, L, C, A, lo, last, 1, ref)
     dns = _tri_lines(L, bot, H, C, A, lo, last, -1, ref) if ups else []
+    # 像人畫線：上下緣各自先選最成立的線（碰觸數與最多者差 1 次內），再看這兩條是不是三角；
+    # 不從較差的線裡硬湊（箱型最好的兩條是水平線，不能改拿兩條斜切進價格的線湊成三角）
+    ups = [u for u in ups if len(u["a"]) >= len(ups[0]["a"]) - 1]
+    dns = [d for d in dns if len(d["a"]) >= len(dns[0]["a"]) - 1] if dns else []
     best = None
     for u in ups:
         for d in dns:
+            if u["brk"] is not None and d["brk"] is not None:
+                continue
+            ev = (u["brk"] if u["brk"] is not None else d["brk"] if d["brk"] is not None else last + 1) - 1
+            if any(t > ev for t in u["a"] + d["a"]):
+                continue                          # 另一條線的碰觸不可在突破之後
             s0, s1 = min(u["a"][0], d["a"][0]), max(u["a"][0], d["a"][0])
-            if last - s0 < 15 or sum(t >= s1 for t in u["a"]) < 2 or sum(t >= s1 for t in d["a"]) < 2:
-                continue                          # 兩條線要描述同一段整理：共同區間內各碰 2 次以上
+            if ev - s0 < 15 or len(u["a"]) + len(d["a"]) < 5:
+                continue                          # 型態至少 15 日、兩線合計至少 5 次碰線
             w0 = (u["s"] - d["s"]) * s1 + u["k"] - d["k"]
-            w1 = (u["s"] - d["s"]) * last + u["k"] - d["k"]
-            if w0 < TRI_MIN_HEIGHT * ref or w1 < TRI_TIP * w0 or w1 > TRI_NARROW * w0:
+            w1 = (u["s"] - d["s"]) * ev + u["k"] - d["k"]
+            broke = ev < last or C[end] > u["s"] * end + u["k"] + BREAK * A[end] or C[end] < d["s"] * end + d["k"] - BREAK * A[end]
+            if w0 < TRI_MIN_HEIGHT * ref or w1 < (TRI_TIP_BREAK if broke else TRI_TIP) * w0 or w1 > TRI_NARROW * w0:
                 continue                          # 不可太扁；要明顯收窄，但不可已收到尖端
             seq = sorted([(t, "U") for t in u["a"]] + [(t, "D") for t in d["a"]])
             if sum(1 for x, y in zip(seq, seq[1:]) if x[1] != y[1]) < 3:
                 continue                          # 價格要在兩線間來回
-            key = (u["peaks"] + d["peaks"], u["score"] + d["score"], u["density"] + d["density"])
+            # 碰線次數、頂點、反應相同時，選開口較大的一組（三角通常在尖端前表態；6173 艾斯畫的是平上緣＋上升下緣）
+            key = (len(u["a"]) + len(d["a"]), u["peaks"] + d["peaks"], u["score"] + d["score"], round(w1 / w0, 2),
+                   u["density"] + d["density"])
             if best is None or key > best[0]:
-                best = (key, u, d)
+                best = (key, u, d, ev)
     if not best:
         return None
-    _, u, d = best
-    level = lambda l: abs(l["s"]) * (last - l["a"][0]) <= 0.5 * ref
+    _, u, d, ev = best
+    level = lambda l: abs(l["s"]) * (ev - l["a"][0]) <= 0.5 * ref
     kind = ("箱型整理" if level(u) and level(d) else "上升三角" if level(u) else "下降三角" if level(d) else "三角收斂")
     up, dn = u["s"] * end + u["k"], d["s"] * end + d["k"]
-    state = ("收盤向上突破上緣" if C[end] > up + BREAK * A[end] else "收盤向下跌破下緣" if C[end] < dn - BREAK * A[end]
-             else "位於型態內")
+    if u["brk"] is not None:
+        bday, pos = u["brk"], "break_up"
+    elif d["brk"] is not None:
+        bday, pos = d["brk"], "break_down"
+    elif C[end] > up + BREAK * A[end]:
+        bday, pos = end, "break_up"
+    elif C[end] < dn - BREAK * A[end]:
+        bday, pos = end, "break_down"
+    else:
+        bday, pos = None, "inside"
+    if bday is None:
+        state = "位於型態內"
+    else:
+        act = "收盤向上突破上緣" if pos == "break_up" else "收盤向下跌破下緣"
+        state = act if bday == end else f"{_d(df.index[bday])} {act}"
+        if bday != end and dn <= C[end] <= up:
+            state += "，今日回到型態內"
     start = min(u["a"][0], d["a"][0])
     text = (f"{_d(df.index[start])} 起形成{kind}，最新收盤 {_p(C[end])}，{state}（上緣 {_p(up)}、下緣 {_p(dn)}；"
             f"上緣碰線 {len(u['a'])} 次、下緣 {len(d['a'])} 次）")
     return {"kind": kind, "upper": (u["s"], u["k"]), "lower": (d["s"], d["k"]),
-            "anchors": {"upper": u["a"], "lower": d["a"]}, "state": state, "text": text, "gap": None, "start": start}
+            "anchors": {"upper": u["a"], "lower": d["a"]}, "state": state, "pos": pos, "bday": bday,
+            "eval": ev, "text": text, "gap": None, "start": start}
 
 
 def triangle_observation(df: pd.DataFrame, tri: Dict[str, Any], day: int, provisional: bool) -> Dict[str, Any]:
     """三角取代舊算法時，AI 收到的結構欄位也改用同一個結果（避免文字寫上升三角、欄位寫楔形）。"""
-    pos = {"收盤向上突破上緣": "break_up", "收盤向下跌破下緣": "break_down"}.get(tri["state"], "inside")
     close, prev = float(df["Close"].iloc[day]), float(df["Close"].iloc[max(0, day - 1)])
-    broke = pos != "inside"
-    return {"kind": tri["kind"], "state": pos, "validity": "active",
+    bday = tri.get("bday")
+    return {"kind": tri["kind"], "state": tri["pos"], "validity": "active",
             "formation_date": df.index[tri["start"]].strftime("%Y-%m-%d"),
-            "event_date": df.index[day].strftime("%Y-%m-%d") if broke else None,
-            "event_age": 0 if broke else None, "event_direction": (1 if pos == "break_up" else -1) if broke else None,
+            "event_date": df.index[bday].strftime("%Y-%m-%d") if bday is not None else None,
+            "event_age": day - bday if bday is not None else None,
+            "event_direction": (1 if tri["pos"] == "break_up" else -1) if bday is not None else None,
             "is_provisional": provisional,
             "daily_direction": "up" if close > prev else "down" if close < prev else "flat"}
 
@@ -919,11 +959,15 @@ def detect(df: pd.DataFrame, events: Optional[Dict[str, Any]] = None, provisiona
     if f3_recent or (ev and f3_window(ev["bday"], 20)) or f3_window(today, 5):
         flag_text.append("股數基準變動，量比可比性受限")
     tri = user_triangle(adj, atr_prev, last_official)
-    if tri:     # §4b 艾斯畫法三角優先：文字、名稱、價位、AI 結構欄位、驗證圖全部用同一個結果
-        old = {"箱型整理", "上升三角", "下降三角", "對稱三角收斂", "上升楔形", "下降楔形", "上升通道", "下降通道"}
-        summary = [x for x in summary if "起形成" not in x and "原上緣" not in x and "原下緣" not in x]
-        names = [x for x in names if x not in old]
-        levels = [x for x in levels if not any(x.startswith(o) for o in old)]
+    # 10-06：三角只認新算法；有新三角時舊算法型態全部讓位，沒有時只拿掉舊算法的三角（楔形、通道、箱型保留）
+    old = {"箱型整理", "上升三角", "下降三角", "對稱三角收斂", "上升楔形", "下降楔形", "上升通道", "下降通道"}
+    drop = old if tri else {"上升三角", "下降三角", "對稱三角收斂"}
+    summary = [x for x in summary if not any(o in x for o in drop)]
+    names = [x for x in names if x not in drop]
+    levels = [x for x in levels if not any(x.startswith(o) for o in drop)]
+    if shape_observation and shape_observation["kind"] in drop:
+        shape_observation = None
+    if tri:     # §4b 艾斯畫法三角：文字、名稱、價位、AI 結構欄位、驗證圖全部用同一個結果
         summary.insert(0, tri["text"])
         names.insert(0, tri["kind"])
         levels += [f"{tri['kind']}上緣 {_p(_at(tri['upper'], today))}（上方候選壓力）",

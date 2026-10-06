@@ -154,7 +154,7 @@ def render(data: dict) -> Image.Image:
     for value in data.get("flags") or []:
         flags.extend(wrap("資料旗標：" + str(value), 21, width - 2 * margin))
     metrics = []
-    chosen = data.get("triangle") or data.get("formation") or data.get("ended") or data.get("invalid")
+    chosen = data.get("triangle")   # 10-06：突破日只標新三角（舊算法的線已不畫，標了像亂點）
     if chosen and chosen.get("ref") is not None:
         ref = chosen["ref"]
         metrics.append(f"型態 ATR 基準 {ref:.4f}｜突破距離 {data['break_multiplier'] * ref:.4f}｜回測半寬 {data['retest_multiplier'] * ref:.4f}")
