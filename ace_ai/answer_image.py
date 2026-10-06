@@ -1447,6 +1447,8 @@ def _level_note(label: str, card: dict) -> tuple[str, str]:
         role = str(info.get('role_text') or '')
         # 白話一行：「持續上揚，5 天後支撐上移到 34.92」（收盤不變推算）
         tail = f"，5 天後{role.replace('至 ', '到 ')}" if role else ''
+        if info.get('limit_proof'):      # 失敗值比跌停還低：跌停也續揚（強支撐）
+            return f"{'MA20 ' if label == '布林中軌' else ''}{info['limit_proof']}（失敗值 {info['fail_price']:,.2f}）{tail}", UP
         return f"{'MA20 ' if label == '布林中軌' else ''}{plain}{tail}", color
     if '量區' in label:
         return '成交密集區邊緣（籌碼成本區）', MUTED

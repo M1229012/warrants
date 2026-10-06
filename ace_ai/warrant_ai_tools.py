@@ -2772,6 +2772,10 @@ def analyze_ma_deduction(df: pd.DataFrame, periods: Sequence[int] = (5, 10, 20, 
             "turn": turn,
             "turn_day": turn_day,
             "turn_text": turn_phrase(turn, turn_day),
+            # 失敗值＝明天要扣掉的價格：上揚均線收盤低於它才轉彎；比跌停價還低＝跌停也續揚（強支撐）
+            "fail_price": _num(deductions[0]),
+            "limit_proof": ("跌停也續揚" if now == "上揚" and deductions[0] < close * 0.9
+                            else "漲停也續彎" if now == "下彎" and deductions[0] > close * 1.1 else ""),
             "ma_above_close": above_close,
             "signal": signal,
         }
@@ -3060,8 +3064,30 @@ def get_volume_profile(stock_code: str) -> Dict[str, Any]:
             return "收盤在兩大量區之下" if not bundle.get("intraday") else "現價在兩大量區之下"
         return "收盤在兩大量區之間" if not bundle.get("intraday") else "現價在兩大量區之間"
 
+    def near_zones() -> List[Dict[str, Any]]:
+        # 量達最大量價位 5 成以上的相鄰價位合併成一區；取收盤上下最近各一個（與兩大量區重疊的不列）
+        cut = float(profile[max_idx]) * NEAR_ZONE_RATIO
+        groups, cur = [], []
+        for i in range(len(centers)):
+            if profile[i] >= cut and profile[i] > 0:
+                cur.append(i)
+            elif cur:
+                groups.append(cur)
+                cur = []
+        if cur:
+            groups.append(cur)
+        groups = [g for g in groups if max_idx not in g and second_idx not in g]
+        below = [g for g in groups if float(bins[g[0]]) <= close]
+        above = [g for g in groups if float(bins[g[0]]) > close]
+        out = []
+        for g in ([max(below, key=lambda g: bins[g[0]])] if below else []) + ([min(above, key=lambda g: bins[g[0]])] if above else []):
+            out.append({"label": "近價大量區", "price_low": _num(float(bins[g[0]])), "price_high": _num(float(bins[g[-1] + 1])),
+                        "relative_strength_pct": _num(max(profile[i] for i in g) / profile[max_idx] * 100)})
+        return out
+
     recent_event = str(pattern.get("recent_maximum_zone_pattern", "") or "")
     return {
+        "near_volume_zones": near_zones() if profile[max_idx] > 0 else [],
         "stock_code": code,
         "stock_name": name,
         "data_date": _fmt_date(bundle["df"].index[-1] if LIVE_PATTERN_SCORE and bundle.get("intraday") else plot_df.index[-1]),
@@ -5953,6 +5979,9 @@ def chart_flow_marks_for_stock(
 # 持股成本位置（型態／操作類問題用；只整理價位，不下買賣指令）
 # ============================================================
 
+NEAR_ZONE_RATIO = _env_float("NEAR_VOLUME_ZONE_RATIO", 0.5)
+
+
 def key_price_levels(tech: Dict[str, Any], vp: Dict[str, Any]) -> Dict[str, Any]:
     """現價上下方的關鍵價位（均線、附近大量區、布林三軌），附距現價 %；全部來自既有計算結果。
 
@@ -5994,6 +6023,8 @@ def key_price_levels(tech: Dict[str, Any], vp: Dict[str, Any]) -> Dict[str, Any]
     for key, label in (("maximum_volume_zone", "最大量區"), ("second_volume_zone", "第二大量區")):
         zone = vp.get(key) or {}
         add_zone(label, zone.get("price_low"), zone.get("price_high"))
+    for zone in vp.get("near_volume_zones") or []:      # 10-06：前兩大以外、靠近收盤的大量區（聯電 09 月初整理區）
+        add_zone("近價大量區", zone.get("price_low"), zone.get("price_high"))
     bb = tech.get("bollinger") or {}
     add("布林上軌", bb.get("upper"), "bollinger")
     add("布林下軌", bb.get("lower"), "bollinger")  # 布林中軌就是 MA20，不重複列
