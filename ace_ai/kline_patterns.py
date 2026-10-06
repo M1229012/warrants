@@ -664,6 +664,7 @@ TRI_TIP = _env("TRI_TIP", 0.15)             # 還在型態內：兩線寬度至�
 TRI_TIP_BREAK = _env("TRI_TIP_BREAK", 0.15)  # 已突破（今天或最近幾天）：突破前寬度也要剩 15%（6173 選到 H9 長上影往下斜、剩 12% 不對）
 TRI_NARROW = _env("TRI_NARROW", 0.65)       # 寬度要收窄到起點的 65% 以下才算收斂
 TRI_FLAT = _env("TRI_FLAT", 1.0)
+TRI_MAJOR_POKE = _env("TRI_MAJOR_POKE", 0.4)   # 起點之後的主要轉折（圖上 H／L）實體不可刺穿線超過 0.4 ATR（2467 H7、H10 實體刺穿＝線畫錯）
 TRI_MIN_HEIGHT = _env("TRI_MIN_HEIGHT", 3.0)   # 共同起點寬度至少 3 ATR：太扁平的不是三角（1608 使用者否決）
 
 
@@ -673,7 +674,7 @@ def _tri_turns(P, sg: int, lo: int, last: int) -> List[int]:
     return [t for t in range(lo, last + 1) if P[t] * sg >= (P[max(0, t - w):min(last, t + w) + 1] * sg).max()]
 
 
-def _tri_line(P, B, Q, C, A, s: float, k: float, i0: int, last: int, sg: int, ref: float) -> Optional[Dict[str, Any]]:
+def _tri_line(P, B, Q, C, A, s: float, k: float, i0: int, last: int, sg: int, ref: float, majors=()) -> Optional[Dict[str, Any]]:
     """評一條趨勢線（i0＝起點轉折）。sg=1 上緣（P=高、B=實體頂、Q=低）、-1 下緣（P=低、B=實體底、Q=高）。
     最近 TRI_BREAK_RECENT 日內才收在線外＝型態剛突破（brk＝突破日），線只驗到突破前一天。None＝線被破或品質不足。"""
     out = lambda t: (C[t] - (s * t + k)) * sg
@@ -724,13 +725,17 @@ def _tri_line(P, B, Q, C, A, s: float, k: float, i0: int, last: int, sg: int, re
             reacted += 1
     if reacted < 1:
         return None
+    mj = [m for m in majors if i0 <= m <= stop]
+    if any(m > i0 + 2 and (B[m] - (s * m + k)) * sg > TRI_MAJOR_POKE * ref for m in mj):
+        return None                               # 主要轉折的實體刺穿線（2467 H7、H10）＝線畫錯；只有影線刺穿可以（6173 H9）
+    near = lambda m: (P[m] - (s * m + k)) * sg >= -TRI_TOUCH * ref and (B[m] - (s * m + k)) * sg <= TRI_TOUCH * ref
     turns = set(_tri_turns(P, sg, i0, stop))
     return {"s": float(s), "k": float(k), "a": [g[0] for g in groups], "score": reacted + 0.5 * pending,
             "density": len(touches), "peaks": sum(1 for g in groups if turns.intersection(g)),
-            "brk": r0 if r0 <= last else None}
+            "brk": r0 if r0 <= last else None, "major": sum(1 for m in mj if near(m))}
 
 
-def _tri_lines(P, B, Q, C, A, lo: int, last: int, sg: int, ref: float) -> List[Dict[str, Any]]:
+def _tri_lines(P, B, Q, C, A, lo: int, last: int, sg: int, ref: float, majors=()) -> List[Dict[str, Any]]:
     """兩個轉折點（影線或實體邊）連成候選趨勢線，逐條驗證；回傳去重後的好線（頂點碰最多者優先）。"""
     pts = [(t, float(v)) for t in _tri_turns(P, sg, lo, last) for v in {P[t], B[t]}]
     out = []
@@ -741,10 +746,11 @@ def _tri_lines(P, B, Q, C, A, lo: int, last: int, sg: int, ref: float) -> List[D
             s = (y2 - y1) / (x2 - x1)
             if s * sg > 0.3 * ref / 60 or abs(s) > (0.12 if sg > 0 else 0.2) * ref:
                 continue                          # 上緣不往上、下緣不往下（容忍 0.3 ATR／60 日）；上緣下斜每日 ≤0.12 ATR（艾斯範例 ≤0.06、2421 約 0.1；3008 急漲後回檔 0.16 不算），下緣可較陡
-            r = _tri_line(P, B, Q, C, A, s, y1 - s * x1, x1, last, sg, ref)
+            r = _tri_line(P, B, Q, C, A, s, y1 - s * x1, x1, last, sg, ref, majors)
             if r:
                 out.append(r)
-    out.sort(key=lambda r: (-len(r["a"]), -r["peaks"], -r["score"], -r["density"], r["a"][0]))   # 碰最多次的線最成立
+    # 碰到最多主要轉折（圖上 H／L）的線最成立，再比碰線次數、頂點、反應、碰到的 K 棒數
+    out.sort(key=lambda r: (-r["major"], -len(r["a"]), -r["peaks"], -r["score"], -r["density"], r["a"][0]))
     uniq: List[Dict[str, Any]] = []
     for r in out:
         if all(abs(r["s"] - u["s"]) > 0.02 * ref or abs((r["s"] - u["s"]) * last + r["k"] - u["k"]) > 0.2 * ref for u in uniq):
@@ -765,12 +771,14 @@ def user_triangle(df: pd.DataFrame, atr_prev, end: int) -> Optional[Dict[str, An
         return None
     ref = float(A[last])
     top, bot = np.maximum(O, C), np.minimum(O, C)
-    ups = _tri_lines(H, top, L, C, A, lo, last, 1, ref)
-    dns = _tri_lines(L, bot, H, C, A, lo, last, -1, ref) if ups else []
+    piv = [p for p in zigzag(H[:last + 1], L[:last + 1], C[:last + 1], atr_prev[:last + 1]) if p["confirm"] <= last]
+    ups = _tri_lines(H, top, L, C, A, lo, last, 1, ref, [p["idx"] for p in piv if p["type"] == "H"])
+    dns = _tri_lines(L, bot, H, C, A, lo, last, -1, ref, [p["idx"] for p in piv if p["type"] == "L"]) if ups else []
     # 像人畫線：上下緣各自先選最成立的線（碰觸數與最多者差 1 次內），再看這兩條是不是三角；
     # 不從較差的線裡硬湊（箱型最好的兩條是水平線，不能改拿兩條斜切進價格的線湊成三角）
-    ups = [u for u in ups if len(u["a"]) >= len(ups[0]["a"]) - 1]
-    dns = [d for d in dns if len(d["a"]) >= len(dns[0]["a"]) - 1] if dns else []
+    # 候選：主要轉折與碰線數都與最好的線差 1 以內（最好的線若已被反向跌破／突破，次好的線仍可入選，2421）
+    tier = lambda ls: [x for x in ls if x["major"] >= ls[0]["major"] - 1 and len(x["a"]) >= max(len(y["a"]) for y in ls) - 1] if ls else []
+    ups, dns = tier(ups), tier(dns)
     best = None
     for u in ups:
         for d in dns:
@@ -790,9 +798,9 @@ def user_triangle(df: pd.DataFrame, atr_prev, end: int) -> Optional[Dict[str, An
             seq = sorted([(t, "U") for t in u["a"]] + [(t, "D") for t in d["a"]])
             if sum(1 for x, y in zip(seq, seq[1:]) if x[1] != y[1]) < 3:
                 continue                          # 價格要在兩線間來回
-            # 碰線次數、頂點、反應相同時，選開口較大的一組（三角通常在尖端前表態；6173 艾斯畫的是平上緣＋上升下緣）
-            key = (len(u["a"]) + len(d["a"]), u["peaks"] + d["peaks"], u["score"] + d["score"], round(w1 / w0, 2),
-                   u["density"] + d["density"])
+            # 主要轉折、碰線次數、頂點、反應、碰線 K 棒數都相同時，選開口較大的一組（三角通常在尖端前表態）
+            key = (u["major"] + d["major"], len(u["a"]) + len(d["a"]), u["peaks"] + d["peaks"], u["score"] + d["score"],
+                   u["density"] + d["density"], round(w1 / w0, 2))
             if best is None or key > best[0]:
                 best = (key, u, d, ev)
     if not best:
