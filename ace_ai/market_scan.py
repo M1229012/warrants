@@ -216,6 +216,9 @@ def score_pending(budget_seconds: float = SCORE_BUDGET, log: Callable[[str], Non
         universe = codes or sorted({c for codes_ in _member_codes().values() for c in codes_}) or \
             local_market_cache.codes_with_history(69)
         scored = local_market_cache.latest_pattern_score_dates(universe)
+        # 10-06：失敗紀錄存本地 DB；重新部署不再整批重算失敗股（每次重啟都燒 FinMind 額度）
+        _FAILED_AT.update({k: v for k, v in (local_market_cache.get_state("pattern_score_failed", {}) or {}).items()
+                           if k not in _FAILED_AT})
         todo = [c for c in universe
                 if (not last_bars.get(c) or scored.get(c) != last_bars[c])
                 and not (last_bars.get(c) and _FAILED_AT.get(c) == last_bars[c])]
@@ -261,6 +264,10 @@ def score_pending(budget_seconds: float = SCORE_BUDGET, log: Callable[[str], Non
         return {"done": done, "failed": failed, "pending": pending, "latest": latest,
                 "elapsed": time.monotonic() - started}
     finally:
+        try:
+            local_market_cache.set_state("pattern_score_failed", dict(_FAILED_AT))
+        except Exception:
+            pass
         if "before_keys" in locals():
             tools.CACHE.drop_new_since(before_keys)   # 收尾也釋放
         _SCORE_LOCK.release()
