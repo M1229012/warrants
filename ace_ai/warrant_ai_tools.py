@@ -267,6 +267,9 @@ _FM_BG_LOGGED = {"day": ""}
 def finmind_background_allowed() -> bool:
     """背景作業（補資料、算分數）只在目前 Token 還剩一半以上額度時才用 FinMind（10-04：會員優先）。
     第一支用到一半就停，第二支完整留給會員；查不到用量時保守不用。"""
+    tokens = finmind_tokens()
+    if tokens and current_finmind_token() != tokens[0]:
+        return False                              # 10-07：背景只用第一支；第一支冷卻後第二、三支完整留給會員
     usage = finmind_usage()
     limit, remaining = usage.get("limit") or 0, usage.get("remaining")
     ok = bool(usage.get("available") and limit and remaining is not None and remaining >= limit * FINMIND_BACKGROUND_MIN_REMAINING)
@@ -2381,6 +2384,12 @@ def _load_price_bundle(stock_code: str) -> Dict[str, Any]:
             # 停牌股永遠 gap>5，每次都重抓 FinMind 也拿不到新的；今天確認過一次就不再問。
             if gap <= 5 or _STALE_CHECKED.get(code) == (today, local_last):
                 return persistent["df"], str(persistent.get("market") or ""), "本地69日歷史快取"
+        if current_api_priority() == "background" and not finmind_background_allowed():
+            # 10-07：背景（型態分數底庫等）抓日K原本不受額度保護，冷門股湊不滿 69 根就每輪打 FinMind，部署後一次吃光 3 支 Token。
+            # 額度不足時背景只用本地市場底庫；底庫也沒有就跳過，等會員查詢時再抓。
+            if persistent and persistent.get("count", 0) >= 30:
+                return persistent["df"], str(persistent.get("market") or ""), "本地市場底庫（背景）"
+            raise ToolDataError(f"{code} 背景保留 FinMind 額度給會員，暫不抓日K")
         try:
             started = time.perf_counter()
             stock_df, market, _ = kf.fetch_stock_data_yf(code, period=PRICE_FETCH_PERIOD)
