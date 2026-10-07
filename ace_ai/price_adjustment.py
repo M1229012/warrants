@@ -53,10 +53,7 @@ def adjust_shares(frame, events, as_of=None):
             if vf and 'Volume' in out:
                 out['Volume']=out['Volume'].astype(float)
                 out.loc[mask,'Volume'] *= vf
-            elif 'Volume' in out:
-                # 缺純股數比率的權息混合事件，不能拿原始股數跨事件比較。
-                out['Volume']=out['Volume'].astype(float)
-                out.loc[mask,'Volume']=float('nan')
+            # 權息混合事件沒有純股數比率：成交量維持原始張數（與券商 App 一致），不清空
             applied.append(dict(ev))
     # 大幅斷層僅作資料警示，絕不從這個比例反推還原因子。
     validate_adjusted(out)
@@ -89,5 +86,5 @@ def basis_note(frame):
     if not items:
         return ''
     names='、'.join(f"{e['date']} {e['kind']}" for e in items)
-    extra='；權息混合事件缺股數比率，事件前成交量不納入跨期比較' if any(not e.get('volume_factor') for e in items) else '；成交量同步換算等值股數（估）'
+    extra='；權息事件前成交量為原始張數' if any(not e.get('volume_factor') for e in items) else '；成交量同步換算等值股數（估）'
     return f'已依核實參考價還原至最新股數基準（{names}），非當年實際成交價'+extra
