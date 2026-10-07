@@ -126,6 +126,7 @@ def line_specs(data: dict) -> list[dict]:
             lines.append({"label": label, "coef": triangle[edge],
                           "start": anchors[0], "fit_end": anchors[-1], "stop": last,
                           "ref_end": triangle.get("reference_until") or -1,   # 參考線段（收斂區間之前）畫虛線
+                          "hist_from": triangle.get("first_bday") if triangle.get("first_bday") is not None else 10**9,   # 突破後＝歷史線（灰虛線）
                           "anchors": anchors, "color": color, "historical": False})
     elif False and formation:   # 10-06：驗證圖只畫新三角；舊算法的整理線（通道、楔形）不再畫，避免兩套線混在一起
         # 10-06：舊算法的歷史線若上下同方向（楔形／通道）不畫，避免 2421 那種離譜的灰線
@@ -240,9 +241,10 @@ def render(data: dict) -> Image.Image:
         a, b = max(start, line["start"]), min(end, line["stop"])
         s, k = line["coef"]
         for i in range(a, b):
-            if i >= line["fit_end"] or line["historical"] or i < line.get("ref_end", -1):
+            if i >= line["fit_end"] or line["historical"] or i < line.get("ref_end", -1) or i >= line.get("hist_from", 10**9):
+                color = "#87909E" if i >= line.get("hist_from", 10**9) else line["color"]
                 for t0, t1 in ((0.0, 0.32), (0.55, 0.87)):
-                    draw.line((px(i + t0), py(s * (i + t0) + k), px(i + t1), py(s * (i + t1) + k)), fill=line["color"], width=3)
+                    draw.line((px(i + t0), py(s * (i + t0) + k), px(i + t1), py(s * (i + t1) + k)), fill=color, width=3)
             else:
                 draw.line((px(i), py(s * i + k), px(i + 1), py(s * (i + 1) + k)), fill=line["color"], width=3)
         for i in line["anchors"]:

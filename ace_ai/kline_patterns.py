@@ -999,7 +999,7 @@ def _tri_status(tr: Dict[str, Any]) -> str:
 
 
 def user_triangle(df: pd.DataFrame, atr_prev, end: int, state: Optional[Dict[str, Any]] = None,
-                  out_state: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+                  out_state: Optional[Dict[str, Any]] = None, replay_days: Optional[int] = None) -> Optional[Dict[str, Any]]:
     """end＝今天。單日選擇流程依日期執行，正式突破紀錄以「狀態快照」跨日保存：
       state＝前次保存的快照（同規則版本、價格指紋相符才用），從它的截至日隔天補跑；沒有就從固定起點重播 TRI_INIT_REPLAY 日。
       out_state（dict）會被填入新的快照（呼叫端決定是否寫入；盤中不寫）。
@@ -1009,12 +1009,12 @@ def user_triangle(df: pd.DataFrame, atr_prev, end: int, state: Optional[Dict[str
     _TURN_CACHE.clear()
     _TURN_CACHE["on"] = True
     try:
-        return _user_triangle(df, atr_prev, end, state, out_state)
+        return _user_triangle(df, atr_prev, end, state, out_state, replay_days)
     finally:
         _TURN_CACHE.clear()
 
 
-def _user_triangle(df, atr_prev, end, state=None, out_state=None):
+def _user_triangle(df, atr_prev, end, state=None, out_state=None, replay_days=None):
     H, L, O, C = (df[k].to_numpy(dtype=float) for k in ("High", "Low", "Open", "Close"))
     A = np.asarray(atr_prev, dtype=float)
     last = end - 1
@@ -1045,7 +1045,7 @@ def _user_triangle(df, atr_prev, end, state=None, out_state=None):
     sig = TRI_STATE_VERSION + "|" + _tri_params_sig()
     bar_hash = lambda i: _bar_hash(O[i], H[i], L[i], C[i])
     records: List[Dict[str, Any]] = []
-    start_X = max(first_valid + 31, end - TRI_INIT_REPLAY)
+    start_X = max(first_valid + 31, end - (TRI_INIT_REPLAY if replay_days is None else max(0, int(replay_days))))   # 族群總覽等大量呼叫可設 0（只看今天）
     reconstructed = True                          # 沒有有效快照：從固定起點重建，紀錄標「回溯辨識」
     if state and state.get("sig") == sig and state.get("as_of") in pos and pos[state["as_of"]] <= end:
         a = pos[state["as_of"]]
@@ -1234,7 +1234,7 @@ def _tri_store():
 
 
 def detect(df: pd.DataFrame, events: Optional[Dict[str, Any]] = None, provisional_today: bool = False,
-           *, include_debug: bool = False, state_key: str = "") -> Dict[str, Any]:
+           *, include_debug: bool = False, state_key: str = "", replay_days: Optional[int] = None) -> Dict[str, Any]:
     """provisional_today＝最後一根是盤中／收盤後暫定 K（§11）。回傳 {summary, names, flags, ...}。"""
     need = ["Open", "High", "Low", "Close"]
     if df is None or not set(need) <= set(df.columns):
@@ -1359,7 +1359,7 @@ def detect(df: pd.DataFrame, events: Optional[Dict[str, Any]] = None, provisiona
             tri_state = store.get_state(state_key)
         except Exception as exc:
             print(f"⚠️ 三角狀態讀取失敗｜{state_key}｜{type(exc).__name__}: {exc}", flush=True)
-    tri = user_triangle(adj, atr_prev, last_official, tri_state, new_state)
+    tri = user_triangle(adj, atr_prev, last_official, tri_state, new_state, replay_days)
     for attempt in range(2):
         if store is None or not new_state or provisional_today:
             break
@@ -1374,7 +1374,7 @@ def detect(df: pd.DataFrame, events: Optional[Dict[str, Any]] = None, provisiona
                 print(f"ℹ️ 三角狀態未覆寫（已有較新或同時更新的結果）｜{state_key}｜{new_state.get('as_of')}", flush=True)
                 break
             tri_state, new_state = latest, {}
-            tri = user_triangle(adj, atr_prev, last_official, tri_state, new_state)
+            tri = user_triangle(adj, atr_prev, last_official, tri_state, new_state, replay_days)
         except Exception as exc:
             print(f"⚠️ 三角狀態寫入失敗｜{state_key}｜{type(exc).__name__}: {exc}", flush=True)
             break
@@ -1390,8 +1390,12 @@ def detect(df: pd.DataFrame, events: Optional[Dict[str, Any]] = None, provisiona
         summary.insert(0, tri["text"])
         label = tri["kind"] + ("候選" if tri.get("candidate") else "")
         names.insert(0, label)
-        levels += [f"{label}上緣 {_p(_at(tri['upper'], today))}（上方候選壓力）",
-                   f"{label}下緣 {_p(_at(tri['lower'], today))}（下方候選支撐）"]
+        if tri.get("first_bday") is not None:     # 10-08：已突破的固定線只驗證到形成截止日，不是現行支撐壓力
+            levels += [f"原{label}上緣 {_p(_at(tri['upper'], today))}（已突破，非現行支撐壓力）",
+                       f"原{label}下緣 {_p(_at(tri['lower'], today))}（已突破，非現行支撐壓力）"]
+        else:
+            levels += [f"{label}上緣 {_p(_at(tri['upper'], today))}（上方候選壓力）",
+                       f"{label}下緣 {_p(_at(tri['lower'], today))}（下方候選支撐）"]
         shape_observation = triangle_observation(adj, tri, last_official, provisional_today)
     if not any(x for x in summary if not x.startswith("股價位於")):
         summary.insert(0, "目前沒有明確的整理型態或趨勢")
