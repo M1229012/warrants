@@ -525,6 +525,29 @@ def set_state(key: str, value: Any) -> None:
         return
 
 
+def set_state_if_newer(key: str, value: Dict[str, Any], field: str = "as_of", expect_revision: Optional[int] = None) -> bool:
+    """原子更新：已存的 value[field] 比新的大（較新），或 expect_revision 與已存 revision 不符（讀取後被別人更新），
+    就不覆寫、回傳 False；寫入失敗丟 DBError（不靜默）。"""
+    try:
+        with _LOCK:
+            with _db() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute("SELECT value FROM kv WHERE key=?", (str(key),)).fetchone()
+                old = json.loads(row[0]) if row else None
+                if isinstance(old, dict) and (str(old.get(field) or "") > str(value.get(field) or "")
+                                              or (expect_revision is not None and int(old.get("revision") or 0) != expect_revision)):
+                    conn.rollback()
+                    return False
+                conn.execute("INSERT INTO kv(key,value,updated_at) VALUES(?,?,?) "
+                             "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+                             (str(key), json.dumps(value, ensure_ascii=False, default=str),
+                              datetime.now(timezone.utc).isoformat()))
+                conn.commit()
+                return True
+    except Exception as exc:
+        raise DBError(f"寫入狀態（{key}）失敗：{type(exc).__name__}: {exc}") from exc
+
+
 def append_state_list(key: str, record: Any, keep: int = 0) -> List[Any]:
     """在同一個 SQLite transaction 內 讀 → 附加 → 寫 → commit（BEGIN IMMEDIATE 先取得寫入鎖），
     兩個請求同時新增時不會後寫蓋掉前寫。原資料壞掉（JSON 錯誤或不是清單）時丟 StateCorrupt，不當成空清單覆蓋。"""

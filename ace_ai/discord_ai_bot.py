@@ -644,6 +644,7 @@ class QueryPlan:
     planner_used: bool = False
     pattern: bool = False       # 複合問題（例：分點部位＋型態）也要畫型態評分卡
     beta_fallback: Optional["QueryPlan"] = None  # beta_only route 的正式舊 route；非 tester 靜默改走這個
+    uncertain: bool = False     # 規則只認出股票、看不出要問什麼：交給 AI 讀整句分類（10-06）
 
     def add(self, name: str, **kwargs: Any) -> None:
         call = ToolCall(name, {k: v for k, v in kwargs.items() if v not in (None, "")})
@@ -1070,8 +1071,9 @@ def futures_card(data: Dict[str, Any], question: str = "", retail: Optional[Dict
 
 
 def branch_stock_events_card(data: Dict[str, Any], numbers: Optional[Dict[str, int]] = None,
-                             chart_bars: int = 0) -> Optional[Dict[str, Any]]:
+                             chart_bars: int = 0, compact: bool = False) -> Optional[Dict[str, Any]]:
     """某分點在某檔股票的全部 A～E 事件（不限 K 線 70 日）：新到舊，每筆列金額、權證、狀態。
+    compact＝一次問多個分點：一列數字＋最近 3 筆、權證只列 1 檔，避免圖片太長。
     numbers＝{事件日: K 線上的編號}：K 線範圍內的事件在前面加上和圖上相同的圈號。"""
     numbers = numbers or {}
     events = list(reversed(data.get("all_events") or []))
@@ -1092,9 +1094,10 @@ def branch_stock_events_card(data: Dict[str, Any], numbers: Optional[Dict[str, i
     if data.get("avg_holding_days") is not None:
         tiles.append({"label": "平均持有", "value": f"{float(data['avg_holding_days']):.0f} 天", "tone": "ink"})
     rows = []
-    for e in events:
+    for e in events[:3] if compact else events:
         warrants = e.get("warrants") or []
-        warrant_text = "、".join(warrants[:3]) + (f" 等 {len(warrants)} 檔" if len(warrants) > 3 else "")
+        keep = 1 if compact else 3
+        warrant_text = "、".join(warrants[:keep]) + (f" 等 {len(warrants)} 檔" if len(warrants) > keep else "")
         state = str(e.get("state") or "")
         if state.startswith("出清") and e.get("result_return_pct") is not None:
             state += f"（{float(e['result_return_pct']):+.1f}%）"
@@ -1103,6 +1106,11 @@ def branch_stock_events_card(data: Dict[str, Any], numbers: Optional[Dict[str, i
         rows.append({"lead": f"{mark}{e.get('date', '')}｜{e.get('event', '')}",
                      "parts": [p for p in (str(e.get("buy_amount_text") or ""), warrant_text, state) if p]})
     name = f"{data.get('stock_name', '')}（{data.get('stock_code', '')}）"
+    if compact:
+        brief = [tiles[0], dict(tiles[1]), tiles[3]]
+        return {"branch": f"{data.get('branch', '')}｜{name}",
+                "tags": [f"最近 {len(rows)} 筆" if total > len(rows) else "全部 A～E 事件"], "label": "權證分點",
+                "sections": [{"type": "tiles", "items": brief}, {"type": "rows", "items": rows}]}
     return {"branch": f"{data.get('branch', '')}｜{name}", "tags": ["全部 A～E 事件"], "label": "權證分點", "sections": [
         {"type": "tiles", "items": tiles[:3]},
         {"type": "tiles", "items": tiles[3:]},
@@ -1446,6 +1454,16 @@ def is_top_warrant_question(parsed: "ParsedQuestion") -> bool:
     return ("warrant" in parsed.intents or "權證" in text) and bool(_TOP_WORDS_RE.search(text)) and "win_rate" not in parsed.intents
 
 
+def _has_unread_words(parsed: "ParsedQuestion") -> bool:
+    """拿掉股票代號／名稱、標點、時間詞後還剩 2 個以上中文字＝句子有規則沒讀懂的內容。"""
+    text = parsed.original or ""
+    for code, name in parsed.stocks:
+        text = text.replace(str(code), "").replace(str(name or ""), "")
+    text = re.sub(r"[^\u4e00-\u9fff]", "", text)
+    text = re.sub(r"最近|今天|現在|目前|這檔|這支|請問|一下|呢|嗎|啊|的", "", text)
+    return len(text) >= 2
+
+
 class QueryRouter:
     """規則判斷優先；只有規則無法決定要用哪些 Tool 時才呼叫 Gemini Planner。"""
 
@@ -1518,6 +1536,10 @@ class QueryRouter:
             if categories == {"price"} and not analysis and "cost" not in intents and not _WHY_RE.search(parsed.original or ""):
                 return self._stock_plan(parsed, categories, analysis)
             plan = self._pattern_plan(parsed)
+            # 規則沒認出任何「要問什麼」，句子卻還有別的字（「聯電最近是發生甚麼事」）：先走型態，但交給 AI 判斷題意
+            plan.uncertain = (len(parsed.stocks) == 1 and not categories and not analysis and "cost" not in intents
+                              and not pattern_asked(parsed)
+                              and _has_unread_words(parsed))
             if _WHY_MOVE_RE.search(parsed.original or ""):
                 # 「今天為什麼大跌」：型態＋近期新聞一起給 AI（仍只呼叫 1 次）
                 for code, _ in parsed.stocks:
@@ -1567,19 +1589,22 @@ class QueryRouter:
             return plan
         if parsed.stocks:
             code = parsed.stocks[0][0]
+            names = parsed.branches[:3]          # 「永豐金內湖跟華南永昌台中在聯電」：每個分點都要抓（10-06 只抓第一個）
             if "position" in parsed.intents:
                 # 「部位還在嗎」：直接讀回測 FIFO 狀態，0 次 Gemini，不抓 MoneyDJ。
-                plan = QueryPlan(route="rule_branch_position", need_final_llm=analysis)
-                plan.add("get_branch_stock_position", branch_name=branch, stock_code=code)
+                plan = QueryPlan(route="rule_branch_position", need_final_llm=analysis or len(names) > 1)
+                for name in names:
+                    plan.add("get_branch_stock_position", branch_name=name, stock_code=code)
                 if pattern_asked(parsed):
                     self._add_pattern(plan, parsed)   # 一句問兩件事：部位＋型態，兩個都答
                 return plan
             plan = QueryPlan(route="rule_branch_stock", need_final_llm=True)
-            plan.add("detect_current_branch_events", stock_code=code, branch_name=branch)
-            plan.add("get_branch_stock_position", branch_name=branch, stock_code=code)
-            # 指定股票的報酬用下方 history；全分點績效包含其他股票，不能代替。
-            plan.add("get_branch_recent_behavior", branch_name=branch, stock_code=code)
-            plan.add("get_branch_stock_history", branch_name=branch, stock_code=code)
+            for name in names:
+                plan.add("detect_current_branch_events", stock_code=code, branch_name=name)
+                plan.add("get_branch_stock_position", branch_name=name, stock_code=code)
+                # 指定股票的報酬用下方 history；全分點績效包含其他股票，不能代替。
+                plan.add("get_branch_recent_behavior", branch_name=name, stock_code=code)
+                plan.add("get_branch_stock_history", branch_name=name, stock_code=code)
             if pattern_asked(parsed):
                 self._add_pattern(plan, parsed)
             return plan
@@ -1884,7 +1909,7 @@ _OVERLOAD_CONFIG = tools._env_int("DISCORD_AI_GEMINI_OVERLOAD_COOLDOWN", 15)
 # 將先前 env.example 的 120 秒預設一併遷移，避免舊 Railway 設定繼續鎖住所有模型。
 GEMINI_OVERLOAD_COOLDOWN = max(10, 15 if _OVERLOAD_CONFIG == 120 else _OVERLOAD_CONFIG)
 GEMINI_OVERLOAD_RETRY_WAIT = max(0.0, tools._env_float("DISCORD_AI_GEMINI_OVERLOAD_RETRY_WAIT", 1.5))    # 主模型 503：等一下換金鑰重試一次
-GEMINI_CALL_TIMEOUT_MS = max(5000, tools._env_int("DISCORD_AI_GEMINI_CALL_TIMEOUT_MS", 20000))   # 10-03：一次卡 148 秒
+GEMINI_CALL_TIMEOUT_MS = max(5000, tools._env_int("DISCORD_AI_GEMINI_CALL_TIMEOUT_MS", 12000))   # 10-03：一次卡 148 秒；10-07：504 塞車白等 20 秒→12 秒就換金鑰／模型（正常回答約 6～8 秒）
 _TIMEOUT_RE = re.compile(r"timed? ?out|timeout|ReadTimeout|deadline exceeded", re.IGNORECASE)
 GEMINI_MINUTE_COOLDOWN = 60                                                                          # 每分鐘限流：這把金鑰×模型暫停
 _OVERLOAD_RE = re.compile(r"\b503\b|UNAVAILABLE|overloaded|high demand|\b500\b|INTERNAL", re.IGNORECASE)
@@ -2371,6 +2396,7 @@ AI_CARD_SCHEMA = {
 
 FINAL_CARD_FORMAT = """輸出格式（艾斯 AI 解讀）：只輸出符合 schema 的 JSON，不要 Markdown、不要星號或條列符號。你是在「解讀」，不是在整理資料：K 線、均線、評分卡與關鍵價位表已經在圖上，文字要說明這些訊號代表什麼。
 - answer：這段會以粗體呈現，只放1～2句短結論，通常30～60字、最多80字；複合問題直接點出各面向的判斷與最重要限制，不把所有依據塞在這裡。數字只有關鍵價位才引用，不逐項報均線、量比或分點名單；詳情放why。從這題最重要的處境或訊號切入，不固定以結構偏強弱開頭，不保證漲跌、不替人決定買賣。
+- 支撐／壓力依距離由近到遠寫，最近的先講（含「近價大量區」），不可跳過近的直接講季線；均線的 limit_proof 寫「跌停也續揚」時視為強支撐（「漲停也續彎」視為強壓力），fail_price 是明天收盤要守住的價位。
 - 語氣方向跟著結構走：多頭排列、量增、沿上軌等偏強結構先寫偏強；偏弱先寫偏弱；多空抵銷才寫中性。風險寫成條件（若跌破／若量縮…），不可讓風險蓋過主要判斷，summary 方向和 answer 一致。不寫空泛警語：「風險不容忽視」「需謹慎」「宜保守」「而非追價」「不宜追高」「短期波動風險」這類沒有價位條件的提醒都不要。不可寫「假突破／假跌破」「突破成功／失敗」「型態失效」這類結論。
 - why：按需要解釋關鍵證據如何支持答案；若answer已說清楚可留空。型態與趨勢只能引用kline_patterns，不重報評分或所有指標。
 - scenarios：依原問句選擇0～2個有必要的觀察條件，可留空，不強制多空各一個。title用短標直接點出本題要觀察的變化，不套固定情境名稱；text 用「若收盤…／若跌破…，代表…」的條件式，30～70 字，要有具體觀察價位。只陳述條件與意義，不預測漲跌、不給買賣指令；使用者問操作策略／進出場／停損時也一樣，不寫「建議買進／賣出／停損設在…」，改成要觀察的價位與條件。從K線型態、支撐壓力、量價、均線與布林中選擇能回答本題的證據，不固定順序；why只談真正影響本題答案的面向，不為了湊數羅列指標。K 線型態名稱（箱型、三角收斂、上升／下降趨勢、缺口、紅三兵、吞噬、晨星、十字線、長上／下影線等）只能引用 kline_patterns 有列出的，不可自己判斷；突破狀態照原文的客觀事實描述（價格在上下緣的哪裡、突破後第幾天）；「○○ 起形成」是型態起點、「○○ 收盤向上突破」是突破日，兩個日期不可混用或互換，kline_patterns 有「創近 N 日新高／新低」「越過前高／跌破前低」「脫離近 N 日盤整區」時，與本題相關才在answer或why解釋，用詞照原文（越過、脫離、創高），價位與日期照抄；不可自行下「突破成功／失敗」「假突破／假跌破」「型態失效」這類結論，也不可解讀成偏多或偏空；recent_bars_10（近 10 日 日期 開 高 低 收）與 ma_recent_3d 只用來描述近期走勢與均線方向。answer 第一句要直接回答使用者問的事。均線排列一定照資料寫：MA5<MA10<MA20<MA60 是空頭排列，不可說成多方架構強勢、多方掌控；反之亦然；單日紅K或帶量不等於結構轉多。情境要和目前結構一致：均線空頭排列時，偏多情境寫成「轉強條件」（例「若收盤站穩季線並突破布林上軌，才有機會扭轉空頭排列」），不可寫「多方續攻」「開啟新一波漲勢」這種已經轉多或預測漲勢的說法；均線多頭排列時，偏空情境同理寫成「轉弱條件」。新聞、三大法人或沒有可觀察價位的問題給空陣列。
@@ -2464,11 +2490,16 @@ def _compact_tool_data(name: str, data: Dict[str, Any], has_scorecard: bool) -> 
         data["bollinger"] = {k: v for k, v in (data.get("bollinger") or {}).items() if k in _BOLLINGER_KEEP}
         data_full_patterns = data.get("kline_patterns") or {}
         data["kline_patterns"] = (data_full_patterns.get("summary") or []) + [f"資料旗標：{f}" for f in data_full_patterns.get("flags") or []]   # 白話結論＋旗標（§12）
+        triangle_structure = data_full_patterns.get("triangle")   # 10-07：三角正式／候選身分與完整事件，不能被摘要掉
+        if triangle_structure:
+            data["triangle_structure"] = triangle_structure
         if has_scorecard:
             # 均線值、排列、扣抵都在評分卡；這裡只留評分卡沒有的 KD／MACD 訊號與布林狀態。
             data = {k: data.get(k) for k in ("stock_code", "data_date", "signal_status", "intraday_observation", "kd", "macd", "bollinger",
                                              "ma20_cross_recent_3_days", "ma_kline_signals", "recent_bars_10", "ma_recent_3d")}
             data["kline_patterns"] = ((data_full_patterns or {}).get("summary") or []) + [f"資料旗標：{f}" for f in (data_full_patterns or {}).get("flags") or []]
+            if triangle_structure:
+                data["triangle_structure"] = triangle_structure
             b = data.get("bollinger") or {}
             data["bollinger"] = {k: b.get(k) for k in ("position", "width_trend", "band_walk") if b.get(k)}   # 布林只留一句狀態
             data["kd"] = {"signals": (data.get("kd") or {}).get("signals")}
@@ -6474,7 +6505,7 @@ class AceQueryEngine:
                 plan.add("get_market_institutional", market=market_of(parsed))
                 if "futures" not in parsed.intents:
                     plan.tool_calls = [c for c in plan.tool_calls if c.name != "get_futures_positions"]
-        if plan.route in ("help", "rule_stock_bundle") and not (unknown_codes(parsed) and not parsed.stocks):
+        if (plan.route in ("help", "rule_stock_bundle") or plan.uncertain) and not (unknown_codes(parsed) and not parsed.stocks):
             # 規則沒把握（看不懂，或認得股票但看不出要問什麼）→ 1 次 Gemini 用「完整原句」分類，程式再檢查；
             # 寫了代號但名冊查不到（0000）：直接說查不到，不花 1 次 Gemini 去猜
             plan = self._classify_fallback(question, parsed, stats) or plan
@@ -6599,18 +6630,19 @@ class AceQueryEngine:
             if flow:
                 panels.append({"branch_card": institutional_card(flow, question), "hide_text": True})
         if plan.route == "rule_branch_stock" and warrant_ok:
-            history = next((r.data for r in results if r.ok and r.name == "get_branch_stock_history"), None)
             chart_panel = next((p for p in panels if p.get("stock_code") and p.get("bars")), None)
             numbers: Dict[str, int] = {}
             for mark in answer_image._mark_events(chart_panel) if chart_panel else []:
                 if mark.get("no") and mark.get("buy_date"):
                     numbers.setdefault(str(mark["buy_date"]), int(mark["no"]))
-            card = branch_stock_events_card(history, numbers, len((chart_panel or {}).get("bars") or [])) if history else None
-            if card:
-                # 保留清單排版；不關掉原計畫的 AI，讓它回答報酬與白話提問。
-                panels.append({"branch_card": card, "hide_text": not plan.need_final_llm})
-                if chart_panel:
-                    chart_panel["hide_mark_table"] = True   # 完整清單在下方卡片，K 線下只有 70 日的標註表不重複畫
+            histories = [r.data for r in results if r.ok and r.name == "get_branch_stock_history" and r.data]
+            for history in histories:
+                card = branch_stock_events_card(history, numbers, len((chart_panel or {}).get("bars") or []),
+                                                compact=len(histories) > 1)   # 多分點：精簡卡，圖片不要太長
+                if card:   # 一個分點一張卡；保留清單排版，不關掉原計畫的 AI
+                    panels.append({"branch_card": card, "hide_text": not plan.need_final_llm})
+                    if chart_panel:
+                        chart_panel["hide_mark_table"] = True   # 完整清單在下方卡片，K 線下只有 70 日的標註表不重複畫
         elif "warrant" in parsed.intents and warrant_ok and plan.route != "rule_branch":
             chips = next((r.data for r in results if r.ok and r.name == "get_sheet_stock_chips"), None)
             summary = warrant_summary_card(chips) if chips else None
@@ -6971,6 +7003,10 @@ class AceQueryEngine:
                 return text
             pruned, removed = prune_ungrounded_sentences(text, payload, facts)
             removed_all.extend(removed)
+            if pruned and removed:
+                # 刪句後條列重新編號（「1.…3.…」→「1.…2.…」）；小數（1.6 倍）後面接數字不會被當成編號
+                count = iter(range(1, 100))
+                pruned = re.sub(r"(?<![\d.])\d{1,2}\.(?=\D)", lambda m: f"{next(count)}.", pruned)
             return pruned.strip() if pruned and not facts.check(pruned) else ""
 
         card = dict(card)

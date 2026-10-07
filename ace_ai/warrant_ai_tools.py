@@ -103,7 +103,7 @@ NEWS_LOOKBACK_DAYS = _env_int("DISCORD_AI_NEWS_LOOKBACK_DAYS", 14)
 NEWS_CNYES_MAX_ITEMS = _env_int("DISCORD_AI_NEWS_CNYES_MAX_ITEMS", 8)
 NEWS_CNYES_BODY_ITEMS = _env_int("DISCORD_AI_NEWS_CNYES_BODY_ITEMS", 5)
 NEWS_ARTICLE_TIMEOUT = _env_float("DISCORD_AI_NEWS_ARTICLE_TIMEOUT", 6.0)
-NEWS_BODY_BATCH_TIMEOUT = _env_float("DISCORD_AI_NEWS_BODY_BATCH_TIMEOUT", 8.0)
+NEWS_BODY_BATCH_TIMEOUT = _env_float("DISCORD_AI_NEWS_BODY_BATCH_TIMEOUT", 4.0)   # 10-07：8→4 秒，鉅亨內文逾時不拖住回答
 NEWS_CONTENT_MAX_CHARS = _env_int("DISCORD_AI_NEWS_CONTENT_MAX_CHARS", 1500)
 TAIPEI_TZ = timezone(timedelta(hours=8))
 TEXT_CELL_MAX_CHARS = 120
@@ -267,6 +267,9 @@ _FM_BG_LOGGED = {"day": ""}
 def finmind_background_allowed() -> bool:
     """背景作業（補資料、算分數）只在目前 Token 還剩一半以上額度時才用 FinMind（10-04：會員優先）。
     第一支用到一半就停，第二支完整留給會員；查不到用量時保守不用。"""
+    tokens = finmind_tokens()
+    if tokens and current_finmind_token() != tokens[0]:
+        return False                              # 10-07：背景只用第一支；第一支冷卻後第二、三支完整留給會員
     usage = finmind_usage()
     limit, remaining = usage.get("limit") or 0, usage.get("remaining")
     ok = bool(usage.get("available") and limit and remaining is not None and remaining >= limit * FINMIND_BACKGROUND_MIN_REMAINING)
@@ -2384,6 +2387,12 @@ def _load_price_bundle(stock_code: str, spot_history_mode: bool = False) -> Dict
             # 停牌股永遠 gap>5，每次都重抓 FinMind 也拿不到新的；今天確認過一次就不再問。
             if gap <= 5 or _STALE_CHECKED.get(code) == (today, local_last):
                 return persistent["df"], str(persistent.get("market") or ""), "本地69日歷史快取"
+        if current_api_priority() == "background" and not finmind_background_allowed():
+            # 10-07：背景（型態分數底庫等）抓日K原本不受額度保護，冷門股湊不滿 69 根就每輪打 FinMind，部署後一次吃光 3 支 Token。
+            # 額度不足時背景只用本地市場底庫；底庫也沒有就跳過，等會員查詢時再抓。
+            if persistent and persistent.get("count", 0) >= 30:
+                return persistent["df"], str(persistent.get("market") or ""), "本地市場底庫（背景）"
+            raise ToolDataError(f"{code} 背景保留 FinMind 額度給會員，暫不抓日K")
         try:
             started = time.perf_counter()
             stock_df, market, _ = kf.fetch_stock_data_yf(code, period=PRICE_FETCH_PERIOD)
@@ -2783,6 +2792,10 @@ def analyze_ma_deduction(df: pd.DataFrame, periods: Sequence[int] = (5, 10, 20, 
             "turn": turn,
             "turn_day": turn_day,
             "turn_text": turn_phrase(turn, turn_day),
+            # 失敗值＝明天要扣掉的價格：上揚均線收盤低於它才轉彎；比跌停價還低＝跌停也續揚（強支撐）
+            "fail_price": _num(deductions[0]),
+            "limit_proof": ("跌停也續揚" if now == "上揚" and deductions[0] < close * 0.9
+                            else "漲停也續彎" if now == "下彎" and deductions[0] > close * 1.1 else ""),
             "ma_above_close": above_close,
             "signal": signal,
         }
@@ -2923,8 +2936,13 @@ def _kline_patterns(df: pd.DataFrame, code: str = "", provisional_today: bool = 
     try:
         import kline_patterns
         events = get_corporate_actions(code) if code else None
-        result = kline_patterns.detect(df, events, provisional_today)
-        return {k: result.get(k) for k in ("summary", "names", "levels", "flags", "atr20")}
+        result = kline_patterns.detect(df, events, provisional_today, state_key=f"tri_state_{code}" if code else "")
+        out = {k: result.get(k) for k in ("summary", "names", "levels", "flags", "atr20")}
+        shape = (result.get("observations") or {}).get("structure")
+        if shape and "candidate" in shape:          # 10-07：三角正式／候選身分與完整事件紀錄給 AI
+            out["triangle"] = {k: shape.get(k) for k in ("kind", "candidate", "candidate_reasons", "validity", "state",
+                                                          "current_position", "pattern_events", "near_tip")}
+        return out
     except Exception as exc:                       # 型態判斷失敗不影響其他技術資料
         print(f"⚠️ K 線型態判斷略過｜{err_text(exc)}", flush=True)
         return {}
@@ -3071,8 +3089,30 @@ def get_volume_profile(stock_code: str) -> Dict[str, Any]:
             return "收盤在兩大量區之下" if not bundle.get("intraday") else "現價在兩大量區之下"
         return "收盤在兩大量區之間" if not bundle.get("intraday") else "現價在兩大量區之間"
 
+    def near_zones() -> List[Dict[str, Any]]:
+        # 量達最大量價位 5 成以上的相鄰價位合併成一區；取收盤上下最近各一個（與兩大量區重疊的不列）
+        cut = float(profile[max_idx]) * NEAR_ZONE_RATIO
+        groups, cur = [], []
+        for i in range(len(centers)):
+            if profile[i] >= cut and profile[i] > 0:
+                cur.append(i)
+            elif cur:
+                groups.append(cur)
+                cur = []
+        if cur:
+            groups.append(cur)
+        groups = [g for g in groups if max_idx not in g and second_idx not in g]
+        below = [g for g in groups if float(bins[g[0]]) <= close]
+        above = [g for g in groups if float(bins[g[0]]) > close]
+        out = []
+        for g in ([max(below, key=lambda g: bins[g[0]])] if below else []) + ([min(above, key=lambda g: bins[g[0]])] if above else []):
+            out.append({"label": "近價大量區", "price_low": _num(float(bins[g[0]])), "price_high": _num(float(bins[g[-1] + 1])),
+                        "relative_strength_pct": _num(max(profile[i] for i in g) / profile[max_idx] * 100)})
+        return out
+
     recent_event = str(pattern.get("recent_maximum_zone_pattern", "") or "")
     return {
+        "near_volume_zones": near_zones() if profile[max_idx] > 0 else [],
         "stock_code": code,
         "stock_name": name,
         "data_date": _fmt_date(bundle["df"].index[-1] if LIVE_PATTERN_SCORE and bundle.get("intraday") else plot_df.index[-1]),
@@ -3798,11 +3838,10 @@ def get_recent_news(stock_code: str, limit: int = NEWS_MAX_ITEMS) -> Dict[str, A
     def build() -> Dict[str, Any]:
         cached_points = kf._load_gsheet_news_points_cache_for_display(code, name, allow_stale=False)
         cnyes: List[Dict[str, Any]] = []
-        if NEWS_CNYES_ENABLE:
-            try:
-                cnyes = fetch_cnyes_news(code, name)
-            except Exception as exc:  # 鉅亨失敗時仍有六來源標題
-                print(f"⚠️ {code} 鉅亨新聞略過：{type(exc).__name__}: {exc}", flush=True)
+        # 10-07：鉅亨與六來源同時抓（原本先等鉅亨，內文逾時白等 6 秒）
+        from concurrent.futures import ThreadPoolExecutor
+        cnyes_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ace-cnyes-search") if NEWS_CNYES_ENABLE else None
+        cnyes_future = cnyes_pool.submit(fetch_cnyes_news, code, name) if cnyes_pool else None
         others = []
         try:
             articles = kf.fetch_multi_source_news_articles(code, name, max_items=kf.NEWS_GOOGLE_MAX_ITEMS)
@@ -3810,6 +3849,12 @@ def get_recent_news(stock_code: str, limit: int = NEWS_MAX_ITEMS) -> Dict[str, A
         except Exception as exc:
             print(f"⚠️ {code} 六來源新聞略過：{type(exc).__name__}: {exc}", flush=True)
             articles = []
+        if cnyes_future is not None:
+            try:
+                cnyes = cnyes_future.result(timeout=NEWS_BODY_BATCH_TIMEOUT + 8)
+            except Exception as exc:  # 鉅亨失敗時仍有六來源標題
+                print(f"⚠️ {code} 鉅亨新聞略過：{type(exc).__name__}: {exc}", flush=True)
+            cnyes_pool.shutdown(wait=False, cancel_futures=True)
         seen = [a["title"][:14] for a in cnyes]
         for article in articles:
             title = kf._clean_news_title(article.get("title", ""))
@@ -5965,6 +6010,9 @@ def chart_flow_marks_for_stock(
 # 持股成本位置（型態／操作類問題用；只整理價位，不下買賣指令）
 # ============================================================
 
+NEAR_ZONE_RATIO = _env_float("NEAR_VOLUME_ZONE_RATIO", 0.5)
+
+
 def key_price_levels(tech: Dict[str, Any], vp: Dict[str, Any]) -> Dict[str, Any]:
     """現價上下方的關鍵價位（均線、附近大量區、布林三軌），附距現價 %；全部來自既有計算結果。
 
@@ -6006,6 +6054,8 @@ def key_price_levels(tech: Dict[str, Any], vp: Dict[str, Any]) -> Dict[str, Any]
     for key, label in (("maximum_volume_zone", "最大量區"), ("second_volume_zone", "第二大量區")):
         zone = vp.get(key) or {}
         add_zone(label, zone.get("price_low"), zone.get("price_high"))
+    for zone in vp.get("near_volume_zones") or []:      # 10-06：前兩大以外、靠近收盤的大量區（聯電 09 月初整理區）
+        add_zone("近價大量區", zone.get("price_low"), zone.get("price_high"))
     bb = tech.get("bollinger") or {}
     add("布林上軌", bb.get("upper"), "bollinger")
     add("布林下軌", bb.get("lower"), "bollinger")  # 布林中軌就是 MA20，不重複列

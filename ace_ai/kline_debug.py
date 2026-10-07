@@ -65,11 +65,27 @@ def load_panel(code: str) -> dict[str, Any]:
     if frame.empty:
         raise ValueError("沒有可使用的正式收盤日 K")
     events = tools.get_corporate_actions(code)
-    return build_panel(frame, events, code, name)
+    return build_panel(frame, events, code, name, state_key=f"tri_state_{code}")
 
 
-def build_panel(frame: pd.DataFrame, events: dict | None, code: str, name: str = "") -> dict:
-    result = kline_patterns.detect(frame, events, include_debug=True)
+def _state_summary(state_key: str) -> str:
+    """三角存檔摘要（重啟前後比對用）：as_of、revision、正式紀錄數、各筆首次突破（辨識）日。"""
+    store = kline_patterns._tri_store()
+    if store is None:
+        return "三角存檔：未啟用（不是正式資料庫，未讀寫）"
+    try:
+        st = store.get_state(state_key) or {}
+    except Exception as exc:
+        return f"三角存檔：讀取失敗（{type(exc).__name__}）"
+    if not st:
+        return "三角存檔：尚無紀錄"
+    recs = st.get("records") or []
+    firsts = "、".join(r.get("recognized", "")[5:] + ("（回溯）" if r.get("reconstructed_at") else "") for r in recs) or "無"
+    return f"三角存檔：as_of {st.get('as_of')}｜revision {st.get('revision', 0)}｜正式紀錄 {len(recs)} 筆｜首次突破 {firsts}"
+
+
+def build_panel(frame: pd.DataFrame, events: dict | None, code: str, name: str = "", state_key: str = "") -> dict:
+    result = kline_patterns.detect(frame, events, include_debug=True, state_key=state_key)
     snapshot = result.get("debug")
     if not snapshot:
         raise ValueError("；".join(result.get("summary") or ["日 K 資料不足或無法判定"]))
@@ -88,7 +104,8 @@ def build_panel(frame: pd.DataFrame, events: dict | None, code: str, name: str =
                             "triangle": result.get("triangle"),
                             "formation": result.get("formation"), "ended": result.get("ended"),
                             "invalid": snapshot.get("invalid"), "trend": snapshot.get("trend"),
-                            "summary": result["summary"], "flags": result.get("flags") or [],
+                            "summary": result["summary"],
+                            "flags": (result.get("flags") or []) + ([_state_summary(state_key)] if state_key else []),
                             "atr20": result.get("atr20"), "break_multiplier": snapshot["break_multiplier"],
                             "retest_multiplier": snapshot["retest_multiplier"]}}
 
@@ -108,6 +125,7 @@ def line_specs(data: dict) -> list[dict]:
             anchors = list(triangle["anchors"][edge])
             lines.append({"label": label, "coef": triangle[edge],
                           "start": anchors[0], "fit_end": anchors[-1], "stop": last,
+                          "ref_end": triangle.get("reference_until") or -1,   # 參考線段（收斂區間之前）畫虛線
                           "anchors": anchors, "color": color, "historical": False})
     elif False and formation:   # 10-06：驗證圖只畫新三角；舊算法的整理線（通道、楔形）不再畫，避免兩套線混在一起
         # 10-06：舊算法的歷史線若上下同方向（楔形／通道）不畫，避免 2421 那種離譜的灰線
@@ -203,7 +221,12 @@ def render(data: dict) -> Image.Image:
     if chosen and chosen.get("bday") is not None and start <= chosen["bday"] <= end:
         xx = px(chosen["bday"])
         draw.line((xx, top, xx, bottom), fill="#BFC7D3", width=2)
-        text(min(xx + 5, right - 210), top - 31, "突破日 " + bars[chosen["bday"]]["date"][5:], 21, ink)
+        first = chosen.get("first_bday")
+        label = ("突破日 " + bars[chosen["bday"]]["date"][5:]) if first in (None, chosen["bday"]) else \
+            f"首次 {bars[first]['date'][5:]}｜最近 {bars[chosen['bday']]['date'][5:]}"   # 再次突破時首次日期也要看得到
+        if first not in (None, chosen["bday"]) and start <= first <= end:
+            draw.line((px(first), top, px(first), bottom), fill="#D8DEE6", width=2)
+        text(min(xx + 5, right - 260), top - 31, label, 21, ink)
 
     for i in range(start, end + 1):
         bar = bars[i]
@@ -217,7 +240,7 @@ def render(data: dict) -> Image.Image:
         a, b = max(start, line["start"]), min(end, line["stop"])
         s, k = line["coef"]
         for i in range(a, b):
-            if i >= line["fit_end"] or line["historical"]:
+            if i >= line["fit_end"] or line["historical"] or i < line.get("ref_end", -1):
                 for t0, t1 in ((0.0, 0.32), (0.55, 0.87)):
                     draw.line((px(i + t0), py(s * (i + t0) + k), px(i + t1), py(s * (i + t1) + k)), fill=line["color"], width=3)
             else:
