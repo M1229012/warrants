@@ -2925,7 +2925,7 @@ def _kline_patterns(df: pd.DataFrame, code: str = "", provisional_today: bool = 
     try:
         import kline_patterns
         events = get_corporate_actions(code) if code else None
-        result = kline_patterns.detect(df, events, provisional_today)
+        result = kline_patterns.detect(df, events, provisional_today, replay_days=kline_patterns.TRI_BREAK_RECENT)   # 10-08：正式版無三角存檔，只重播最近 5 日
         return {k: result.get(k) for k in ("summary", "names", "levels", "flags", "atr20")}
     except Exception as exc:                       # 型態判斷失敗不影響其他技術資料
         print(f"⚠️ K 線型態判斷略過｜{err_text(exc)}", flush=True)

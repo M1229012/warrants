@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
@@ -356,7 +357,7 @@ def _event_status(ev: Dict, day: int, c, h, l, official: bool) -> Tuple[str, Lis
 
 
 # ---------------------------------------------------------------- §6 趨勢
-def trend(piv: List[Dict], c, ma20, atr_prev, day: int) -> Optional[Dict[str, Any]]:
+def trend(piv: List[Dict], c, ma20, atr_prev, day: int, ohlc=None) -> Optional[Dict[str, Any]]:
     atr = atr_prev[day]
     if np.isnan(atr) or day < 6 or np.isnan(ma20[day]) or np.isnan(ma20[day - 5]):
         return None
@@ -370,21 +371,29 @@ def trend(piv: List[Dict], c, ma20, atr_prev, day: int) -> Optional[Dict[str, An
     if not (up or down):
         return None
     base = ls if up else hs
-    line = _at(_line(base[0], base[1]), day)
+    coef = _line(base[0], base[1])
+    if ohlc is not None:     # 10-06：趨勢線跟三角線同一套品質（碰線要回測、有反應、≥3 次）；只連兩點不算線
+        H, L, O = ohlc
+        A = np.where(np.isnan(atr_prev), np.nanmedian(atr_prev), atr_prev)
+        P, B, Q = (L, np.minimum(O, c), H) if up else (H, np.maximum(O, c), L)
+        q = _tri_line(P, B, Q, c, A, coef[0], coef[1], int(base[0]["idx"]), day - 1, -1 if up else 1, float(A[day - 1]))
+        if q is None or len(q["a"]) < 3 or q["brk"] is not None:
+            coef = None
+    line = _at(coef, day) if coef else None
     m = BREAK * atr
     kind = "上升趨勢" if up else "下降趨勢"
     notes = []
-    if up and c[day] < line - m:
+    if line is not None and up and c[day] < line - m:
         notes.append("跌破上升趨勢線")
-    if down and c[day] > line + m:
+    if line is not None and down and c[day] > line + m:
         notes.append("站上下降趨勢線")
     if up and c[day] < ls[1]["price"] - m:
         notes.append("原上升結構受破壞")
     if down and c[day] > hs[1]["price"] + m:
         notes.append("原下降結構受破壞")
-    text = f"{kind}（轉折高低點{'墊高' if up else '降低'}），趨勢線約 {_p(line)}" + ("；" + "、".join(notes) if notes else "")
-    return {"kind": kind, "line": _p(line), "notes": notes, "text": text,
-            "line_coefficients": _line(base[0], base[1]), "points": [dict(p) for p in base]}
+    text = f"{kind}（轉折高低點{'墊高' if up else '降低'}）" + (f"，趨勢線約 {_p(line)}" if line is not None else "")         + ("；" + "、".join(notes) if notes else "")
+    return {"kind": kind, "line": _p(line) if line is not None else None, "notes": notes, "text": text,
+            "line_coefficients": coef, "points": [dict(p) for p in base]}
 
 
 # ---------------------------------------------------------------- §7 缺口
@@ -556,9 +565,9 @@ def trend_observation(tr: Optional[Dict], closes, atr_prev, day: int, provisiona
     sign = 1 if tr["kind"] == "上升趨勢" else -1
     close, margin = closes[day], BREAK * atr_prev[day]
     last_pivot = tr["points"][-1]["price"]
-    line = _at(tr["line_coefficients"], day)
+    line = _at(tr["line_coefficients"], day) if tr.get("line_coefficients") else None
     status = ("broken" if (close - last_pivot) * sign < -margin else
-              "line_crossed" if (close - line) * sign < -margin else "intact")
+              "line_crossed" if line is not None and (close - line) * sign < -margin else "intact")
     return {"kind": tr["kind"], "state": status, "is_provisional": provisional}
 
 
@@ -637,81 +646,595 @@ def levels_break(df: pd.DataFrame, piv: List[Dict], atr_prev, today: int) -> Dic
     return {"text": text, "names": names, "observations": observations}
 
 
-# ---------------------------------------------------------------- §4b 使用者畫法三角（09-30 使用者手繪 40+ 張歸納）
-TRI_DAYS, TRI_TOUCH, TRI_RECENT = int(_env("TRI_DAYS", 180)), _env("TRI_TOUCH", 0.3), int(_env("TRI_RECENT", 20))
-TRI_UP_POKE, TRI_DN_POKE, TRI_POKES, TRI_FLAT = _env("TRI_UP_POKE", 2.0), _env("TRI_DN_POKE", 1.5), int(_env("TRI_POKES", 3)), _env("TRI_FLAT", 1.0)
+# ---------------------------------------------------------------- §4b 三角（10-07 v2：形成截止日 F、逐日 ATR、獨立碰線事件、整組排序）
+# 三角＝上下兩條趨勢線聚合，通常在尖端前表態。流程：
+#   1) 形成截止日 F：還在形成＝昨天；近期突破 b＝F=b-1。候選線、碰線、轉折、品質都只用 F 時已知的資料（快照不因 F 後資料改變）。
+#   2) 每根 K 的誤差用自己的 atr_prev[t]（已只含 t-1 以前）；斜率用起點 ATR、型態高度用共同起點 ATR。
+#   3) 碰線＝獨立事件：碰線後要有收盤離線 ≥0.6 ATR 的分離證據，再碰才算下一次；同日碰上下緣不算交替。
+#   4) 整組排序：兩側較少的主要轉折 → 主要轉折總數 → 兩側較少的碰線 → 碰線總數 → 反應 → 假突破少 → 貼線誤差小。
+#   5) F 之後只掃事件（突破、回到型態內、反向突破），不回頭改形成期。
+TRI_DAYS = int(_env("TRI_DAYS", 150))       # 往回找幾根
+TRI_PIVOT = int(_env("TRI_PIVOT", 3))       # 局部轉折＝前後 3 日內最高／最低，idx+3 日才可用
+TRI_TOUCH = _env("TRI_TOUCH", 0.4)          # 碰線：影線或實體距線 0.4 ATR（當日）內
+TRI_SEP = _env("TRI_SEP", 0.6)              # 分離證據：收盤向內離線 0.6 ATR（當日）
+TRI_OUT = _env("TRI_OUT", 0.15)             # 收盤穿出 0.15 ATR＝穿出（歷史與今日同一門檻）
+TRI_OUT_MAX = _env("TRI_OUT_MAX", 1.0)      # 收盤穿出 >1 ATR＝線被破
+TRI_POKE_MAX = _env("TRI_POKE_MAX", 2.0)    # 影線刺穿 >2 ATR＝線被破
+TRI_BACK = int(_env("TRI_BACK", 2))         # 小幅穿出 2 天內收回＝假突破；第 3 天還在外＝線被破
+TRI_BREAK_RECENT = int(_env("TRI_BREAK_RECENT", 5))
+# 往回重建最近 5 天內的突破（逐日重播窗口；已知限制：窗口首日沒有更早的固定紀錄可帶，試過暖機 10 日反而更糟，已撤回）
+TRI_REACT = _env("TRI_REACT", 1.0)          # 碰線後 5 日內離線 1 ATR＝有反應
+TRI_RECENT = int(_env("TRI_RECENT", 25))    # 兩線在 F 前 25 日內都要有碰線事件
+TRI_TIP = _env("TRI_TIP", 0.15)             # F 時寬度 <15%：標「接近尖端」
+TRI_TIP_BREAK = _env("TRI_TIP_BREAK", 0.08)  # F 時寬度 <8%：已收到尖端＝不成立（同一政策，不分突破前後）
+TRI_NARROW = _env("TRI_NARROW", 0.65)       # F 時寬度 ≤ 共同起點的 65%＝收斂
+TRI_FLAT = _env("TRI_FLAT", 1.0)
+TRI_MAJOR_POKE = _env("TRI_MAJOR_POKE", 0.4)   # 主要轉折實體刺穿 >0.4 ATR＝線作廢；影線刺穿 >0.4 ATR＝扣分
+TRI_MIN_HEIGHT = _env("TRI_MIN_HEIGHT", 3.0)   # 共同起點寬度 ≥3 ATR（共同起點日 ATR）
 
 
-def _tri_lines(H, L, O, C, A, upper: bool, lo: int, end: int, first: Optional[set] = None) -> List[Dict[str, Any]]:
-    """單邊候選線：局部轉折（左右各 2 根）的影線或實體兩兩相連；收盤不可有效穿越、影線刺穿有上限、接觸 3 日內合併。
-    first 有給時只用這些 index 當第一個錨點（上緣＝整理區最高峰）。"""
-    top, bot = np.maximum(O, C), np.minimum(O, C)
-    wick, body = (H, top) if upper else (L, bot)
-    sg = 1 if upper else -1
-    ext = (lambda v, i: v[i] == v[i - 2:i + 3].max()) if upper else (lambda v, i: v[i] == v[i - 2:i + 3].min())
-    piv = [i for i in range(max(lo, 2), end - 1) if ext(wick, i) or ext(body, i)]
-    firsts = sorted(first) if first else piv
-    x_all = np.arange(end + 1)
-    out = []
-    for i in firsts:
-        for j in piv:
-            if j - i < 5:
+def _tri_turns(P, sg: int, lo: int, last: int) -> List[int]:
+    """局部轉折：前後 TRI_PIVOT 日內最高（sg=1）／最低（sg=-1）；右邊 TRI_PIVOT 天確認，只回傳到 last 已可用者。"""
+    w = TRI_PIVOT
+    key = (id(P), sg, len(P))
+    full = _TURN_CACHE.get(key) if _TURN_CACHE.get("on") else None
+    if full is None:
+        full = [t for t in range(0, len(P) - w) if P[t] * sg >= (P[max(0, t - w):t + w + 1] * sg).max()]
+        if _TURN_CACHE.get("on"):
+            _TURN_CACHE[key] = full
+    return [t for t in full if lo <= t <= last - w]
+
+
+_TURN_CACHE: Dict[Any, Any] = {}               # 只在 user_triangle 呼叫期間啟用，結束清空（避免 id 重用）
+
+
+def _tri_line(P, B, Q, C, A, s: float, k: float, i0: int, last: int, sg: int, ref: Optional[float] = None,
+              majors=(), src_major: Optional[int] = None, confirm: bool = True) -> Optional[Dict[str, Any]]:
+    """驗證一條線在形成截止日 F（＝last）的品質；A＝逐日 ATR。sg=1 上緣（P=高、B=實體頂、Q=低），-1 下緣。
+    majors＝[(idx, confirm)] 或 [idx]；只用 confirm ≤ F 的。None＝線被破或品質不足（含原因不回傳，呼叫端只需要合格線）。"""
+    F = last
+    line = lambda t: s * t + k
+    if np.isnan(A[i0:F + 1]).any():
+        return None                               # ATR 不足不硬判（不用未來或中位數補值）
+    fake_days: List[int] = []
+    touches: List[int] = []                       # 每根實際碰線 K 棒都保留
+    run = 0
+    for t in range(i0, F + 1):
+        a, y = A[t], line(t)
+        if (P[t] - y) * sg > TRI_POKE_MAX * a:
+            return None                           # 影線刺穿太深
+        out = (C[t] - y) * sg
+        if out > TRI_OUT * a:
+            run += 1
+            if out > TRI_OUT_MAX * a or run > TRI_BACK:
+                return None                       # 真突破：線在 F 前已被破
+            fake_days.append(t)
+        else:
+            run = 0
+        if out > TRI_OUT * a or ((P[t] - y) * sg >= -TRI_TOUCH * a and (B[t] - y) * sg <= TRI_TOUCH * a):
+            touches.append(t)
+    # 獨立回測波段（v5）：只用已確認的接觸（t+TRI_PIVOT ≤ F）建立正式事件；未確認接觸另存 pending，不充數。
+    # 新事件 b：事件內任一較早接觸 a 與 b 之間，要有已確認的反向轉折 v（Q 的局部轉折、v+TRI_PIVOT ≤ F），
+    # 且 g(v)−g(a)、g(v)−g(b) ≥ TRI_REACT×A[v]（g＝收盤向內離線距離）；否則同一波段。
+    # confirm=False（三角候選）：未確認接觸也納入、v 不要求是已確認轉折，只用來標「候選」。
+    g = lambda t: (line(t) - C[t]) * sg
+    conf = [t for t in touches if not confirm or t + TRI_PIVOT <= F]
+    pending = [t for t in touches if t + TRI_PIVOT > F]          # 依確認期限獨立計算（候選模式也一樣）
+    confirmed_turns = set(_tri_turns(Q, -sg, i0, F))
+    turns_v = confirmed_turns if confirm else None
+    reasons: set = set()
+    events: List[Dict[str, Any]] = []
+    for t in conf:
+        if events:
+            days = events[-1]["days"]
+            sep = next((v for v in range(days[0] + 1, t)
+                        if (turns_v is None or v in turns_v) and v + (TRI_PIVOT if confirm else 0) <= F
+                        and g(v) - g(t) >= TRI_REACT * A[v]
+                        and any(x < v and g(v) - g(x) >= TRI_REACT * A[v] for x in days)), None)
+            if sep is None:
+                days.append(t)
+                events[-1]["fake"] = events[-1]["fake"] or t in fake_days
                 continue
-            for pi, pj in ((wick, wick), (wick, body), (body, wick), (body, body)):
-                s = (pj[j] - pi[i]) / (j - i); k = pi[i] - s * i
-                x = x_all[i:end]                                     # 形成期到前一日；今天另判突破
-                ln = s * x + k
-                if ((C[x] - ln) * sg > 0.5 * A[x]).any():
-                    continue
-                poke = (wick[x] - ln) * sg
-                if (poke > (TRI_UP_POKE if upper else TRI_DN_POKE) * A[x]).any() or (poke > TRI_TOUCH * A[x]).sum() > TRI_POKES:
-                    continue
-                hit = x[(np.abs(wick[x] - ln) <= TRI_TOUCH * A[x]) | (np.abs(body[x] - ln) <= TRI_TOUCH * A[x])]
-                groups, last = 0, -99
-                for h in hit:
-                    groups += h - last >= 3
-                    last = h
-                if groups < (2 if upper else 3) or hit[-1] < end - TRI_RECENT:
-                    continue
-                out.append({"s": float(s), "k": float(k), "a": (int(i), int(j)), "g": int(groups)})
+            if not confirm and sep not in confirmed_turns:
+                reasons.add("反向轉折未確認")
+        else:
+            sep = None
+        if not confirm and t in pending:
+            reasons.add("接觸尚待確認")
+        events.append({"rep": t, "days": [t], "sep": sep, "react": None, "fake": t in fake_days})
+    if run:
+        return None                               # F 當天收在線外：F 不是形成期
+    if len(events) < 2 or F - touches[-1] > TRI_RECENT:
+        return None
+    fakes = sum(1 for i, t in enumerate(fake_days) if i == 0 or t - fake_days[i - 1] > 1)
+    if fakes > 2:
+        return None                               # 假突破最多 2 段
+    reacted = 0
+    for ev in events:
+        e = ev["days"][-1]
+        for n in range(e + 1, min(e + 6, F + 1)):
+            if (line(n) - Q[n]) * sg >= TRI_REACT * A[n]:
+                ev["react"] = n
+                reacted += 1
+                break
+    if reacted < 1:
+        return None
+    mj = [(m if not isinstance(m, tuple) else m) for m in majors]
+    mj = [(m[0], m[1]) if isinstance(m, tuple) else (m, m) for m in mj]
+    mj = [m for m, c in mj if c <= F and i0 - 3 <= m <= F]
+    fake_set = set(fake_days)
+    for m in mj:
+        if m > i0 + 3 and m not in fake_set and (B[m] - line(m)) * sg > TRI_MAJOR_POKE * A[m]:
+            return None                           # 主要轉折實體刺穿線＝線畫錯（假突破日除外）
+    contact = {d: ev for ev in events for d in ev["days"]}
+    near = lambda m: m in contact and (P[m] - line(m)) * sg >= -TRI_TOUCH * A[m] and (B[m] - line(m)) * sg <= TRI_TOUCH * A[m]
+    touched = {m for m in mj if near(m)}
+    if src_major is not None and src_major in mj and events and events[0]["rep"] == i0:
+        touched.add(src_major)                   # 起點借用的主要轉折＝第一事件的來源（只加這一個）
+    pierced = {m for m in mj if m > i0 + 3 and m not in fake_set and (P[m] - line(m)) * sg > TRI_MAJOR_POKE * A[m]}
+    turns = set(_tri_turns(P, sg, i0, F))
+    zone = lambda d: max(0.0, (line(d) - P[d]) * sg, (B[d] - line(d)) * sg) / A[d]   # 線落在影線區間內＝0
+    err = float(np.mean([min(zone(d) for d in ev["days"]) for ev in events]))
+    return {"s": float(s), "k": float(k), "i0": int(i0), "a": [ev["rep"] for ev in events], "events": events,
+            "major": len(touched) - len(pierced), "mtouch": len(touched), "reacted": reacted, "fakes": fakes,
+            "peaks": sum(1 for ev in events if turns.intersection(ev["days"])), "err": err,
+            "turn_events": sum(1 for ev in events if (turns | set(mj)).intersection(ev["days"])),
+            "density": len(contact), "score": reacted, "brk": None, "R_line": float(A[i0]), "pending": pending,
+            "reasons": sorted(reasons)}
+
+
+def _tri_lines(P, B, Q, C, A, lo: int, F: int, sg: int, majors: List[Tuple[int, int]],
+               confirm: bool = True) -> List[Dict[str, Any]]:
+    """F 時已可用的轉折點兩兩連線；起點可在主要轉折前後 3 根（可用日＝該主要轉折確認日）。"""
+    mj = [(m, c) for m, c in majors if c <= F and lo <= m]
+    anchors = {t: t + TRI_PIVOT for t in _tri_turns(P, sg, lo, F)}
+    for m, c in mj:
+        anchors[m] = min(anchors.get(m, c), c)
+    pts = [(t, float(v), "影線" if v == P[t] else "實體" if v == B[t] else "實體內")
+           for t in sorted(anchors) for v in {P[t], B[t], B[t] - sg * TRI_TOUCH * A[t]}]
+    near_m = {t: m for m, c in mj for t in range(m - 3, m + 4) if lo <= t <= F and t not in anchors}
+    starts = sorted(pts + [(t, float(v), "近轉折") for t in near_m for v in {P[t], B[t]}])
+    out = []
+    for x1, y1, src1 in starts:
+        R = A[x1]
+        for x2, y2, src2 in pts:
+            if x2 - x1 < 3:
+                continue
+            s = (y2 - y1) / (x2 - x1)
+            if s * sg > 0.3 * R / 60 or abs(s) > (0.12 if sg > 0 else 0.2) * R:
+                continue                          # 斜率尺度＝起點 ATR
+            r = _tri_line(P, B, Q, C, A, s, y1 - s * x1, x1, F, sg, majors=mj, src_major=near_m.get(x1), confirm=confirm)
+            if r:
+                r.update(src=(x1, src1, x2, src2))
+                out.append(r)
+    out.sort(key=lambda r: (-r["major"], -len(r["a"]), -r["peaks"], -r["reacted"], r["err"], r["src"]))
+    uniq: List[Dict[str, Any]] = []
+    for r in out:
+        def same(u):
+            x0 = max(r["i0"], u["i0"])
+            g = lambda x: abs((r["s"] - u["s"]) * x + r["k"] - u["k"])
+            return max(g(x0), g(F)) <= 0.2 * A[x0]   # 共同期間兩端都接近（共同起點 ATR）才算同一條
+        if not any(same(u) for u in uniq):
+            uniq.append(r)
+        if len(uniq) >= 30:
+            break
+    # 分層：主要轉折與最高差 1 以內，層內碰線與最多者差 1 以內
+    layer = [x for x in uniq if x["major"] >= uniq[0]["major"] - 1] if uniq else []
+    top = max((len(x["a"]) for x in layer), default=0)
+    return [x for x in layer if len(x["a"]) >= top - 1]
+
+
+def _tri_sequence(u, d) -> List[Tuple[int, str]]:
+    """上下緣共用的「順序明確接觸序列」：每個事件取第一個不是同日雙側的接觸日；整個事件都不明才略過。
+    交替次數與初期高度都用這份序列。"""
+    ud = {t for ev in u["events"] for t in ev["days"]}
+    dd = {t for ev in d["events"] for t in ev["days"]}
+    both = ud & dd
+    seq = []
+    for side, ln in (("U", u), ("D", d)):
+        for ev in ln["events"]:
+            clear = [t for t in ev["days"] if t not in both]
+            if clear:
+                seq.append((clear[0], side))
+    return sorted(seq)
+
+
+def _tri_alternations(u, d) -> int:
+    seq = [x for _, x in _tri_sequence(u, d)]
+    return sum(1 for x, y in zip(seq, seq[1:]) if x != y)
+
+
+def _tri_height(H, L, O, C, A, u, d) -> Optional[Dict[str, Any]]:
+    """初期接觸高度：_tri_sequence 最早 4 個交替接觸（U-D-U-D 或 D-U-D-U）。
+    接觸價＝線值夾在 [實體頂, High]（上緣）／[Low, 實體底]（下緣）；H＝最高上緣接觸價−最低下緣接觸價；
+    R_height＝四接觸首日至末日逐日 ATR 中位數。"""
+    top, bot = np.maximum(O, C), np.minimum(O, C)
+    pick: List[Tuple[int, str]] = []
+    for t, side in _tri_sequence(u, d):
+        if not pick or pick[-1][1] != side:
+            pick.append((t, side))
+        if len(pick) == 4:
+            break
+    if len(pick) < 4:
+        return None
+    price = lambda t, side: (min(max(u["s"] * t + u["k"], top[t]), H[t]) if side == "U"
+                             else max(min(d["s"] * t + d["k"], bot[t]), L[t]))
+    hi = max(price(t, x) for t, x in pick if x == "U")
+    lo_ = min(price(t, x) for t, x in pick if x == "D")
+    return {"H": float(hi - lo_), "R": float(np.nanmedian(A[pick[0][0]:pick[-1][0] + 1])),
+            "contacts": [(int(t), x) for t, x in pick]}
+
+
+def _tri_form(H, L, O, C, A, lo: int, F: int, piv, confirm: bool = True, local: bool = False) -> Optional[Dict[str, Any]]:
+    """形成截止日 F 的三角快照（只用 F 時已知資料）。confirm=False＝三角候選（未確認接觸也算）。
+    local=True＝補充候選：主要轉折支持不足時，改要求每側 ≥2 個含已確認局部／主要轉折的接觸事件、且至少 1 個主要轉折。"""
+    top, bot = np.maximum(O, C), np.minimum(O, C)
+    mh = [(p["idx"], p["confirm"]) for p in piv if p["type"] == "H"]
+    ml = [(p["idx"], p["confirm"]) for p in piv if p["type"] == "L"]
+    ups = _tri_lines(H, top, L, C, A, lo, F, 1, mh, confirm)
+    dns = _tri_lines(L, bot, H, C, A, lo, F, -1, ml, confirm) if ups else []
+    best = None
+    for u in ups:
+        for d in dns:
+            support = (min(u["turn_events"], d["turn_events"]) >= 2 and min(u["mtouch"], d["mtouch"]) >= 1) if local \
+                else min(u["mtouch"], d["mtouch"]) >= 2
+            if not support or len(u["a"]) + len(d["a"]) < 5:
+                continue                          # 每側 2 個主要轉折、合計 5 次碰線事件
+            start = min(u["a"][0], d["a"][0])     # formation_start：兩側有效首接觸較早者
+            joint = max(u["i0"], d["i0"])         # joint_start：兩線都開始的共同幾何起點
+            if F - start < 15:
+                continue
+            hgt = _tri_height(H, L, O, C, A, u, d)
+            if hgt is None or hgt["H"] < TRI_MIN_HEIGHT * hgt["R"]:
+                continue                          # 初期接觸高度 H ≥ 3×R_height
+            w0 = (u["s"] - d["s"]) * joint + u["k"] - d["k"]
+            wF = (u["s"] - d["s"]) * F + u["k"] - d["k"]
+            if wF <= 0 or w0 <= 0 or wF > TRI_NARROW * w0 or wF < TRI_TIP_BREAK * w0:
+                continue                          # 共同開口 w0 只管收斂、尖端、交叉
+            if _tri_alternations(u, d) < 3:
+                continue
+            n = len(u["a"]) + len(d["a"])
+            key = (min(u["major"], d["major"]), u["major"] + d["major"], min(len(u["a"]), len(d["a"])), n,
+                   u["reacted"] + d["reacted"], -(u["fakes"] + d["fakes"]), -round(u["err"] + d["err"], 3),
+                   tuple(-x if isinstance(x, int) else 0 for x in u["src"] + d["src"]))
+            if best is None or key > best[0]:
+                best = (key, u, d, start, joint, w0, wF, hgt)
+    if not best:
+        return None
+    _, u, d, start, joint, w0, wF, hgt = best
+    return {"u": u, "d": d, "F": F, "start": start, "joint": joint, "R_geom": float(A[joint]), "w0": w0, "wF": wF,
+            "height": hgt, "near_tip": wF < TRI_TIP * w0, "joint_days": F - joint, "candidate": not confirm or local,
+            "reasons": (["主要轉折支持不足，局部轉折支持"] if local else [])
+            + (sorted(set(u.get("reasons", [])) | set(d.get("reasons", []))) if not confirm else [])}
+
+
+def _tri_kind(snap) -> str:
+    u, d, F = snap["u"], snap["d"], snap["F"]
+    level = lambda l: abs(l["s"]) * (F - l["i0"]) <= 0.5 * snap["R_geom"]
+    return "箱型整理" if level(u) and level(d) else "上升三角" if level(u) else "下降三角" if level(d) else "三角收斂"
+
+
+def _tri_track(df, C, A, snap, end: int) -> Dict[str, Any]:
+    """沿形成快照的固定上下線，逐日掃 F+1～end 的事件（門檻 TRI_OUT×當日 ATR）；交會後停止判位。"""
+    u, d = snap["u"], snap["d"]
+    up_at = lambda t: u["s"] * t + u["k"]
+    dn_at = lambda t: d["s"] * t + d["k"]
+    history: List[Dict[str, Any]] = []
+    pos, crossed = "inside", False
+    for t in range(snap["F"] + 1, end + 1):
+        if up_at(t) <= dn_at(t):
+            crossed = True
+            break
+        o = TRI_OUT * A[t]
+        strong = lambda dist: "強" if dist > TRI_OUT_MAX * A[t] else ""
+        if C[t] > up_at(t) + o and pos != "above":
+            history.append({"type": "break_up", "date": _d(df.index[t]), "idx": t, "strength": strong(C[t] - up_at(t))})
+            pos = "above"
+        elif C[t] < dn_at(t) - o and pos != "below":
+            history.append({"type": "break_down", "date": _d(df.index[t]), "idx": t, "strength": strong(dn_at(t) - C[t])})
+            pos = "below"
+        elif dn_at(t) <= C[t] <= up_at(t) and pos != "inside":
+            history.append({"type": "returned_inside", "date": _d(df.index[t]), "idx": t})
+            pos = "inside"
+    breaks = [h for h in history if h["type"] != "returned_inside"]
+    return {"history": history, "pos": pos, "crossed": crossed, "breaks": breaks,
+            "reversed": any(a["type"] != b["type"] for a, b in zip(breaks, breaks[1:]))}
+
+
+TRI_STATE_VERSION = "tri-v7"
+TRI_INIT_REPLAY = int(_env("TRI_INIT_REPLAY", 20))   # 沒有狀態快照時，從固定起點（今天往回 20 日）重播建立
+TRI_TRACK_DAYS = int(_env("TRI_TRACK_DAYS", 20))     # 已突破型態沿固定線追蹤最多 20 日（或交會）就結束
+
+
+def _tri_params_sig() -> str:
+    return "|".join(f"{k}={v}" for k, v in sorted(globals().items()) if k.startswith("TRI_") and isinstance(v, (int, float)))
+
+
+def _shift_snap(snap: Dict[str, Any], delta: int) -> Dict[str, Any]:
+    """快照所有 K 棒序號平移 delta（新序號＝舊＋delta），線截距同步換算；用來跨資料窗口保存／載入。"""
+    sh = lambda x: None if x is None else int(x) + delta
+    out = dict(snap)
+    for side in ("u", "d"):
+        ln = dict(snap[side])
+        ln["k"] = float(ln["k"]) - float(ln["s"]) * delta
+        ln["i0"] = sh(ln["i0"])
+        ln["a"] = [sh(x) for x in ln["a"]]
+        ln["events"] = [dict(e, rep=sh(e["rep"]), days=[sh(x) for x in e["days"]], sep=sh(e.get("sep")),
+                             react=sh(e.get("react"))) for e in ln["events"]]
+        ln["pending"] = [sh(x) for x in ln.get("pending", [])]
+        ln["src"] = tuple(sh(x) if isinstance(x, (int, np.integer)) else x for x in ln.get("src", ()))
+        out[side] = ln
+    for key in ("F", "start", "joint"):
+        out[key] = sh(snap[key])
+    out["height"] = dict(snap["height"], contacts=[(sh(t), x) for t, x in snap["height"]["contacts"]])
     return out
 
 
-def user_triangle(df: pd.DataFrame, atr_prev, end: int) -> Optional[Dict[str, Any]]:
-    """下緣＝起漲點→回檔低點的長上升支撐（≥3 次），上緣＝下緣起點後最高峰起畫（≥2 次，不可比下緣陡）。"""
+def _jsonable(x):
+    if isinstance(x, dict):
+        return {k: _jsonable(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        return [_jsonable(v) for v in x]
+    if isinstance(x, np.integer):
+        return int(x)
+    if isinstance(x, np.floating):
+        return float(x)
+    if isinstance(x, (np.bool_,)):
+        return bool(x)
+    return x
+
+
+def _tri_status(tr: Dict[str, Any]) -> str:
+    """一組型態事件的最新狀態（白話）。"""
+    if not tr["breaks"]:
+        return "仍在型態內"
+    b0, h = tr["breaks"][0], tr["history"][-1]
+    if tr["crossed"]:
+        return "已過交會點"
+    if h["type"] == "returned_inside":
+        return "後回內待確認"
+    if tr["reversed"]:
+        return f"{h['date']} 反向{'突破' if h['type'] == 'break_up' else '跌破'}"
+    return "仍在線外" if h is b0 else f"{h['date']} 再次同向"
+
+
+def user_triangle(df: pd.DataFrame, atr_prev, end: int, state: Optional[Dict[str, Any]] = None,
+                  out_state: Optional[Dict[str, Any]] = None, replay_days: Optional[int] = None) -> Optional[Dict[str, Any]]:
+    """end＝今天。單日選擇流程依日期執行，正式突破紀錄以「狀態快照」跨日保存：
+      state＝前次保存的快照（同規則版本、價格指紋相符才用），從它的截至日隔天補跑；沒有就從固定起點重播 TRI_INIT_REPLAY 日。
+      out_state（dict）會被填入新的快照（呼叫端決定是否寫入；盤中不寫）。
+    X 日：型態＝F=X−1 的正式快照（搜尋起點 lo_F＝max(first_valid, F−TRI_DAYS)），不成立看三角候選；
+          與已固定紀錄當日判定同型態就沿用固定線；正式型態、尚無紀錄、X 日收盤穿出 0.15×A[X] → 建立紀錄。
+    目前型態＝今天形成的正式／候選型態（同型態沿用固定線）；沒有時才用保留期限內、仍在追蹤的已突破型態。"""
+    _TURN_CACHE.clear()
+    _TURN_CACHE["on"] = True
+    try:
+        return _user_triangle(df, atr_prev, end, state, out_state, replay_days)
+    finally:
+        _TURN_CACHE.clear()
+
+
+def _user_triangle(df, atr_prev, end, state=None, out_state=None, replay_days=None):
     H, L, O, C = (df[k].to_numpy(dtype=float) for k in ("High", "Low", "Open", "Close"))
-    A = np.where(np.isnan(atr_prev), np.nanmedian(atr_prev), atr_prev)
-    lo = max(21, end - TRI_DAYS)
-    if end - lo < 30:
+    A = np.asarray(atr_prev, dtype=float)
+    last = end - 1
+    valid = np.where(~np.isnan(A))[0]
+    if not len(valid) or np.isnan(A[end]):
+        return None                               # ATR 資料不足
+    first_valid = int(valid[0])
+    dates = [ts.strftime("%Y-%m-%d") for ts in df.index]
+    pos = {d: i for i, d in enumerate(dates)}
+    forms: Dict[Tuple[int, bool], Any] = {}
+
+    def form(F: int, confirm: bool = True, local: bool = False):   # 每個截止日只算一次；搜尋起點依各自截止日計算
+        if (F, confirm, local) not in forms:
+            lo_F = max(first_valid, F - TRI_DAYS)
+            if F - lo_F < 30:
+                forms[(F, confirm, local)] = None
+            else:
+                piv = [p for p in zigzag(H[:F + 1], L[:F + 1], C[:F + 1], A[:F + 1]) if p["confirm"] <= F]
+                forms[(F, confirm, local)] = _tri_form(H, L, O, C, A, lo_F, F, piv, confirm, local)
+        return forms[(F, confirm, local)]
+
+    def same_shape(x, y, X: int) -> bool:         # 當日判定：共同有效期間起點與 X 日，上下緣都在 0.5 ATR 內
+        t0 = max(x["u"]["i0"], x["d"]["i0"], y["u"]["i0"], y["d"]["i0"])
+        return all(abs((x[e]["s"] - y[e]["s"]) * t + x[e]["k"] - y[e]["k"]) <= 0.5 * A[t]
+                   for e in ("u", "d") for t in (t0, X))
+
+    # 載入狀態快照：規則版本、參數、價格指紋（截至日前 30 根收盤）都要相符
+    sig = TRI_STATE_VERSION + "|" + _tri_params_sig()
+    bar_hash = lambda i: _bar_hash(O[i], H[i], L[i], C[i])
+    records: List[Dict[str, Any]] = []
+    start_X = max(first_valid + 31, end - (TRI_INIT_REPLAY if replay_days is None else max(0, int(replay_days))))   # 族群總覽等大量呼叫可設 0（只看今天）
+    reconstructed = True                          # 沒有有效快照：從固定起點重建，紀錄標「回溯辨識」
+    if state and state.get("sig") == sig and state.get("as_of") in pos and pos[state["as_of"]] <= end:
+        a = pos[state["as_of"]]
+        fp = state.get("fingerprint") or {}
+        mine = [d for d in dates[:a + 1] if d >= min(fp, default="9")]
+        if fp and mine == [d for d in sorted(fp) if d >= dates[0]] and all(bar_hash(pos[d]) == fp[d] for d in mine):
+            for r in state.get("records", []):
+                if r["F_date"] in pos and r["recognized"] in pos:
+                    records.append({"snap": _shift_snap(r["snap"], pos[r["F_date"]]), "recognized": pos[r["recognized"]],
+                                    "reconstructed_at": r.get("reconstructed_at")})
+            start_X, reconstructed = a + 1, False
+    run_day = dates[end]
+
+    def expired(r, X):                            # 1) 追蹤結束：辨識後超過 TRI_TRACK_DAYS，或兩線在 X 日前已交會
+        u, d = r["snap"]["u"], r["snap"]["d"]
+        return X - r["recognized"] > TRI_TRACK_DAYS or (u["s"] - d["s"]) * X + u["k"] - d["k"] <= 0
+    for X in range(start_X, end + 1):
+        records = [r for r in records if not expired(r, X)]   # 每天先清過期紀錄，再判斷新突破（逐日＝一次補算）
+        F = X - 1
+        pick = form(F) or form(F, False) or form(F, True, True)   # 正式 → 候選 → 補充候選（後兩者不建正式紀錄）
+        if pick is None or pick.get("candidate"):
+            continue
+        if any(same_shape(r["snap"], pick, X) for r in records):
+            continue
+        u, d = pick["u"], pick["d"]
+        o = TRI_OUT * A[X]
+        if C[X] > u["s"] * X + u["k"] + o or C[X] < d["s"] * X + d["k"] - o:
+            records.append({"snap": pick, "recognized": X,      # 當天主流程真的發出突破，才建立正式紀錄
+                            "reconstructed_at": run_day if reconstructed else None})
+    # 追蹤結束：超過 TRI_TRACK_DAYS 或已過交會點
+    tracks = {id(r): _tri_track(df, C, A, r["snap"], end) for r in records}
+    if out_state is not None:
+        out_state.clear()
+        out_state.update(_jsonable({
+            "sig": sig, "as_of": dates[end],
+            "fingerprint": {dates[i]: bar_hash(i) for i in range(0, end + 1)},
+            "records": [{"F_date": dates[r["snap"]["F"]], "recognized": dates[r["recognized"]],
+                         "reconstructed_at": r.get("reconstructed_at"),
+                         "snap": _shift_snap(r["snap"], -r["snap"]["F"])} for r in records]}))
+    keep_from = end - TRI_BREAK_RECENT
+    live = list(records)                          # 迴圈已清掉過期（>TRI_TRACK_DAYS 或交會）＝全部仍在追蹤
+    pick = form(last) or form(last, False) or (None if live else form(last, True, True))   # 補充候選不和仍在追蹤的正式突破競爭
+    own = next((r for r in records if pick is not None and same_shape(r["snap"], pick, end)), None)
+    if own is not None:
+        main = own["snap"]                        # 今天的型態就是先前已突破的那組：沿用固定線與首次日期
+    elif pick is not None:
+        main = pick
+    else:                                         # 今天沒有形成型態：只用保留期限內、仍在追蹤的已突破型態
+        recent = [r for r in records if r["recognized"] >= keep_from]   # 當主型態只用保留期限內辨識的（舊紀錄不因存在就當成目前成立）
+        own = recent[-1] if recent else None
+        main = own["snap"] if own else None
+    if main is None:
         return None
-    best = None
-    for d in _tri_lines(H, L, O, C, A, False, lo, end):
-        seg = np.arange(d["a"][0], end)
-        peaks = {int(seg[np.argmax(H[seg])]), int(seg[np.argmax(np.maximum(O, C)[seg])])}
-        for u in _tri_lines(H, L, O, C, A, True, d["a"][0], end, peaks):
-            if u["s"] > d["s"] * 0.5 or u["s"] * end + u["k"] <= d["s"] * end + d["k"]:
-                continue
-            key = (d["g"] + u["g"], end - d["a"][0])
-            if best is None or key > best[0]:
-                best = (key, u, d)
-    if not best:
-        return None
-    _, u, d = best
-    a_ref = float(np.nanmedian(A[end - 19:end + 1]))
-    flat = lambda l: abs(l["s"]) * (end - l["a"][0]) <= TRI_FLAT * a_ref
-    kind = ("箱型整理" if flat(u) and flat(d) else "上升三角" if flat(u) else "三角收斂" if u["s"] < 0 else "上升楔形")
+    tr = tracks.get(id(own)) if own is not None else _tri_track(df, C, A, main, end)
+    u, d, F = main["u"], main["d"], main["F"]
+    kind = _tri_kind(main)
     up, dn = u["s"] * end + u["k"], d["s"] * end + d["k"]
-    state = ("收盤向上突破上緣" if C[end] > up + BREAK * A[end] else "收盤向下跌破下緣" if C[end] < dn - BREAK * A[end]
-             else "位於型態內")
-    start = df.index[min(u["a"][0], d["a"][0])]
-    text = (f"{_d(start)} 起形成{kind}，最新收盤 {_p(C[end])}，{state}（上緣 {_p(up)}、下緣 {_p(dn)}；"
-            f"上緣接觸 {u['g']} 次、下緣 {d['g']} 次）")
-    return {"kind": kind, "upper": (u["s"], u["k"]), "lower": (d["s"], d["k"]), "anchors": {"upper": u["a"], "lower": d["a"]},
-            "state": state, "text": text}
+    breaks, posn = tr["breaks"], tr["pos"]
+    cand = bool(main.get("candidate"))
+    if cand:                                      # 候選：只描述價格相對候選線的位置，不產生正式突破
+        state_txt = {"above": "價格位於候選上緣之上", "below": "價格位於候選下緣之下"}.get(posn, "位於候選線之間")
+        if tr["crossed"]:
+            state_txt = "已過候選線交會點"
+        breaks, compat = [], "inside"
+    elif not breaks:
+        state_txt, compat = ("位於型態內" + ("（接近尖端）" if main["near_tip"] else "")), "inside"
+    else:
+        last_b = breaks[-1]
+        act = "收盤向上突破上緣" if last_b["type"] == "break_up" else "收盤向下跌破下緣"
+        state_txt = act if last_b["idx"] == end else f"{last_b['date']} {act}"
+        if tr["reversed"]:
+            state_txt = f"{breaks[0]['date']} {'突破' if breaks[0]['type'] == 'break_up' else '跌破'}後反向，" + state_txt
+        elif len(breaks) > 1:
+            state_txt = f"{breaks[0]['date']} 首次{'突破' if breaks[0]['type'] == 'break_up' else '跌破'}，" + state_txt + "（再次同向）"
+        if posn == "inside":
+            state_txt += "，今日回到型態內（待確認）"
+        compat = last_b["type"]
+    if tr["crossed"] and not cand:
+        state_txt += "（已過上下緣交會點，位置不適用）"
+    rec_out = []
+    for r in records:                             # 顯示：保留期限內辨識的紀錄＋目前型態本身的紀錄
+        if r["recognized"] < keep_from and r is not own:
+            continue
+        rt = tracks[id(r)]
+        b0 = rt["breaks"][0] if rt["breaks"] else None
+        rec_out.append({"kind": _tri_kind(r["snap"]), "formation_cutoff": _d(df.index[r["snap"]["F"]]),
+                        "recognized": _d(df.index[r["recognized"]]), "is_current": r is own,
+                        "event_date": _d(df.index[r["recognized"]]), "reconstructed_at": r.get("reconstructed_at"),
+                        "retrospective": bool(r.get("reconstructed_at")),   # 回溯辨識：不是當天實際發出的訊號
+                        "first_break": {k: v for k, v in b0.items() if k != "idx"} if b0 else None,
+                        "history": [{k: v for k, v in h.items() if k != "idx"} for h in rt["history"]],
+                        "status": _tri_status(rt), "failed": rt["reversed"],
+                        "upper": (r["snap"]["u"]["s"], r["snap"]["u"]["k"]), "lower": (r["snap"]["d"]["s"], r["snap"]["d"]["k"]),
+                        "_last": (rt["history"][-1]["idx"] if rt["history"] else r["recognized"])})
+    others = sorted([x for x in rec_out if not x["is_current"]], key=lambda x: x["_last"])
+    if others:                                    # 圖卡只留最近一組歷史型態的最新狀態，其餘見明細
+        o = others[-1]
+        fb = o["first_break"]
+        state_txt += (f"；歷史另一組{o['kind']}：{fb['date']} {'上破' if fb['type'] == 'break_up' else '下破'}，{o['status']}"
+                      + (f"；其餘 {len(others) - 1} 組見明細" if len(others) > 1 else ""))
+    for x in rec_out:
+        x.pop("_last")
+    reasons = main.get("reasons", [])
+    label = f"三角候選（{'、'.join(reasons) or '證據待確認'}）" if cand else kind
+    early = u if u["i0"] < d["i0"] else d          # 較早那條線在收斂區間前只有起點一次碰線＝參考線（2474 上緣 06/08）
+    ref_only = main["joint"] - main["start"] > 10 and sum(1 for t in early["a"] if t < main["joint"]) <= 1
+    lead = (f"{_d(df.index[main['start']])} 起{'上緣' if early is u else '下緣'}參考線、{_d(df.index[main['joint']])} 起收斂形成{label}"
+            if ref_only else f"{_d(df.index[main['start']])} 起形成{label}")
+    text = (f"{lead}，最新收盤 {_p(C[end])}，{state_txt}（上緣 {_p(up)}、下緣 {_p(dn)}；"
+            f"上緣碰線 {len(u['a'])} 次、下緣 {len(d['a'])} 次）")
+    hg = main["height"]
+    day = lambda ts: [_d(df.index[t]) for t in ts]
+    return {"kind": kind, "candidate": cand, "candidate_reasons": reasons,
+            "upper": (u["s"], u["k"]), "lower": (d["s"], d["k"]),
+            "anchors": {"upper": u["a"], "lower": d["a"]}, "state": state_txt, "pos": compat,
+            "current_position": "unknown" if tr["crossed"] else posn, "history": [] if cand else tr["history"],
+            "failed": tr["reversed"] and not cand, "pending": bool(breaks) and posn == "inside" and not tr["crossed"],
+            "first_break": breaks[0] if breaks else None, "first_bday": breaks[0]["idx"] if breaks else None,
+            "bday": breaks[-1]["idx"] if breaks else None, "eval": F, "text": text, "gap": None,
+            "start": main["start"], "joint_start": main["joint"], "near_tip": main["near_tip"],
+            "reference_until": main["joint"] if ref_only else None,
+            "height": {"H": hg["H"], "R_height": hg["R"], "contacts": [(_d(df.index[t]), x) for t, x in hg["contacts"]]},
+            "scale": {"R_geom": main["R_geom"], "R_geom_date": _d(df.index[main["joint"]]),
+                      "R_line_upper": u["R_line"], "R_line_lower": d["R_line"]},
+            "events": {"upper": u["events"], "lower": d["events"]},
+            "pending_touches": {"upper": day(u.get("pending", [])), "lower": day(d.get("pending", []))},
+            "recent_pattern_events": rec_out}
+
+
+def triangle_observation(df: pd.DataFrame, tri: Dict[str, Any], day: int, provisional: bool) -> Dict[str, Any]:
+    """AI 結構欄位：當前位置、最近突破事件、事件是否失敗分開給。"""
+    close, prev = float(df["Close"].iloc[day]), float(df["Close"].iloc[max(0, day - 1)])
+    bday = tri.get("bday")
+    cur = tri.get("current_position", "inside")
+    if tri.get("candidate"):
+        state = {"above": "outside_candidate_upper", "below": "outside_candidate_lower"}.get(cur, "inside_candidate")
+        validity = "candidate"                             # 候選：價格可在候選線外，但不是正式突破
+    elif cur == "unknown":
+        state, validity = "past_apex", "not_applicable"     # 已過交會點：不說目前在型態內
+    else:
+        state = tri["pos"] if cur in ("above", "below") else ("returned_inside" if bday is not None else "inside")
+        validity = "failed" if tri.get("failed") else "pending" if tri.get("pending") else "active"
+    return {"kind": tri["kind"], "candidate": bool(tri.get("candidate")), "candidate_reasons": tri.get("candidate_reasons", []),
+            "pattern_events": tri.get("recent_pattern_events", []), "validity": validity,
+            "state": state,
+            "current_position": cur, "events": [{"type": h["type"], "date": h["date"]} for h in tri.get("history", [])],
+            "near_tip": tri.get("near_tip", False),
+            "formation_date": df.index[tri["start"]].strftime("%Y-%m-%d"),
+            "event_date": df.index[bday].strftime("%Y-%m-%d") if bday is not None else None,
+            "event_age": day - bday if bday is not None else None,
+            "event_direction": (1 if tri["pos"] == "break_up" else -1) if bday is not None else None,
+            "is_provisional": provisional,
+            "daily_direction": "up" if close > prev else "down" if close < prev else "flat"}
+
+
+def _bar_hash(o, h, l, c) -> str:
+    import hashlib
+    return hashlib.md5(f"{o:.4f}|{h:.4f}|{l:.4f}|{c:.4f}".encode()).hexdigest()[:8]
+
+
+def _tri_same_prices(df: pd.DataFrame, state: Optional[Dict[str, Any]]) -> bool:
+    """這次請求的行情與已存快照的指紋（雙方都有的日期）完全一致。"""
+    fp = (state or {}).get("fingerprint") or {}
+    mine = {ts.strftime("%Y-%m-%d"): _bar_hash(*row) for ts, row in
+            zip(df.index, df[["Open", "High", "Low", "Close"]].to_numpy(dtype=float))}
+    if not fp or not mine:
+        return False
+    lo_d, hi_d = max(min(fp), min(mine)), min(max(fp), max(mine))   # 共同時間區間：容許前端截窗、尾端新增交易日
+    a = [d for d in sorted(fp) if lo_d <= d <= hi_d]
+    b = [d for d in sorted(mine) if lo_d <= d <= hi_d]
+    return bool(a) and a == b and all(fp[d] == mine[d] for d in a)   # 區間內日期序列（補入／刪除 K 棒）與逐日 OHLC 都要一致
+
+
+TRI_STATE_STORE: Any = None     # 測試可換成假儲存器；None＝正式資料庫（Railway /data 或 DISCORD_AI_TRI_STATE_DB=1 才啟用）
+
+
+def _tri_store():
+    if TRI_STATE_STORE is not None:
+        return TRI_STATE_STORE
+    try:
+        import local_market_cache
+    except Exception:
+        return None
+    on = Path(local_market_cache.DB_PATH).as_posix().startswith("/data") or os.getenv("DISCORD_AI_TRI_STATE_DB", "") == "1"
+    return local_market_cache if on else None
 
 
 def detect(df: pd.DataFrame, events: Optional[Dict[str, Any]] = None, provisional_today: bool = False,
-           *, include_debug: bool = False) -> Dict[str, Any]:
+           *, include_debug: bool = False, state_key: str = "", replay_days: Optional[int] = None) -> Dict[str, Any]:
     """provisional_today＝最後一根是盤中／收盤後暫定 K（§11）。回傳 {summary, names, flags, ...}。"""
     need = ["Open", "High", "Low", "Close"]
     if df is None or not set(need) <= set(df.columns):
@@ -798,10 +1321,11 @@ def detect(df: pd.DataFrame, events: Optional[Dict[str, Any]] = None, provisiona
         names.append(cur["kind"])
         levels += [f"{cur['kind']}上緣 {_p(up)}（上方候選壓力）", f"{cur['kind']}下緣 {_p(dn)}（下方候選支撐）"]
 
-    tr = trend(piv, c, ma20, atr_prev, last_official)
+    tr = trend(piv, c, ma20, atr_prev, last_official, (h, l, adj["Open"].to_numpy(dtype=float)))
     if tr:
         summary.insert(0, tr["text"])
         names.append(tr["kind"])
+    if tr and tr["line"] is not None:
         levels.append(f"趨勢線 {tr['line']}（{'下方候選支撐' if tr['line'] < c[today] else '上方候選壓力'}）")
     gp = gaps(adj, atr_prev, last_official, set(flags.get("F2_days") or []))
     summary += gp["text"]
@@ -828,13 +1352,47 @@ def detect(df: pd.DataFrame, events: Optional[Dict[str, Any]] = None, provisiona
     flag_text += flags.get("F2") or []
     if f3_recent or (ev and f3_window(ev["bday"], 20)) or f3_window(today, 5):
         flag_text.append("股數基準變動，量比可比性受限")
-    tri = None if ev else user_triangle(adj, atr_prev, last_official)   # 進行中的突破事件用固定線追蹤（時間正確），不覆蓋
-    if tri:     # §4b 使用者畫法三角優先：取代舊畫線型態的描述，避免兩套線互相矛盾
-        old = {"箱型整理", "上升三角", "下降三角", "對稱三角收斂", "上升楔形", "下降楔形", "上升通道", "下降通道"}
-        summary = [x for x in summary if "起形成" not in x and "原上緣" not in x and "原下緣" not in x]
-        names = [x for x in names if x not in old]
+    tri_state, new_state = None, {}
+    store = _tri_store() if state_key else None   # 三角正式突破紀錄的跨日狀態快照；盤中只讀不寫
+    if store is not None:
+        try:
+            tri_state = store.get_state(state_key)
+        except Exception as exc:
+            print(f"⚠️ 三角狀態讀取失敗｜{state_key}｜{type(exc).__name__}: {exc}", flush=True)
+    tri = user_triangle(adj, atr_prev, last_official, tri_state, new_state, replay_days)
+    for attempt in range(2):
+        if store is None or not new_state or provisional_today:
+            break
+        rev = int((tri_state or {}).get("revision") or 0)
+        new_state["revision"] = rev + 1
+        try:
+            if store.set_state_if_newer(state_key, new_state, "as_of", expect_revision=rev):
+                break
+            latest = store.get_state(state_key)        # 期間被別的請求更新：行情相同才重讀、重算一次
+            if (attempt or not latest or str(latest.get("as_of") or "") > str(new_state.get("as_of") or "")
+                    or not _tri_same_prices(adj, latest)):   # 行情不同（對方較新或已更正）：停止寫入，不用舊行情覆寫
+                print(f"ℹ️ 三角狀態未覆寫（已有較新或同時更新的結果）｜{state_key}｜{new_state.get('as_of')}", flush=True)
+                break
+            tri_state, new_state = latest, {}
+            tri = user_triangle(adj, atr_prev, last_official, tri_state, new_state, replay_days)
+        except Exception as exc:
+            print(f"⚠️ 三角狀態寫入失敗｜{state_key}｜{type(exc).__name__}: {exc}", flush=True)
+            break
+    # 10-06：三角只認新算法；有新三角時舊算法型態全部讓位，沒有時只拿掉舊算法的三角（楔形、通道、箱型保留）
+    old = {"箱型整理", "上升三角", "下降三角", "對稱三角收斂", "上升楔形", "下降楔形", "上升通道", "下降通道"}
+    drop = old if tri and not tri.get("candidate") else {"上升三角", "下降三角", "對稱三角收斂"}   # 候選不讓其他已確認型態讓位
+    summary = [x for x in summary if not any(o in x for o in drop)]
+    names = [x for x in names if x not in drop]
+    levels = [x for x in levels if not any(x.startswith(o) for o in drop)]
+    if shape_observation and shape_observation["kind"] in drop:
+        shape_observation = None
+    if tri:     # §4b 艾斯畫法三角：文字、名稱、價位、AI 結構欄位、驗證圖全部用同一個結果
         summary.insert(0, tri["text"])
-        names.insert(0, tri["kind"])
+        label = tri["kind"] + ("候選" if tri.get("candidate") else "")
+        names.insert(0, label)
+        levels += [f"{label}上緣 {_p(_at(tri['upper'], today))}（上方候選壓力）",
+                   f"{label}下緣 {_p(_at(tri['lower'], today))}（下方候選支撐）"]
+        shape_observation = triangle_observation(adj, tri, last_official, provisional_today)
     if not any(x for x in summary if not x.startswith("股價位於")):
         summary.insert(0, "目前沒有明確的整理型態或趨勢")
     result = {"summary": summary, "names": names, "levels": levels, "flags": flag_text, "triangle": tri,
