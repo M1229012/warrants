@@ -40,6 +40,8 @@ BACKFILL_BUDGET = float(os.getenv("DISCORD_AI_SPOT_BACKFILL_BUDGET", "25") or 25
 BACKGROUND_BUDGET = float(os.getenv("DISCORD_AI_SPOT_BACKGROUND_BUDGET", "600") or 600)
 # 型態＋籌碼整合頁：只等最近完整日這幾秒，歷史全部背景補
 QUICK_BUDGET = float(os.getenv("DISCORD_AI_SPOT_QUICK_BUDGET", "8") or 8)
+QUICK_FILL_DAYS = int(os.getenv("DISCORD_AI_SPOT_QUICK_FILL_DAYS", "3") or 3)          # 缺 ≤3 天：出圖前同步補
+QUICK_FILL_SECONDS = float(os.getenv("DISCORD_AI_SPOT_QUICK_FILL_SECONDS", "4") or 4)
 # 一般現股籌碼題（full／latest）同步階段只確保最近完整日，總時間上限；70 日歷史一律交給背景
 SYNC_BUDGET = float(os.getenv("DISCORD_AI_SPOT_SYNC_BUDGET", "10") or 10)
 # 單頁讀取逾時（秒）：來源很慢時不要一頁等 20 秒
@@ -190,11 +192,12 @@ def _note_pending(code: str) -> None:
         codes.append(code)
 
 
-def background_future(stock_code: str) -> Optional[Future]:
-    """這一檔正在背景補資料時，回傳補完會完成的 Future；沒有在補就回 None。"""
+def background_future(stock_code: str, include_done: bool = False) -> Optional[Future]:
+    """這一檔正在背景補資料時，回傳補完會完成的 Future；沒有在補就回 None。
+    include_done＝True：已補完的也回傳（10-08：背景比 Gemini 先補完時，仍要依它換圖）。"""
     with _BACKGROUND_GUARD:
         fut = _BACKGROUND_DONE.get(str(stock_code))
-    return fut if fut is not None and not fut.done() else None
+    return fut if fut is not None and (include_done or not fut.done()) else None
 _STOCK_LOCKS: Dict[str, threading.Lock] = {}
 _STOCK_LOCKS_GUARD = threading.Lock()
 _SOURCE_STATE = {"down_until": 0.0, "fails": 0}
@@ -1002,10 +1005,25 @@ def build_report(stock_code: str, mode: str = "full", now: Optional[datetime] = 
                            latest_date=dates[-1], lock_wait=0.5)
         progress["fetched"] += step.get("fetched", 0)
         progress["errors"] += step.get("errors", 0)
+    left = deadline - time.monotonic()
+    if mode == "quick" and not progress.get("cooldown") and not progress.get("errors"):
+        # 10-08：70 日窗口只缺少數幾天時，出圖前先同步補（通常 1～2 秒），直接顯示 70/70，不必靠事後換圖
+        window = dates[-REQUESTED_DAYS:]
+        st = local_market_cache.spot_day_status(stock_code, window)
+        missing = [d for d in window if (st.get(d) or {}).get("status") not in CONFIRMED_STATUSES]
+        if 0 < len(missing) <= QUICK_FILL_DAYS:
+            step = ensure_days(stock_code, missing, budget=max(left, QUICK_FILL_SECONDS), now=now, fetch_source=fetch_source,
+                               latest_date=dates[-1], lock_wait=0.5)
+            progress["fetched"] += step.get("fetched", 0)
+            progress["errors"] += step.get("errors", 0)
     t_fetched = time.perf_counter()
     statuses = local_market_cache.spot_day_status(stock_code, dates)   # 這一題只讀一次全窗口狀態，之後重用
     if mode != "latest":
         progress["remaining"] = _unresolved(stock_code, dates, statuses)
+        gaps = [f"{d}:{(statuses.get(d) or {}).get('status') or '無紀錄'}" for d in dates[-REQUESTED_DAYS:]
+                if (statuses.get(d) or {}).get("status") not in CONFIRMED_STATUSES]
+        if gaps:   # 10-08：缺哪幾天、什麼狀態（待更新／來源錯誤／無紀錄）
+            print(f"📭 現股分點缺日｜{stock_code}｜{len(gaps)} 天｜{'、'.join(gaps[:8])}", flush=True)
         if progress["remaining"] and not progress.get("errors"):
             # 來源這一題已經出錯就不排背景（避免一路撞壞掉的來源）；缺的歷史交給背景（同一檔只排一次、有佇列上限、來源冷卻中不排），這一題先用已有的資料回答
             progress["background"] = continue_in_background(stock_code, dates, dates[-1], (), fetch_source)

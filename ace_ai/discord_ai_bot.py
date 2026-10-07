@@ -5104,7 +5104,8 @@ class AceQueryEngine:
                 self._inflight.pop(key, None)
         self._bind_late_cache(result, key, not getattr(self._request_local, "spot_partial", False))
         # 10-06：這一題用到的現股資料只要還在背景補（籌碼、型態＋籌碼、指定分點…所有問法），補完就整題重算換圖
-        waits = [f for f in (spot_chip.background_future(c) for c in spot_chip.pending_codes()) if f is not None]
+        # 10-08：出圖時已交給背景（圖上有「補齊中」）的股票，回答完不管背景補完沒都要排換圖；已補完的立即重算
+        waits = [f for f in (spot_chip.background_future(c, include_done=True) for c in spot_chip.pending_codes()) if f is not None]
         fut = None
         if waits and result.spot_refresh is None:
             fut = Future()
