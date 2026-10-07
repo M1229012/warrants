@@ -1390,8 +1390,12 @@ def detect(df: pd.DataFrame, events: Optional[Dict[str, Any]] = None, provisiona
         summary.insert(0, tri["text"])
         label = tri["kind"] + ("候選" if tri.get("candidate") else "")
         names.insert(0, label)
-        levels += [f"{label}上緣 {_p(_at(tri['upper'], today))}（上方候選壓力）",
-                   f"{label}下緣 {_p(_at(tri['lower'], today))}（下方候選支撐）"]
+        if tri.get("first_bday") is not None:     # 10-08：已突破的固定線只驗證到形成截止日，不是現行支撐壓力
+            levels += [f"原{label}上緣 {_p(_at(tri['upper'], today))}（已突破，非現行支撐壓力）",
+                       f"原{label}下緣 {_p(_at(tri['lower'], today))}（已突破，非現行支撐壓力）"]
+        else:
+            levels += [f"{label}上緣 {_p(_at(tri['upper'], today))}（上方候選壓力）",
+                       f"{label}下緣 {_p(_at(tri['lower'], today))}（下方候選支撐）"]
         shape_observation = triangle_observation(adj, tri, last_official, provisional_today)
     if not any(x for x in summary if not x.startswith("股價位於")):
         summary.insert(0, "目前沒有明確的整理型態或趨勢")

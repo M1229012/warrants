@@ -38,6 +38,15 @@ def parse_code(question: str) -> str:
     return next(iter(codes))
 
 
+def parse_codes(question: str, limit: int = 10) -> list[str]:
+    """一次驗證多檔（10-06）：「型態驗證 2344 1608 2421」依輸入順序、最多 limit 檔；只有一檔時沿用 parse_code。"""
+    q=str(question or '').strip()
+    found=list(dict.fromkeys(c.upper() for c in re.findall(r'(?<![0-9A-Za-z])(?:[0-9]{4,6}[A-Za-z]?|TAIEX|TPEX)(?![0-9A-Za-z])',q,re.I)))
+    if len(found)<=1:return [parse_code(q)]
+    if not is_request(q):raise ValueError('請說：型態驗證 2344 1608（一次最多10檔）')
+    return found[:limit]
+
+
 def load_panel(code: str) -> dict[str, Any]:
     """僅管理員路由呼叫；沿用既有行情與公司行動入口。"""
     import warrant_ai_tools as tools
@@ -56,11 +65,27 @@ def load_panel(code: str) -> dict[str, Any]:
     if frame.empty:
         raise ValueError("沒有可使用的正式收盤日 K")
     events = tools.get_corporate_actions(code)
-    return build_panel(frame, events, code, name)
+    return build_panel(frame, events, code, name)   # 正式版沒有三角存檔（不傳 state_key）
 
 
-def build_panel(frame: pd.DataFrame, events: dict | None, code: str, name: str = "") -> dict:
-    result = kline_patterns.detect(frame, events, include_debug=True)
+def _state_summary(state_key: str) -> str:
+    """三角存檔摘要（重啟前後比對用）：as_of、revision、正式紀錄數、各筆首次突破（辨識）日。"""
+    store = kline_patterns._tri_store()
+    if store is None:
+        return "三角存檔：未啟用（不是正式資料庫，未讀寫）"
+    try:
+        st = store.get_state(state_key) or {}
+    except Exception as exc:
+        return f"三角存檔：讀取失敗（{type(exc).__name__}）"
+    if not st:
+        return "三角存檔：尚無紀錄"
+    recs = st.get("records") or []
+    firsts = "、".join(r.get("recognized", "")[5:] + ("（回溯）" if r.get("reconstructed_at") else "") for r in recs) or "無"
+    return f"三角存檔：as_of {st.get('as_of')}｜revision {st.get('revision', 0)}｜正式紀錄 {len(recs)} 筆｜首次突破 {firsts}"
+
+
+def build_panel(frame: pd.DataFrame, events: dict | None, code: str, name: str = "", state_key: str = "") -> dict:
+    result = kline_patterns.detect(frame, events, include_debug=True, state_key=state_key)
     snapshot = result.get("debug")
     if not snapshot:
         raise ValueError("；".join(result.get("summary") or ["日 K 資料不足或無法判定"]))
@@ -69,13 +94,18 @@ def build_panel(frame: pd.DataFrame, events: dict | None, code: str, name: str =
              **{k: float(row[k]) for k in ("Open", "High", "Low", "Close")},
              "Volume": float(row.get("Volume", 0)) if pd.notna(row.get("Volume", 0)) else 0.0}
             for day, row in used.iterrows()]
+    start = max(0, len(bars) - kline_patterns.SEARCH_DAYS)
+    tri = result.get("triangle")
+    if tri:   # 10-06：三角起點比 60 根更早（換尺度、長三角）時，顯示範圍跟著延伸，看得到抓了哪些點
+        start = max(0, min([start] + [int(a[0]) - 5 for a in tri["anchors"].values()]))
     return {"kline_debug": {"stock_code": code, "stock_name": name, "bars": bars,
-                            "display_start": max(0, len(bars) - kline_patterns.SEARCH_DAYS),
+                            "display_start": start,
                             "last_official": snapshot["last_official"], "pivots": result["pivots"],
                             "triangle": result.get("triangle"),
                             "formation": result.get("formation"), "ended": result.get("ended"),
                             "invalid": snapshot.get("invalid"), "trend": snapshot.get("trend"),
-                            "summary": result["summary"], "flags": result.get("flags") or [],
+                            "summary": result["summary"],
+                            "flags": (result.get("flags") or []) + ([_state_summary(state_key)] if state_key else []),
                             "atr20": result.get("atr20"), "break_multiplier": snapshot["break_multiplier"],
                             "retest_multiplier": snapshot["retest_multiplier"]}}
 
@@ -95,8 +125,11 @@ def line_specs(data: dict) -> list[dict]:
             anchors = list(triangle["anchors"][edge])
             lines.append({"label": label, "coef": triangle[edge],
                           "start": anchors[0], "fit_end": anchors[-1], "stop": last,
+                          "ref_end": triangle.get("reference_until") or -1,   # 參考線段（收斂區間之前）畫虛線
+                          "hist_from": triangle.get("first_bday") if triangle.get("first_bday") is not None else 10**9,   # 突破後＝歷史線（灰虛線）
                           "anchors": anchors, "color": color, "historical": False})
-    elif formation:
+    elif False and formation:   # 10-06：驗證圖只畫新三角；舊算法的整理線（通道、楔形）不再畫，避免兩套線混在一起
+        # 10-06：舊算法的歷史線若上下同方向（楔形／通道）不畫，避免 2421 那種離譜的灰線
         stop = min(last, formation.get("end_day", formation.get("inv_day", last)))
         for edge, label, color in (("upper", "上緣", "#C76C00"), ("lower", "下緣", "#1478B5")):
             lines.append({"label": label + ("（歷史）" if historical else ""),
@@ -140,7 +173,7 @@ def render(data: dict) -> Image.Image:
     for value in data.get("flags") or []:
         flags.extend(wrap("資料旗標：" + str(value), 21, width - 2 * margin))
     metrics = []
-    chosen = data.get("triangle") or data.get("formation") or data.get("ended") or data.get("invalid")
+    chosen = data.get("triangle")   # 10-06：突破日只標新三角（舊算法的線已不畫，標了像亂點）
     if chosen and chosen.get("ref") is not None:
         ref = chosen["ref"]
         metrics.append(f"型態 ATR 基準 {ref:.4f}｜突破距離 {data['break_multiplier'] * ref:.4f}｜回測半寬 {data['retest_multiplier'] * ref:.4f}")
@@ -189,7 +222,12 @@ def render(data: dict) -> Image.Image:
     if chosen and chosen.get("bday") is not None and start <= chosen["bday"] <= end:
         xx = px(chosen["bday"])
         draw.line((xx, top, xx, bottom), fill="#BFC7D3", width=2)
-        text(min(xx + 5, right - 210), top - 31, "突破日 " + bars[chosen["bday"]]["date"][5:], 21, ink)
+        first = chosen.get("first_bday")
+        label = ("突破日 " + bars[chosen["bday"]]["date"][5:]) if first in (None, chosen["bday"]) else \
+            f"首次 {bars[first]['date'][5:]}｜最近 {bars[chosen['bday']]['date'][5:]}"   # 再次突破時首次日期也要看得到
+        if first not in (None, chosen["bday"]) and start <= first <= end:
+            draw.line((px(first), top, px(first), bottom), fill="#D8DEE6", width=2)
+        text(min(xx + 5, right - 260), top - 31, label, 21, ink)
 
     for i in range(start, end + 1):
         bar = bars[i]
@@ -203,9 +241,10 @@ def render(data: dict) -> Image.Image:
         a, b = max(start, line["start"]), min(end, line["stop"])
         s, k = line["coef"]
         for i in range(a, b):
-            if i >= line["fit_end"] or line["historical"]:
+            if i >= line["fit_end"] or line["historical"] or i < line.get("ref_end", -1) or i >= line.get("hist_from", 10**9):
+                color = "#87909E" if i >= line.get("hist_from", 10**9) else line["color"]
                 for t0, t1 in ((0.0, 0.32), (0.55, 0.87)):
-                    draw.line((px(i + t0), py(s * (i + t0) + k), px(i + t1), py(s * (i + t1) + k)), fill=line["color"], width=3)
+                    draw.line((px(i + t0), py(s * (i + t0) + k), px(i + t1), py(s * (i + t1) + k)), fill=color, width=3)
             else:
                 draw.line((px(i), py(s * i + k), px(i + 1), py(s * (i + 1) + k)), fill=line["color"], width=3)
         for i in line["anchors"]:

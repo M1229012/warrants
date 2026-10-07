@@ -695,7 +695,7 @@ ADMIN_HELP_GROUPS = (
     ("會員統計", ("使用統計（可加近7天／本月／今日／累計）", "問答次數（前10名）", "問答次數完整名單（CSV）",
                   "熱門股票今日／近7天", "大家都問什麼類型的問題", "統計診斷")),
     ("額度（/額度 指令）", ("贈送 AI 次數", "設定身分組每日 AI 次數", "清除身分組每日設定", "查詢某人／身分組額度")),
-    ("型態驗證", ("型態驗證 2330（趨勢線、錨點、轉折確認日）",)),
+    ("型態驗證", ("型態驗證 2330（趨勢線、錨點、轉折確認日）", "型態驗證 2344 1608 2421（一次最多 10 檔，公開）")),
     ("本週精選", ("本週精選排名", "3006 幫我生成週精選文字", "這版確認，生成圖片")),
     ("草稿", ("直接說修改需求", "還原上一版", "目前草稿")),
     ("資料維護", ("系統狀態", "用量（含費用估算）", "錯誤紀錄", "更新市場底庫", "更新族群名冊", "匯出狀態／匯入狀態")),
@@ -5739,15 +5739,24 @@ class AceQueryEngine:
             return AnswerResult(text="型態驗證僅限管理員透過 /ace 使用。", route="admin_kline_denied",
                                 gemini_calls=0, elapsed=time.perf_counter()-started, as_text=True)
         try:
-            code = kline_debug.parse_code(question)
-            panel = kline_debug.load_panel(code)
+            codes = kline_debug.parse_codes(question)
         except Exception as exc:
-            self.log(f"型態驗證未完成｜{tools.err_text(exc)}")
             return AnswerResult(text="型態驗證未完成：" + tools.err_text(exc), route="admin_kline_error",
                                 gemini_calls=0, elapsed=time.perf_counter()-started, cacheable=False, as_text=True)
-        return AnswerResult(text="管理員型態驗證：沿用程式計算結果與價格基準；未使用 AI 畫線。",
-                            route="admin_kline_debug", gemini_calls=0, elapsed=time.perf_counter()-started,
-                            panels=[panel], cacheable=False, image_title=f"{code}｜型態驗證")
+        results = []
+        for code in codes:   # 10-08：一次多檔，每檔一張圖（第一張為主回覆，其餘接在後面）
+            try:
+                panel = kline_debug.load_panel(code)
+                results.append(AnswerResult(text="管理員型態驗證：沿用程式計算結果與價格基準；未使用 AI 畫線。",
+                                            route="admin_kline_debug", gemini_calls=0, elapsed=time.perf_counter()-started,
+                                            panels=[panel], cacheable=False, image_title=f"{code}｜型態驗證"))
+            except Exception as exc:
+                self.log(f"型態驗證未完成｜{code}｜{tools.err_text(exc)}")
+                results.append(AnswerResult(text=f"{code} 型態驗證未完成：" + tools.err_text(exc), route="admin_kline_error",
+                                            gemini_calls=0, elapsed=time.perf_counter()-started, cacheable=False, as_text=True))
+        first = results[0]
+        first.followups = list(first.followups) + results[1:]
+        return first
 
     def _answer_admin_command(self, question: str, started: float, context_key: str = "") -> Optional[AnswerResult]:
         """管理員維護指令；找不到對應指令時回 None（交給後面的精選／草稿流程）。"""
@@ -7064,7 +7073,7 @@ def schedule_late_ai_image(engine, original, target, make_files, no_mentions):
 
 PUBLIC_ANSWER_ROUTES = frozenset(("planner", "answer_cache"))
 # /ace 管理指令字眼：含內部狀態、路徑、快取、筆數、log 的回覆一開始就 ephemeral defer。
-_ADMIN_PRIVATE_RE = re.compile(r"型態驗證|驗證型態|趨勢線驗證|錯誤|ERROR|狀態|用量|使用量|USAGE|底庫|名冊|維護|DEBUG|LOG|日誌|快取|CACHE|草稿|說明|HELP|指令", re.IGNORECASE)
+_ADMIN_PRIVATE_RE = re.compile(r"錯誤|ERROR|狀態|用量|使用量|USAGE|底庫|名冊|維護|DEBUG|LOG|日誌|快取|CACHE|草稿|說明|HELP|指令", re.IGNORECASE)
 
 
 # 週精選（只有管理員能用）：排名、草稿、改稿、套用文字、精選圖片都公開，不會因為 ephemeral 重新整理後消失
@@ -8044,7 +8053,7 @@ def run_discord_bot(config: BotConfig) -> None:
         is_admin = admin_mode = access.admin_mode
         # /ask 與 /ace 的成功分析公開；/ace 管理指令（狀態、用量、底庫、維護、debug…）一開始就只給本人看，
         # 其他失敗類與管理類回覆在結果出來後改成只有本人看得到。
-        ephemeral = bool(config.ephemeral or (access.entry == "ace" and not demo and (_ADMIN_PRIVATE_RE.search(question) or kline_debug.is_request(question))))
+        ephemeral = bool(config.ephemeral or (access.entry == "ace" and not demo and (_ADMIN_PRIVATE_RE.search(question))))   # 10-08：型態驗證改公開
 
         async def send_private(title, text, panels=None, as_text=False, copy=False):
             followup = not ephemeral and interaction.response.is_done()
