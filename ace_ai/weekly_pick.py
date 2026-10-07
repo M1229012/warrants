@@ -431,9 +431,8 @@ def weekly_technical_score(pattern_score_100: Any) -> float:
 def _direction_points(d: Dict[str, Any], full: float) -> Tuple[float, str]:
     """均線方向＋扣抵推算：上揚且扣抵後不轉彎＝滿分；上揚但將轉下彎＝一半以下；下彎＝0。"""
     now, turn, day = d.get("direction_now"), d.get("turn"), d.get("turn_day")
-    # 分數看 5 日內第一次轉向；文字用 turn_text（3 日內來回轉向時是方向序列），一律標明收盤不變
-    text = str(d.get("turn_text") or tools.turn_phrase(turn, day))
-    when = text if text.startswith("收盤不變") else f"收盤不變{text}"
+    # 分數看 5 日內第一次轉向；文字用 turn_text（要守的價位條件），舊資料沒有才寫收盤不變推算
+    when = str(d.get("turn_text") or f"收盤不變{tools.turn_phrase(turn, day)}")
     if not now:
         return full / 2, "資料不足，給一半"
     if now == "上揚":

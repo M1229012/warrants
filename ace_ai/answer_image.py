@@ -1528,9 +1528,8 @@ def _level_note(label: str, card: dict) -> tuple[str, str]:
     if info:
         outlook, color = _deduction_outlook(info)
         plain = {'續揚': '持續上揚', '續彎': '持續下彎'}.get(outlook, outlook)
-        role = str(info.get('role_text') or '')
-        # 白話一行：「持續上揚，5 天後支撐上移到 34.92」（收盤不變推算）
-        tail = f"，5 天後{role.replace('至 ', '到 ')}" if role else ''
+        # 10-08：拿掉「5 天後支撐上移到…」（收盤不變推算，股價一變就誤導，也太長）
+        tail = ''
         if info.get('limit_proof'):      # 失敗值比跌停還低：跌停也續揚（扣抵條件強，不等於價格守得住）
             return f"{'MA20 ' if label == '布林中軌' else ''}{info['limit_proof']}（失敗值 {info['fail_price']:,.2f}）{tail}", UP
         return f"{'MA20 ' if label == '布林中軌' else ''}{plain}{tail}", color
@@ -1617,7 +1616,7 @@ def _deduction_chips(draw, x, y, width, card, dry) -> int:
     deduction = card.get('ma_deduction') or {}
     if not deduction:
         return 0
-    label = '均線扣抵（收盤不變推算）'
+    label = '均線扣抵'
     chips = []
     for key, info in deduction.items():
         outlook, color = _deduction_outlook(info)
@@ -1628,10 +1627,8 @@ def _deduction_chips(draw, x, y, width, card, dry) -> int:
     widths = [font(19, True).getlength(t) + 26 for t, _ in chips]
     start = x + font(20, True).getlength(label) + 16
     rows = _flow_rows(widths, width - (start - x), 10)
-    # 未來 3 日維持上揚門檻（扣抵價）：只列 MA5／MA20，收盤要高於這些價，均線才繼續往上
-    holds = [f"{k} {'、'.join(number(v) for v in deduction[k]['hold_prices_3d'])}"
-             for k in ('MA5', 'MA20') if (deduction.get(k) or {}).get('hold_prices_3d')]
-    hold_lines = wrap('未來 3 天收盤守住這些價，均線就會繼續往上：' + '｜'.join(holds), 19, width) if holds else []
+    # 10-08：轉向的均線已在標籤寫「後天收 X 以上才續揚」，不再另列 3 日扣抵價（字太多）
+    hold_lines: list[str] = []
     if not dry:
         draw.text((x, y + 17), label, font=font(20, True), fill=INK, anchor='lm')
         cx, cy = start, y
@@ -3288,8 +3285,12 @@ def text_card(text: str) -> dict:
 def render_answer(question: str, answer: str, panels: list[dict] | None = None,
                   *, title: str = '艾斯助手｜喬巴｜研究筆記', demo: bool = False) -> Image.Image:
     # 測試版所有舊分數卡都只保留技術價位，不輸出分數／分級／評分條。
-    panels = [dict(p, scorecard=dict(p['scorecard'], hide_score=True, card_title='技術位置', card_note='均線、價量與價位整理'))
-              if p.get('scorecard') else p for p in panels or []]
+    # 10-08：正式版拿掉評分卡前，DISCORD_AI_TEST_SHOW_SCORECARD=1（預設）照正式版顯示分數，方便比對評分修正。
+    if os.getenv('DISCORD_AI_TEST_SHOW_SCORECARD', '1').strip().lower() in ('1', 'true', 'yes', 'on'):
+        panels = list(panels or [])
+    else:
+        panels = [dict(p, scorecard=dict(p['scorecard'], hide_score=True, card_title='技術位置', card_note='均線、價量與價位整理'))
+                  if p.get('scorecard') else p for p in panels or []]
     clean_display=any((p.get('branch_card') or {}).get('clean_display') for p in panels)
     if clean_display:
         cleaned=[]
