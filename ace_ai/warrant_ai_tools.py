@@ -103,7 +103,7 @@ NEWS_LOOKBACK_DAYS = _env_int("DISCORD_AI_NEWS_LOOKBACK_DAYS", 14)
 NEWS_CNYES_MAX_ITEMS = _env_int("DISCORD_AI_NEWS_CNYES_MAX_ITEMS", 8)
 NEWS_CNYES_BODY_ITEMS = _env_int("DISCORD_AI_NEWS_CNYES_BODY_ITEMS", 5)
 NEWS_ARTICLE_TIMEOUT = _env_float("DISCORD_AI_NEWS_ARTICLE_TIMEOUT", 6.0)
-NEWS_BODY_BATCH_TIMEOUT = _env_float("DISCORD_AI_NEWS_BODY_BATCH_TIMEOUT", 8.0)
+NEWS_BODY_BATCH_TIMEOUT = _env_float("DISCORD_AI_NEWS_BODY_BATCH_TIMEOUT", 4.0)   # 10-07：8→4 秒，鉅亨內文逾時不拖住回答
 NEWS_CONTENT_MAX_CHARS = _env_int("DISCORD_AI_NEWS_CONTENT_MAX_CHARS", 1500)
 TAIPEI_TZ = timezone(timedelta(hours=8))
 TEXT_CELL_MAX_CHARS = 120
@@ -3813,11 +3813,10 @@ def get_recent_news(stock_code: str, limit: int = NEWS_MAX_ITEMS) -> Dict[str, A
     def build() -> Dict[str, Any]:
         cached_points = kf._load_gsheet_news_points_cache_for_display(code, name, allow_stale=False)
         cnyes: List[Dict[str, Any]] = []
-        if NEWS_CNYES_ENABLE:
-            try:
-                cnyes = fetch_cnyes_news(code, name)
-            except Exception as exc:  # 鉅亨失敗時仍有六來源標題
-                print(f"⚠️ {code} 鉅亨新聞略過：{type(exc).__name__}: {exc}", flush=True)
+        # 10-07：鉅亨與六來源同時抓（原本先等鉅亨，內文逾時白等 6 秒）
+        from concurrent.futures import ThreadPoolExecutor
+        cnyes_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ace-cnyes-search") if NEWS_CNYES_ENABLE else None
+        cnyes_future = cnyes_pool.submit(fetch_cnyes_news, code, name) if cnyes_pool else None
         others = []
         try:
             articles = kf.fetch_multi_source_news_articles(code, name, max_items=kf.NEWS_GOOGLE_MAX_ITEMS)
@@ -3825,6 +3824,12 @@ def get_recent_news(stock_code: str, limit: int = NEWS_MAX_ITEMS) -> Dict[str, A
         except Exception as exc:
             print(f"⚠️ {code} 六來源新聞略過：{type(exc).__name__}: {exc}", flush=True)
             articles = []
+        if cnyes_future is not None:
+            try:
+                cnyes = cnyes_future.result(timeout=NEWS_BODY_BATCH_TIMEOUT + 8)
+            except Exception as exc:  # 鉅亨失敗時仍有六來源標題
+                print(f"⚠️ {code} 鉅亨新聞略過：{type(exc).__name__}: {exc}", flush=True)
+            cnyes_pool.shutdown(wait=False, cancel_futures=True)
         seen = [a["title"][:14] for a in cnyes]
         for article in articles:
             title = kf._clean_news_title(article.get("title", ""))

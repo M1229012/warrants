@@ -1902,7 +1902,7 @@ _OVERLOAD_CONFIG = tools._env_int("DISCORD_AI_GEMINI_OVERLOAD_COOLDOWN", 15)
 # 將先前 env.example 的 120 秒預設一併遷移，避免舊 Railway 設定繼續鎖住所有模型。
 GEMINI_OVERLOAD_COOLDOWN = max(10, 15 if _OVERLOAD_CONFIG == 120 else _OVERLOAD_CONFIG)
 GEMINI_OVERLOAD_RETRY_WAIT = max(0.0, tools._env_float("DISCORD_AI_GEMINI_OVERLOAD_RETRY_WAIT", 1.5))    # 主模型 503：等一下換金鑰重試一次
-GEMINI_CALL_TIMEOUT_MS = max(5000, tools._env_int("DISCORD_AI_GEMINI_CALL_TIMEOUT_MS", 20000))   # 10-03：一次卡 148 秒
+GEMINI_CALL_TIMEOUT_MS = max(5000, tools._env_int("DISCORD_AI_GEMINI_CALL_TIMEOUT_MS", 12000))   # 10-03：一次卡 148 秒；10-07：504 塞車白等 20 秒→12 秒就換金鑰／模型（正常回答約 6～8 秒）
 _TIMEOUT_RE = re.compile(r"timed? ?out|timeout|ReadTimeout|deadline exceeded", re.IGNORECASE)
 GEMINI_MINUTE_COOLDOWN = 60                                                                          # 每分鐘限流：這把金鑰×模型暫停
 _OVERLOAD_RE = re.compile(r"\b503\b|UNAVAILABLE|overloaded|high demand|\b500\b|INTERNAL", re.IGNORECASE)
