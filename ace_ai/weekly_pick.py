@@ -56,6 +56,11 @@ class WeeklyPickConfig:
     surge_5d_pct: float = tools._env_float("WEEKLY_PICK_SURGE_5D_PCT", 15.0)
     overhead_zone_pct: float = tools._env_float("WEEKLY_PICK_OVERHEAD_ZONE_PCT", 5.0)
     support_zone_pct: float = tools._env_float("WEEKLY_PICK_SUPPORT_ZONE_PCT", 8.0)
+    # 10-08 支撐修正（3406）：近價大量區算支撐；整群最高／最低差 ≤1% 的支撐合併成一道（0＝不合併）
+    near_zone_support: bool = os.getenv("WEEKLY_PICK_NEAR_ZONE_SUPPORT", "1").strip().lower() in ("1", "true", "yes", "on")
+    support_merge_pct: float = tools._env_float("WEEKLY_PICK_SUPPORT_MERGE_PCT", 1.0)
+    # B 組：MA5 在現價下方且「跌停也續揚」才算支撐；整批比較通過前預設關閉
+    ma5_limit_support: bool = os.getenv("WEEKLY_PICK_MA5_LIMIT_SUPPORT", "0").strip().lower() in ("1", "true", "yes", "on")
     high_confidence_win_rate: float = tools._env_float("WEEKLY_PICK_HIGH_CONFIDENCE_WIN_RATE", 65.0)
     high_confidence_sample: int = tools._env_int("WEEKLY_PICK_HIGH_CONFIDENCE_SAMPLE", 30)
     unresolved_high_ratio: float = tools._env_float("WEEKLY_PICK_UNRESOLVED_HIGH_RATIO", 0.30)
@@ -426,21 +431,66 @@ def weekly_technical_score(pattern_score_100: Any) -> float:
 def _direction_points(d: Dict[str, Any], full: float) -> Tuple[float, str]:
     """均線方向＋扣抵推算：上揚且扣抵後不轉彎＝滿分；上揚但將轉下彎＝一半以下；下彎＝0。"""
     now, turn, day = d.get("direction_now"), d.get("turn"), d.get("turn_day")
+    # 分數看 5 日內第一次轉向；文字用 turn_text（3 日內來回轉向時是方向序列），一律標明收盤不變
+    text = str(d.get("turn_text") or tools.turn_phrase(turn, day))
+    when = text if text.startswith("收盤不變") else f"收盤不變{text}"
     if not now:
         return full / 2, "資料不足，給一半"
     if now == "上揚":
         if turn == "轉下彎":
-            return round(full * 0.4, 1), f"上揚，但扣抵價偏高，收盤不變{tools.turn_phrase(turn, day)}"
+            return round(full * 0.4, 1), f"上揚，但扣抵價偏高，{when}"
         return full, "上揚，扣抵後仍續揚"
     if now == "下彎":
         if turn == "轉上揚":
-            return round(full * 0.5, 1), f"下彎，但扣抵價偏低，收盤不變{tools.turn_phrase(turn, day)}"
+            return round(full * 0.5, 1), f"下彎，但扣抵價偏低，{when}"
         return 0.0, "下彎" + ("，且在股價上方形成壓力" if d.get("ma_above_close") else "")
     if turn == "轉上揚":
-        return round(full * 0.7, 1), f"走平，收盤不變{tools.turn_phrase(turn, day)}"
+        return round(full * 0.7, 1), f"走平，{when}"
     if turn == "轉下彎":
-        return round(full * 0.2, 1), f"走平，收盤不變{tools.turn_phrase(turn, day)}"
+        return round(full * 0.2, 1), f"走平，{when}"
     return full / 2, "走平"
+
+
+def _support_levels(close: Optional[float], values: Dict[str, Optional[float]], deduction: Dict[str, Any],
+                    vp: Dict[str, Any], config: WeeklyPickConfig) -> List[Tuple[float, str]]:
+    """現價下方的支撐 [(距離%, 名稱)]：MA10／20／60、兩大量區、近價大量區（MA5 只在 B 組條件下）。
+
+    彼此相近的支撐合併成一道：由近到遠分群，整群最高／最低差 ≤ support_merge_pct（不會 100→100.9→101.8 一路串），
+    先依價位排序，結果不受輸入順序影響。
+    """
+    if not close:
+        return []
+    raw: List[Tuple[float, str]] = []   # (支撐價位, 名稱)；股價在量區內時價位＝現價
+    keys = (("MA5",) if config.ma5_limit_support else ()) + ("MA10", "MA20", "MA60")
+    for label in keys:
+        level = values.get(label)
+        if not level or level > close:
+            continue
+        strong = (deduction.get(label) or {}).get("limit_proof") == "跌停也續揚"
+        if label == "MA5" and not strong:
+            continue       # MA5 只有跌停也續揚才算（扣抵條件強不等於價格守得住，所以另要在現價下方）
+        raw.append((level, f"{label}（扣抵條件強）" if strong else label))
+    zones = [vp.get("maximum_volume_zone") or {}, vp.get("second_volume_zone") or {}]
+    if config.near_zone_support:
+        zones += list(vp.get("near_volume_zones") or [])
+    for zone in zones:
+        low, high = _f(zone.get("price_low")), _f(zone.get("price_high"))
+        if low is None or high is None:
+            continue
+        name = zone.get("label") or "大量區"
+        if high <= close:
+            raw.append((high, f"{name}上緣"))
+        elif low <= close:
+            raw.append((close, f"{name}（股價在區內）"))
+    raw.sort(key=lambda r: (-r[0], r[1]))
+    groups: List[List[Tuple[float, str]]] = []
+    for level, label in raw:
+        top = groups[-1][0][0] if groups else None
+        if top is not None and config.support_merge_pct > 0 and (top / level - 1) * 100 <= config.support_merge_pct:
+            groups[-1].append((level, label))
+        else:
+            groups.append([(level, label)])
+    return [((close / g[0][0] - 1) * 100, "＋".join(lb for _, lb in g)) for g in groups]
 
 
 def score_pattern(tech: Dict[str, Any], vp: Dict[str, Any], extras: Dict[str, Any], config: WeeklyPickConfig) -> Dict[str, Any]:
@@ -565,20 +615,7 @@ def score_pattern(tech: Dict[str, Any], vp: Dict[str, Any], extras: Dict[str, An
         add("量區結構", "上方量區壓力", 4, 6, f"上方{overhead[1]} {overhead[2]:g} 距離 {overhead[0]:.1f}%")
 
     # ---------- 下方支撐 15：最近支撐距離 11＋8% 內支撐數 4 ----------
-    supports = []
-    if close:
-        for label, level in (("MA10", values["MA10"]), ("MA20", values["MA20"]), ("MA60", values["MA60"])):
-            if level and level <= close:
-                supports.append(((close / level - 1) * 100, label))
-        for key in ("maximum_volume_zone", "second_volume_zone"):
-            zone = vp.get(key) or {}
-            low, high = _f(zone.get("price_low")), _f(zone.get("price_high"))
-            if low is None or high is None:
-                continue
-            if high <= close:
-                supports.append(((close / high - 1) * 100, f"{zone.get('label') or '大量區'}上緣"))
-            elif low <= close:
-                supports.append((0.0, f"{zone.get('label') or '大量區'}（股價在區內）"))
+    supports = _support_levels(close, values, deduction, vp, config)
     if supports:
         gap, label = min(supports)
         points = 11 if gap <= 3 else 9 if gap <= 5 else 6 if gap <= config.support_zone_pct else 3 if gap <= 12 else 1

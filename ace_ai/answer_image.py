@@ -1531,6 +1531,8 @@ def _level_note(label: str, card: dict) -> tuple[str, str]:
         role = str(info.get('role_text') or '')
         # 白話一行：「持續上揚，5 天後支撐上移到 34.92」（收盤不變推算）
         tail = f"，5 天後{role.replace('至 ', '到 ')}" if role else ''
+        if info.get('limit_proof'):      # 失敗值比跌停還低：跌停也續揚（扣抵條件強，不等於價格守得住）
+            return f"{'MA20 ' if label == '布林中軌' else ''}{info['limit_proof']}（失敗值 {info['fail_price']:,.2f}）{tail}", UP
         return f"{'MA20 ' if label == '布林中軌' else ''}{plain}{tail}", color
     if '量區' in label:
         return '成交密集區邊緣（籌碼成本區）', MUTED
@@ -2471,6 +2473,9 @@ def _answer_emphasis(text: str) -> tuple:
     first = re.match(r'.*?[。！？!?][」』”"]?', text, re.S)
     if first and len(first.group()) <= 80:
         return first.group(), text[first.end():].strip()
+    cut = max(text.rfind(c, 0, 80) for c in '，；、')     # 第一句太長：切在 80 字內最後一個逗號，標題不能整個消失
+    if cut >= 15:
+        return text[:cut] + '。', text[cut + 1:].strip()
     return '', text
 
 

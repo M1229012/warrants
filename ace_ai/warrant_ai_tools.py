@@ -2730,6 +2730,24 @@ def _bollinger_position(close: Optional[float], upper: Optional[float], mid: Opt
 MA_DEDUCTION_DAYS = _env_int("DISCORD_AI_MA_DEDUCTION_DAYS", 5)
 
 
+def _deduction_path(now: str, steps: Sequence[Tuple[str, float]], ma: float) -> str:
+    """未來 3 日（收盤不變）均線方向序列；只有來回轉向（方向變化 ≥2 次）才回傳文字，單純轉向沿用 turn_phrase。"""
+    dirs = [d for d in [now] + [s for s, _ in steps] if d != "走平"]
+    if sum(a != b for a, b in zip(dirs, dirs[1:])) < 2:
+        return ""
+    words, seen, prev = [], {now}, now
+    for (label, change), when in zip(steps, ("明天", "後天", "第 3 日")):
+        word = label
+        if label != "走平" and abs(change) < abs(ma) * 0.001:
+            word = "小幅" + word
+        if label != "走平" and label in seen and label != prev:
+            word = "再" + word
+        words.append(when + word)
+        seen.add(label)
+        prev = label
+    return "→".join(words)
+
+
 def analyze_ma_deduction(df: pd.DataFrame, periods: Sequence[int] = (5, 10, 20, 60), days: int = MA_DEDUCTION_DAYS) -> Dict[str, Any]:
     """均線扣抵：明天的 MA_n 會移除 n 個交易日前那根收盤（扣抵價）。
 
@@ -2762,15 +2780,18 @@ def analyze_ma_deduction(df: pd.DataFrame, periods: Sequence[int] = (5, 10, 20, 
             if future != "走平" and future != now:
                 turn, turn_day = ("轉下彎" if future == "下彎" else "轉上揚"), day
                 break
+        # 10-08（3406）：3 日內來回轉向時寫方向序列（上揚→小幅下彎→再上揚），只寫「後天起轉下彎」會誤導；評分仍看 days 日
+        path = _deduction_path(now, [(direction(c), c) for c in changes[:3]], ma)
+        turn_text = f"收盤不變：{path}" if path else turn_phrase(turn, turn_day)
         projected = ma + sum(changes)
         high, low = max(deductions), min(deductions)
         above_close = ma > close
         if turn == "轉下彎":
             signal = (f"MA{n} 目前{now}，但未來 {k} 日扣抵價最高 {high:,.2f} 高於現價；收盤若維持 {close:,.2f}，"
-                      f"{turn_phrase(turn, turn_day)}" + ("，且均線在股價上方，下彎後容易形成壓力" if above_close else ""))
+                      f"{path or turn_phrase(turn, turn_day)}" + ("，且均線在股價上方，下彎後容易形成壓力" if above_close else ""))
         elif turn == "轉上揚":
             signal = (f"MA{n} 目前{now}，未來 {k} 日扣抵價最低 {low:,.2f} 低於現價；收盤若維持 {close:,.2f}，"
-                      f"{turn_phrase(turn, turn_day)}")
+                      f"{path or turn_phrase(turn, turn_day)}")
         elif now == "上揚":
             signal = f"MA{n} 上揚，未來 {k} 日扣抵價（{low:,.2f}～{high:,.2f}）不高於現價，收盤維持不變時仍續揚"
         elif now == "下彎":
@@ -2791,8 +2812,9 @@ def analyze_ma_deduction(df: pd.DataFrame, periods: Sequence[int] = (5, 10, 20, 
             "projected_value_if_close_unchanged": _num(projected),
             "turn": turn,
             "turn_day": turn_day,
-            "turn_text": turn_phrase(turn, turn_day),
-            # 失敗值＝明天要扣掉的價格：上揚均線收盤低於它才轉彎；比跌停價還低＝跌停也續揚（強支撐）
+            "turn_text": turn_text,
+            "path_3d": [direction(c) for c in changes[:3]],
+            # 失敗值＝明天要扣掉的價格：上揚均線收盤低於它才轉彎；比跌停價還低＝跌停也續揚（扣抵條件強，不等於價格守得住）
             "fail_price": _num(deductions[0]),
             "limit_proof": ("跌停也續揚" if now == "上揚" and deductions[0] < close * 0.9
                             else "漲停也續彎" if now == "下彎" and deductions[0] > close * 1.1 else ""),
