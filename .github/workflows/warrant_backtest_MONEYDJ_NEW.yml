@@ -26,6 +26,12 @@ on:
         default: false
         type: boolean
 
+      chain_repair:
+        description: "每日自動流程完整成功後，自動接續「完整修補模式」（Railway 排程傳 true）"
+        required: false
+        default: false
+        type: boolean
+
   # 測試期間停用排程，只保留 workflow_dispatch。
 
 
@@ -472,3 +478,28 @@ jobs:
             warrant_cache/prescan_failed_codes.csv
           if-no-files-found: ignore
           retention-days: 14
+
+      # 每日自動流程完整成功後，自動接續完整修補模式。
+      # success() 只有在 Python 步驟退出碼 0 時成立：今日資料未發布逾時、
+      # API4／API5 完整性未通過等提前停止都會回退出碼 2（EXIT_NONZERO_ON_ABORT 預設 1），
+      # job 失敗就不會觸發修補。指定 target_date 的補跑不接續。
+      # 用 GITHUB_TOKEN 觸發 workflow_dispatch 是 GitHub 允許的例外，會建立新的 run；
+      # 受上方 concurrency 限制，修補會排隊等本次 job 完全結束（含快取存檔）才開始，
+      # 因此會讀到本次 daily 剛寫好的快取。
+      - name: Chain repair after successful daily
+        if: >-
+          success()
+          && github.event_name == 'workflow_dispatch'
+          && github.event.inputs.run_plan == '每日自動流程'
+          && github.event.inputs.chain_repair == 'true'
+          && github.event.inputs.target_date == ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          WORKFLOW_FILE="$(basename "${GITHUB_WORKFLOW_REF%@*}")"
+          echo "每日自動流程完整成功，接續觸發完整修補模式：$WORKFLOW_FILE @ $GITHUB_REF_NAME"
+          gh workflow run "$WORKFLOW_FILE" \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref "$GITHUB_REF_NAME" \
+            -f run_plan="完整修補模式"
