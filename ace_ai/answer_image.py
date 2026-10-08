@@ -1515,10 +1515,9 @@ def _level_rows(card: dict) -> list[tuple[str, str, float, float | None]]:
 
 def _deduction_outlook(info: dict) -> tuple[str, str]:
     """（推算文字, 顏色）：收盤維持不變時均線會不會轉向。"""
-    if info.get('turn'):
-        day = info.get('turn_day')
-        text = info.get('turn_text') or f"{ {1: '明天起', 2: '後天起'}.get(day, f'第 {day} 個交易日起') }{info['turn']}"
-        return text, DOWN if info['turn'] == '轉下彎' else UP          # 台股慣例：往上紅、往下綠
+    if info.get('turn_text'):          # 10-08：只寫明天的確切條件（後天起依實際收盤而變）
+        risk = info.get('change_dir') == '下彎' or (info.get('direction_now') == '上揚' and info.get('change_dir') == '走平')
+        return info['turn_text'], DOWN if risk else UP          # 台股慣例：往上紅、往下綠
     return {'上揚': ('續揚', INK), '下彎': ('續彎', INK)}.get(info.get('direction_now'), ('走平', MUTED))
 
 
@@ -1530,8 +1529,8 @@ def _level_note(label: str, card: dict) -> tuple[str, str]:
         plain = {'續揚': '持續上揚', '續彎': '持續下彎'}.get(outlook, outlook)
         # 10-08：拿掉「5 天後支撐上移到…」（收盤不變推算，股價一變就誤導，也太長）
         tail = ''
-        if info.get('limit_proof'):      # 失敗值比跌停還低：跌停也續揚（扣抵條件強，不等於價格守得住）
-            return f"{'MA20 ' if label == '布林中軌' else ''}{info['limit_proof']}（失敗值 {info['fail_price']:,.2f}）{tail}", UP
+        if info.get('limit_proof'):      # 失敗值比跌停還低：只寫失敗值（10-08 使用者：不寫「跌停也續揚」）
+            return f"{'MA20 ' if label == '布林中軌' else ''}失敗值 {info['fail_price']:,.2f}{tail}", (UP if info['limit_proof'] == '跌停也續揚' else DOWN)
         return f"{'MA20 ' if label == '布林中軌' else ''}{plain}{tail}", color
     if '量區' in label:
         return '成交密集區邊緣（籌碼成本區）', MUTED

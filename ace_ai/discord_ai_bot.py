@@ -383,6 +383,7 @@ class ParsedQuestion:
     event_type: str = ""
     notes: List[str] = field(default_factory=list)
     sector: Optional[Dict[str, str]] = None
+    sector_context: Optional[Dict[str, str]] = None   # 10-08：個股題同時點名族群（「台積電型態跟半導體族群比」）
     access: Optional[access_policy.AccessContext] = None
     normalized: str = ""  # 原句＋同義詞標準關鍵字（normalize_intent_text）
     chip: str = ""        # 籌碼類型：spot（現股分點）／warrant（權證分點）／combined／""（非籌碼題）
@@ -440,9 +441,14 @@ class QuestionParser:
             if any(word.upper() in text_upper for word in words)
         }
 
-    def parse(self, question: str, access=None) -> ParsedQuestion:
-        sector = sector_analysis.detect_request(question)   # 大盤層級的問題會在解析器裡就被排除
+    def parse(self, question: str, access=None, _skip_sector: bool = False) -> ParsedQuestion:
+        sector = None if _skip_sector else sector_analysis.detect_request(question)   # 大盤層級的問題會在解析器裡就被排除
         if sector is not None and not _stock_named_instead(question):
+            if needs_enabled():
+                stock_side = self.parse(question, access=access, _skip_sector=True)
+                if stock_side.stocks:      # 10-08：複合題（個股＋族群）不提早結束，個股需求不能遺失
+                    stock_side.sector_context = sector
+                    return stock_side
             return ParsedQuestion(original=question, intents={"sector"}, sector=sector, access=access)
         kf = tools.core()
         text_upper = question.upper()
@@ -645,6 +651,7 @@ class QueryPlan:
     pattern: bool = False       # 複合問題（例：分點部位＋型態）也要畫型態評分卡
     beta_fallback: Optional["QueryPlan"] = None  # beta_only route 的正式舊 route；非 tester 靜默改走這個
     uncertain: bool = False     # 規則只認出股票、看不出要問什麼：交給 AI 讀整句分類（10-06）
+    needs: Optional[Dict[str, Any]] = None   # 10-08：需求表（要回答什麼、排除什麼、對象），送進最後提示
 
     def add(self, name: str, **kwargs: Any) -> None:
         call = ToolCall(name, {k: v for k, v in kwargs.items() if v not in (None, "")})
@@ -1454,6 +1461,48 @@ def is_top_warrant_question(parsed: "ParsedQuestion") -> bool:
     return ("warrant" in parsed.intents or "權證" in text) and bool(_TOP_WORDS_RE.search(text)) and "win_rate" not in parsed.intents
 
 
+NEEDS_PARSE_ENABLE = os.getenv("DISCORD_AI_NEEDS_PARSE", "1").strip().lower() in ("1", "true", "yes", "on")
+_NEEDS_TAILS = ("怎麼樣", "怎樣", "如何", "怎麼看", "好不好", "好嗎", "走勢", "分析", "型態", "技術面", "一下", "看看")
+NEEDS_TYPES = ["pattern", "chips", "news", "price", "institutional", "futures", "cost", "compare", "members", "rank", "other"]
+_NEED_INTENTS: Dict[str, Set[str]] = {
+    "pattern": {"analysis", "technical"}, "news": {"news"}, "price": {"price"}, "institutional": {"institutional"},
+    "futures": {"futures"}, "cost": {"cost", "analysis"}, "compare": {"analysis"}, "chips": {"warrant"},
+}
+_EXCLUDE_INTENTS: Dict[str, Set[str]] = {
+    "pattern": {"analysis", "technical", "volume_profile"}, "news": {"news"}, "price": {"price"},
+    "institutional": {"institutional"}, "futures": {"futures"}, "chips": {"warrant", "win_rate", "recent_trades", "position"},
+}
+
+
+def needs_enabled() -> bool:
+    """需求表開關；跑既有 unittest 時預設關（Gemini 次數與族群路由不受影響），需求表測試會明確設環境變數。"""
+    if not NEEDS_PARSE_ENABLE:
+        return False
+    return not (any("unittest" in str(a) for a in sys.argv[:3]) and "DISCORD_AI_NEEDS_PARSE" not in os.environ)
+
+
+def needs_semantic(parsed: "ParsedQuestion") -> bool:
+    """要不要交給 AI 整句解析需求：固定格式／已驗收的單一需求走規則；其餘自然問句（多需求、排除、限定、族群比較）交給 AI。
+    不是用關鍵字判斷「有沒有排除語氣」，而是看規則讀完之後還有沒有沒讀懂的內容。"""
+    if not needs_enabled():
+        return False
+    if parsed.sector_context:
+        return True
+    if not parsed.stocks or parsed.sector:
+        return False
+    text = parsed.original or ""
+    for code, name in parsed.stocks:
+        text = text.replace(str(code), "").replace(str(name or ""), "")
+    for words in INTENT_KEYWORDS.values():
+        for w in sorted(words, key=len, reverse=True):
+            text = text.replace(w, "")
+    for w in sorted(FILLER_WORDS + _NEEDS_TAILS, key=len, reverse=True):
+        text = text.replace(w, "")
+    if len(parsed.stocks) >= 2 and len(set(parsed.intents) & {"news", "technical", "analysis", "price", "institutional", "warrant", "futures"}) >= 2:
+        return True                    # 「2330新聞、2454型態」：要逐檔綁定需求
+    return len(re.sub(r"[^\u4e00-\u9fff]", "", text)) >= 1     # 「2330新聞，不技術」剩「不」也要交給 AI
+
+
 def _has_unread_words(parsed: "ParsedQuestion") -> bool:
     """拿掉股票代號／名稱、標點、時間詞後還剩 2 個以上中文字＝句子有規則沒讀懂的內容。"""
     text = parsed.original or ""
@@ -1910,10 +1959,29 @@ _OVERLOAD_CONFIG = tools._env_int("DISCORD_AI_GEMINI_OVERLOAD_COOLDOWN", 15)
 GEMINI_OVERLOAD_COOLDOWN = max(10, 15 if _OVERLOAD_CONFIG == 120 else _OVERLOAD_CONFIG)
 GEMINI_OVERLOAD_RETRY_WAIT = max(0.0, tools._env_float("DISCORD_AI_GEMINI_OVERLOAD_RETRY_WAIT", 1.5))    # 主模型 503：等一下換金鑰重試一次
 GEMINI_CALL_TIMEOUT_MS = max(5000, tools._env_int("DISCORD_AI_GEMINI_CALL_TIMEOUT_MS", 12000))   # 10-03：一次卡 148 秒；10-07：504 塞車白等 20 秒→12 秒就換金鑰／模型（正常回答約 6～8 秒）
+GEMINI_MAX_ATTEMPTS = max(1, tools._env_int("DISCORD_AI_GEMINI_MAX_ATTEMPTS", 5))      # 10-08：一次呼叫換金鑰／模型總次數上限
+GEMINI_MIN_CALL_SECONDS = 3.0                                                                  # 剩不到 3 秒就不再啟動新呼叫
+QUESTION_DEADLINE_SECONDS = max(15.0, tools._env_float("DISCORD_AI_QUESTION_DEADLINE_SECONDS", 50.0))   # 整題（解析＋排隊＋工具＋AI）
+IMAGE_RESERVE_SECONDS = 4.0                                                                    # 留給產生圖卡
+_QUESTION_CLOCK = threading.local()                                                            # 目前這題的截止時間（monotonic）
+QUESTION_MAX_GEMINI_CALLS = max(1, tools._env_int("DISCORD_AI_QUESTION_MAX_GEMINI_CALLS", 8))   # 整題 Gemini 呼叫總數上限
+
+
+def question_left() -> Optional[float]:
+    """這題還剩幾秒（沒有在答題中＝None）。"""
+    st = getattr(_QUESTION_CLOCK, "state", None)
+    return (st["deadline"] - time.monotonic()) if st else None
+
+
+def _question_calls_exhausted() -> bool:
+    st = getattr(_QUESTION_CLOCK, "state", None)
+    return bool(st) and st["calls"] >= QUESTION_MAX_GEMINI_CALLS
 _TIMEOUT_RE = re.compile(r"timed? ?out|timeout|ReadTimeout|deadline exceeded", re.IGNORECASE)
 GEMINI_MINUTE_COOLDOWN = 60                                                                          # 每分鐘限流：這把金鑰×模型暫停
 _OVERLOAD_RE = re.compile(r"\b503\b|UNAVAILABLE|overloaded|high demand|\b500\b|INTERNAL", re.IGNORECASE)
-_RATE_RE = re.compile(r"\b429\b|RESOURCE_EXHAUSTED|quota|rate limit|exceeded", re.IGNORECASE)
+_RATE_RE = re.compile(r"\b429\b|RESOURCE_EXHAUSTED|quota|rate limit|(?<!DEADLINE_)exceeded", re.IGNORECASE)
+# 10-08：504／DEADLINE_EXCEEDED＝逾時塞車，不是限流（原本被 "exceeded" 誤判成每分鐘限流而冷卻 60 秒）
+_DEADLINE_RE = re.compile(r"\b504\b|DEADLINE_EXCEEDED|deadline exceeded", re.IGNORECASE)
 _DAILY_RE = re.compile(r"PerDay|per day|daily|RequestsPerDay", re.IGNORECASE)
 _MISSING_MODEL_RE = re.compile(r"\b404\b|NOT_FOUND|is not found|no longer available", re.IGNORECASE)
 _BAD_KEY_RE = re.compile(r"API_KEY_INVALID|API key not valid|PERMISSION_DENIED|\b403\b", re.IGNORECASE)
@@ -2044,6 +2112,8 @@ class GeminiQuota:
             if _BAD_KEY_RE.search(error):
                 self._bad_keys[key] = now + 3600
                 return "bad_key"
+            if _DEADLINE_RE.search(error):
+                return "timeout"          # 不冷卻，直接換下一把金鑰／模型
             if _RATE_RE.search(error):
                 if _DAILY_RE.search(error):
                     self._blocked[(key, model)] = float("inf")
@@ -2164,12 +2234,22 @@ class GeminiGateway:
             self.log(f"Gemini 背景工作已滿，改用規則式內容：{purpose}")
             return GeminiResult(ok=False, error="gemini_busy", purpose=purpose)
         request_id = str(getattr(tools._API_REQUEST_LOCAL, "request_id", "") or "")
-        deadline = time.monotonic() + self.DEADLINE
+        now = time.monotonic()
+        deadline = now + self.DEADLINE
+        clock_state = getattr(_QUESTION_CLOCK, "state", None)
+        question_end = float(clock_state["deadline"]) if clock_state else 0.0
+        if question_end:
+            deadline = min(deadline, question_end - IMAGE_RESERVE_SECONDS)
+        if deadline - now < GEMINI_MIN_CALL_SECONDS:
+            gate.release()
+            self.log(f"整題時間快用完，不再呼叫 Gemini，改用規則式內容：{purpose}")
+            return GeminiResult(ok=False, error="question_deadline", purpose=purpose)
         box: Dict[str, GeminiResult] = {}
         done = threading.Event()
         late_future = Future()
 
         def run() -> None:
+            _QUESTION_CLOCK.state = clock_state          # 同一題的期限與呼叫次數交給 Gemini 執行緒
             try:
                 with tools.api_request_scope(request_id):
                     box["result"] = work(deadline)
@@ -2180,10 +2260,11 @@ class GeminiGateway:
                 late_future.set_result(box["result"])
                 done.set()
         threading.Thread(target=run, name="ace-gemini", daemon=True).start()
-        if not done.wait(self.DEADLINE):
-            self.log(f"Gemini 超過 {self.DEADLINE:.0f} 秒，改用規則式內容：{purpose}")
-            tools.record_api_event("Gemini", status=504, latency=self.DEADLINE, detail=purpose)
-            return GeminiResult(ok=False, error=f"deadline {self.DEADLINE:.0f}s", latency=self.DEADLINE, purpose=purpose,
+        budget = deadline - now
+        if not done.wait(budget):
+            self.log(f"Gemini 超過 {budget:.0f} 秒，改用規則式內容：{purpose}")
+            tools.record_api_event("Gemini", status=504, latency=budget, detail=purpose)
+            return GeminiResult(ok=False, error=f"deadline {budget:.0f}s", latency=budget, purpose=purpose,
                                 late_future=late_future if purpose == "final_answer" else None)
         return box["result"]
 
@@ -2209,13 +2290,13 @@ class GeminiGateway:
         return self._run_with_deadline(purpose, work)
 
     @staticmethod
-    def _call_once(kf: Any, key: str, model: str, contents: Any, config: Dict[str, Any]) -> Any:
+    def _call_once(kf: Any, key: str, model: str, contents: Any, config: Dict[str, Any], timeout_ms: int = 0) -> Any:
         """打一次 API；模型不支援思考參數時，同一次不帶參數重打（之後這個模型都不帶）。"""
         thinking = _thinking_config(model)
         use = dict(config, thinking_config=thinking) if thinking else config
         # Client 要留一個參照到請求結束；直接鏈式呼叫時 Client 會先被回收關閉
         try:
-            client = kf.genai.Client(api_key=key, http_options={"timeout": GEMINI_CALL_TIMEOUT_MS})   # 單次逾時：卡住就換金鑰／模型
+            client = kf.genai.Client(api_key=key, http_options={"timeout": int(timeout_ms or GEMINI_CALL_TIMEOUT_MS)})   # 單次逾時：卡住就換金鑰／模型
         except TypeError:      # 舊版 SDK／測試替身不吃 http_options
             client = kf.genai.Client(api_key=key)
         try:
@@ -2254,16 +2335,29 @@ class GeminiGateway:
                 continue
             overload_retried = False
             for key in self.quota.key_order(model, len(keys)):
-                if deadline and time.monotonic() >= deadline:
-                    last_error = last_error or "deadline"
+                left = (deadline - time.monotonic()) if deadline else None
+                if (left is not None and left < GEMINI_MIN_CALL_SECONDS) or attempts >= GEMINI_MAX_ATTEMPTS or _question_calls_exhausted():
+                    last_error = last_error or ("deadline" if left is not None and left < GEMINI_MIN_CALL_SECONDS else "max_attempts")
                     break
                 if not self.quota.acquire(key, model):
                     continue
                 attempts += 1
                 call_started = time.perf_counter()
                 try:
-                    with self._slots:
-                        response = self._call_once(kf, keys[key], model, contents, config)
+                    # 10-08：等執行名額也算在期限內；單次逾時取「設定值」與「剩餘時間」較小者
+                    if not self._slots.acquire(timeout=max(0.1, left - 1.0) if left is not None else None):
+                        raise TimeoutError("Gemini 執行名額等待逾時")
+                    try:
+                        left = (deadline - time.monotonic()) if deadline else None          # 等到名額後重算剩餘時間
+                        if left is not None and left < GEMINI_MIN_CALL_SECONDS:
+                            raise TimeoutError("Gemini 等名額後剩餘時間不足")
+                        st = getattr(_QUESTION_CLOCK, "state", None)
+                        if st is not None:
+                            st["calls"] += 1
+                        call_ms = GEMINI_CALL_TIMEOUT_MS if left is None else int(max(2000, min(GEMINI_CALL_TIMEOUT_MS, (left - 1.0) * 1000)))
+                        response = self._call_once(kf, keys[key], model, contents, config, call_ms)
+                    finally:
+                        self._slots.release()
                 except Exception as exc:  # google-genai 例外型別眾多：依錯誤種類換金鑰或換模型
                     last_error = f"{type(exc).__name__}: {exc}"
                     kind = self.quota.note_error(key, model, last_error)
@@ -2277,7 +2371,7 @@ class GeminiGateway:
                         overload_retried = True    # 主模型塞車多半一下就過：等一下換金鑰再試一次，省下備援額度
                         time.sleep(GEMINI_OVERLOAD_RETRY_WAIT)
                         continue
-                    if kind in ("overloaded", "missing_model") or _TIMEOUT_RE.search(last_error):
+                    if kind in ("overloaded", "missing_model", "timeout") or _TIMEOUT_RE.search(last_error):
                         break          # 整個模型的問題（含單次逾時）：換金鑰沒用，直接換下一個模型
                     continue
                 if overload_retried:
@@ -2297,7 +2391,7 @@ class GeminiGateway:
                          f"latency={latency:.2f}s｜嘗試 {attempts} 次｜tokens {in_tokens}+{out_tokens}（{source}）｜結果=成功")
                 return GeminiResult(ok=True, text=text, latency=latency, purpose=purpose, input_tokens=in_tokens,
                                     output_tokens=out_tokens, total_tokens=in_tokens + out_tokens, token_source=source)
-            if deadline and time.monotonic() >= deadline:
+            if (deadline and time.monotonic() >= deadline) or attempts >= GEMINI_MAX_ATTEMPTS:
                 break
         latency = time.perf_counter() - started
         if not attempts:
@@ -2305,7 +2399,7 @@ class GeminiGateway:
                                         else "所有模型與金鑰的額度都暫時用完或暫停中")
         self.log(f"Gemini 呼叫｜用途={purpose}｜嘗試 {attempts} 次｜latency={latency:.2f}s｜結果=失敗｜{last_error[:160]}")
         rate_limited = (not attempts and '503' not in last_error) or any(k in ("daily", "minute") for k in kinds) or \
-            any(k.lower() in last_error.lower() for k in _RATE_LIMIT_KEYWORDS)
+            bool(_RATE_RE.search(last_error) and not _DEADLINE_RE.search(last_error))
         return GeminiResult(ok=False, error=last_error or "Gemini 沒有回傳內容", rate_limited=rate_limited,
                             latency=latency, purpose=purpose, token_source="none")
 
@@ -2396,7 +2490,7 @@ AI_CARD_SCHEMA = {
 
 FINAL_CARD_FORMAT = """輸出格式（艾斯 AI 解讀）：只輸出符合 schema 的 JSON，不要 Markdown、不要星號或條列符號。你是在「解讀」，不是在整理資料：K 線、均線、評分卡與關鍵價位表已經在圖上，文字要說明這些訊號代表什麼。
 - answer：這段會以粗體呈現，只放1～2句結論，通常30～60字、最多80字，先講使用者現在最需要注意的事；複合問題直接點出各面向的判斷與最重要限制，不把所有依據塞在這裡。數字只有關鍵價位才引用，不逐項報均線、量比或分點名單；詳情放why。從這題最重要的處境或訊號切入，不固定以結構偏強弱開頭，不保證漲跌、不替人決定買賣。
-- 支撐／壓力依距離由近到遠寫，最近的先講（含「近價大量區」），不可跳過近的直接講季線；均線的 limit_proof 寫「跌停也續揚」代表扣抵條件強（明天收跌停均線仍上揚；「漲停也續彎」同理），只說明均線方向，不等於股價一定守住這條線，不可寫成強支撐；fail_price 是明天收盤高於它均線才會續揚的價位（扣抵價）。均線扣抵只寫成價位條件，照 turn_text 寫（例「MA20 後天收 1,110 以上才續揚」），不可寫「收盤不變會轉下彎」「5 天後支撐上移到…」這類推算。
+- 支撐／壓力依距離由近到遠寫，最近的先講（含「近價大量區」），不可跳過近的直接講季線；均線扣抵不可寫「跌停也續揚」「漲停也續彎」字樣，要提就寫「MA20 失敗值 955」（fail_price：上揚均線明天收盤要高於它才續揚、下彎均線要低於它才續彎，等於或在附近＝走平）；limit_proof 有值只代表失敗值離現價很遠、扣抵條件強，不等於股價一定守住這條線，不可寫成強支撐。turn_text／rise_price_tomorrow 是明天的確切條件；path 是假設收盤不變的逐日模擬，後面幾天依賴這個假設，只能寫成條件，不可寫成確定預測；目前下彎的均線寫「轉揚」，不寫「續揚」。均線扣抵只寫成價位條件，照 turn_text 寫（例「MA20 明天收至少 1,115 才續揚」），不可寫「收盤不變會轉下彎」「5 天後支撐上移到…」這類推算。
 - 語氣方向跟著結構走：多頭排列、量增、沿上軌等偏強結構先寫偏強；偏弱先寫偏弱；多空抵銷才寫中性。風險寫成條件（若跌破／若量縮…），不可讓風險蓋過主要判斷，summary 方向和 answer 一致。不寫空泛警語：「風險不容忽視」「需謹慎」「宜保守」「而非追價」「不宜追高」「短期波動風險」這類沒有價位條件的提醒都不要。不可寫「假突破／假跌破」「突破成功／失敗」「型態失效」這類結論。
 - why：重點不要少，說法要精簡：圖上值得講的訊號（均線、型態、量區支撐壓力、扣抵、KD／MACD、布林、法人與分點）挑與本題相關的都可以講，通常 3～4 句、約 120～180 字；用歸納代替列舉（寫「站上所有均線」不寫「站上5日、10日、20日及60日均線」；寫「統一、台新等分點持續買進」不逐家報張數與成本），同方向的證據合併成一句（例「站上所有均線且投信連買 6 日」），不逐項報指標數值。圖上已有的數字（均線值、KD／MACD 數值、分點成本與張數）不要重抄，只在當作關鍵價位時引用 1～2 個。不寫「從技術面來看」「籌碼方面」這類開場詞。若answer已說清楚可留空。型態與趨勢只能引用kline_patterns，不重報評分或所有指標。
 - scenarios：依原問句選擇0～2個有必要的觀察條件，可留空，不強制多空各一個。title用短標直接點出本題要觀察的變化，不套固定情境名稱；text 用「若收盤…／若跌破…，代表…」的條件式，25～45 字，要有具體觀察價位，不重複 why 已講過的理由。只陳述條件與意義，不預測漲跌、不給買賣指令；使用者問操作策略／進出場／停損時也一樣，不寫「建議買進／賣出／停損設在…」，改成要觀察的價位與條件。從K線型態、支撐壓力、量價、均線與布林中選擇能回答本題的證據，不固定順序；why只談真正影響本題答案的面向，不為了湊數羅列指標。K 線型態名稱（箱型、三角收斂、上升／下降趨勢、缺口、紅三兵、吞噬、晨星、十字線、長上／下影線等）只能引用 kline_patterns 有列出的，不可自己判斷；突破狀態照原文的客觀事實描述（價格在上下緣的哪裡、突破後第幾天）；「○○ 起形成」是型態起點、「○○ 收盤向上突破」是突破日，兩個日期不可混用或互換，kline_patterns 有「創近 N 日新高／新低」「越過前高／跌破前低」「脫離近 N 日盤整區」時，與本題相關才在answer或why解釋，用詞照原文（越過、脫離、創高），價位與日期照抄；不可自行下「突破成功／失敗」「假突破／假跌破」「型態失效」這類結論，也不可解讀成偏多或偏空；recent_bars_10（近 10 日 日期 開 高 低 收）與 ma_recent_3d 只用來描述近期走勢與均線方向。answer 第一句要直接回答使用者問的事。均線排列一定照資料寫：MA5<MA10<MA20<MA60 是空頭排列，不可說成多方架構強勢、多方掌控；反之亦然；單日紅K或帶量不等於結構轉多。情境要和目前結構一致：均線空頭排列時，偏多情境寫成「轉強條件」（例「若收盤站穩季線並突破布林上軌，才有機會扭轉空頭排列」），不可寫「多方續攻」「開啟新一波漲勢」這種已經轉多或預測漲勢的說法；均線多頭排列時，偏空情境同理寫成「轉弱條件」。新聞、三大法人或沒有可觀察價位的問題給空陣列。
@@ -2505,10 +2599,10 @@ def _compact_tool_data(name: str, data: Dict[str, Any], has_scorecard: bool) -> 
             data["kd"] = {"signals": (data.get("kd") or {}).get("signals")}
             data["macd"] = {"signals": (data.get("macd") or {}).get("signals"), "osc_trend": (data.get("macd") or {}).get("osc_trend")}
         else:
-            data["ma_deduction"] = {k: {f: v.get(f) for f in ("direction_now", "turn_text", "outlook", "hold_prices_3d")}
+            data["ma_deduction"] = {k: {f: v.get(f) for f in ("direction_now", "turn_text", "fail_price", "rise_price_tomorrow", "next_deduction_price", "path", "outlook")}
                                     for k, v in (data.get("ma_deduction") or {}).items() if k in ("MA20", "MA60")}
     elif name == "get_pattern_scorecard":
-        data["ma_deduction"] = {k: {f: v.get(f) for f in ("direction_now", "turn_text", "outlook", "hold_prices_3d")}
+        data["ma_deduction"] = {k: {f: v.get(f) for f in ("direction_now", "turn_text", "fail_price", "rise_price_tomorrow", "next_deduction_price", "path", "outlook")}
                                 for k, v in (data.get("ma_deduction") or {}).items()}
         data["plus_reasons"] = (data.get("plus_reasons") or [])[:4]
         data["minus_reasons"] = (data.get("minus_reasons") or [])[:4]
@@ -2619,6 +2713,10 @@ def question_focus(question: str) -> List[str]:
     return labels
 
 
+FINAL_NEEDS_RULES = ("【需求表】payload.needs.needs 是本題每一項需求：每一項都要回答，資料不足就明確說哪項資料不足，不可略過；"
+                     "exclude_types／exclude_targets 是使用者說不要的類別或股票，不可分析、不可寫進回答；"
+                     "sector_context 是族群比較資料（族群成分股型態分數中位數、這檔名次），有 missing 就照實說族群比較資料不足。"
+                     "parse_failed＝需求表解析失敗：依使用者原句只回答所問，原句說不要的內容一律不寫。")
 FINAL_FOCUS_RULES = ("【先回答重點】payload.question_focus 是使用者這題真正問的重點。回答第一段必須直接回答這些重點，"
                      "再補其他技術面：量能＝今日（盤中用累計量與預估量）對 MV5／MV20 的量比，明講「有／沒有放量」；"
                      "三大法人籌碼＝用 get_institutional_flow 說外資／投信／自營商最新一日、近5日、近20日買賣超張數與連買／連賣天數，"
@@ -2687,6 +2785,8 @@ def build_final_prompt(payload: Dict[str, Any]) -> str:
     sections = [FINAL_BASE_PROMPT]
     if payload.get("question_focus"):
         sections.append(FINAL_FOCUS_RULES)
+    if payload.get("needs"):
+        sections.append(FINAL_NEEDS_RULES)
     if names & {"get_technical_analysis", "get_pattern_scorecard", "get_volume_profile"}:
         sections.append(FINAL_TECH_RULES)
     if "get_recent_news" in names:
@@ -2728,7 +2828,10 @@ def build_final_prompt(payload: Dict[str, Any]) -> str:
     sections.append('先判斷response_focus：holding是個人持倉、成本與風險需求，current是行情／型態，review是交易檢討；陳述句也可有隱含求助，不需問號。holding的answer先接住持倉處境，再解釋最重要風險與可觀察条件；不要只報均線或重述成本。')
     sections.append('回答重點：先接住問題而非一律報型態。問持倉後續／要注意什麼，先說最重要的風險與支撐／壓力觀察條件，說明守住或跌破的意義；缺買進理由不阻止目前分析。問改善才回顧交易規劃，問型態則分析目前型態。日期只是背景，不能一律變成覆盤。成本估算稱估算；未提供理由、計畫、日期不能推測當時沒有做。answer寫分析，humor_opening只放自然接話，不重複。')
     payload_json = json.dumps(payload.get("tool_results") or {}, ensure_ascii=False, separators=(",", ":"), default=tools.json_safe)
-    return "\n\n".join(sections) + f"\n\n使用者問題：{payload['question']}\n\ntool_results（JSON）：\n{payload_json}\n"
+    needs_part = ""
+    if payload.get("needs"):        # 10-08：需求表實際內容（每項需求、排除、比較資料）
+        needs_part = "需求表（JSON）：\n" + json.dumps(payload["needs"], ensure_ascii=False, separators=(",", ":"), default=tools.json_safe) + "\n\n"
+    return "\n\n".join(sections) + f"\n\n使用者問題：{payload['question']}\n\n{needs_part}tool_results（JSON）：\n{payload_json}\n"
 
 
 _NUMBER_RE = re.compile(r"(?<![A-Za-z0-9])[-+]?\d[\d,]*(?:\.\d+)?")
@@ -5182,17 +5285,26 @@ class AceQueryEngine:
                 self._inflight[key] = future
         if shared is not None:
             self.log(f"相同問題正在計算，共用結果：{question}")
-            result = shared.result(timeout=self.config.tool_timeout_seconds + 120)
+            left = question_left()
+            result = shared.result(timeout=max(1.0, left) if left is not None else self.config.tool_timeout_seconds + 120)
             self.memory.update(context_key, parsed)
             return replace(result, context_note=note)
 
         try:
             if ahead and on_queue:
                 on_queue(ahead)
-            with (contextlib.nullcontext() if priority else self._slots):
+            left = question_left()
+            if not priority and not self._slots.acquire(timeout=max(0.1, left - IMAGE_RESERVE_SECONDS) if left is not None else None):
+                result = AnswerResult(text=QUEUE_FULL_MESSAGE, route="queue_full", gemini_calls=0, elapsed=time.perf_counter() - started)
+                future.set_result(result)
+                return result                 # 10-08：排隊等到整題期限：不無限等
+            try:
                 effective = f"{question}（{note}）" if note else question
                 result = self._answer_uncached(effective, started, parsed)
                 result = self._attach_late_ai(result)
+            finally:
+                if not priority:
+                    self._slots.release()
             future.set_result(result)
         except BaseException as exc:
             future.set_exception(exc)
@@ -5594,9 +5706,16 @@ class AceQueryEngine:
                is_admin: bool = False, admin_mode: bool = False, access=None, image=None) -> AnswerResult:
         # /ask always stays closed, including requests from administrators.
         allowed = bool(access.admin_mode) if access is not None else bool(is_admin and admin_mode)
-        with stock_banter.question_scope(question), tools.quote_policy(admin_live=allowed):
-            return self._answer_with_quote_policy(question, context_key, on_queue,
-                                                  is_admin, admin_mode, access, image)
+        own_clock = getattr(_QUESTION_CLOCK, "state", None) is None
+        if own_clock:       # 10-08：整題期限從收到問題就開始（排隊、解析、工具、AI、圖卡都在內）
+            _QUESTION_CLOCK.state = {"deadline": time.monotonic() + QUESTION_DEADLINE_SECONDS, "calls": 0}
+        try:
+            with stock_banter.question_scope(question), tools.quote_policy(admin_live=allowed):
+                return self._answer_with_quote_policy(question, context_key, on_queue,
+                                                      is_admin, admin_mode, access, image)
+        finally:
+            if own_clock:
+                _QUESTION_CLOCK.state = None
 
     def _answer_with_quote_policy(self, question: str, context_key: str = "", on_queue: Optional[Callable[[int], None]] = None,
                is_admin: bool = False, admin_mode: bool = False, access=None, image=None) -> AnswerResult:
@@ -6382,6 +6501,129 @@ class AceQueryEngine:
         parsed = self.parser.parse(question)
         return parsed, self.router.plan(parsed, stats), stats
 
+    def _parse_needs(self, question: str, parsed: ParsedQuestion, stats: "AnswerStats") -> Optional[Dict[str, Any]]:
+        """AI 讀整句回傳需求表；失敗回 None（呼叫端標記 parse_failed，最後提示要求只答所問、遵守排除）。"""
+        if getattr(self, "gateway", None) is None:
+            return None
+        schema = {"type": "object", "properties": {
+            "needs": {"type": "array", "items": {"type": "object", "properties": {
+                "type": {"type": "string", "enum": NEEDS_TYPES},
+                "targets": {"type": "array", "items": {"type": "string"}},
+                "date_range": {"type": "string"}}, "required": ["type", "targets", "date_range"]}},
+            "exclude_types": {"type": "array", "items": {"type": "string", "enum": NEEDS_TYPES}},
+            "exclude_targets": {"type": "array", "items": {"type": "string"}},
+            "compare_with": {"type": "array", "items": {"type": "string"}}},
+            "required": ["needs", "exclude_types", "exclude_targets", "compare_with"]}
+        prompt = ("你是台股問句的需求解析器，只輸出 JSON，不要回答問題。讀完整句，列出使用者真正要回答的每一項需求。\n"
+                  "type：pattern＝走勢型態技術面、chips＝分點籌碼主力權證、news＝新聞消息、price＝只問股價、institutional＝三大法人、"
+                  "futures＝台指期、cost＝自己的成本持股、compare＝比較、members＝族群成分股、rank＝排行、other＝其他。\n"
+                  "targets：這項需求的股票名稱／代號或族群名稱；date_range：提到的期間（沒有填空字串）。\n"
+                  "exclude_types／exclude_targets：使用者明確說不要的分析類別或股票（例「不要技術分析」「不要看台積電」）。"
+                  "compare_with：要拿來比較的股票或族群。\n問題：" + question)
+        result = self.gateway.generate(prompt, purpose="intent", schema=schema, temperature=0.0)
+        stats.record_gemini(result)
+        if not result.ok:
+            return None
+        try:
+            data = json.loads(result.text)
+        except (ValueError, TypeError):
+            return None
+        if not isinstance(data, dict) or not isinstance(data.get("needs"), list):
+            return None
+        self.log(f"🧭 需求表：{json.dumps(data, ensure_ascii=False)[:300]}")
+        return data
+
+    def _apply_needs(self, needs: Dict[str, Any], parsed: ParsedQuestion) -> Dict[str, Set[str]]:
+        """需求表套回解析結果，回傳 {股票代號: 這檔要做的意圖}。
+        排除是硬限制：排除後沒有剩下的類別或股票就是空，不會恢復原本的意圖或股票。"""
+        items = [n for n in needs.get("needs") or [] if isinstance(n, dict)]
+        drop: Set[str] = set()
+        for t in needs.get("exclude_types") or []:
+            drop |= _EXCLUDE_INTENTS.get(str(t), set())
+        out_targets = {str(x).strip() for x in needs.get("exclude_targets") or [] if str(x).strip()}
+        parsed.stocks = [(c, nm) for c, nm in parsed.stocks if c not in out_targets and nm not in out_targets]
+
+        def resolve(target: str) -> Optional[Tuple[str, str]]:
+            for c, nm in parsed.stocks:
+                if target in (c, nm):
+                    return (c, nm)
+            if len(parsed.stocks) >= 3:
+                return None
+            try:
+                hit = self.parser.parse(target, access=self._access(), _skip_sector=True)
+            except Exception:
+                return None
+            for stock in (hit.stocks if hit is not None else [])[:1]:
+                if stock[0] not in out_targets and stock[1] not in out_targets:
+                    parsed.stocks.append(stock)
+                    return stock
+            return None
+
+        per_stock: Dict[str, Set[str]] = {}
+        untargeted: Set[str] = set()
+        for n in items:
+            want = _NEED_INTENTS.get(str(n.get("type")), set()) - drop
+            codes = [st[0] for st in (resolve(str(t).strip()) for t in n.get("targets") or [] if str(t).strip()) if st]
+            if not (n.get("targets") or []):
+                untargeted |= want
+            for code in codes:
+                per_stock.setdefault(code, set()).update(want)
+            days = DAYS_RE.search(str(n.get("date_range") or ""))
+            if days:
+                parsed.days = max(1, min(250, int(days.group(1))))
+        for code, _ in parsed.stocks:
+            per_stock[code] = (per_stock.get(code, set()) | untargeted) - drop
+        per_stock = {c: v for c, v in per_stock.items() if c in {x for x, _ in parsed.stocks}}
+        parsed.intents = set().union(*per_stock.values()) if per_stock else set()
+        if parsed.sector_context is None:
+            for target in list(needs.get("compare_with") or []) + [t for n in items if n.get("type") == "compare" for t in n.get("targets") or []]:
+                hit = sector_match.match(str(target))
+                if hit:
+                    parsed.sector_context = {"industry": hit["industry"], "name": hit["name"], "mode": "technical"}
+                    break
+        return per_stock
+
+    def _plan_from_needs(self, parsed: ParsedQuestion, per_stock: Dict[str, Set[str]], stats: "AnswerStats") -> QueryPlan:
+        """逐檔依各自需求排工具再合併（「2330新聞、2454型態」不會兩檔都跑新聞＋技術）；一律重建，不沿用舊工具清單。"""
+        stocks = [(c, nm) for c, nm in parsed.stocks if per_stock.get(c)]
+        if not stocks:
+            return QueryPlan(route="clarify", clarification="依你的排除條件，沒有剩下要查的股票或項目；可以換個說法再問一次。")
+        merged: Optional[QueryPlan] = None
+        for code, name in stocks:
+            one = replace(parsed, stocks=[(code, name)], intents=set(per_stock[code]))
+            plan = self.router.plan(one, stats)
+            if merged is None:
+                merged = plan
+                continue
+            for call in plan.tool_calls:
+                merged.add(call.name, **call.kwargs)
+            merged.need_final_llm = merged.need_final_llm or plan.need_final_llm
+            merged.pattern = merged.pattern or plan.pattern or plan.route == "rule_pattern"
+        merged.need_final_llm = True
+        return merged
+
+    @staticmethod
+    def _sector_context_data(sector: Dict[str, str], codes: List[str]) -> Dict[str, Any]:
+        """族群比較用：成分股本地型態分數中位數、這檔在族群內的名次（只讀本地底庫，不打外部 API）。"""
+        out: Dict[str, Any] = {"sector": sector.get("name") or sector.get("industry")}
+        try:
+            members = sector_analysis.get_members(sector["industry"], sector.get("name", ""))
+            member_codes = [str(m.get("code") or m.get("stock_code") or "") for m in members.get("stocks") or []]
+            scores = local_market_cache.pattern_scores_for([c for c in member_codes if c])
+        except Exception as exc:
+            out["missing"] = f"族群資料暫時取不到（{type(exc).__name__}）"
+            return out
+        values = sorted((v["score"] for v in scores.values()), reverse=True)
+        if not values:
+            out["missing"] = "族群成分股尚無型態分數"
+            return out
+        out.update(members_scored=len(values), median_score=round(float(np.median(values)), 1))
+        for code in codes:
+            if code in scores:
+                rank = 1 + sum(1 for v in values if v > scores[code]["score"])
+                out.setdefault("stocks", {})[code] = {"score": scores[code]["score"], "rank": rank, "of": len(values)}
+        return out
+
     def _classify_fallback(self, question: str, parsed: ParsedQuestion, stats: "AnswerStats") -> Optional[QueryPlan]:
         plan = self._classify_fallback_impl(question, parsed, stats)
         if plan is not None and plan.route == "rule_stock_bundle":
@@ -6467,6 +6709,17 @@ class AceQueryEngine:
         return None
 
     def _answer_uncached(self, question: str, started: float, parsed: Optional[ParsedQuestion] = None) -> AnswerResult:
+        own_clock = getattr(_QUESTION_CLOCK, "state", None) is None     # 公開入口已建立就沿用（背景重算等直接進來才自己建）
+        if own_clock:
+            _QUESTION_CLOCK.state = {"deadline": time.monotonic() + QUESTION_DEADLINE_SECONDS - max(0.0, time.perf_counter() - started),
+                                     "calls": 0}
+        try:
+            return self._answer_uncached_impl(question, started, parsed)
+        finally:
+            if own_clock:
+                _QUESTION_CLOCK.state = None
+
+    def _answer_uncached_impl(self, question: str, started: float, parsed: Optional[ParsedQuestion] = None) -> AnswerResult:
         stats = AnswerStats()
         self.log(f"使用者問題：{question}")
         if parsed is None:
@@ -6508,7 +6761,23 @@ class AceQueryEngine:
                 plan.add("get_market_institutional", market=market_of(parsed))
                 if "futures" not in parsed.intents:
                     plan.tool_calls = [c for c in plan.tool_calls if c.name != "get_futures_positions"]
-        if (plan.route in ("help", "rule_stock_bundle") or plan.uncertain) and not (unknown_codes(parsed) and not parsed.stocks):
+        needs_table: Optional[Dict[str, Any]] = None
+        if needs_semantic(parsed) and plan.route not in ("clarify",):
+            # 10-08：自然問句交給 AI 整句解析需求表（取代下方分類呼叫），逐檔依需求重建工具清單
+            needs_table = self._parse_needs(question, parsed, stats)
+            if needs_table is not None:
+                per_stock = self._apply_needs(needs_table, parsed)
+                plan = self._plan_from_needs(parsed, per_stock, stats)
+                needs_table["per_stock"] = {c: sorted(v) for c, v in per_stock.items()}
+            else:
+                # 解析失敗：不能照原本可能忽略「不要…」的工具清單執行；改用原分類器（一次）決定主題，最後提示要求只答所問
+                plan = self._classify_fallback(question, parsed, stats) or plan
+                needs_table = {"parse_failed": True}
+            if parsed.sector_context and parsed.stocks:
+                needs_table["sector_context"] = self._sector_context_data(parsed.sector_context, [c for c, _ in parsed.stocks])
+            plan.needs = needs_table
+            plan.need_final_llm = plan.need_final_llm or bool(parsed.stocks)
+        elif (plan.route in ("help", "rule_stock_bundle") or plan.uncertain) and not (unknown_codes(parsed) and not parsed.stocks):
             # 規則沒把握（看不懂，或認得股票但看不出要問什麼）→ 1 次 Gemini 用「完整原句」分類，程式再檢查；
             # 寫了代號但名冊查不到（0000）：直接說查不到，不花 1 次 Gemini 去猜
             plan = self._classify_fallback(question, parsed, stats) or plan
@@ -6970,7 +7239,9 @@ class AceQueryEngine:
         request_id = str(getattr(self._request_local, "request_id", "") or "")
         futures = [(call, self.executor.submit(contextvars.copy_context().run, tools.run_tool_scoped, call.name, call.kwargs, cancel_event, request_id)) for call in calls]
         tools_started = time.perf_counter()
-        done, _ = wait([f for _, f in futures], timeout=self.config.tool_timeout_seconds)
+        left = question_left()
+        done, _ = wait([f for _, f in futures], timeout=self.config.tool_timeout_seconds if left is None
+                       else max(1.0, min(self.config.tool_timeout_seconds, left - IMAGE_RESERVE_SECONDS - GEMINI_MIN_CALL_SECONDS)))
         self._perf_add("tools", time.perf_counter() - tools_started)
         results: List[tools.ToolResult] = []
         for call, future in futures:
@@ -7089,6 +7360,8 @@ class AceQueryEngine:
         if not plan.need_final_llm or not any(r.ok for r in results):
             return rule_answer, True
         payload = build_final_payload(question, results)
+        if plan.needs:
+            payload["needs"] = plan.needs        # 10-08：需求表真的傳到最後回答
         prompt = build_final_prompt(payload)
         stats.prompt_chars = len(prompt)
         gemini_started = time.perf_counter()
@@ -7311,6 +7584,7 @@ def schedule_late_ai_image(engine, original, target, make_files, no_mentions):
 
 
 PUBLIC_ANSWER_ROUTES = frozenset(("planner", "answer_cache"))
+PUBLIC_ADMIN_ROUTES = frozenset(("admin_kline_debug",))
 # /ace 管理指令字眼：含內部狀態、路徑、快取、筆數、log 的回覆一開始就 ephemeral defer。
 _ADMIN_PRIVATE_RE = re.compile(r"錯誤|ERROR|狀態|用量|使用量|USAGE|底庫|名冊|維護|DEBUG|LOG|日誌|快取|CACHE|草稿|說明|HELP|指令", re.IGNORECASE)
 
@@ -7327,7 +7601,14 @@ def is_public_answer(result) -> bool:
     if result.denied_feature:
         return False
     return (result.route.startswith("rule_") or result.route in PUBLIC_ANSWER_ROUTES
-            or result.route in PUBLIC_WEEKLY_ROUTES)
+            or result.route in PUBLIC_WEEKLY_ROUTES or result.route in PUBLIC_ADMIN_ROUTES)
+
+
+def followup_ephemeral(result, *, ephemeral=False) -> bool:
+    """型態驗證逐張決定可見性；其他後續回覆保留原設定。"""
+    if result.route in PUBLIC_ADMIN_ROUTES or result.route in ("admin_kline_error", "admin_kline_denied"):
+        return bool(ephemeral or not is_public_answer(result))
+    return bool(ephemeral)
 
 
 # ============================================================
@@ -7635,7 +7916,16 @@ def _startup_warmup() -> None:
 
 def _clean_card_text(value: Any, limit: int) -> str:
     text = re.sub(r"\*+|^#+\s*|【[^】]*】", "", str(value or "")).strip()
-    return text
+    # 10-08：同一句重複出現只留第一次（依需求表的重要性縮文另做，這裡不截斷）
+    parts = re.split(r"(?<=[。！？；])", text)
+    seen, kept = set(), []
+    for part in parts:
+        key = re.sub(r"[\s，。！？；、]", "", part)
+        if key and key in seen:
+            continue
+        seen.add(key)
+        kept.append(part)
+    return "".join(kept).strip()
 
 
 def parse_ai_card(text: str) -> Optional[Dict[str, Any]]:
@@ -7670,6 +7960,9 @@ def parse_ai_card(text: str) -> Optional[Dict[str, Any]]:
         # 同一次模型產生的接梗與分析在事實核對前合併；不另設圖卡、不注入固定笑話。
         answer = opening + ("" if opening[-1] in "。！？!?…" else "。") + answer
     focus = data.get("response_focus")
+    norm = lambda t: re.sub(r"[\s，。！？；、]", "", t)
+    if summary and (norm(summary) in norm(answer) or norm(summary) in norm(why)):
+        summary = ""          # 10-08：總結只是重複結論／理由就不畫
     card = {"response_style": style,
             "answer": answer, "why": why, "scenarios": scenarios[:2], "summary": summary}
     if focus in ("holding", "current", "review"):
@@ -8387,7 +8680,7 @@ def run_discord_bot(config: BotConfig) -> None:
             for extra in result.followups:
                 # 「兩種一起看」：第 1 張現股分點籌碼、第 2 張權證分點籌碼，不硬塞成一張超長圖。
                 extra_sent = await interaction_image(interaction, extra.image_title or question, with_context_note(extra),
-                                        panels_with_context(extra), ephemeral=ephemeral, followup=True)
+                                        panels_with_context(extra), ephemeral=followup_ephemeral(extra, ephemeral=ephemeral), followup=True)
                 schedule_refresh(extra,extra_sent,extra.image_title or question,interaction.guild)
             if member_usage_stats.successful(result):
                 await record_member_usage('success', result.route, result)

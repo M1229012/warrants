@@ -25,6 +25,10 @@ import pandas as pd
 KEEP_DAYS = max(70, int(os.getenv("DISCORD_AI_PATTERN_HISTORY_DAYS", "150") or 150))
 DEFAULT_PATH = "/data/ace_ai_market_cache.sqlite3" if Path("/data").exists() else str(Path(__file__).parent / ".cache" / "ace_ai_market_cache.sqlite3")
 DB_PATH = Path(os.getenv("DISCORD_AI_MARKET_CACHE_DB", DEFAULT_PATH))
+# 10-08 測試隔離：跑 unittest 時，資料庫不在系統暫存資料夾就改用暫存檔，避免測試清掉實際 .cache／/data 的資料表
+import sys as _sys, tempfile as _tempfile
+if any("unittest" in str(a) for a in _sys.argv[:3]) and not str(DB_PATH.resolve()).lower().startswith(str(Path(_tempfile.gettempdir()).resolve()).lower()):
+    DB_PATH = Path(_tempfile.mkdtemp(prefix="ace_ai_test_db_")) / "ace_ai_market_cache.sqlite3"
 _LOCK = threading.RLock()
 _INITIALIZED = False
 # 單日最高／最低價比值上限（台股漲跌幅 10%，新上市前 5 日無漲跌幅；超過這個比值視為來源錯誤）
@@ -274,7 +278,20 @@ def has_recent_history(stock_code: str, min_rows: int = 69, max_calendar_gap_day
     return (now.normalize() - data["last_date"]).days <= max_calendar_gap_days
 
 
-def save_pattern_score(stock_code: str, date: str, score: float, grade: str, components: Any, basis: str) -> None:
+# 10-08：型態評分規則版本（weekly_pick 設定）。分數 basis 末尾帶「｜rule=版本」，讀取只用同版本，排行不混用新舊規則；
+# 空字串＝舊規則（沒有 rule 標記的既有分數）。
+PATTERN_RULE = ""
+
+
+def _rule_filter() -> Tuple[str, List[str]]:
+    if PATTERN_RULE:
+        return " AND basis LIKE ?", [f"%rule={PATTERN_RULE}%"]
+    return " AND basis NOT LIKE '%rule=%'", []
+
+
+def save_pattern_score(stock_code: str, date: str, score: float, grade: str, components: Any, basis: str,
+                       rule: Optional[str] = None) -> None:
+    """rule＝實際計分設定的規則版本（None＝目前全域版本）；自訂設定算的分數不會被標成正式規則。"""
     if not stock_code or not date:
         return
     try:
@@ -283,6 +300,8 @@ def save_pattern_score(stock_code: str, date: str, score: float, grade: str, com
         return
     now = datetime.now(timezone.utc).isoformat()
     payload = json.dumps(components or [], ensure_ascii=False, separators=(",", ":"))
+    tag = PATTERN_RULE if rule is None else rule
+    basis = str(basis or "") + (f"｜rule={tag}" if tag else "")
     with _LOCK:
         try:
             with _db() as conn:
@@ -304,8 +323,9 @@ def save_pattern_score(stock_code: str, date: str, score: float, grade: str, com
 def latest_pattern_score(stock_code: str) -> Optional[Dict[str, Any]]:
     try:
         with _db() as conn:
-            row = conn.execute("SELECT date,score,grade,basis,components_json FROM pattern_scores WHERE stock_code=? ORDER BY date DESC LIMIT 1",
-                               (str(stock_code),)).fetchone()
+            cond, extra = _rule_filter()
+            row = conn.execute("SELECT date,score,grade,basis,components_json FROM pattern_scores WHERE stock_code=?" + cond +
+                               " ORDER BY date DESC LIMIT 1", [str(stock_code)] + extra).fetchone()
     except Exception:
         return None
     if not row:
@@ -437,6 +457,34 @@ def latest_changes(codes: Iterable[str], as_of: Optional[Dict[str, str]] = None)
     return out
 
 
+def bars_fingerprint(stock_code: str, limit: int = KEEP_DAYS) -> str:
+    """底庫最近 limit 根已確認日K（日期＋OHLCV）的指紋；同日期價格或成交量更正，指紋就不同。"""
+    try:
+        with _db() as conn:
+            rows = conn.execute("SELECT date,open,high,low,close,volume FROM daily_bars WHERE stock_code=? AND confirmed=1 "
+                                "ORDER BY date DESC LIMIT ?", (str(stock_code), int(limit))).fetchall()
+    except Exception:
+        return ""
+    raw = "|".join(f"{d},{o:.4f},{h:.4f},{l:.4f},{c:.4f},{(vol or 0):.0f}" for d, o, h, l, c, vol in rows)
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()[:12] if rows else ""
+
+
+def latest_pattern_score_basis(codes: Iterable[str]) -> Dict[str, Tuple[str, str]]:
+    """{代號: (最新分數日期, basis)}，只看目前規則版本。"""
+    out: Dict[str, Tuple[str, str]] = {}
+    cond, extra = _rule_filter()
+    try:
+        with _db() as conn:
+            for code in dict.fromkeys(str(c).strip() for c in codes if str(c).strip()):
+                row = conn.execute("SELECT date,basis FROM pattern_scores WHERE stock_code=?" + cond + " ORDER BY date DESC LIMIT 1",
+                                   [code] + extra).fetchone()
+                if row:
+                    out[code] = (str(row[0]), str(row[1] or ""))
+    except Exception:
+        return out
+    return out
+
+
 def latest_pattern_score_dates(codes: Iterable[str]) -> Dict[str, str]:
     """指定股票各自最新的型態分數日期；純本地查詢，不限制日期範圍。"""
     wanted = list(dict.fromkeys(str(c).strip() for c in codes if str(c).strip()))
@@ -449,9 +497,10 @@ def latest_pattern_score_dates(codes: Iterable[str]) -> Dict[str, str]:
                 for chunk_start in range(0, len(wanted), 400):
                     chunk = wanted[chunk_start:chunk_start + 400]
                     marks = ",".join("?" * len(chunk))
+                    cond, extra = _rule_filter()
                     rows = conn.execute(
                         f"SELECT stock_code, MAX(date) FROM pattern_scores "
-                        f"WHERE stock_code IN ({marks}) GROUP BY stock_code", chunk).fetchall()
+                        f"WHERE stock_code IN ({marks}){cond} GROUP BY stock_code", chunk + extra).fetchall()
                     out.update({str(code): str(date) for code, date in rows if date})
     except Exception:
         return out
@@ -472,10 +521,11 @@ def pattern_scores_for(codes: Iterable[str], max_age_days: int = 5) -> Dict[str,
                 for chunk_start in range(0, len(wanted), 400):
                     chunk = wanted[chunk_start:chunk_start + 400]
                     marks = ",".join("?" * len(chunk))
+                    cond, extra = _rule_filter()
                     rows = conn.execute(
                         f"""SELECT stock_code, date, score, grade FROM pattern_scores
-                            WHERE stock_code IN ({marks}) AND date>=? ORDER BY stock_code, date DESC""",
-                        chunk + [cutoff]).fetchall()
+                            WHERE stock_code IN ({marks}) AND date>=?{cond} ORDER BY stock_code, date DESC""",
+                        chunk + [cutoff] + extra).fetchall()
                     for code, date, score, grade in rows:
                         out.setdefault(str(code), {"date": str(date), "score": float(score), "grade": str(grade or "")})
     except Exception:

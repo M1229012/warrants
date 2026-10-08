@@ -1047,7 +1047,7 @@ def _overview_rows(codes: List[str]) -> List[Dict[str, Any]]:
         # 總覽不打 API：有當天已查過的公司行動就用，沒有就標「未核實」，不可假裝沒有事件（審查 #3）
         cached = (tools._CORP_CACHE.get(code) or ("", None))
         events = cached[1] if cached[0] == tools.taipei_now().strftime("%Y-%m-%d") else {"status": "unverified"}
-        k = kline_patterns.detect(df, events, state_key=f"tri_state_{code}")
+        k = kline_patterns.detect(df, events, state_key=f"tri_state_{code}", state_write=False)
         shape = _shape_label(k)
         pct = lambda n: round((close / float(c.iloc[-1 - n]) - 1) * 100, 2)
         rows.append({"code": code, "name": names.get(code, code), "d1": pct(1), "d5": pct(5), "d20": pct(20),

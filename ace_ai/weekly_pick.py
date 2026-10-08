@@ -61,6 +61,10 @@ class WeeklyPickConfig:
     support_merge_pct: float = tools._env_float("WEEKLY_PICK_SUPPORT_MERGE_PCT", 1.0)
     # B 組：MA5 在現價下方且「跌停也續揚」才算支撐；整批比較通過前預設關閉
     ma5_limit_support: bool = os.getenv("WEEKLY_PICK_MA5_LIMIT_SUPPORT", "0").strip().lower() in ("1", "true", "yes", "on")
+    # 支撐距離改成和圖卡相同：(現價−支撐)÷現價（原本 現價÷支撐−1）
+    support_card_distance: bool = os.getenv("WEEKLY_PICK_SUPPORT_CARD_DISTANCE", "1").strip().lower() in ("1", "true", "yes", "on")
+    # 均線方向改看逐日模擬 path（未來只有走平＝新中間級距；原本跳過走平、用今天容差）
+    deduction_path_score: bool = os.getenv("WEEKLY_PICK_DEDUCTION_PATH_SCORE", "1").strip().lower() in ("1", "true", "yes", "on")
     high_confidence_win_rate: float = tools._env_float("WEEKLY_PICK_HIGH_CONFIDENCE_WIN_RATE", 65.0)
     high_confidence_sample: int = tools._env_int("WEEKLY_PICK_HIGH_CONFIDENCE_SAMPLE", 30)
     unresolved_high_ratio: float = tools._env_float("WEEKLY_PICK_UNRESOLVED_HIGH_RATIO", 0.30)
@@ -415,6 +419,20 @@ PATTERN_COMPONENTS = (("均線趨勢", 30), ("價格位置", 20), ("量區結構
 PATTERN_COMPONENT_WEIGHTS = {"均線趨勢": 25, "價格位置": 15, "量區結構": 25, "下方支撐": 25, "布林": 10}
 
 
+_RULE_FIELDS = ("near_ma20_pct", "extended_ma20_pct", "surge_5d_pct", "overhead_zone_pct", "support_zone_pct",
+                "near_zone_support", "support_merge_pct", "ma5_limit_support", "support_card_distance", "deduction_path_score")
+
+
+def pattern_rule_version(config: Optional["WeeklyPickConfig"] = None) -> str:
+    """型態評分規則版本：新規則開關全關＝舊規則（空字串，相容既有分數）；否則依所有評分設定雜湊。"""
+    import hashlib
+    c = config or WeeklyPickConfig()
+    if not (c.near_zone_support or c.support_merge_pct > 0 or c.ma5_limit_support or c.support_card_distance or c.deduction_path_score):
+        return ""
+    raw = "pattern-v2|" + "|".join(f"{k}={getattr(c, k)}" for k in _RULE_FIELDS)
+    return "p2-" + hashlib.md5(raw.encode("utf-8")).hexdigest()[:8]
+
+
 def weekly_technical_score(pattern_score_100: Any) -> float:
     """把唯一的 100 分型態評分等比例換算成週精選技術面 50 分。
 
@@ -428,13 +446,31 @@ def weekly_technical_score(pattern_score_100: Any) -> float:
     return round(value * PATTERN_WEIGHT / 100.0, 2)
 
 
-def _direction_points(d: Dict[str, Any], full: float) -> Tuple[float, str]:
-    """均線方向＋扣抵推算：上揚且扣抵後不轉彎＝滿分；上揚但將轉下彎＝一半以下；下彎＝0。"""
+def _direction_points(d: Dict[str, Any], full: float, config: Optional["WeeklyPickConfig"] = None) -> Tuple[float, str]:
+    """均線方向＋扣抵推算：上揚且扣抵後不轉彎＝滿分；上揚但將轉下彎＝一半以下；下彎＝0。
+    文字用 turn_text（明天的確切條件）；deduction_path_score 開啟時改看逐日模擬 path（只有走平＝中間級距）。"""
     now, turn, day = d.get("direction_now"), d.get("turn"), d.get("turn_day")
-    # 分數看 5 日內第一次轉向；文字用 turn_text（要守的價位條件），舊資料沒有才寫收盤不變推算
     when = str(d.get("turn_text") or f"收盤不變{tools.turn_phrase(turn, day)}")
+    path = d.get("path") if config is not None and config.deduction_path_score else None
     if not now:
         return full / 2, "資料不足，給一半"
+    if path is not None:
+        down, up, flat = "下彎" in path, "上揚" in path, "走平" in path
+        if now == "上揚":
+            if down:
+                return round(full * 0.4, 1), f"上揚，但扣抵價偏高，{when}"
+            if flat:
+                return round(full * 0.7, 1), f"上揚，但扣抵後可能走平，{when}"
+            return full, "上揚，扣抵後仍續揚"
+        if now == "下彎":
+            if up:
+                return round(full * 0.5, 1), f"下彎，但扣抵價偏低，{when}"
+            return 0.0, "下彎" + ("，且在股價上方形成壓力" if d.get("ma_above_close") else "")
+        if up and not down:
+            return round(full * 0.7, 1), f"走平，{when}"
+        if down:
+            return round(full * 0.2, 1), f"走平，{when}"
+        return full / 2, "走平"
     if now == "上揚":
         if turn == "轉下彎":
             return round(full * 0.4, 1), f"上揚，但扣抵價偏高，{when}"
@@ -489,7 +525,8 @@ def _support_levels(close: Optional[float], values: Dict[str, Optional[float]], 
             groups[-1].append((level, label))
         else:
             groups.append([(level, label)])
-    return [((close / g[0][0] - 1) * 100, "＋".join(lb for _, lb in g)) for g in groups]
+    dist = (lambda lv: (1 - lv / close) * 100) if config.support_card_distance else (lambda lv: (close / lv - 1) * 100)
+    return [(dist(g[0][0]), "＋".join(lb for _, lb in g)) for g in groups]
 
 
 def score_pattern(tech: Dict[str, Any], vp: Dict[str, Any], extras: Dict[str, Any], config: WeeklyPickConfig) -> Dict[str, Any]:
@@ -522,7 +559,7 @@ def score_pattern(tech: Dict[str, Any], vp: Dict[str, Any], extras: Dict[str, An
         add("均線趨勢", "均線排列", 4, 12, "均線糾結")
     deduction = tech.get("ma_deduction") or {}
     for key, full in (("MA20", 10), ("MA60", 8)):
-        points, note = _direction_points(deduction.get(key) or {}, full)
+        points, note = _direction_points(deduction.get(key) or {}, full, config)
         add("均線趨勢", f"{key} 方向", points, full, f"{key} {note}")
 
     # ---------- 價格位置 20：距 MA20 12＋站上 MA60 4＋追高風險 4 ----------
@@ -707,11 +744,15 @@ def build_pattern_scorecard(
     pattern = score_pattern(tech, vp, extras, config)
     try:
         import local_market_cache
+        if not str(tech.get("signal_status") or "").startswith("收盤確認"):
+            raise ValueError("盤中／盤後暫定分數不進正式排行")   # 10-08
+        if pattern_rule_version(config) != local_market_cache.PATTERN_RULE:
+            raise ValueError("自訂評分設定不寫正式分數（同股同日會覆寫正式規則的分數）")   # 10-08
         local_market_cache.save_pattern_score(
             str(tech.get("stock_code") or vp.get("stock_code") or ""),
             str(tech.get("data_date") or vp.get("data_date") or ""),
             pattern["score"], pattern_grade(pattern["score"]), pattern.get("components"),
-            str(tech.get("signal_status") or ""),
+            str(tech.get("signal_status") or ""), rule=pattern_rule_version(config),
         )
     except Exception:
         pass
@@ -2405,3 +2446,10 @@ def extract_admin_moneydj_branch(text: str) -> str:
 
 def is_weekly_admin_feature_question(text: str) -> bool:
     return is_weekly_pick_question(text) or is_weekly_draft_question(text) or is_weekly_image_question(text) or is_admin_moneydj_image_question(text)
+
+
+try:   # 10-08：分數存讀都帶規則版本（正式版新規則全關＝空字串＝舊分數照用）
+    import local_market_cache as _lmc
+    _lmc.PATTERN_RULE = pattern_rule_version()
+except Exception:
+    pass

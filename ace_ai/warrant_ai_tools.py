@@ -264,9 +264,25 @@ FINMIND_BACKGROUND_MIN_REMAINING = float(os.getenv("DISCORD_AI_FINMIND_BACKGROUN
 _FM_BG_LOGGED = {"day": ""}
 
 
+_LOCAL_ONLY = threading.local()
+
+
+@contextmanager
+def local_only():
+    """10-08：背景重算型態分數只用本地底庫，整條呼叫鏈（日K、公司行動）都不打 FinMind。"""
+    old = getattr(_LOCAL_ONLY, "on", False)
+    _LOCAL_ONLY.on = True
+    try:
+        yield
+    finally:
+        _LOCAL_ONLY.on = old
+
+
 def finmind_background_allowed() -> bool:
     """背景作業（補資料、算分數）只在目前 Token 還剩一半以上額度時才用 FinMind（10-04：會員優先）。
-    第一支用到一半就停，第二支完整留給會員；查不到用量時保守不用。"""
+    第一支用到一半就停，第二支完整留給會員；查不到用量時保守不用。local_only() 內一律不用。"""
+    if getattr(_LOCAL_ONLY, "on", False):
+        return False
     tokens = finmind_tokens()
     if tokens and current_finmind_token() != tokens[0]:
         return False                              # 10-07：背景只用第一支；第一支冷卻後第二、三支完整留給會員
@@ -352,6 +368,10 @@ _CORE_LOCK = threading.Lock()
 
 class ToolDataError(RuntimeError):
     """Tool 取得資料失敗；訊息會轉成 Discord 可讀的中文說明。"""
+
+
+class ToolSourceError(ToolDataError):
+    """資料來源暫時失敗（網路、服務錯誤）：和「資料不足／額度保留」不同，背景可以稍後重試。"""
 
 
 class SheetUnavailableError(ToolDataError):
@@ -624,6 +644,7 @@ class TTLCache:
     def __init__(self, namespace: str = "discord_ai") -> None:
         self.namespace = namespace
         self._data: Dict[str, Tuple[float, Any]] = {}
+        self._owner: Dict[str, int] = {}      # key → 建立它的執行緒（背景只清自己的）
         self._lock = threading.Lock()
         self._key_locks: Dict[str, threading.Lock] = {}
 
@@ -656,6 +677,7 @@ class TTLCache:
             doomed = [k for k in self._data if k.startswith(heads)]
             for k in doomed:
                 del self._data[k]
+                self._owner.pop(k, None)
         return len(doomed)
 
     def remaining(self, key: str) -> float:
@@ -666,7 +688,9 @@ class TTLCache:
 
     def set(self, key: str, value: Any, ttl_seconds: float) -> None:
         with self._lock:
-            self._data[self._full_key(key)] = (time.time() + max(1.0, float(ttl_seconds)), value)
+            full_key = self._full_key(key)
+            self._data[full_key] = (time.time() + max(1.0, float(ttl_seconds)), value)
+            self._owner[full_key] = threading.get_ident()
             if len(self._data) > self.MAX_ENTRIES:
                 self._evict()
 
@@ -675,11 +699,13 @@ class TTLCache:
             return set(self._data)
 
     def drop_new_since(self, before: set) -> int:
-        """刪掉 before 之後才新增的 key（背景批次算完就釋放記憶體，不碰會員查詢原本就有的快取）。"""
+        """刪掉 before 之後才新增、且由目前執行緒建立的 key（10-08：同時段會員查詢建立的快取不刪）。"""
+        me = threading.get_ident()
         with self._lock:
-            doomed = [k for k in self._data if k not in before]
+            doomed = [k for k in self._data if k not in before and self._owner.get(k) == me]
             for k in doomed:
                 del self._data[k]
+                self._owner.pop(k, None)
         return len(doomed)
 
     def _evict(self) -> None:
@@ -687,10 +713,12 @@ class TTLCache:
         now = time.time()
         for k in [k for k, (exp, _) in self._data.items() if exp < now]:
             del self._data[k]
+            self._owner.pop(k, None)
         extra = len(self._data) - int(self.MAX_ENTRIES * 0.9)
         if extra > 0:
             for k, _ in sorted(self._data.items(), key=lambda kv: kv[1][0])[:extra]:
                 del self._data[k]
+                self._owner.pop(k, None)
         for k in [k for k, lock in self._key_locks.items() if k not in self._data and not lock.locked()]:
             del self._key_locks[k]
 
@@ -2251,6 +2279,23 @@ def get_retail_futures(days: int = 0) -> Dict[str, Any]:
 
 # 已確認來源沒有更新資料的股票（停牌等）：code -> (日期, 本地最後一根 K 棒日期)，當天不再重抓。
 _STALE_CHECKED: Dict[str, Tuple[str, str]] = {}
+DAILY_READY_MINUTE = _env_int("DISCORD_AI_DAILY_READY_MINUTE", 15 * 60 + 30)   # 收盤日K通常此時已入底庫
+
+
+def expected_last_close(now: Any = None) -> pd.Timestamp:
+    """應該要有的最近收盤日（10-08：取代「5 個日曆日內就接受」）：平日、過了日K就緒時間才算今天；
+    往回跳過週末與交易所明確回覆休市的日子。只用日曆與交易所休市紀錄，不看底庫有什麼資料。"""
+    now = now or taipei_now()
+    day = pd.Timestamp(now.date())
+    if now.weekday() >= 5 or now.hour * 60 + now.minute < DAILY_READY_MINUTE:
+        day -= pd.Timedelta(days=1)
+    try:
+        closed = set(local_market_cache.market_closed_days([(day - pd.Timedelta(days=i)).strftime("%Y-%m-%d") for i in range(15)]))
+    except Exception:
+        closed = set()
+    while day.weekday() >= 5 or day.strftime("%Y-%m-%d") in closed:
+        day -= pd.Timedelta(days=1)
+    return day
 
 
 def _missing_trading_days(df: pd.DataFrame) -> List[str]:
@@ -2385,7 +2430,8 @@ def _load_price_bundle(stock_code: str, spot_history_mode: bool = False) -> Dict
             local_last = pd.Timestamp(persistent["last_date"]).strftime("%Y-%m-%d")
             gap = (pd.Timestamp(taipei_now().date()) - persistent["last_date"]).days
             # 停牌股永遠 gap>5，每次都重抓 FinMind 也拿不到新的；今天確認過一次就不再問。
-            if gap <= 5 or _STALE_CHECKED.get(code) == (today, local_last):
+            stale_key = f"{today} {taipei_now().hour}"     # 停牌／資料源還沒更新：同一小時只問一次
+            if persistent["last_date"] >= expected_last_close() or _STALE_CHECKED.get(code) == (stale_key, local_last):
                 return persistent["df"], str(persistent.get("market") or ""), "本地69日歷史快取"
         if current_api_priority() == "background" and not finmind_background_allowed():
             # 10-07：背景（型態分數底庫等）抓日K原本不受額度保護，冷門股湊不滿 69 根就每輪打 FinMind，部署後一次吃光 3 支 Token。
@@ -2402,7 +2448,7 @@ def _load_price_bundle(stock_code: str, spot_history_mode: bool = False) -> Dict
             if stock_df is not None and not stock_df.empty:
                 _save_daily_cache(code, stock_df, market=str(market or ""), source="FinMind", confirmed=True)
                 if local_last and pd.Timestamp(stock_df.index[-1]).strftime("%Y-%m-%d") <= local_last:
-                    _STALE_CHECKED[code] = (today, local_last)
+                    _STALE_CHECKED[code] = (f"{today} {taipei_now().hour}", local_last)
                 return stock_df, str(market or ""), "FinMind 日K"
             error: Exception = ToolDataError(f"{code} FinMind 沒有股價資料")
         except Exception as exc:  # FinMind 失敗時才以富果歷史日K備援；正常盤中不拿富果做歷史預抓。
@@ -2410,7 +2456,7 @@ def _load_price_bundle(stock_code: str, spot_history_mode: bool = False) -> Dict
             error = exc
         if not (FUGLE_API_KEYS or FUGLE_API_KEY):
             print(f"⚠️ {code} 股價取得失敗（無富果備援）：{type(error).__name__}: {error}", flush=True)
-            raise ToolDataError(f"{code} 暫時取不到股價資料")   # 細節只寫 Log，不外漏給會員
+            raise ToolSourceError(f"{code} 暫時取不到股價資料")   # 細節只寫 Log，不外漏給會員
         print(f"⚠️ {code} FinMind 股價失敗，才改用富果歷史日K備援：{type(error).__name__}: {error}", flush=True)
         days = int(re.search(r"\d+", PRICE_FETCH_PERIOD).group(0)) if re.search(r"\d+", PRICE_FETCH_PERIOD) else 180
         frame = _drop_invalid_bars(code, fetch_fugle_daily(code, days), "富果日K")
@@ -2730,14 +2776,44 @@ def _bollinger_position(close: Optional[float], upper: Optional[float], mid: Opt
 MA_DEDUCTION_DAYS = _env_int("DISCORD_AI_MA_DEDUCTION_DAYS", 5)
 
 
-def turn_condition(turn: str, day: Optional[int], price: Optional[float]) -> str:
-    """均線轉向改寫成價位條件（10-08 使用者：寫「收盤不變會怎樣」，隔天股價一變就誤導）。
-    上揚均線第 N 天扣抵價高於現價：「後天收 1,110 以上才續揚」；下彎均線：「後天收 1,110 以上就翻揚」。"""
-    if not turn or not day or price is None:
-        return ""
-    when = {1: "明天", 2: "後天"}.get(int(day), f"第 {int(day)} 個交易日")
-    text = f"{price:,.2f}".rstrip("0").rstrip(".")
-    return f"{when}收 {text} 以上" + ("才續揚" if turn == "轉下彎" else "就翻揚")
+def tick_size(price: float) -> float:
+    """台股升降單位（證交所／櫃買普通股）。"""
+    p = abs(float(price))
+    return 0.01 if p < 10 else 0.05 if p < 50 else 0.1 if p < 100 else 0.5 if p < 500 else 1.0 if p < 1000 else 5.0
+
+
+def tick_above(x: float) -> float:
+    """嚴格高於 x 的第一個合法價位（「收至少 X」的 X）。"""
+    t = tick_size(x)
+    v = (math.floor(x / t + 1e-9) + 1) * t
+    return round(v, 2)
+
+
+def limit_prices(ref: float) -> Tuple[float, float]:
+    """（跌停價, 漲停價）：參考價 ±10%，依升降單位往內捨入（一般情況；除權息參考價另計）。"""
+    down, up = ref * 0.9, ref * 1.1
+    td, tu = tick_size(down), tick_size(up)
+    return round(math.ceil(down / td - 1e-9) * td, 2), round(math.floor(up / tu + 1e-9) * tu, 2)
+
+
+def tomorrow_condition(now: str, rise_at: float) -> str:
+    """圖卡只寫明天的確切條件（後天以後依前一天實際收盤而變，不寫成確定門檻）。"""
+    p = tick_above(rise_at)
+    text = f"{p:,.2f}".rstrip("0").rstrip(".")
+    return f"明天收至少 {text} " + ("才續揚" if now == "上揚" else "才轉揚")
+
+
+FLAT_RATIO = 0.0002   # 均線一天變動小於 MA 的 0.02%＝走平（direction 與失敗值共用）
+
+
+def ma_flip_prices(deduction: float, n: int, ma: float) -> Tuple[float, float]:
+    """明天收盤的方向門檻（與 direction 同一套分類，走平容許範圍以明天的新均線計）。
+
+    明天變化 c＝(收盤−扣抵價)/n、新均線＝ma+c；上揚要 c > FLAT×(ma+c)，下彎要 c < −FLAT×(ma+c)。
+    回傳（收盤「高於」它才上揚, 收盤「低於」它才下彎）；落在兩者之間（含剛好等於扣抵價）＝走平。
+    """
+    m = abs(ma)
+    return deduction + n * FLAT_RATIO * m / (1 - FLAT_RATIO), deduction - n * FLAT_RATIO * m / (1 + FLAT_RATIO)
 
 
 def analyze_ma_deduction(df: pd.DataFrame, periods: Sequence[int] = (5, 10, 20, 60), days: int = MA_DEDUCTION_DAYS) -> Dict[str, Any]:
@@ -2756,24 +2832,33 @@ def analyze_ma_deduction(df: pd.DataFrame, periods: Sequence[int] = (5, 10, 20, 
             continue
         start = len(closes) - n
         ma = float(closes.iloc[start:].mean())
-        flat = abs(ma) * 0.0002
+        flat = abs(ma) * FLAT_RATIO
         k = max(1, min(days, n))
         deductions = [float(v) for v in closes.iloc[start:start + k]]
         dates = [_fmt_date(d) for d in closes.index[start:start + k]]
         changes = [(close - d) / n for d in deductions]
+        rise_at, fall_at = ma_flip_prices(deductions[0], n, ma)
 
         def direction(change: float) -> str:
             return "上揚" if change > flat else "下彎" if change < -flat else "走平"
 
         now = direction((close - float(closes.iloc[start - 1])) / n)
-        turn, turn_day = "", None
+        turn, turn_day = "", None                # 舊評分用（略過走平、用今天容差）；新評分改看 path
         for day, change in enumerate(changes, 1):
             future = direction(change)
             if future != "走平" and future != now:
                 turn, turn_day = ("轉下彎" if future == "下彎" else "轉上揚"), day
                 break
-        # 10-08（3406）：文字寫成要守的價位條件，評分仍看 days 日內第一次轉向
-        turn_text = turn_condition(turn, turn_day, deductions[turn_day - 1] if turn_day else None)
+        # 10-08 逐日模擬（收盤不變）：每天先算當天新均線，再用新均線的 FLAT_RATIO 判向；門檻用前一日均線解
+        sim, path, rises = ma, [], []
+        for dprice in deductions:
+            rises.append(ma_flip_prices(dprice, n, sim)[0])
+            new = sim + (close - dprice) / n
+            ch, tol = new - sim, FLAT_RATIO * abs(new)
+            path.append("上揚" if ch > tol else "下彎" if ch < -tol else "走平")
+            sim = new
+        first_change = next((i for i, x in enumerate(path, 1) if x != now), None)
+        turn_text = tomorrow_condition(now, rise_at) if (first_change or now != "上揚") else ""
         projected = ma + sum(changes)
         high, low = max(deductions), min(deductions)
         above_close = ma > close
@@ -2783,6 +2868,8 @@ def analyze_ma_deduction(df: pd.DataFrame, periods: Sequence[int] = (5, 10, 20, 
         elif turn == "轉上揚":
             signal = (f"MA{n} 目前{now}，未來 {k} 日扣抵價最低 {low:,.2f} 低於現價；收盤若維持 {close:,.2f}，"
                       f"{turn_phrase(turn, turn_day)}")
+        elif now == "上揚" and "走平" in path:
+            signal = f"MA{n} 上揚，但收盤不變時第 {path.index('走平') + 1} 日起可能走平；{turn_text}"
         elif now == "上揚":
             signal = f"MA{n} 上揚，未來 {k} 日扣抵價（{low:,.2f}～{high:,.2f}）不高於現價，收盤維持不變時仍續揚"
         elif now == "下彎":
@@ -2804,10 +2891,16 @@ def analyze_ma_deduction(df: pd.DataFrame, periods: Sequence[int] = (5, 10, 20, 
             "turn": turn,
             "turn_day": turn_day,
             "turn_text": turn_text,
+            "path": path,                                   # 未來 days 日方向（收盤不變模擬；後面幾天依賴假設）
+            "first_change_day": first_change,
+            "change_dir": path[first_change - 1] if first_change else "",
+            "first_down_day": next((i for i, x in enumerate(path, 1) if x == "下彎"), None),
+            "rise_price_tomorrow": _num(tick_above(rise_at)),
             # 失敗值＝明天要扣掉的價格：上揚均線收盤低於它才轉彎；比跌停價還低＝跌停也續揚（扣抵條件強，不等於價格守得住）
-            "fail_price": _num(deductions[0]),
-            "limit_proof": ("跌停也續揚" if now == "上揚" and deductions[0] < close * 0.9
-                            else "漲停也續彎" if now == "下彎" and deductions[0] > close * 1.1 else ""),
+            # 失敗值＝方向翻轉的門檻：上揚均線收盤要「高於」它才續揚；下彎均線收盤要「低於」它才續彎
+            "fail_price": _num(rise_at if now == "上揚" else fall_at if now == "下彎" else deductions[0]),
+            "limit_proof": ("跌停也續揚" if now == "上揚" and limit_prices(close)[0] > rise_at
+                            else "漲停也續彎" if now == "下彎" and limit_prices(close)[1] < fall_at else ""),
             "ma_above_close": above_close,
             "signal": signal,
         }
@@ -2827,7 +2920,7 @@ def analyze_ma_deduction(df: pd.DataFrame, periods: Sequence[int] = (5, 10, 20, 
         result[f"MA{n}"].update({
             "deduct_trend": trend,
             "role_text": f"{role}至 {projected:,.2f}",
-            "hold_prices_3d": [_num(v) for v in deductions[:3]],       # 未來 3 日各自要收高於這價，均線才維持上揚
+            "hold_prices_3d": [_num(tick_above(r)) for r in rises[:3]],   # 10-08：真正續揚門檻（逐日模擬；後兩日依賴收盤不變假設）
             "outlook": f"未來 {k} 日{trend}，{role}至 {projected:,.2f}（收盤不變推算）",
         })
     return result

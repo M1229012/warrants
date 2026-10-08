@@ -769,14 +769,18 @@ def _tri_line(P, B, Q, C, A, s: float, k: float, i0: int, last: int, sg: int, re
     contact = {d: ev for ev in events for d in ev["days"]}
     near = lambda m: m in contact and (P[m] - line(m)) * sg >= -TRI_TOUCH * A[m] and (B[m] - line(m)) * sg <= TRI_TOUCH * A[m]
     touched = {m for m in mj if near(m)}
-    if src_major is not None and src_major in mj and events and events[0]["rep"] == i0:
-        touched.add(src_major)                   # 起點借用的主要轉折＝第一事件的來源（只加這一個）
+    borrowed = 0
+    if src_major is not None and src_major in mj and events and events[0]["rep"] == i0 and src_major not in touched:
+        if TRI_SPLIT_BORROWED:
+            borrowed = 1                          # 10-08：借用來源本身沒貼線，另計、不算實際貼線支持
+        else:
+            touched.add(src_major)               # 起點借用的主要轉折＝第一事件的來源（只加這一個）
     pierced = {m for m in mj if m > i0 + 3 and m not in fake_set and (P[m] - line(m)) * sg > TRI_MAJOR_POKE * A[m]}
     turns = set(_tri_turns(P, sg, i0, F))
     zone = lambda d: max(0.0, (line(d) - P[d]) * sg, (B[d] - line(d)) * sg) / A[d]   # 線落在影線區間內＝0
     err = float(np.mean([min(zone(d) for d in ev["days"]) for ev in events]))
     return {"s": float(s), "k": float(k), "i0": int(i0), "a": [ev["rep"] for ev in events], "events": events,
-            "major": len(touched) - len(pierced), "mtouch": len(touched), "reacted": reacted, "fakes": fakes,
+            "major": len(touched) - len(pierced), "mtouch": len(touched), "borrowed": borrowed, "reacted": reacted, "fakes": fakes,
             "peaks": sum(1 for ev in events if turns.intersection(ev["days"])), "err": err,
             "turn_events": sum(1 for ev in events if (turns | set(mj)).intersection(ev["days"])),
             "density": len(contact), "score": reacted, "brk": None, "R_line": float(A[i0]), "pending": pending,
@@ -807,7 +811,8 @@ def _tri_lines(P, B, Q, C, A, lo: int, F: int, sg: int, majors: List[Tuple[int, 
             if r:
                 r.update(src=(x1, src1, x2, src2))
                 out.append(r)
-    out.sort(key=lambda r: (-r["major"], -len(r["a"]), -r["peaks"], -r["reacted"], r["err"], r["src"]))
+    out.sort(key=(lambda r: (-r["major"], -r["borrowed"], -len(r["a"]), -r["peaks"], -r["reacted"], r["err"], r["src"])) if TRI_SPLIT_BORROWED
+             else (lambda r: (-r["major"], -len(r["a"]), -r["peaks"], -r["reacted"], r["err"], r["src"])))
     uniq: List[Dict[str, Any]] = []
     for r in out:
         def same(u):
@@ -937,17 +942,40 @@ def _tri_track(df, C, A, snap, end: int) -> Dict[str, Any]:
             history.append({"type": "returned_inside", "date": _d(df.index[t]), "idx": t})
             pos = "inside"
     breaks = [h for h in history if h["type"] != "returned_inside"]
+    for h in breaks:
+        # 10-08 兩日確認：首次越線後（到下一個事件前），連續兩根完整收盤 K 同方向都超出 TRI_OUT×當日 ATR 才確認；
+        # 中間一天幅度不足就重新計數（100.2、100.1、100.2、100.2 → 第 4 天確認）；過交會點不再確認
+        nxt = next((x["idx"] for x in history if x["idx"] > h["idx"]), end + 1)
+        run, h["confirm"] = 0, "越線、尚未確認"
+        for t in range(h["idx"], min(nxt, end + 1)):
+            if up_at(t) <= dn_at(t):
+                h["confirm"] = "已過交會點，不確認"
+                break
+            beyond = (C[t] > up_at(t) + TRI_OUT * A[t]) if h["type"] == "break_up" else (C[t] < dn_at(t) - TRI_OUT * A[t])
+            run = run + 1 if beyond else 0
+            if run >= 2:
+                h["confirm"], h["confirmed_date"] = "確認", _d(df.index[t])
+                break
+        else:
+            if nxt <= end:
+                h["confirm"] = "越線後收回，未確認"
+            elif run == 1 and h["idx"] == end:
+                h["confirm"] = "待下一日收盤"
     return {"history": history, "pos": pos, "crossed": crossed, "breaks": breaks,
             "reversed": any(a["type"] != b["type"] for a, b in zip(breaks, breaks[1:]))}
 
 
-TRI_STATE_VERSION = "tri-v7"
+TRI_STATE_VERSION = "tri-v8"   # 10-08：指紋含 ZIGZAG_ATR 等全部參數、窗口外紀錄不載入、兩日確認欄位
 TRI_INIT_REPLAY = int(_env("TRI_INIT_REPLAY", 20))   # 沒有狀態快照時，從固定起點（今天往回 20 日）重播建立
 TRI_TRACK_DAYS = int(_env("TRI_TRACK_DAYS", 20))     # 已突破型態沿固定線追蹤最多 20 日（或交會）就結束
+TRI_CONFIRM2 = int(_env("TRI_CONFIRM2", 0))          # 10-08：1＝文字顯示兩日確認（比較驗證前預設關；欄位一律計算）
+TRI_SPLIT_BORROWED = int(_env("TRI_SPLIT_BORROWED", 0))   # 10-08：1＝借用旁邊 K 棒的主要轉折不算實際貼線支持（另計排序）
 
 
 def _tri_params_sig() -> str:
-    return "|".join(f"{k}={v}" for k, v in sorted(globals().items()) if k.startswith("TRI_") and isinstance(v, (int, float)))
+    # 10-08：原本只收 TRI_*，改 ZIGZAG_ATR 等參數後仍沿用舊快照；改成所有大寫數值參數
+    return "|".join(f"{k}={v}" for k, v in sorted(globals().items())
+                    if k.isupper() and isinstance(v, (int, float)) and not isinstance(v, bool))
 
 
 def _shift_snap(snap: Dict[str, Any], delta: int) -> Dict[str, Any]:
@@ -1047,6 +1075,7 @@ def _user_triangle(df, atr_prev, end, state=None, out_state=None, replay_days=No
     records: List[Dict[str, Any]] = []
     start_X = max(first_valid + 31, end - (TRI_INIT_REPLAY if replay_days is None else max(0, int(replay_days))))   # 族群總覽等大量呼叫可設 0（只看今天）
     reconstructed = True                          # 沒有有效快照：從固定起點重建，紀錄標「回溯辨識」
+    window_dropped = False                        # 有紀錄因資料窗口較短無法載入：這次只顯示、不寫回（避免把仍有效的紀錄洗掉）
     if state and state.get("sig") == sig and state.get("as_of") in pos and pos[state["as_of"]] <= end:
         a = pos[state["as_of"]]
         fp = state.get("fingerprint") or {}
@@ -1054,8 +1083,12 @@ def _user_triangle(df, atr_prev, end, state=None, out_state=None, replay_days=No
         if fp and mine == [d for d in sorted(fp) if d >= dates[0]] and all(bar_hash(pos[d]) == fp[d] for d in mine):
             for r in state.get("records", []):
                 if r["F_date"] in pos and r["recognized"] in pos:
-                    records.append({"snap": _shift_snap(r["snap"], pos[r["F_date"]]), "recognized": pos[r["recognized"]],
-                                    "reconstructed_at": r.get("reconstructed_at")})
+                    snap = _shift_snap(r["snap"], pos[r["F_date"]])
+                    if min([snap["start"], snap["joint"], snap["u"]["i0"], snap["d"]["i0"]] + snap["u"]["a"] + snap["d"]["a"]) < 0:
+                        window_dropped = True
+                        continue                  # 10-08：形成期間超出目前資料窗口（不代表紀錄失效）
+                    records.append({"snap": snap, "recognized": pos[r["recognized"]],
+                                    "reconstructed_at": r.get("reconstructed_at"), "detected_on": r.get("detected_on")})
             start_X, reconstructed = a + 1, False
     run_day = dates[end]
 
@@ -1065,7 +1098,7 @@ def _user_triangle(df, atr_prev, end, state=None, out_state=None, replay_days=No
     for X in range(start_X, end + 1):
         records = [r for r in records if not expired(r, X)]   # 每天先清過期紀錄，再判斷新突破（逐日＝一次補算）
         F = X - 1
-        pick = form(F) or form(F, False) or form(F, True, True)   # 正式 → 候選 → 補充候選（後兩者不建正式紀錄）
+        pick = form(F)                            # 10-08 提速：候選／補充候選必為 candidate、不建紀錄，歷史日不必搜尋（結果相同）
         if pick is None or pick.get("candidate"):
             continue
         if any(same_shape(r["snap"], pick, X) for r in records):
@@ -1074,16 +1107,18 @@ def _user_triangle(df, atr_prev, end, state=None, out_state=None, replay_days=No
         o = TRI_OUT * A[X]
         if C[X] > u["s"] * X + u["k"] + o or C[X] < d["s"] * X + d["k"] - o:
             records.append({"snap": pick, "recognized": X,      # 當天主流程真的發出突破，才建立正式紀錄
-                            "reconstructed_at": run_day if reconstructed else None})
+                            "reconstructed_at": run_day if reconstructed else None,
+                            "detected_on": None if reconstructed else run_day})
     # 追蹤結束：超過 TRI_TRACK_DAYS 或已過交會點
     tracks = {id(r): _tri_track(df, C, A, r["snap"], end) for r in records}
     if out_state is not None:
         out_state.clear()
+    if out_state is not None and not window_dropped:
         out_state.update(_jsonable({
             "sig": sig, "as_of": dates[end],
             "fingerprint": {dates[i]: bar_hash(i) for i in range(0, end + 1)},
             "records": [{"F_date": dates[r["snap"]["F"]], "recognized": dates[r["recognized"]],
-                         "reconstructed_at": r.get("reconstructed_at"),
+                         "reconstructed_at": r.get("reconstructed_at"), "detected_on": r.get("detected_on"),
                          "snap": _shift_snap(r["snap"], -r["snap"]["F"])} for r in records]}))
     keep_from = end - TRI_BREAK_RECENT
     live = list(records)                          # 迴圈已清掉過期（>TRI_TRACK_DAYS 或交會）＝全部仍在追蹤
@@ -1116,6 +1151,8 @@ def _user_triangle(df, atr_prev, end, state=None, out_state=None, replay_days=No
         last_b = breaks[-1]
         act = "收盤向上突破上緣" if last_b["type"] == "break_up" else "收盤向下跌破下緣"
         state_txt = act if last_b["idx"] == end else f"{last_b['date']} {act}"
+        if TRI_CONFIRM2 and last_b.get("confirm"):
+            state_txt += f"（{last_b['confirmed_date']} 兩日確認）" if last_b["confirm"] == "確認" else f"（{last_b['confirm']}）"
         if tr["reversed"]:
             state_txt = f"{breaks[0]['date']} {'突破' if breaks[0]['type'] == 'break_up' else '跌破'}後反向，" + state_txt
         elif len(breaks) > 1:
@@ -1134,6 +1171,7 @@ def _user_triangle(df, atr_prev, end, state=None, out_state=None, replay_days=No
         rec_out.append({"kind": _tri_kind(r["snap"]), "formation_cutoff": _d(df.index[r["snap"]["F"]]),
                         "recognized": _d(df.index[r["recognized"]]), "is_current": r is own,
                         "event_date": _d(df.index[r["recognized"]]), "reconstructed_at": r.get("reconstructed_at"),
+                        "detected_on": r.get("detected_on"),
                         "retrospective": bool(r.get("reconstructed_at")),   # 回溯辨識：不是當天實際發出的訊號
                         "first_break": {k: v for k, v in b0.items() if k != "idx"} if b0 else None,
                         "history": [{k: v for k, v in h.items() if k != "idx"} for h in rt["history"]],
@@ -1234,7 +1272,8 @@ def _tri_store():
 
 
 def detect(df: pd.DataFrame, events: Optional[Dict[str, Any]] = None, provisional_today: bool = False,
-           *, include_debug: bool = False, state_key: str = "", replay_days: Optional[int] = None) -> Dict[str, Any]:
+           *, include_debug: bool = False, state_key: str = "", replay_days: Optional[int] = None,
+           state_write: bool = True) -> Dict[str, Any]:
     """provisional_today＝最後一根是盤中／收盤後暫定 K（§11）。回傳 {summary, names, flags, ...}。"""
     need = ["Open", "High", "Low", "Close"]
     if df is None or not set(need) <= set(df.columns):
@@ -1361,7 +1400,7 @@ def detect(df: pd.DataFrame, events: Optional[Dict[str, Any]] = None, provisiona
             print(f"⚠️ 三角狀態讀取失敗｜{state_key}｜{type(exc).__name__}: {exc}", flush=True)
     tri = user_triangle(adj, atr_prev, last_official, tri_state, new_state, replay_days)
     for attempt in range(2):
-        if store is None or not new_state or provisional_today:
+        if store is None or not new_state or provisional_today or not state_write:   # state_write=False：輸入不同的入口只讀
             break
         rev = int((tri_state or {}).get("revision") or 0)
         new_state["revision"] = rev + 1
