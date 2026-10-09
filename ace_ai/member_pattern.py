@@ -6,7 +6,7 @@ import re
 from urllib.parse import urlparse
 from datetime import date
 
-VERSION = "member_pattern_v3_chart_facts"
+VERSION = "member_pattern_v4_verified_basis"
 
 def date_key(value):
     """Calendar date key; retain display format and never change trading indices."""
@@ -18,11 +18,11 @@ def date_key(value):
     except ValueError:
         return None
 
-def unavailable(view, notice):
+def unavailable(view, notice, **diagnostic):
     return dict(view, rows=[], visible=False, notice=notice, current_position=None,
-                upper=None, lower=None, near_tip=False)
+                upper=None, lower=None, near_tip=False, diagnostic=diagnostic)
 
-def geometry(result):
+def geometry(result, source_frame=None, events=None):
     """Serialize the exact detection frame by date, not sliced-chart indices."""
     tri = result.get("triangle")
     frame = (result.get("debug") or {}).get("frame")
@@ -30,6 +30,27 @@ def geometry(result):
         return None
     rows = []
     anchors = tri.get("anchors") or {}
+    source_rows = {}
+    verified_events = []
+    basis_valid = True
+    if source_frame is not None:
+        for day, bar in source_frame.iterrows():
+            key = date_key(day)
+            if key is None or key in source_rows:
+                basis_valid = False
+            source_rows[key] = [float(bar[k]) for k in ("Open", "High", "Low", "Close")]
+        # Mirror only pure cash events actually applied by detect.adjust().
+        applied = {e['date'] for e in frame.attrs.get('share_adjustments') or []}
+        if events and events.get('status') == 'ok':
+            first, last = date_key(frame.index[0]), date_key(frame.index[-1])
+            for event in sorted(events.get('items') or [], key=lambda e: e['date']):
+                day = date_key(event.get('date'))
+                if day and first < day <= last and event.get('date') not in applied and event.get('kind') in {'息', '除息'} and event.get('factor'):
+                    factor = float(event['factor'])
+                    if not math.isfinite(factor) or factor <= 0:
+                        basis_valid = False
+                    else:
+                        verified_events.append((day, factor))
     for i, (day, bar) in enumerate(frame.iterrows()):
         up = tri["upper"][0] * i + tri["upper"][1]
         lo = tri["lower"][0] * i + tri["lower"][1]
@@ -40,6 +61,19 @@ def geometry(result):
                      "reference": tri.get("reference_until") is not None and i < tri["reference_until"],
                      "upper_extension": i > max(anchors.get("upper") or [i]),
                      "lower_extension": i > max(anchors.get("lower") or [i])})
+        if source_frame is not None:
+            key = date_key(day)
+            factor = math.prod(f for event_day, f in verified_events if key < event_day)
+            original = source_rows.get(key)
+            if (not original or not math.isfinite(factor) or factor <= 0 or
+                    not all(math.isfinite(v) and v > 0 for v in original) or
+                    not all(math.isclose(actual, value * factor, abs_tol=0.00001, rel_tol=0.000001)
+                            for actual, value in zip(rows[-1]["ohlc"], original))):
+                basis_valid = False
+            else:
+                # Draw each date in the chart's original basis, without fitting new lines.
+                rows[-1].update(chart_ohlc=original, basis_factor=factor,
+                                upper=float(up / factor), lower=float(lo / factor))
     last = rows[-1]
     return {"kind": tri["kind"], "candidate": bool(tri.get("candidate")),
             "candidate_reasons": tri.get("candidate_reasons") or [],
@@ -47,17 +81,23 @@ def geometry(result):
             "state": tri.get("state", ""), "first_break": deepcopy(tri.get("first_break")),
             "formation_date": rows[max(0, int(tri.get("joint_start", tri["start"])))]["date"],
             "data_date": last["date"], "upper": last["upper"], "lower": last["lower"],
-            "rows": rows}
+            "rows": rows, "basis_valid": basis_valid,
+            "historical_conversion": bool(verified_events)}
 
 def overlay(panel, view):
     """Fail closed when chart OHLC differs from the detector's price basis."""
     if not view or not panel.get("bars"):
         return None
+    if view.get("basis_valid") is False:
+        return unavailable(view, "三角線還原係數無法核對，暫不疊線", reason="unverified_basis")
+    chart_day, line_day = date_key(panel["bars"][-1].get("date")), date_key(view.get("data_date"))
+    if chart_day is None or chart_day != line_day:
+        return unavailable(view, "三角線資料日期與圖表不同，暫不疊線", reason="latest_date_mismatch", chart_date=chart_day, line_date=line_day)
     by_day = {}
     for row in view["rows"]:
         key = date_key(row["date"])
         if key is None or key in by_day:
-            return unavailable(view, "三角線資料日期無法核對，暫不疊線")
+            return unavailable(view, "三角線資料日期無法核對，暫不疊線", date=row.get("date"), reason="invalid_or_duplicate_date")
         by_day[key] = row
     points = []
     previous = None
@@ -65,15 +105,19 @@ def overlay(panel, view):
         key = date_key(bar["date"])
         row = by_day.get(key)
         if row is None or (previous is not None and key <= previous):
-            return unavailable(view, "三角線資料日期與圖表不同，暫不疊線")
+            return unavailable(view, "三角線資料日期與圖表不同，暫不疊線", date=bar.get("date"), reason="missing_or_unordered_date")
         previous = key
-        for actual, key in zip(row["ohlc"], ("Open", "High", "Low", "Close")):
+        for actual, key in zip(row.get("chart_ohlc", row["ohlc"]), ("Open", "High", "Low", "Close")):
             value = bar.get(key)
-            if value is None or not math.isclose(float(value), actual, abs_tol=0.00001, rel_tol=0.000001):
-                return unavailable(view, "三角線與圖表價格基準不同，暫不疊線")
+            try:
+                matches = math.isfinite(float(value)) and math.isclose(float(value), actual, abs_tol=0.00001, rel_tol=0.000001)
+            except (TypeError, ValueError):
+                matches = False
+            if not matches:
+                return unavailable(view, "三角線與圖表價格基準不同，暫不疊線", date=bar.get("date"), field=key, expected=actual, actual=value)
         points.append(dict(row, date=bar["date"]))
     last = points[-1]
-    close = last["ohlc"][3]
+    close = last.get("chart_ohlc", last["ohlc"])[3]
     position = ("above" if close > last["upper"] else "below" if close < last["lower"] else "inside") if last["applicable"] else "not_applicable"
     return dict(view, rows=points, visible=True, detector_position=view.get("current_position"),
                 current_position=position, data_date=last["date"], upper=last["upper"], lower=last["lower"])
@@ -88,7 +132,8 @@ def chart_label(view):
         return "三角歷史線｜上下緣已交會，目前位置不適用"
     name = view["kind"] + ("候選" if view.get("candidate") else "")
     tip = "｜接近尖端" if view.get("near_tip") else ""
-    return f"{name}｜橘上緣 {view['upper']:,.2f}、藍下緣 {view['lower']:,.2f}（當日）｜虛線：候選／參考／延伸{tip}"
+    basis = "｜歷史段按除息換算" if view.get("historical_conversion") else ""
+    return f"{name}｜橘上緣 {view['upper']:,.2f}、藍下緣 {view['lower']:,.2f}（當日）｜虛線：候選／參考／延伸{tip}{basis}"
 
 def needs_for(parsed, plan, code):
     if plan.needs is not None:
@@ -177,7 +222,7 @@ def chart_context(panels, compound=False):
                  "stock_name": p.get("stock_name", "")}
         view = p.get("member_triangle")
         if view:
-            stock["triangle"] = ({k: deepcopy(v) for k, v in view.items() if k not in ("rows", "detector_position")}
+            stock["triangle"] = ({k: deepcopy(v) for k, v in view.items() if k not in ("rows", "detector_position", "diagnostic")}
                                  if view.get("visible") else {"visible": False, "notice": view.get("notice")})
             stock["show_score"] = bool(p.get("scorecard"))
         out["stocks"][p["stock_code"]] = stock

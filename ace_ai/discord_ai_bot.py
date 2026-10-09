@@ -3060,6 +3060,29 @@ class FactSheet:
         self.chart_triangles: Dict[str, Dict[str, Any]] = {}
         self.chart_line_numbers: Dict[str, Dict[str, Set[str]]] = {}
         self._add_chart_triangles(payload.get("chart_context") or {})
+        self._add_chart_ma(payload.get("chart_context") or {}, results)
+
+    def _add_chart_ma(self, context: Dict[str, Any], results: Sequence[tools.ToolResult]) -> None:
+        """Visible same-day MA values are the source for card comparisons, even without scores."""
+        dates = {str(r.data.get("stock_code")): member_pattern.date_key(r.data.get("data_date"))
+                 for r in results if r.ok and r.name == "get_technical_analysis" and isinstance(r.data, dict)}
+        for code, stock in (context.get("stocks") or {}).items():
+            code = str(code)
+            bar = stock.get("last_bar") or {}
+            day = member_pattern.date_key(bar.get("date"))
+            if code not in self.stocks or day is None or (dates.get(code) and day != dates[code]):
+                continue
+            for key in ("MA5", "MA10", "MA20", "MA60"):
+                try:
+                    value = float(bar[key])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if not math.isfinite(value) or value <= 0:
+                    continue
+                self.ma_values.setdefault(code, {})[key] = [value]
+                numbers = _variants_of(str(value))
+                self.market.update(numbers)
+                self.stock_numbers.setdefault(code, set()).update(numbers)
 
     def _add_chart_triangles(self, context: Dict[str, Any]) -> None:
         """Only admit current, visible chart lines; retain per-stock numeric ownership."""
@@ -3216,11 +3239,32 @@ class FactSheet:
         except (KeyError, IndexError):
             return []
         plain = _CONDITIONAL_RE.split(_PAREN_RE.sub("", sentence))[0]      # 條件句（若…）不核對
-        if ma[0] < ma[1] < ma[2] < ma[3] and _BULL_ALIGN_RE.search(plain):
-            return [f"排列不符：寫「{_BULL_ALIGN_RE.search(plain).group()}」，均線實際為空頭排列"]
-        if ma[0] > ma[1] > ma[2] > ma[3] and _BEAR_ALIGN_RE.search(plain):
-            return [f"排列不符：寫「{_BEAR_ALIGN_RE.search(plain).group()}」，均線實際為多頭排列"]
-        return []
+        issues = []
+        comparisons = _CONDITIONAL_RE.split(sentence)[0]
+        for sequence in re.findall(r"MA\d+(?:\s*[<>＜＞]\s*MA\d+)+", comparisons, flags=re.I):
+            keys = re.findall(r"MA\d+", sequence.upper())
+            operators = re.findall(r"[<>＜＞]", sequence)
+            if not all(values.get(k) for k in keys):
+                continue
+            for left, op, right in zip(keys, operators, keys[1:]):
+                a, b = values[left][0], values[right][0]
+                if not (a < b if op in ("<", "＜") else a > b):
+                    issues.append(f"均線比較不符：{left}{op}{right}")
+        bullish, bearish = all(a > b for a, b in zip(ma, ma[1:])), all(a < b for a, b in zip(ma, ma[1:]))
+        # Mixed arrangements cannot be called a complete four-MA bull/bear alignment.
+        full_bull = bool(re.search(r"多頭排列|多頭架構", plain))
+        full_bear = bool(re.search(r"空頭排列|空頭架構", plain))
+        # Explicitly described short-term subsets may differ from the MA60 direction.
+        subset = bool(re.search(r"短期|短線|MA5.*MA10.*MA20", plain)) and not re.search(r"MA60|所有|全部|完整", plain)
+        if subset:
+            bullish, bearish = ma[0] > ma[1] > ma[2], ma[0] < ma[1] < ma[2]
+        for pattern, valid, full in ((_BULL_ALIGN_RE, bullish, full_bull), (_BEAR_ALIGN_RE, bearish, full_bear)):
+            match = pattern.search(plain)
+            if match and not valid and (full or (bearish if pattern is _BULL_ALIGN_RE else bullish)):
+                prefix = plain[:match.start()]
+                if not re.search(r"(?:未|尚未|不是|並非|沒有|不屬於|未形成|不構成)\s*$", prefix):
+                    issues.append(f"排列不符：寫「{match.group()}」，均線未符合該排列")
+        return issues
 
     def _number_issues(self, sentence: str, codes: List[str]) -> List[str]:
         text = sentence
@@ -7132,6 +7176,8 @@ class AceQueryEngine:
                 view = member_pattern.overlay(panel, (technical.get("kline_patterns") or {}).get("member_view"))
                 if view:
                     panel["member_triangle"] = view
+                    if not view.get("visible"):
+                        self.log(f"{code} 三角疊線未通過｜{view.get('notice')}｜{json.dumps(view.get('diagnostic') or {}, ensure_ascii=False, default=str)}")
                 panel["disable_compare"] = not member_pattern.comparing(plan)
                 if TEST_SHOW_SCORECARD and (not view or member_pattern.wants_score(parsed, plan, code)):
                     # 10-08：正式版還有評分卡，測試版先照正式版顯示，方便比對評分修正；整飾板拿掉時設 0

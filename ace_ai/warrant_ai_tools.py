@@ -3099,7 +3099,7 @@ def _kline_patterns(df: pd.DataFrame, code: str = "", provisional_today: bool = 
                                                           "current_position", "pattern_events", "near_tip")}
         if result.get("triangle"):
             import member_pattern
-            out["member_view"] = member_pattern.geometry(result)
+            out["member_view"] = member_pattern.geometry(result, source_frame=df, events=events)
             out["triangle"] = dict(shape or {}, first_break=result["triangle"].get("first_break"))
         return out
     except Exception as exc:                       # 型態判斷失敗不影響其他技術資料

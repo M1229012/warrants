@@ -1256,6 +1256,9 @@ def draw_member_triangle(draw, panel, px, py, left, right, top, bottom):
     for edge, color in (('upper', '#C76C00'), ('lower', '#1478B5')):
         for i in range(1, len(rows)):
             a, b = rows[i - 1], rows[i]
+            # Cash ex-dividend changes chart basis; do not invent a diagonal connector.
+            if a.get('basis_factor', 1.0) != b.get('basis_factor', 1.0):
+                continue
             if not (a.get('applicable') and b.get('applicable') and a.get('show_' + edge) and b.get('show_' + edge)):
                 continue
             xa, ya, xb, yb = px(i - 1), py(a[edge]), px(i), py(b[edge])
