@@ -4,8 +4,23 @@ from copy import deepcopy
 import math
 import re
 from urllib.parse import urlparse
+from datetime import date
 
-VERSION = "member_pattern_v1"
+VERSION = "member_pattern_v2_dates_inline"
+
+def date_key(value):
+    """Calendar date key; retain display format and never change trading indices."""
+    match = re.fullmatch(r"(\d{4})[-/](\d{1,2})[-/](\d{1,2})(?:[ T].*)?", str(value).strip())
+    if not match:
+        return None
+    try:
+        return date(*map(int, match.groups())).isoformat()
+    except ValueError:
+        return None
+
+def unavailable(view, notice):
+    return dict(view, rows=[], visible=False, notice=notice, current_position=None,
+                upper=None, lower=None, near_tip=False)
 
 def geometry(result):
     """Serialize the exact detection frame by date, not sliced-chart indices."""
@@ -38,22 +53,42 @@ def overlay(panel, view):
     """Fail closed when chart OHLC differs from the detector's price basis."""
     if not view or not panel.get("bars"):
         return None
-    by_day = {r["date"]: r for r in view["rows"]}
+    by_day = {}
+    for row in view["rows"]:
+        key = date_key(row["date"])
+        if key is None or key in by_day:
+            return unavailable(view, "三角線資料日期無法核對，暫不疊線")
+        by_day[key] = row
     points = []
+    previous = None
     for bar in panel["bars"]:
-        row = by_day.get(bar["date"])
-        if row is None:
-            return dict(view, rows=[], visible=False, notice="三角線資料日期與圖表不同，暫不疊線")
+        key = date_key(bar["date"])
+        row = by_day.get(key)
+        if row is None or (previous is not None and key <= previous):
+            return unavailable(view, "三角線資料日期與圖表不同，暫不疊線")
+        previous = key
         for actual, key in zip(row["ohlc"], ("Open", "High", "Low", "Close")):
             value = bar.get(key)
             if value is None or not math.isclose(float(value), actual, abs_tol=0.00001, rel_tol=0.000001):
-                return dict(view, rows=[], visible=False, notice="三角線與圖表價格基準不同，暫不疊線")
-        points.append(dict(row))
+                return unavailable(view, "三角線與圖表價格基準不同，暫不疊線")
+        points.append(dict(row, date=bar["date"]))
     last = points[-1]
     close = last["ohlc"][3]
     position = ("above" if close > last["upper"] else "below" if close < last["lower"] else "inside") if last["applicable"] else "not_applicable"
     return dict(view, rows=points, visible=True, detector_position=view.get("current_position"),
                 current_position=position, data_date=last["date"], upper=last["upper"], lower=last["lower"])
+
+def chart_label(view):
+    """A single existing chart-header line; no separate triangle card."""
+    if not view:
+        return ""
+    if not view.get("visible"):
+        return "三角線暫無法核對，未疊線"
+    if view.get("current_position") == "not_applicable":
+        return "三角歷史線｜上下緣已交會，目前位置不適用"
+    name = view["kind"] + ("候選" if view.get("candidate") else "")
+    tip = "｜接近尖端" if view.get("near_tip") else ""
+    return f"{name}｜橘上緣 {view['upper']:,.2f}、藍下緣 {view['lower']:,.2f}（當日）｜虛線：候選／參考／延伸{tip}"
 
 def needs_for(parsed, plan, code):
     if plan.needs is not None:
@@ -142,7 +177,8 @@ def chart_context(panels, compound=False):
                  "stock_name": p.get("stock_name", "")}
         view = p.get("member_triangle")
         if view:
-            stock["triangle"] = {k: deepcopy(v) for k, v in view.items() if k != "rows"}
+            stock["triangle"] = ({k: deepcopy(v) for k, v in view.items() if k not in ("rows", "detector_position")}
+                                 if view.get("visible") else {"visible": False, "notice": view.get("notice")})
             stock["show_score"] = bool(p.get("scorecard"))
         out["stocks"][p["stock_code"]] = stock
     return out
@@ -155,16 +191,47 @@ def scoped_payload(payload, context):
             data["articles"] = news_panel(data)["news_articles"]
         stock = context.get("stocks", {}).get(data.get("stock_code"), {}) if isinstance(data, dict) else {}
         view = stock.get("triangle")
-        if view and not stock.get("show_score"):
-            if key.split(":")[0] == "get_pattern_scorecard":
+        if view:
+            tool = key.split(":")[0]
+            if not stock.get("show_score") and tool == "get_pattern_scorecard":
                 del payload["tool_results"][key]; continue
-            if key.split(":")[0] == "get_technical_analysis":
-                payload["tool_results"][key] = {k: data[k] for k in ("stock_code", "stock_name", "data_date", "signal_status", "freshness", "triangle_structure") if k in data}
-                structure = payload["tool_results"][key].get("triangle_structure")
-                if isinstance(structure, dict):
+            if tool == "get_technical_analysis":
+                if not stock.get("show_score"):
+                    data = {k: data[k] for k in ("stock_code", "stock_name", "data_date", "signal_status", "freshness", "triangle_structure") if k in data}
+                    payload["tool_results"][key] = data
+                structure = data.get("triangle_structure")
+                if not view.get("visible"):
+                    if isinstance(structure, dict):
+                        data["triangle_history"] = {"historical_only": True, "pattern_events": deepcopy(structure.get("pattern_events") or [])}
+                    data.pop("triangle_structure", None)
+                    data["kline_patterns"] = [s for s in data.get("kline_patterns") or [] if not _TRIANGLE_POSITION.search(str(s))]
+                    data["triangle_chart_notice"] = view.get("notice")
+                elif isinstance(structure, dict):
+                    structure["detector_position"] = structure.pop("current_position", None)
                     structure["chart_position"] = view.get("current_position")
                     structure["chart_position_date"] = view.get("data_date")
     return payload
+
+_TRIANGLE_POSITION = re.compile(r"三角|候選線|型態[內外]|[上下]緣|越線|交會|線內|線外")
+
+def without_unverified_positions(text, context):
+    """Also guard final/late AI output; prompts alone are not validation."""
+    stocks = context.get("stocks", {})
+    blocked = {code: s for code, s in stocks.items() if s.get("triangle") and not s["triangle"].get("visible")}
+    if not blocked:
+        return str(text or "")
+    invalid_names = {code for code in blocked} | {s.get("stock_name") for s in blocked.values() if s.get("stock_name")}
+    valid_names = {name for code, s in stocks.items() if code not in blocked
+                   for name in (code, s.get("stock_name")) if name}
+    kept = []
+    for sentence in re.split(r"(?<=[。！？；\n])", str(text or "")):
+        if not _TRIANGLE_POSITION.search(sentence):
+            kept.append(sentence); continue
+        if re.search(r"量區|布林", sentence) and not re.search(r"三角|候選線|型態[內外]|越線|交會|線[內外]", sentence):
+            kept.append(sentence); continue
+        if any(name in sentence for name in valid_names) and not any(name in sentence for name in invalid_names):
+            kept.append(sentence)
+    return "".join(kept).strip()
 
 
 def without_hidden_scores(text, context):

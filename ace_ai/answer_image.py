@@ -1319,6 +1319,11 @@ def draw_chart(draw, y: int, panel: dict) -> None:
         draw.rounded_rectangle((chip_x, y + 80, chip_x + chip_w, y + 116), radius=18, fill=UP_BG if change >= 0 else DOWN_BG)
         draw.text((chip_x + chip_w / 2, y + 98), chip, font=font(22, True), fill=color, anchor='mm')
     draw_value_tiles(draw, x0 + 32, y + 136, CONTENT - 64, last)
+    if panel.get('member_triangle'):
+        import member_pattern
+        label = member_pattern.chart_label(panel['member_triangle'])
+        label, label_size = fit(label, 18, CONTENT - 64, False, 14)
+        text_at(draw, (x0 + 32, y + 236), label, label_size, MUTED)
 
     lane_top, lane_bottom = mark_lanes(panel)
     extra = lane_top + lane_bottom + _price_extra(panel)

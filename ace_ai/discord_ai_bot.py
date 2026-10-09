@@ -2721,6 +2721,7 @@ MEMBER_PATTERN_RULES = """會員型態圖：chart_context.stocks 是圖上實際
 先回答原問句，再解釋圖上型態、目前位置與關鍵價位；不討論未顯示的KD/MACD、分點、隱藏扣抵或內部明細。新聞、持倉或籌碼另有明確需求時仍逐項回答。
 三角不需使用者點名，依triangle_structure的正式／候選與事件解讀；候選線外不等於正式突破，0.15ATR越線不等於突破已確認。歷史事件與目前型態分開，回到線內、反向、接近尖端與過交會点要照實說明。
 圖上上緣／下緣都是當日參考價，不說是明天確定價位。圖線visible=false時明說無法核對，不引用該線作防守；已突破的原線不是自動有效支撐，必須回測與結構證據支持。
+圖線visible=false時，禁止判斷目前位於三角內／外或使用上下緣價位；triangle_history僅為歷史紀錄，不能證明今日位置。改以圖上可核對的均線、量區與價格解讀。
 目前價格位置以chart_context中的current_position與last_bar為準；triangle_structure舊位置只作辨識紀錄，不把候選在線外或盤中越線寫成正式突破事件。
 why用約180～260字解釋型態是否成立、目前位置、關鍵風險。scenarios最多2個，寫具體條件：若收盤有效越線及延續／回測守住會代表什麼，若收回型態內或跌破觀察位置如何重新評估。用條件式觀察，不替用戶下買賣指令、不保證獲利、不設定個人停損比例。沒有量能數據不捏造放量。
 不要重複報所有均線／價位；summary留空。"""
@@ -7058,7 +7059,6 @@ class AceQueryEngine:
                 view = member_pattern.overlay(panel, (technical.get("kline_patterns") or {}).get("member_view"))
                 if view:
                     panel["member_triangle"] = view
-                    panels.append(member_pattern.structure_card(panel))
                 panel["disable_compare"] = not member_pattern.comparing(plan)
                 if TEST_SHOW_SCORECARD and (not view or member_pattern.wants_score(parsed, plan, code)):
                     # 10-08：正式版還有評分卡，測試版先照正式版顯示，方便比對評分修正；整飾板拿掉時設 0
@@ -7133,6 +7133,7 @@ class AceQueryEngine:
             text = f"{data_notice}\n\n{body}"          # 缺什麼上面已經寫了，不再逐項重複一次
         elif data_notice:
             text = f"{data_notice}\n\n{text}"
+        text = member_pattern.without_unverified_positions(text, getattr(getattr(self, "_request_local", None), "member_chart_context", None) or {})
         ai_card = self._take_ai_card()
         if comparison is not None:
             # 圖上已有兩邊的 K 線與型態比較表，文字只放結論：AI 結論，AI 失敗或時間點不同時放一句規則結論。
@@ -7469,6 +7470,8 @@ class AceQueryEngine:
         rule_answer = brief_rule_answer(results) if brief else build_rule_based_answer(results)
         holding_lead = stock_banter.holding_reply(question,results)
         if holding_lead:rule_answer = holding_lead + '\n\n' + rule_answer
+        context = getattr(getattr(self, "_request_local", None), "member_chart_context", None) or {}
+        rule_answer = member_pattern.without_unverified_positions(rule_answer, context)
         if not plan.need_final_llm or not any(r.ok for r in results):
             return rule_answer, True
         payload = build_final_payload(question, results)
@@ -7503,6 +7506,7 @@ class AceQueryEngine:
 
     def _finish_compose(self, question, plan, results, payload, result, rule_answer):
         """Validate normal and late AI output identically; never call Gemini again."""
+        rule_answer = member_pattern.without_unverified_positions(rule_answer, payload.get("chart_context") or {})
         facts = FactSheet(question, results, payload)
         card = parse_ai_card(result.text)
         if card is not None:
@@ -7539,8 +7543,9 @@ class AceQueryEngine:
             context = payload.get("chart_context") or {}
             if context:
                 for key in ("answer", "why", "summary"):
-                    card[key] = member_pattern.without_hidden_scores(card.get(key, ""), context)
-                card["scenarios"] = [dict(s, text=member_pattern.without_hidden_scores(s["text"], context)) for s in card.get("scenarios") or []]
+                    card[key] = member_pattern.without_unverified_positions(member_pattern.without_hidden_scores(card.get(key, ""), context), context)
+                card["scenarios"] = [dict(s, text=member_pattern.without_unverified_positions(member_pattern.without_hidden_scores(s["text"], context), context),
+                                          title=member_pattern.without_unverified_positions(s.get("title", ""), context) or "觀察條件") for s in card.get("scenarios") or []]
                 card["scenarios"] = [s for s in card["scenarios"] if s["text"]]
                 if not card["answer"]:
                     return "AI解讀未符合本題顯示範圍；請依圖上型態與價位核對。\n\n" + rule_answer, False
@@ -7555,6 +7560,10 @@ class AceQueryEngine:
             text = ai_card_text(card)
             return f"{text}\n\n{time_line}\n\n{DISCLAIMER}" if time_line else f"{text}\n\n{DISCLAIMER}", True
         answer = result.text
+        context = payload.get("chart_context") or {}
+        answer = member_pattern.without_unverified_positions(member_pattern.without_hidden_scores(answer, context), context)
+        if not answer:
+            return "AI解讀未符合本題顯示範圍；請依圖上可核對的價位資料觀察。\n\n" + rule_answer, False
         issues = facts.check(answer)
         if issues:
             # 只刪掉有問題的句子（數字對不上、張冠李戴、均線數值或站上／跌破方向寫錯、把題目假設價當報價）；
