@@ -3091,12 +3091,16 @@ def _kline_patterns(df: pd.DataFrame, code: str = "", provisional_today: bool = 
     try:
         import kline_patterns
         events = get_corporate_actions(code) if code else None
-        result = kline_patterns.detect(df, events, provisional_today, state_key=f"tri_state_{code}" if code else "")
+        result = kline_patterns.detect(df, events, provisional_today, include_debug=True, state_key=f"tri_state_{code}" if code else "")
         out = {k: result.get(k) for k in ("summary", "names", "levels", "flags", "atr20")}
         shape = (result.get("observations") or {}).get("structure")
         if shape and "candidate" in shape:          # 10-07：三角正式／候選身分與完整事件紀錄給 AI
             out["triangle"] = {k: shape.get(k) for k in ("kind", "candidate", "candidate_reasons", "validity", "state",
                                                           "current_position", "pattern_events", "near_tip")}
+        if result.get("triangle"):
+            import member_pattern
+            out["member_view"] = member_pattern.geometry(result)
+            out["triangle"] = dict(shape or {}, first_break=result["triangle"].get("first_break"))
         return out
     except Exception as exc:                       # 型態判斷失敗不影響其他技術資料
         print(f"⚠️ K 線型態判斷略過｜{err_text(exc)}", flush=True)

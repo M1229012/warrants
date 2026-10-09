@@ -2,7 +2,7 @@
 from __future__ import annotations
 import argparse, os, pathlib, subprocess, sys, tempfile, uuid, json
 HERE = pathlib.Path(__file__).resolve().parent
-DEFAULT = ['test_optimization_1008','test_audit_needs_extra','test_audit_score_extra','test_audit_local_only_extra','test_audit_triangle_extra','test_triangle_state','test_user_triangle_direction','test_kline_debug','test_discord_access','test_fix_1008','test_perf_regressions','test_review_regressions','test_routing_corpus','test_closed_quotes','test_support_score_fix','test_near_zone_limit','test_needs_1008']
+DEFAULT = ['test_member_pattern','test_optimization_1008','test_audit_needs_extra','test_audit_score_extra','test_audit_local_only_extra','test_audit_triangle_extra','test_triangle_state','test_user_triangle_direction','test_kline_debug','test_discord_access','test_fix_1008','test_perf_regressions','test_review_regressions','test_routing_corpus','test_closed_quotes','test_support_score_fix','test_near_zone_limit','test_needs_1008']
 def worker(module, temp):
     import platform
     platform.uname()

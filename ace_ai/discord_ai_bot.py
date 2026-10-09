@@ -44,6 +44,7 @@ import discord_access as access_policy
 import warrant_ai_tools as tools
 import weekly_pick
 import answer_image
+import member_pattern
 import weekly_image
 import sector_analysis
 import sys
@@ -1463,12 +1464,14 @@ def is_top_warrant_question(parsed: "ParsedQuestion") -> bool:
 
 NEEDS_PARSE_ENABLE = os.getenv("DISCORD_AI_NEEDS_PARSE", "1").strip().lower() in ("1", "true", "yes", "on")
 _NEEDS_TAILS = ("怎麼樣", "怎樣", "如何", "怎麼看", "好不好", "好嗎", "走勢", "分析", "型態", "技術面", "一下", "看看")
-NEEDS_TYPES = ["pattern", "chips", "news", "price", "institutional", "futures", "cost", "compare", "members", "rank", "other"]
+NEEDS_TYPES = ["pattern", "chips", "news", "price", "institutional", "futures", "cost", "compare", "members", "rank", "score", "spot", "other"]
 _NEED_INTENTS: Dict[str, Set[str]] = {
+    "score": {"score", "analysis", "technical"}, "spot": {"spot", "analysis", "technical"},
     "pattern": {"analysis", "technical"}, "news": {"news"}, "price": {"price"}, "institutional": {"institutional"},
     "futures": {"futures"}, "cost": {"cost", "analysis"}, "compare": {"analysis"}, "chips": {"warrant"}, "members": {"sector"}, "rank": {"sector"},
 }
 _EXCLUDE_INTENTS: Dict[str, Set[str]] = {
+    "score": {"score"}, "spot": {"spot"},
     "pattern": {"analysis", "technical", "volume_profile"}, "news": {"news"}, "price": {"price"},
     "institutional": {"institutional"}, "futures": {"futures"}, "chips": {"warrant", "win_rate", "recent_trades", "position"},
     "members": {"sector"}, "rank": {"sector"}, "compare": {"analysis"}, "cost": {"cost"}, "other": set(),
@@ -2583,6 +2586,7 @@ def _compact_tool_data(name: str, data: Dict[str, Any], has_scorecard: bool) -> 
     if name == "get_technical_analysis":
         data["bollinger"] = {k: v for k, v in (data.get("bollinger") or {}).items() if k in _BOLLINGER_KEEP}
         data_full_patterns = data.get("kline_patterns") or {}
+        data.pop("member_view", None)
         data["kline_patterns"] = (data_full_patterns.get("summary") or []) + [f"資料旗標：{f}" for f in data_full_patterns.get("flags") or []]   # 白話結論＋旗標（§12）
         triangle_structure = data_full_patterns.get("triangle")   # 10-07：三角正式／候選身分與完整事件，不能被摘要掉
         if triangle_structure:
@@ -2713,6 +2717,15 @@ def question_focus(question: str) -> List[str]:
     return labels
 
 
+MEMBER_PATTERN_RULES = """會員型態圖：chart_context.stocks 是圖上實際內容。三角圖沒有分數時禁止談分數、評等、排名、加扣分；不因其他股票有分數而替此股補分。
+先回答原問句，再解釋圖上型態、目前位置與關鍵價位；不討論未顯示的KD/MACD、分點、隱藏扣抵或內部明細。新聞、持倉或籌碼另有明確需求時仍逐項回答。
+三角不需使用者點名，依triangle_structure的正式／候選與事件解讀；候選線外不等於正式突破，0.15ATR越線不等於突破已確認。歷史事件與目前型態分開，回到線內、反向、接近尖端與過交會点要照實說明。
+圖上上緣／下緣都是當日參考價，不說是明天確定價位。圖線visible=false時明說無法核對，不引用該線作防守；已突破的原線不是自動有效支撐，必須回測與結構證據支持。
+目前價格位置以chart_context中的current_position與last_bar為準；triangle_structure舊位置只作辨識紀錄，不把候選在線外或盤中越線寫成正式突破事件。
+why用約180～260字解釋型態是否成立、目前位置、關鍵風險。scenarios最多2個，寫具體條件：若收盤有效越線及延續／回測守住會代表什麼，若收回型態內或跌破觀察位置如何重新評估。用條件式觀察，不替用戶下買賣指令、不保證獲利、不設定個人停損比例。沒有量能數據不捏造放量。
+不要重複報所有均線／價位；summary留空。"""
+
+
 FINAL_NEEDS_RULES = ("【需求表】payload.needs.needs 是本題每一項需求：每一項都要回答，資料不足就明確說哪項資料不足，不可略過；"
                      "exclude_types／exclude_targets 是使用者說不要的類別或股票，不可分析、不可寫進回答；"
                      "sector_context 是族群比較資料（族群成分股型態分數中位數、這檔名次），有 missing 就照實說族群比較資料不足。"
@@ -2827,10 +2840,14 @@ def build_final_prompt(payload: Dict[str, Any]) -> str:
     sections.append(COMPOUND_SECTOR_RULE)
     sections.append('先判斷response_focus：holding是個人持倉、成本與風險需求，current是行情／型態，review是交易檢討；陳述句也可有隱含求助，不需問號。holding的answer先接住持倉處境，再解釋最重要風險與可觀察条件；不要只報均線或重述成本。')
     sections.append('回答重點：先接住問題而非一律報型態。問持倉後續／要注意什麼，先說最重要的風險與支撐／壓力觀察條件，說明守住或跌破的意義；缺買進理由不阻止目前分析。問改善才回顧交易規劃，問型態則分析目前型態。日期只是背景，不能一律變成覆盤。成本估算稱估算；未提供理由、計畫、日期不能推測當時沒有做。answer寫分析，humor_opening只放自然接話，不重複。')
+    if payload.get("chart_context"):
+        sections.append(MEMBER_PATTERN_RULES)
+        if payload["chart_context"].get("compound"):
+            sections.append("本題為不同股票的複合需求，逐項回答但不自行比較；新聞最多3個事件、保留日期來源與期間限制。answer直接各答一句，why總計180～260字；scenarios最多2個、每個60～100字；summary留空。新聞表已顯示標題，解讀其影響與限制，不重列標題。不得漏答任何需求。")
     payload_json = json.dumps(payload.get("tool_results") or {}, ensure_ascii=False, separators=(",", ":"), default=tools.json_safe)
-    needs_part = ""
+    needs_part = ("圖上實際內容（JSON）：\n" + json.dumps(payload["chart_context"], ensure_ascii=False, separators=(",", ":"), default=tools.json_safe) + "\n\n") if payload.get("chart_context") else ""
     if payload.get("needs"):        # 10-08：需求表實際內容（每項需求、排除、比較資料）
-        needs_part = "需求表（JSON）：\n" + json.dumps(payload["needs"], ensure_ascii=False, separators=(",", ":"), default=tools.json_safe) + "\n\n"
+        needs_part += "需求表（JSON）：\n" + json.dumps(payload["needs"], ensure_ascii=False, separators=(",", ":"), default=tools.json_safe) + "\n\n"
     return "\n\n".join(sections) + f"\n\n使用者問題：{payload['question']}\n\n{needs_part}tool_results（JSON）：\n{payload_json}\n"
 
 
@@ -5047,6 +5064,8 @@ class AceQueryEngine:
         admin_mode=True 代表這題來自管理員專用指令（本週精選、草稿、維護）；
         一般 /ask 永遠不會進到那些流程，避免草稿編輯把正常問題吃掉。
         """
+        if getattr(self, "_request_local", None) is not None:
+            self._request_local.member_chart_context = None
         if admin_mode:
             access_policy.require_feature(self._access(), access_policy.FeaturePolicy("ADMIN"))
         started = time.perf_counter()
@@ -5070,7 +5089,7 @@ class AceQueryEngine:
                 speed_text = str(exc)
             return AnswerResult(speed_text, 'admin_spot_speed', 0, time.perf_counter()-started,
                                 as_text=True, cacheable=False)
-        if kline_debug.is_request(question):
+        if kline_debug.is_request(question) and (admin_mode or kline_debug._COMMAND.search(question) or re.search(r"驗證|核對|錨點|轉折確認", question)):
             return self._answer_kline_debug(question, started, is_admin=is_admin, admin_mode=admin_mode, image=image)
         if admin_mode:
             self.log(f"使用者問題（/ace）：{question[:120]}")   # 管理員路線（草稿、精選、維護）也留下原文，方便查路由
@@ -5258,7 +5277,7 @@ class AceQueryEngine:
         # 快取鍵值用「補完股票之後」的問題，避免 A 使用者的「那它的壓力在哪」拿到 B 使用者的答案；籌碼類型分開快取。
         # 族群追問（「那哪檔最強」）要帶族群名稱與模式，不同族群的同一句追問不能共用答案
         sector = parsed.sector or {}
-        key = "|".join(['現股分點精簡排版v10價格歸屬v1',compact, ",".join(c for c, _ in parsed.stocks), str(parsed.cost_price or ""), ",".join(parsed.branches),
+        key = "|".join([member_pattern.VERSION,'現股分點精簡排版v10價格歸屬v1',compact, ",".join(c for c, _ in parsed.stocks), str(parsed.cost_price or ""), ",".join(parsed.branches),
                         "chip=" + parsed.chip,
                         "sector=" + str(sector.get("name") or sector.get("industry") or "") + ":" + str(sector.get("mode") or "")])
         key = self._access_cache_key(key)
@@ -6538,14 +6557,17 @@ class AceQueryEngine:
             "needs": {"type": "array", "items": {"type": "object", "properties": {
                 "type": {"type": "string", "enum": NEEDS_TYPES},
                 "targets": {"type": "array", "items": {"type": "string"}},
-                "date_range": {"type": "string"}}, "required": ["type", "targets", "date_range"]}},
+                "date_range": {"type": "string"},
+                "include_score": {"type": "boolean", "description": "只有明確要求分數／評分才為true；型態、支撐、防守不是要求評分"}}, "required": ["type", "targets", "date_range"]}},
             "exclude_types": {"type": "array", "items": {"type": "string", "enum": NEEDS_TYPES}},
             "exclude_targets": {"type": "array", "items": {"type": "string"}},
             "compare_with": {"type": "array", "items": {"type": "string"}}},
             "required": ["needs", "exclude_types", "exclude_targets", "compare_with"]}
         prompt = ("你是台股問句的需求解析器，只輸出 JSON，不要回答問題。讀完整句，列出使用者真正要回答的每一項需求。\n"
                   "type：pattern＝走勢型態技術面、chips＝分點籌碼主力權證、news＝新聞消息、price＝只問股價、institutional＝三大法人、"
-                  "futures＝台指期、cost＝自己的成本持股、compare＝比較、members＝族群成分股、rank＝排行、other＝其他。\n"
+                  "futures＝台指期、cost＝自己的成本持股、compare＝比較、members＝族群成分股、rank＝排行、score＝明確問分數、spot＝現股分點。\n"
+                  "怎麼看、支撐壓力、快突破了嗎、如何防守，都可屬pattern，不需要使用者說三角。三角由程式資料判定，不由你猜。"
+                  "不同股票各問新聞與型態不是比較，不要新增compare或chips；未明確要求include_score填false。"
                   "targets：這項需求的股票名稱／代號或族群名稱；date_range：提到的期間（沒有填空字串）。\n"
                   "exclude_types／exclude_targets：使用者明確說不要的分析類別或股票（例「不要技術分析」「不要看台積電」）。"
                   "compare_with：要拿來比較的股票或族群。\n問題：" + question)
@@ -6659,7 +6681,7 @@ class AceQueryEngine:
             if "news" in want:
                 plan.add("get_recent_news", stock_code=code)
             excluded_tools = set()
-            if "institutional" in drop: excluded_tools.add("get_institutional_flow")
+            if "institutional" in drop or "institutional" not in want: excluded_tools.add("get_institutional_flow")
             if "futures" in drop: excluded_tools.add("get_futures_positions")
             if "news" in drop: excluded_tools.add("get_recent_news")
             for call in plan.tool_calls:
@@ -6792,6 +6814,8 @@ class AceQueryEngine:
 
     def _answer_uncached_impl(self, question: str, started: float, parsed: Optional[ParsedQuestion] = None) -> AnswerResult:
         stats = AnswerStats()
+        if getattr(self, "_request_local", None) is not None:
+            self._request_local.member_chart_context = None
         self.log(f"使用者問題：{question}")
         if parsed is None:
             try:
@@ -7026,11 +7050,17 @@ class AceQueryEngine:
                 if focus:
                     panel["institutional_focus"] = _INVESTOR_KEYS[focus]   # 只問單一法人：副圖只畫該法人
         if plan.route in ("rule_pattern", "rule_top_warrant", "rule_index_compare") or plan.pattern:
-            # 測試版型態頁：保留原 K 線與技術數據，以事件回測取代分數／分級。
+            # 會員型態頁疊上同次判斷的三角；評分與分點回測依本題需求顯示。
             for panel in [p for p in panels if p.get("stock_code") and p.get("bars")]:
                 panel.pop("scorecard", None)
                 code = panel["stock_code"]
-                if TEST_SHOW_SCORECARD:
+                technical = next((r.data for r in results if r.ok and r.name == "get_technical_analysis" and r.data.get("stock_code") == code), {})
+                view = member_pattern.overlay(panel, (technical.get("kline_patterns") or {}).get("member_view"))
+                if view:
+                    panel["member_triangle"] = view
+                    panels.append(member_pattern.structure_card(panel))
+                panel["disable_compare"] = not member_pattern.comparing(plan)
+                if TEST_SHOW_SCORECARD and (not view or member_pattern.wants_score(parsed, plan, code)):
                     # 10-08：正式版還有評分卡，測試版先照正式版顯示，方便比對評分修正；整飾板拿掉時設 0
                     card = self._pattern_scorecard(code, results, parsed.cost_price)
                     with_chips = any(r.name == "get_sheet_stock_chips" and r.ok for r in results)
@@ -7039,6 +7069,8 @@ class AceQueryEngine:
                     if card:
                         panel["scorecard"] = card
                         results.append(tools.ToolResult("get_pattern_scorecard", True, card))
+                if not member_pattern.wants_spot(parsed, plan, code):
+                    continue
                 scoped = getattr(parsed, "spot_branch", "") if getattr(parsed, "chip", "") != "warrant" else ""
                 data = (self._prepare_event_backtest(code, panel.get("stock_name", ""), branch_name=scoped, question=question) if scoped
                         else self._prepare_event_backtest(code, panel.get("stock_name", ""), question=question))
@@ -7082,6 +7114,12 @@ class AceQueryEngine:
         if data_notice and plan.need_final_llm:
             plan.need_final_llm = False
             self.log(f"必要資料檢查：不交給 AI｜{data_notice}")
+        news_results = [r.data for r in results if r.ok and r.name == "get_recent_news"]
+        compound = bool(news_results and any(p.get("bars") for p in panels))
+        if compound:
+            panels.extend(member_pattern.news_panel(data) for data in news_results)
+        if getattr(self, "_request_local", None) is not None:
+            self._request_local.member_chart_context = member_pattern.chart_context(panels, compound)
         text, llm_ok = self._compose(question, plan, results, stats)
         if missing:
             obtained = [r for r in results if r.ok]
@@ -7434,6 +7472,9 @@ class AceQueryEngine:
         if not plan.need_final_llm or not any(r.ok for r in results):
             return rule_answer, True
         payload = build_final_payload(question, results)
+        context = getattr(getattr(self, "_request_local", None), "member_chart_context", None)
+        if context and (context.get("compound") or any(v.get("triangle") for v in context.get("stocks", {}).values())):
+            payload = member_pattern.scoped_payload(payload, context)
         if plan.needs:
             payload["needs"] = plan.needs        # 10-08：需求表真的傳到最後回答
         prompt = build_final_prompt(payload)
@@ -7456,7 +7497,7 @@ class AceQueryEngine:
             elif result.rate_limited:
                 prefix = RATE_LIMIT_MESSAGE
             else:
-                prefix = "AI 解讀暫時無法使用" + ("；上方圖表與評分卡的資料照常可參考。" if brief else "，以下先提供系統整理的資料。")
+                prefix = "AI 解讀暫時無法使用" + ("；上方圖表與價位資料照常可參考。" if brief else "，以下先提供系統整理的資料。")
             return f"{prefix}\n\n{rule_answer}", False
         return AceQueryEngine._finish_compose(self, question, plan, results, payload, result, rule_answer)
 
@@ -7495,6 +7536,21 @@ class AceQueryEngine:
                 card["scenario_title"] = "後續觀察重點"
             time_line = build_data_time_line(results)
             card["footer"] = "｜".join(x for x in (time_line, "AI 解讀僅供參考，不構成投資建議。") if x)
+            context = payload.get("chart_context") or {}
+            if context:
+                for key in ("answer", "why", "summary"):
+                    card[key] = member_pattern.without_hidden_scores(card.get(key, ""), context)
+                card["scenarios"] = [dict(s, text=member_pattern.without_hidden_scores(s["text"], context)) for s in card.get("scenarios") or []]
+                card["scenarios"] = [s for s in card["scenarios"] if s["text"]]
+                if not card["answer"]:
+                    return "AI解讀未符合本題顯示範圍；請依圖上型態與價位核對。\n\n" + rule_answer, False
+            if context.get("compound") or any(v.get("triangle") for v in context.get("stocks", {}).values()):
+                card["summary"] = ""
+                card["answer"] = _clean_card_text(card.get("answer"), 120)
+                card["why"] = _clean_card_text(card.get("why"), 360)
+                card["scenarios"] = [dict(s, text=_clean_card_text(s["text"], 150)) for s in card.get("scenarios") or []][:2]
+                card["scenarios"] = [s for s in card["scenarios"] if s["text"]]
+                card["scenario_title"] = "突破與防守觀察" if any(v.get("triangle") for v in context.get("stocks", {}).values()) else "後續觀察重點"
             self._set_ai_card(card)
             text = ai_card_text(card)
             return f"{text}\n\n{time_line}\n\n{DISCLAIMER}" if time_line else f"{text}\n\n{DISCLAIMER}", True

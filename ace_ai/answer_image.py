@@ -1247,6 +1247,42 @@ def _date_ticks(bars: list, step: float) -> list[int]:
     return sorted(range(len(bars) - 1, -1, -interval))
 
 
+def draw_member_triangle(draw, panel, px, py, left, right, top, bottom):
+    """Same dated coefficients as detection, clipped to the chart; never refit."""
+    view = panel.get('member_triangle') or {}
+    if not view.get('visible'):
+        return
+    rows = view.get('rows') or []
+    for edge, color in (('upper', '#C76C00'), ('lower', '#1478B5')):
+        for i in range(1, len(rows)):
+            a, b = rows[i - 1], rows[i]
+            if not (a.get('applicable') and b.get('applicable') and a.get('show_' + edge) and b.get('show_' + edge)):
+                continue
+            xa, ya, xb, yb = px(i - 1), py(a[edge]), px(i), py(b[edge])
+            if max(ya, yb) < top or min(ya, yb) > bottom:
+                continue
+            if yb != ya:
+                lo, hi = sorted(((top - ya) / (yb - ya), (bottom - ya) / (yb - ya)))
+                t0, t1 = max(0.0, lo), min(1.0, hi)
+            else:
+                t0, t1 = 0.0, 1.0
+            x0, y0 = xa + (xb - xa) * t0, ya + (yb - ya) * t0
+            x1, y1 = xa + (xb - xa) * t1, ya + (yb - ya) * t1
+            dashed = view.get('candidate') or a.get('reference') or b.get('reference') or b.get(edge + '_extension')
+            if not dashed:
+                draw.line((x0, y0, x1, y1), fill=color, width=4)
+                continue
+            # Global x phase prevents per-candle tiny dashes appearing continuous.
+            distance = max(x1 - x0, 0.0001)
+            start = math.floor(x0 / 14) * 14
+            while start < x1:
+                begin, end = max(x0, start), min(x1, start + 8)
+                if end > begin:
+                    v0, v1 = (begin - x0) / distance, (end - x0) / distance
+                    draw.line((begin, y0 + (y1 - y0) * v0, end, y0 + (y1 - y0) * v1), fill=color, width=4)
+                start += 14
+
+
 def draw_chart(draw, y: int, panel: dict) -> None:
     x0, x1 = MARGIN, WIDTH - MARGIN
     draw.rounded_rectangle((x0, y, x1, y + panel_height(panel)), radius=20, fill='white', outline=LINE)
@@ -1348,6 +1384,8 @@ def draw_chart(draw, y: int, panel: dict) -> None:
                 t0, t1 = min(start/max(distance, 1), 1), min((start+7)/max(distance, 1), 1)
                 draw.line((xa+(xb-xa)*t0, ya+(yb-ya)*t0, xa+(xb-xa)*t1, ya+(yb-ya)*t1), fill=band_color, width=2)
 
+
+    draw_member_triangle(draw, panel, px, py, left, right, price_top, price_bottom)
 
     # 日期軸緊貼價格區下方；月份切換的日期用粗體，方便看出 K 棒落在哪個月。
     axis_y = bottom + 2
@@ -1920,7 +1958,7 @@ def compare_card(draw, y: float, panels: list[dict], dry: bool) -> int:
 
 
 def _compare_mode(panels: list[dict]) -> bool:
-    return len(panels) >= 2 and all(p.get('scorecard') and not p['scorecard'].get('hide_score') and p.get('bars') for p in panels)
+    return len(panels) >= 2 and not any(p.get('disable_compare') for p in panels) and all(p.get('scorecard') and not p['scorecard'].get('hide_score') and p.get('bars') for p in panels)
 
 
 # ============================================================
