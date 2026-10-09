@@ -44,7 +44,8 @@ def parse_codes(question: str, limit: int = 10) -> list[str]:
     found=list(dict.fromkeys(c.upper() for c in re.findall(r'(?<![0-9A-Za-z])(?:[0-9]{4,6}[A-Za-z]?|TAIEX|TPEX)(?![0-9A-Za-z])',q,re.I)))
     if len(found)<=1:return [parse_code(q)]
     if not is_request(q):raise ValueError('請說：型態驗證 2344 1608（一次最多10檔）')
-    return found[:limit]
+    if len(found) > limit:raise ValueError(f"共 {len(found)} 檔，每次最多 {limit} 檔，請分批驗證")
+    return found
 
 
 def load_panel(code: str) -> dict[str, Any]:

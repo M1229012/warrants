@@ -267,7 +267,7 @@ def _iso_date(value: Any) -> str:
 
 def _stock_row(stock: Dict[str, str], mode: str, deadline: float, cancel: threading.Event) -> Dict[str, Any]:
     code = stock["stock_code"]
-    key = f"stock:{code}:{mode}"
+    key = f"stock:{code}:{mode}:{tools.source_stamp(code)}:{weekly_pick.pattern_rule_version()}"
     hit, cached = CACHE.get(key)
     if hit:
         return cached
@@ -307,10 +307,11 @@ def _stock_row(stock: Dict[str, str], mode: str, deadline: float, cancel: thread
                        score_date=_iso_date(tech["data_date"]), plus_reasons=good[:2], minus_reasons=bad[:2],
                        moving_averages=tech.get("moving_averages", {}), score_basis=tech.get("signal_status", ""),
                        intraday_observation=tech.get("intraday_observation", {}))
-            if not intraday or intraday.get("is_close_confirmed"):
+            if ((not intraday or intraday.get("is_close_confirmed")) and
+                    str(tech.get("signal_status") or "").startswith("收盤確認") and tech.get("input_fp") and tech.get("source_fp")):
                 # 盤中暫定 K 棒算出的分數不寫進本地分數底庫（底庫只放收盤確認的快照）
                 local_market_cache.save_pattern_score(code, row["score_date"], score["score"], grade, score.get("components"),
-                                                      str(tech.get("signal_status") or ""))
+                                                      tools.score_basis(tech), rule=weekly_pick.pattern_rule_version())
     CACHE.set(key, row, RESULT_TTL if not intraday.get("is_live") else min(60, RESULT_TTL))
     return row
 
@@ -380,7 +381,11 @@ def _local_rows(stocks: list) -> tuple:
     for stock in stocks:
         code = str(stock.get("stock_code") or "")
         score, change = scores.get(code), changes.get(code)
-        if (not score or not change or not change.get("close")
+        basis = str((score or {}).get("basis") or "")
+        recorded = {part.split("=",1)[0]: part.split("=",1)[1] for part in basis.split("｜") if "=" in part}
+        fresh = (recorded.get("fp") == local_market_cache.bars_fingerprint(code) and
+                 recorded.get("src") == tools.source_stamp(code) and bool(recorded.get("fp")) and bool(recorded.get("src")))
+        if (not fresh or not score or not change or not change.get("close")
                 or _iso_date(change.get("date")) != _iso_date(score.get("date"))):
             missing.append(stock)
             continue
@@ -405,7 +410,7 @@ def _local_rows(stocks: list) -> tuple:
 def get_ranking(industry: str, mode: str, display_name: str = "") -> Dict[str, Any]:
     if mode not in ("technical", "momentum"):
         raise tools.ToolDataError("不支援的比較方式")
-    key = f"ranking:{industry}:{mode}"
+    key = f"ranking:{industry}:{mode}:{local_market_cache.ranking_revision()}:{weekly_pick.pattern_rule_version()}"
     hit, result = CACHE.get(key)
     if hit:
         return result
@@ -418,6 +423,10 @@ def get_ranking(industry: str, mode: str, display_name: str = "") -> Dict[str, A
             return result
         members = get_members(industry, display_name=display_name)
         deadline = time.monotonic() + SCAN_TIMEOUT
+        from request_runtime import state as request_state
+        request = request_state()
+        if request:
+            deadline = min(deadline, request["deadline"] - 4.0)
         cancel = threading.Event()
         pool = list(members["stocks"])
         local_rows: List[Dict[str, Any]] = []
@@ -932,6 +941,10 @@ def rank_custom(stocks: List[Dict[str, str]], name: str) -> Dict[str, Any]:
         pool += [s for s in stocks if s["stock_code"] in stale_codes]
     rows, failed = list(local_rows), []
     deadline = time.monotonic() + SCAN_TIMEOUT
+    from request_runtime import state as request_state
+    request = request_state()
+    if request:
+        deadline = min(deadline, request["deadline"] - 4.0)
     for stock in pool:
         if time.monotonic() >= deadline:
             failed.append(stock["stock_code"])
@@ -1026,10 +1039,17 @@ def _overview_rows(codes: List[str]) -> List[Dict[str, Any]]:
         names = {}
     rows = []
     for code in codes:
-        bars = local_market_cache.load_bars(code, limit=140)
+        bars = local_market_cache.load_bars(code, limit=local_market_cache.KEEP_DAYS)
         if not bars or bars["count"] < 61:
             continue
-        df = bars["df"]
+        try:
+            with tools.local_only():
+                canonical = tools._load_price_bundle(code)
+            df = tools.closed_frame(canonical).copy()
+            events = canonical.get("corporate_actions") or {"status": "unverified"}
+        except Exception as exc:
+            print(f"族群總覽 {code} 還原基準尚未可用：{tools.err_text(exc)}", flush=True)
+            continue
         c, close = df["Close"], float(df["Close"].iloc[-1])
         value = df["Close"] * df["Volume"]
         hi60 = float(df["High"].iloc[-61:-1].max())
@@ -1045,8 +1065,7 @@ def _overview_rows(codes: List[str]) -> List[Dict[str, Any]]:
         above = sorted((p, n) for n, p in cands if p > close * 1.002)
         below = sorted(((p, n) for n, p in cands if p < close * 0.998), reverse=True)
         # 總覽不打 API：有當天已查過的公司行動就用，沒有就標「未核實」，不可假裝沒有事件（審查 #3）
-        cached = (tools._CORP_CACHE.get(code) or ("", None))
-        events = cached[1] if cached[0] == tools.taipei_now().strftime("%Y-%m-%d") else {"status": "unverified"}
+        # Canonical local bundle uses the same adjustment and confirmed window as individual analysis.
         k = kline_patterns.detect(df, events, state_key=f"tri_state_{code}", state_write=False)
         shape = _shape_label(k)
         pct = lambda n: round((close / float(c.iloc[-1 - n]) - 1) * 100, 2)

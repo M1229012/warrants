@@ -444,7 +444,7 @@ class QuestionParser:
     def parse(self, question: str, access=None, _skip_sector: bool = False) -> ParsedQuestion:
         sector = None if _skip_sector else sector_analysis.detect_request(question)   # 大盤層級的問題會在解析器裡就被排除
         if sector is not None and not _stock_named_instead(question):
-            if needs_enabled():
+            if needs_enabled() and sector.get("mode") not in ("belongs", "members"):
                 stock_side = self.parse(question, access=access, _skip_sector=True)
                 if stock_side.stocks:      # 10-08：複合題（個股＋族群）不提早結束，個股需求不能遺失
                     stock_side.sector_context = sector
@@ -704,7 +704,7 @@ ADMIN_HELP_GROUPS = (
     ("會員統計", ("使用統計（可加近7天／本月／今日／累計）", "問答次數（前10名）", "問答次數完整名單（CSV）",
                   "熱門股票今日／近7天", "大家都問什麼類型的問題", "統計診斷")),
     ("額度（/額度 指令）", ("贈送 AI 次數", "設定身分組每日 AI 次數", "清除身分組每日設定", "查詢某人／身分組額度")),
-    ("型態驗證", ("型態驗證 2330（趨勢線、錨點、轉折確認日）", "型態驗證 2344 1608 2421（一次最多 10 檔，公開）")),
+    ("型態驗證", ("型態驗證 2330（趨勢線、錨點、轉折確認日）", "型態驗證 2344 1608 2421（一次最多 10 檔，公開）", "圖片型態驗證（attachment 附股票清單截圖，最多 10 檔）")),
     ("本週精選", ("本週精選排名", "3006 幫我生成週精選文字", "這版確認，生成圖片")),
     ("草稿", ("直接說修改需求", "還原上一版", "目前草稿")),
     ("資料維護", ("系統狀態", "用量（含費用估算）", "錯誤紀錄", "更新市場底庫", "更新族群名冊", "匯出狀態／匯入狀態")),
@@ -1466,19 +1466,19 @@ _NEEDS_TAILS = ("怎麼樣", "怎樣", "如何", "怎麼看", "好不好", "好�
 NEEDS_TYPES = ["pattern", "chips", "news", "price", "institutional", "futures", "cost", "compare", "members", "rank", "other"]
 _NEED_INTENTS: Dict[str, Set[str]] = {
     "pattern": {"analysis", "technical"}, "news": {"news"}, "price": {"price"}, "institutional": {"institutional"},
-    "futures": {"futures"}, "cost": {"cost", "analysis"}, "compare": {"analysis"}, "chips": {"warrant"},
+    "futures": {"futures"}, "cost": {"cost", "analysis"}, "compare": {"analysis"}, "chips": {"warrant"}, "members": {"sector"}, "rank": {"sector"},
 }
 _EXCLUDE_INTENTS: Dict[str, Set[str]] = {
     "pattern": {"analysis", "technical", "volume_profile"}, "news": {"news"}, "price": {"price"},
     "institutional": {"institutional"}, "futures": {"futures"}, "chips": {"warrant", "win_rate", "recent_trades", "position"},
+    "members": {"sector"}, "rank": {"sector"}, "compare": {"analysis"}, "cost": {"cost"}, "other": set(),
 }
 
 
 def needs_enabled() -> bool:
     """需求表開關；跑既有 unittest 時預設關（Gemini 次數與族群路由不受影響），需求表測試會明確設環境變數。"""
-    if not NEEDS_PARSE_ENABLE:
-        return False
-    return not (any("unittest" in str(a) for a in sys.argv[:3]) and "DISCORD_AI_NEEDS_PARSE" not in os.environ)
+    value = os.getenv("DISCORD_AI_NEEDS_PARSE")
+    return NEEDS_PARSE_ENABLE if value is None else value.strip().lower() in ("1", "true", "yes", "on")
 
 
 def needs_semantic(parsed: "ParsedQuestion") -> bool:
@@ -1963,7 +1963,7 @@ GEMINI_MAX_ATTEMPTS = max(1, tools._env_int("DISCORD_AI_GEMINI_MAX_ATTEMPTS", 5)
 GEMINI_MIN_CALL_SECONDS = 3.0                                                                  # 剩不到 3 秒就不再啟動新呼叫
 QUESTION_DEADLINE_SECONDS = max(15.0, tools._env_float("DISCORD_AI_QUESTION_DEADLINE_SECONDS", 50.0))   # 整題（解析＋排隊＋工具＋AI）
 IMAGE_RESERVE_SECONDS = 4.0                                                                    # 留給產生圖卡
-_QUESTION_CLOCK = threading.local()                                                            # 目前這題的截止時間（monotonic）
+_QUESTION_CLOCK = __import__("request_runtime").CLOCK                                                            # 目前這題的截止時間（monotonic）
 QUESTION_MAX_GEMINI_CALLS = max(1, tools._env_int("DISCORD_AI_QUESTION_MAX_GEMINI_CALLS", 8))   # 整題 Gemini 呼叫總數上限
 
 
@@ -2227,7 +2227,7 @@ class GeminiGateway:
             return True
 
     def _run_with_deadline(self, purpose: str, work: Callable[[float], GeminiResult]) -> GeminiResult:
-        if not self.DEADLINE:
+        if not self.DEADLINE and question_left() is None:
             return work(0.0)
         gate = self._OUTSTANDING          # 拿哪一顆就 release 同一顆
         if not gate.acquire(blocking=False):
@@ -2235,12 +2235,12 @@ class GeminiGateway:
             return GeminiResult(ok=False, error="gemini_busy", purpose=purpose)
         request_id = str(getattr(tools._API_REQUEST_LOCAL, "request_id", "") or "")
         now = time.monotonic()
-        deadline = now + self.DEADLINE
+        deadline = now + self.DEADLINE if self.DEADLINE else float("inf")
         clock_state = getattr(_QUESTION_CLOCK, "state", None)
         question_end = float(clock_state["deadline"]) if clock_state else 0.0
         if question_end:
             deadline = min(deadline, question_end - IMAGE_RESERVE_SECONDS)
-        if deadline - now < GEMINI_MIN_CALL_SECONDS:
+        if deadline <= now or (question_end and question_end - IMAGE_RESERVE_SECONDS - now < GEMINI_MIN_CALL_SECONDS):
             gate.release()
             self.log(f"整題時間快用完，不再呼叫 Gemini，改用規則式內容：{purpose}")
             return GeminiResult(ok=False, error="question_deadline", purpose=purpose)
@@ -2251,7 +2251,7 @@ class GeminiGateway:
         def run() -> None:
             _QUESTION_CLOCK.state = clock_state          # 同一題的期限與呼叫次數交給 Gemini 執行緒
             try:
-                with tools.api_request_scope(request_id):
+                with __import__("request_runtime").scope(clock_state), tools.api_request_scope(request_id):
                     box["result"] = work(deadline)
             except Exception as exc:
                 box["result"] = GeminiResult(ok=False, error=f"{type(exc).__name__}: {exc}", purpose=purpose)
@@ -2300,12 +2300,14 @@ class GeminiGateway:
         except TypeError:      # 舊版 SDK／測試替身不吃 http_options
             client = kf.genai.Client(api_key=key)
         try:
+            __import__("request_runtime").reserve_call(QUESTION_MAX_GEMINI_CALLS)
             return client.models.generate_content(model=model, contents=contents, config=use)
         except Exception as exc:
             if not thinking or "thinking" not in str(exc).lower():
                 raise
             _THINKING_UNSUPPORTED.add(model)
             print(f"⚠️ {model} 不支援思考參數，改用模型預設：{str(exc)[:160]}", flush=True)
+            __import__("request_runtime").reserve_call(QUESTION_MAX_GEMINI_CALLS)
             return client.models.generate_content(model=model, contents=contents, config=config)
 
     def _generate(self, prompt: str, purpose: str, schema: Optional[Dict[str, Any]] = None, temperature: float = 0.3,
@@ -2351,9 +2353,7 @@ class GeminiGateway:
                         left = (deadline - time.monotonic()) if deadline else None          # 等到名額後重算剩餘時間
                         if left is not None and left < GEMINI_MIN_CALL_SECONDS:
                             raise TimeoutError("Gemini 等名額後剩餘時間不足")
-                        st = getattr(_QUESTION_CLOCK, "state", None)
-                        if st is not None:
-                            st["calls"] += 1
+                        __import__("request_runtime").check_budget(IMAGE_RESERVE_SECONDS)
                         call_ms = GEMINI_CALL_TIMEOUT_MS if left is None else int(max(2000, min(GEMINI_CALL_TIMEOUT_MS, (left - 1.0) * 1000)))
                         response = self._call_once(kf, keys[key], model, contents, config, call_ms)
                     finally:
@@ -2608,7 +2608,7 @@ def _compact_tool_data(name: str, data: Dict[str, Any], has_scorecard: bool) -> 
         data["minus_reasons"] = (data.get("minus_reasons") or [])[:4]
     elif name == "get_stock_overview":
         candle = _candle_shape(data)
-        data = {k: data.get(k) for k in ("stock_code", "stock_name", "data_date", "data_source", "intraday", "close", "change_pct", "volume_status", "volume_trend", "volume_ratio_vs_mv5", "volume_ratio_vs_mv20")}
+        data = {k: data.get(k) for k in ("stock_code", "stock_name", "data_date", "data_source", "freshness", "intraday", "close", "change_pct", "volume_status", "volume_trend", "volume_ratio_vs_mv5", "volume_ratio_vs_mv20")}
         data["candle"] = candle
     elif name == "get_branch_warrant_detail":
         # 給 AI 的權證明細：保留習慣統計、快到期、各組重點與每檔的關鍵數字（圖上已有完整表格）
@@ -5071,7 +5071,7 @@ class AceQueryEngine:
             return AnswerResult(speed_text, 'admin_spot_speed', 0, time.perf_counter()-started,
                                 as_text=True, cacheable=False)
         if kline_debug.is_request(question):
-            return self._answer_kline_debug(question, started, is_admin=is_admin, admin_mode=admin_mode)
+            return self._answer_kline_debug(question, started, is_admin=is_admin, admin_mode=admin_mode, image=image)
         if admin_mode:
             self.log(f"使用者問題（/ace）：{question[:120]}")   # 管理員路線（草稿、精選、維護）也留下原文，方便查路由
         if any(word in compact for word in MEMORY_RESET_WORDS):
@@ -5515,7 +5515,7 @@ class AceQueryEngine:
         backtest = self._prepare_event_backtest(code, name, report=report, question=question)
         extra_panels = []
         chart_results = self._run_tools([ToolCall("get_chart_panel", {"stock_code": code, "with_marks": False}),
-                                        ToolCall("get_institutional_flow", {"stock_code": code, "days": 70})])
+                                        ToolCall("get_institutional_flow", {"stock_code": code, "days": 70})]) if backtest else []
         charts = [dict(t.data) for t in chart_results if t.name == 'get_chart_panel' and t.ok]
         inst = next((t.data for t in chart_results if t.name == 'get_institutional_flow' and t.ok), {})
         for panel in charts:
@@ -5708,9 +5708,9 @@ class AceQueryEngine:
         allowed = bool(access.admin_mode) if access is not None else bool(is_admin and admin_mode)
         own_clock = getattr(_QUESTION_CLOCK, "state", None) is None
         if own_clock:       # 10-08：整題期限從收到問題就開始（排隊、解析、工具、AI、圖卡都在內）
-            _QUESTION_CLOCK.state = {"deadline": time.monotonic() + QUESTION_DEADLINE_SECONDS, "calls": 0}
+            _QUESTION_CLOCK.state = __import__("request_runtime").state() or __import__("request_runtime").new_state(QUESTION_DEADLINE_SECONDS)
         try:
-            with stock_banter.question_scope(question), tools.quote_policy(admin_live=allowed):
+            with __import__("request_runtime").scope(_QUESTION_CLOCK.state), stock_banter.question_scope(question), tools.quote_policy(admin_live=allowed):
                 return self._answer_with_quote_policy(question, context_key, on_queue,
                                                       is_admin, admin_mode, access, image)
         finally:
@@ -5988,19 +5988,46 @@ class AceQueryEngine:
                             elapsed=time.perf_counter()-started, cacheable=False, panels=panels,
                             as_text=not panels, image_title=result.get("title") or "族群雷達")
 
-    def _answer_kline_debug(self, question: str, started: float, *, is_admin: bool, admin_mode: bool) -> AnswerResult:
+    def _answer_kline_debug(self, question: str, started: float, *, is_admin: bool, admin_mode: bool, image=None) -> AnswerResult:
         access = self._access()
         if not (is_admin and admin_mode and access is not None and access.admin_mode and not access.simulation):
             return AnswerResult(text="型態驗證僅限管理員透過 /ace 使用。", route="admin_kline_denied",
                                 gemini_calls=0, elapsed=time.perf_counter()-started, as_text=True)
+        ocr_calls, notice = 0, ""
         try:
-            codes = kline_debug.parse_codes(question)
+            if image is not None:
+                data, mime = image
+                if len(data) > 8 * 1024 * 1024 or mime not in ("image/png", "image/jpeg", "image/webp"):
+                    raise ValueError("請使用 8MB 以內的 PNG、JPEG 或 WebP 圖片")
+                from PIL import Image
+                with Image.open(io.BytesIO(data)) as im:
+                    im.verify()
+                extracted = self.gateway.generate_with_image(IMAGE_STOCKS_PROMPT, data, mime,
+                                    purpose="kline_debug_ocr", schema=IMAGE_STOCKS_SCHEMA)
+                ocr_calls = 1
+                if not extracted.ok:
+                    raise ValueError("圖片代號辨識未完成，請稍後重試或直接輸入代號")
+                payload = json.loads(extracted.text)
+                names = tools.get_stock_name_map()
+                items = [(str(x.get("code") or ""), str(x.get("name") or ""))
+                         for x in payload.get("stocks", []) if isinstance(x, dict)]
+                stocks, unknown = normalize_custom_stocks(items, names)
+                codes = list(dict.fromkeys(s["stock_code"] for s in stocks))
+                if not codes:
+                    raise ValueError("圖片中沒有可核對的股票代號，請使用清楚的股票清單截圖")
+                if len(codes) > 10:
+                    raise ValueError(f"辨識到 {len(codes)} 檔；每次最多 10 檔，請裁切圖片分批驗證")
+                if unknown:
+                    notice = "未辨識項目：" + "、".join(unknown) + "；請確認後另行查詢。"
+            else:
+                codes = kline_debug.parse_codes(question)
         except Exception as exc:
             return AnswerResult(text="型態驗證未完成：" + tools.err_text(exc), route="admin_kline_error",
-                                gemini_calls=0, elapsed=time.perf_counter()-started, cacheable=False, as_text=True)
+                                gemini_calls=ocr_calls, elapsed=time.perf_counter()-started, cacheable=False, as_text=True)
         results = []
         for code in codes:   # 10-06：一次多檔，每檔一張圖（第一張為主回覆，其餘接在後面）
             try:
+                __import__("request_runtime").check_budget(IMAGE_RESERVE_SECONDS)
                 panel = kline_debug.load_panel(code)
                 results.append(AnswerResult(text="管理員型態驗證：沿用程式計算結果與價格基準；未使用 AI 畫線。",
                                             route="admin_kline_debug", gemini_calls=0, elapsed=time.perf_counter()-started,
@@ -6010,6 +6037,8 @@ class AceQueryEngine:
                 results.append(AnswerResult(text=f"{code} 型態驗證未完成：" + tools.err_text(exc), route="admin_kline_error",
                                             gemini_calls=0, elapsed=time.perf_counter()-started, cacheable=False, as_text=True))
         first = results[0]
+        first.gemini_calls = ocr_calls
+        first.private_notice = notice
         first.followups = list(first.followups) + results[1:]
         return first
 
@@ -6559,6 +6588,16 @@ class AceQueryEngine:
                     return stock
             return None
 
+        parsed.needs_periods = {}
+        parsed.needs_excluded = drop
+        parsed.needs_items = items
+        for item in items:
+            if item.get("type") in ("members", "rank", "compare") and "sector" not in drop:
+                for target in item.get("targets") or []:
+                    hit = sector_match.match(str(target))
+                    if hit:
+                        parsed.sector_context = {"industry": hit["industry"], "name": hit["name"],
+                                                 "mode": "technical" if item["type"] == "rank" else "members"}
         per_stock: Dict[str, Set[str]] = {}
         untargeted: Set[str] = set()
         for n in items:
@@ -6570,7 +6609,8 @@ class AceQueryEngine:
                 per_stock.setdefault(code, set()).update(want)
             days = DAYS_RE.search(str(n.get("date_range") or ""))
             if days:
-                parsed.days = max(1, min(250, int(days.group(1))))
+                for code in codes or [c for c, _ in parsed.stocks]:
+                    parsed.needs_periods[(code, str(n.get("type")))] = max(1, min(250, int(days.group(1))))
         for code, _ in parsed.stocks:
             per_stock[code] = (per_stock.get(code, set()) | untargeted) - drop
         per_stock = {c: v for c, v in per_stock.items() if c in {x for x, _ in parsed.stocks}}
@@ -6584,22 +6624,51 @@ class AceQueryEngine:
         return per_stock
 
     def _plan_from_needs(self, parsed: ParsedQuestion, per_stock: Dict[str, Set[str]], stats: "AnswerStats") -> QueryPlan:
-        """逐檔依各自需求排工具再合併（「2330新聞、2454型態」不會兩檔都跑新聞＋技術）；一律重建，不沿用舊工具清單。"""
+        """Authoritative per-target plan: never infer extra needs from the raw question again."""
+        items = getattr(parsed, "needs_items", [])
+        drop = getattr(parsed, "needs_excluded", set())
+        if "sector" not in drop and any(n.get("type") in ("members", "rank") for n in items):
+            sector = parsed.sector or parsed.sector_context
+            if sector:
+                parsed.sector = dict(sector)
+                if parsed.sector.get("mode") != "belongs":
+                    parsed.sector["mode"] = "technical" if any(n.get("type") == "rank" for n in items) else "members"
+                nonsector = {c: v - {"sector"} for c, v in per_stock.items()}
+                if not any(nonsector.values()):
+                    return QueryPlan(route="rule_sector")
+                parsed.sector_context = parsed.sector
+                parsed.sector = None
+                per_stock = nonsector
         stocks = [(c, nm) for c, nm in parsed.stocks if per_stock.get(c)]
         if not stocks:
-            return QueryPlan(route="clarify", clarification="依你的排除條件，沒有剩下要查的股票或項目；可以換個說法再問一次。")
-        merged: Optional[QueryPlan] = None
+            return QueryPlan(route="clarify", clarification="依需求與排除條件，沒有可執行的項目；請補充股票或族群名稱。")
+        merged = QueryPlan(route="rule_stock", need_final_llm=True)
         for code, name in stocks:
-            one = replace(parsed, stocks=[(code, name)], intents=set(per_stock[code]))
-            plan = self.router.plan(one, stats)
-            if merged is None:
-                merged = plan
-                continue
+            want = set(per_stock[code])
+            one = replace(parsed, stocks=[(code, name)], intents=want, original=code, normalized=code, sector=None)
+            if want & {"analysis", "technical", "cost"}:
+                plan = self.router._pattern_plan(one)
+                merged.pattern = True
+                merged.route = "rule_pattern"
+            else:
+                plan = self.router._stock_plan(one, want, False)
+            if "institutional" in want:
+                plan.add("get_institutional_flow", stock_code=code, days=getattr(parsed, "needs_periods", {}).get((code, "institutional"), 70))
+            if "futures" in want:
+                plan.add("get_futures_positions")
+            if "news" in want:
+                plan.add("get_recent_news", stock_code=code)
+            excluded_tools = set()
+            if "institutional" in drop: excluded_tools.add("get_institutional_flow")
+            if "futures" in drop: excluded_tools.add("get_futures_positions")
+            if "news" in drop: excluded_tools.add("get_recent_news")
             for call in plan.tool_calls:
-                merged.add(call.name, **call.kwargs)
-            merged.need_final_llm = merged.need_final_llm or plan.need_final_llm
-            merged.pattern = merged.pattern or plan.pattern or plan.route == "rule_pattern"
-        merged.need_final_llm = True
+                if call.name in excluded_tools: continue
+                kwargs = dict(call.kwargs)
+                if call.name == "get_recent_news":
+                    period = getattr(parsed, "needs_periods", {}).get((code, "news"))
+                    if period: kwargs["days"] = period
+                merged.add(call.name, **kwargs)
         return merged
 
     @staticmethod
@@ -6609,6 +6678,8 @@ class AceQueryEngine:
         try:
             members = sector_analysis.get_members(sector["industry"], sector.get("name", ""))
             member_codes = [str(m.get("code") or m.get("stock_code") or "") for m in members.get("stocks") or []]
+            out["members"] = [{"code": m.get("stock_code") or m.get("code"), "name": m.get("stock_name") or m.get("name")} for m in (members.get("stocks") or [])[:80]]
+            out["member_count"] = len(members.get("stocks") or [])
             scores = local_market_cache.pattern_scores_for([c for c in member_codes if c])
         except Exception as exc:
             out["missing"] = f"族群資料暫時取不到（{type(exc).__name__}）"
@@ -6771,7 +6842,7 @@ class AceQueryEngine:
                 needs_table["per_stock"] = {c: sorted(v) for c, v in per_stock.items()}
             else:
                 # 解析失敗：不能照原本可能忽略「不要…」的工具清單執行；改用原分類器（一次）決定主題，最後提示要求只答所問
-                plan = self._classify_fallback(question, parsed, stats) or plan
+                plan = QueryPlan(route="clarify", clarification="題目的需求或排除條件暫時無法確認，請分開描述每檔股票要查的項目。")
                 needs_table = {"parse_failed": True}
             if parsed.sector_context and parsed.stocks:
                 needs_table["sector_context"] = self._sector_context_data(parsed.sector_context, [c for c, _ in parsed.stocks])
@@ -6808,7 +6879,7 @@ class AceQueryEngine:
                 return AnswerResult(text=clarify_message(parsed), route="clarify", gemini_calls=stats.gemini_calls,
                                     elapsed=time.perf_counter() - started)
             return AnswerResult(text=plan.clarification, route=plan.route, gemini_calls=stats.gemini_calls, elapsed=time.perf_counter() - started)
-        if "institutional" in parsed.intents and plan.route not in ("rule_sector", "rule_institutional"):
+        if plan.needs is None and "institutional" in parsed.intents and plan.route not in ("rule_sector", "rule_institutional"):
             planned = {(c.name, c.kwargs.get("stock_code")) for c in plan.tool_calls}
             for code, _ in parsed.stocks:
                 if code not in tools.INDEX_CODES and ("get_institutional_flow", code) not in planned:
@@ -6854,7 +6925,10 @@ class AceQueryEngine:
                 self.log(f"完整點位：K 線拉長到 {lookback} 根（涵蓋 {chart_branch} 在 {codes[0]} 的事件，最多回推 180 天）")
             except Exception as exc:   # 查不到事件就維持 70 根，不影響回答
                 self.log(f"完整點位略過：{type(exc).__name__}: {exc}")
-        for c in codes:
+        chart_codes = codes if plan.needs is None else [c for c in codes
+                       if set((plan.needs.get("per_stock") or {}).get(c, [])) &
+                          {"analysis", "technical", "cost", "price", "institutional", "warrant"}]
+        for c in chart_codes:
             kwargs = {"stock_code": c, "mark_mode": mark_mode, "flow_source": "sheet"}
             if lookback:
                 kwargs["lookback"] = lookback
@@ -6873,7 +6947,7 @@ class AceQueryEngine:
         results = [r for r in combined if r.name != "get_chart_panel"]
         chart_results = [r for r in combined if r.name == "get_chart_panel"]
         panels = []
-        for code, chart in zip(codes, chart_results):
+        for code, chart in zip(chart_codes, chart_results):
             panel = dict(chart.data) if chart.ok else {"stock_code": code, "error": "K 線資料暫時無法取得；以下保留已取得的分析。"}
             if not warrant_ok:
                 panel["marks"] = {}  # 圖上不畫分點標記
@@ -7925,7 +7999,19 @@ def _clean_card_text(value: Any, limit: int) -> str:
             continue
         seen.add(key)
         kept.append(part)
-    return "".join(kept).strip()
+    result = "".join(kept).strip()
+    if limit <= 0 or len(result) <= limit:
+        return result
+    complete = []
+    for part in kept:
+        if len("".join(complete)) + len(part.strip()) <= limit:
+            complete.append(part.strip())
+        else:
+            break  # Keep leading conditions together; never skip to a later conclusion.
+    if complete:
+        return "".join(complete)
+    fallback = "內容較長，請縮小問題範圍以取得完整條件。" if limit >= 22 else "請縮小問題範圍。"
+    return fallback if len(fallback) <= limit else ""
 
 
 def parse_ai_card(text: str) -> Optional[Dict[str, Any]]:
@@ -8507,6 +8593,24 @@ def run_discord_bot(config: BotConfig) -> None:
 
     async def handle_question_with_quote_policy(interaction: "discord.Interaction", question: str, admin_mode: bool,
                                                attachment=None) -> None:
+        import request_runtime
+        state = request_runtime.new_state(QUESTION_DEADLINE_SECONDS)
+        try:
+            with request_runtime.scope(state):
+                await asyncio.wait_for(_handle_question_impl(interaction, question, admin_mode, attachment),
+                                       timeout=QUESTION_DEADLINE_SECONDS)
+        except asyncio.TimeoutError:
+            state["cancelled"] = True
+            try:
+                if interaction.response.is_done():
+                    await interaction.delete_original_response()
+                await interaction_text(interaction, "處理逾時，尚未完成的結果不作判定；請縮小清單或稍後重試。",
+                                       ephemeral=True, followup=interaction.response.is_done())
+            except discord.HTTPException:
+                pass
+
+    async def _handle_question_impl(interaction: "discord.Interaction", question: str, admin_mode: bool,
+                                               attachment=None) -> None:
         request_started = asyncio.get_running_loop().time()
         user_id, channel_id = interaction.user.id, interaction.channel_id or 0
         who = f"{getattr(interaction.user, 'display_name', '') or getattr(interaction.user, 'name', '')}（{user_id}）"
@@ -8788,7 +8892,7 @@ def run_discord_bot(config: BotConfig) -> None:
 
     @client.tree.command(name=config.admin_command_name, description="艾斯 AI 管理員：本週精選、草稿編輯與資料維護")
     @app_commands.describe(question="例如：型態驗證 2330／本週精選排名／3006 幫我生成週精選文字／系統狀態／說明",
-                           attachment="匯入狀態：附上 .json.gz 檔；型態排行：附上股票清單截圖")
+                           attachment="圖片型態驗證／型態排行：股票清單截圖；匯入狀態：.json.gz 檔")
     async def admin_command(interaction: "discord.Interaction", question: str,
                             attachment: Optional[discord.Attachment] = None) -> None:
         compact = re.sub(r"\s+", "", question or "")

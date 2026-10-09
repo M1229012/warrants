@@ -271,11 +271,14 @@ _LOCAL_ONLY = threading.local()
 def local_only():
     """10-08：背景重算型態分數只用本地底庫，整條呼叫鏈（日K、公司行動）都不打 FinMind。"""
     old = getattr(_LOCAL_ONLY, "on", False)
+    previous_bundles = getattr(_LOCAL_ONLY, "bundles", None)
+    _LOCAL_ONLY.bundles = {}
     _LOCAL_ONLY.on = True
     try:
         yield
     finally:
         _LOCAL_ONLY.on = old
+        _LOCAL_ONLY.bundles = previous_bundles
 
 
 def finmind_background_allowed() -> bool:
@@ -2283,19 +2286,9 @@ DAILY_READY_MINUTE = _env_int("DISCORD_AI_DAILY_READY_MINUTE", 15 * 60 + 30)   #
 
 
 def expected_last_close(now: Any = None) -> pd.Timestamp:
-    """應該要有的最近收盤日（10-08：取代「5 個日曆日內就接受」）：平日、過了日K就緒時間才算今天；
-    往回跳過週末與交易所明確回覆休市的日子。只用日曆與交易所休市紀錄，不看底庫有什麼資料。"""
-    now = now or taipei_now()
-    day = pd.Timestamp(now.date())
-    if now.weekday() >= 5 or now.hour * 60 + now.minute < DAILY_READY_MINUTE:
-        day -= pd.Timedelta(days=1)
-    try:
-        closed = set(local_market_cache.market_closed_days([(day - pd.Timedelta(days=i)).strftime("%Y-%m-%d") for i in range(15)]))
-    except Exception:
-        closed = set()
-    while day.weekday() >= 5 or day.strftime("%Y-%m-%d") in closed:
-        day -= pd.Timedelta(days=1)
-    return day
+    """Independent official calendar plus both-market completion; unavailable coverage stays explicit."""
+    import market_calendar
+    return market_calendar.close_status(now or taipei_now(), DAILY_READY_MINUTE)["expected_date"]
 
 
 def _missing_trading_days(df: pd.DataFrame) -> List[str]:
@@ -2304,15 +2297,24 @@ def _missing_trading_days(df: pd.DataFrame) -> List[str]:
     均線、布林、KD 都是「往前數 N 根」算的，缺一天不會報錯只會算錯，所以這一關要擋在出圖前面。
     日曆取不到時回傳空清單，不因為檢查失敗而擋住回答。
     """
+    if getattr(_LOCAL_ONLY, "on", False):
+        import market_calendar
+        if df is None or len(df) < 2: return []
+        sessions = market_calendar.sessions_between(df.index[0], df.index[-1])
+        if sessions is None: return []
+        have = {pd.Timestamp(x).strftime("%Y-%m-%d") for x in df.index}
+        return [d for d in sessions if d not in have]
     try:
         if df is None or len(df) < 2:
             return []
         index = pd.DatetimeIndex(df.index).normalize()
         first, last = index[max(0, len(index) - 70)], index[-1]
         have = set(index)
-        return [d.strftime("%Y-%m-%d") for d in
-                (pd.Timestamp(x).normalize() for x in core()._get_official_trading_dates(first, last))
-                if d not in have]
+        sessions = [pd.Timestamp(x).normalize() for x in core()._get_official_trading_dates(first, last)]
+        import market_calendar
+        if sessions:
+            market_calendar.save_sessions(first, last, sessions, "既有官方交易日查詢")
+        return [d.strftime("%Y-%m-%d") for d in sessions if d not in have]
     except Exception as exc:   # 休市表失敗時照常回答，只是少了這道檢查
         print(f"⚠️ 交易日連續性檢查略過：{type(exc).__name__}: {exc}", flush=True)
         return []
@@ -2421,6 +2423,15 @@ def _load_price_bundle(stock_code: str, spot_history_mode: bool = False) -> Dict
         return _load_index_bundle(str(stock_code).strip().upper())
     code = kf._normalize_stock_name_code_key(stock_code)
 
+    import request_runtime
+    request = request_runtime.state()
+    request_key = (code, locals().get("spot_history_mode", False), getattr(_LOCAL_ONLY, "on", False), intraday_session_now())
+    if request is not None:
+        with request_runtime._LOCK:
+            cached_request = request.setdefault("price_bundles", {}).get(request_key)
+        if cached_request is not None:
+            return cached_request
+
     def daily() -> Tuple[pd.DataFrame, str, str]:
         # 先讀 Persistent Volume / 本機 SQLite 的最近 70 日。只要資料仍夠新，就不再打 FinMind。
         persistent = local_market_cache.load_bars(code, limit=max(70, local_market_cache.KEEP_DAYS))
@@ -2465,7 +2476,7 @@ def _load_price_bundle(stock_code: str, spot_history_mode: bool = False) -> Dict
         return frame, "", "富果日K備援"
 
     def build() -> Dict[str, Any]:
-        daily_df, market, daily_source = _cached(f"price_daily_{code}", TTL_PRICE_SECONDS, daily)
+        daily_df, market, daily_source = daily() if getattr(_LOCAL_ONLY, "on", False) else _cached(f"price_daily_{code}_{source_stamp(code)}", TTL_PRICE_SECONDS, daily)
         if spot_history_mode:
             import spot_history
             archived = spot_history.load_prices(code)
@@ -2538,7 +2549,29 @@ def _load_price_bundle(stock_code: str, spot_history_mode: bool = False) -> Dict
     # 背景掃描的結果不含盤中 K 棒，另存一個 key，免得使用者接著問同一檔時
     # 拿到背景剛寫進去、沒有即時價的版本。
     prefix = "price_closed_" if current_api_priority() == "background" else "price_"
-    return _cached(f"{prefix}{code}" + ("_spot_year_v4" if spot_history_mode else ""), ttl, build)
+    from request_runtime import check_budget
+    check_budget()
+    if getattr(_LOCAL_ONLY, "on", False):
+        bundles = _LOCAL_ONLY.bundles
+        key = (code, locals().get("spot_history_mode", False))
+        if key not in bundles:
+            bundles[key] = build()
+        result = bundles[key]
+    else:
+        result = _cached(f"{prefix}{code}_{source_stamp(code)}" + ("_spot_year_v4" if locals().get("spot_history_mode", False) else ""), ttl, build)
+    import market_calendar
+    sessions = market_calendar.sessions_between(result["closed_df"].index[0], result["closed_df"].index[-1])
+    if sessions is not None:
+        result["closed_df"].attrs["trading_sessions"] = sessions
+    result["freshness"] = market_calendar.close_status(taipei_now(), DAILY_READY_MINUTE)
+    raw = result.get("raw_closed_df")
+    if raw is not None:
+        result["input_fp"] = frame_fingerprint(raw)
+        result["source_fp"] = analysis_fingerprint(result["input_fp"], result.get("corporate_actions") or {})
+    if request is not None:
+        with request_runtime._LOCK:
+            result = request.setdefault("price_bundles", {}).setdefault(request_key, result)
+    return result
 
 
 def closed_frame(bundle: Dict[str, Any]) -> pd.DataFrame:
@@ -2694,6 +2727,9 @@ def get_stock_overview(stock_code: str) -> Dict[str, Any]:
         "market": bundle["market"],
         "data_date": _fmt_date(df.index[-1]),
         "data_source": price_source_note(bundle),
+        "input_fp": bundle.get("input_fp", ""),
+        "source_fp": bundle.get("source_fp", ""),
+        "freshness": bundle.get("freshness", {}),
         "intraday": bundle.get("intraday") or {},
         "open": _num(latest.get("Open")),
         "high": _num(latest.get("High")),
@@ -2956,6 +2992,16 @@ def _get_corporate_actions_locked(code: str) -> Dict[str, Any]:
         result = cached[1]
         if result.get('complete') or time.monotonic() < result.get('_retry_at', 0):
             return result
+    if getattr(_LOCAL_ONLY, "on", False):
+        cached = _CORP_CACHE.get(str(code))
+        saved = local_market_cache.get_state(f"corporate_snapshot_v2_{code}", {}) or {}
+        if cached and cached[0] == taipei_now().strftime("%Y-%m-%d"):
+            return dict(cached[1])
+        if saved:
+            return dict(saved)
+        verified = local_market_cache.get_state(f"corporate_verified_v1_{code}", []) or []
+        return {"status": "unverified", "items": verified, "complete": False,
+                "coverage": ["離線：僅使用已保存公司行動；完整事件涵蓋範圍尚未核實"]}
     kf = core()
     start = (taipei_now() - timedelta(days=400)).strftime("%Y-%m-%d")
     import price_adjustment
@@ -3010,12 +3056,15 @@ def _get_corporate_actions_locked(code: str) -> Dict[str, Any]:
               "coverage": coverage, "complete": successes == 3,
               "_retry_at": time.monotonic() + 60}
     record_api_event("FinMindData", status=200 if successes else 500)
+    local_market_cache.set_state(f"corporate_snapshot_v2_{code}", result)
     _CORP_CACHE[code] = (today, result)
     return result
 
 
 def _recover_corporate_reference(code, actions):
     """斷層警示後再查官方資料，使用原始日K重算；來源仍不足就繼續拒絕分析。"""
+    if getattr(_LOCAL_ONLY, "on", False):
+        raise ToolDataError("公司行動參考價尚未核實；離線重算延後")
     import corporate_action_sources
     today = taipei_now().strftime('%Y-%m-%d')
     start = (taipei_now() - timedelta(days=400)).strftime('%Y-%m-%d')
@@ -3030,6 +3079,7 @@ def _recover_corporate_reference(code, actions):
             if not items.get(key, {}).get('factor'):
                 items[key] = event
         result.update(status='ok', items=sorted(items.values(), key=lambda e: e['date']))
+        local_market_cache.set_state(f"corporate_snapshot_v2_{code}", result)
         _CORP_CACHE[code] = (today, result)
         verified = [e for e in result['items'] if e.get('factor') and math.isfinite(float(e['factor'])) and float(e['factor']) > 0]
         local_market_cache.set_state(f'corporate_verified_v1_{code}', verified)
@@ -3091,6 +3141,9 @@ def get_technical_analysis(stock_code: str) -> Dict[str, Any]:
         "stock_name": name,
         "data_date": _fmt_date(df.index[-1]),
         "data_source": price_source_note(bundle),
+        "input_fp": bundle.get("input_fp", ""),
+        "source_fp": bundle.get("source_fp", ""),
+        "freshness": bundle.get("freshness", {}),
         "intraday": intraday,
         "signal_status": (f"盤後暫定（{_fmt_date(df.index[-1])}；將再次確認收盤）" if intraday.get("post_close_provisional")
                           else f"盤中暫定（{_fmt_date(df.index[-1])} {intraday.get('time','')}；最終以收盤為準）" if use_live and intraday.get("is_live")
@@ -3933,7 +3986,7 @@ def fetch_cnyes_news(code: str, name: str) -> List[Dict[str, Any]]:
     return articles
 
 
-def get_recent_news(stock_code: str, limit: int = NEWS_MAX_ITEMS) -> Dict[str, Any]:
+def get_recent_news(stock_code: str, limit: int = NEWS_MAX_ITEMS, days: Optional[int] = None) -> Dict[str, Any]:
     """近期公司新聞：鉅亨網（有內文）優先，再補既有六來源新聞標題；不抓一般網站原文（曾卡住 Discord 心跳）。"""
     kf = core()
     code, name = _stock_identity(stock_code)
@@ -3982,7 +4035,13 @@ def get_recent_news(stock_code: str, limit: int = NEWS_MAX_ITEMS) -> Dict[str, A
                 "event_key": kf._news_article_event_key(article, code, name),
             })
         with_body = [a for a in cnyes if a["content"]]
-        items = (with_body + [a for a in cnyes if not a["content"]] + others)[: max(1, int(limit))]
+        articles_all = with_body + [a for a in cnyes if not a["content"]] + others
+        if days is not None:
+            since = pd.Timestamp(taipei_now().date()) - pd.Timedelta(days=max(1, min(250, int(days))) - 1)
+            articles_all = [a for a in articles_all if pd.notna(pd.to_datetime(a.get("date"), errors="coerce"))
+                            and since <= pd.Timestamp(a["date"]).tz_localize(None).normalize() <= pd.Timestamp(taipei_now().date())]
+            cached_points = []
+        items = articles_all[:max(1, int(limit))]
         print(f"📰 {code} 新聞｜鉅亨 {len(cnyes)} 篇（有內文 {len(with_body)} 篇）｜六來源標題 {len(others)} 篇｜採用 {len(items)} 篇", flush=True)
         return {
             "stock_code": code,
@@ -3993,7 +4052,9 @@ def get_recent_news(stock_code: str, limit: int = NEWS_MAX_ITEMS) -> Dict[str, A
             "articles": items,
         }
 
-    data = _cached(f"news_{code}", TTL_NEWS_SECONDS, build)
+    data = _cached(f"news_{code}_{days}_{limit}", TTL_NEWS_SECONDS, build)
+    data = dict(data, requested_days=days, coverage_note="僅列來源實際取得的新聞；不代表指定期間全部新聞均已涵蓋",
+                actual_dates=sorted({a.get("date") for a in data.get("articles", []) if a.get("date")}))
     return {**data, "available": bool(data["summary_points"] or data["articles"])}
 
 
@@ -6802,3 +6863,33 @@ _TOOL_FAILURE_MESSAGES.update({
     "detect_current_branch_events": "分點目前事件資料無法取得",
     "get_branch_recent_behavior": "分點近期操作資料無法取得",
 })
+
+
+def frame_fingerprint(frame):
+    """Hash the exact confirmed raw OHLCV window actually consumed by scoring."""
+    import hashlib
+    rows = frame.sort_index().iloc[::-1]
+    raw = "|".join(f"{pd.Timestamp(i).strftime('%Y-%m-%d')},{float(r['Open']):.4f},{float(r['High']):.4f},{float(r['Low']):.4f},{float(r['Close']):.4f},{float(r.get('Volume', 0)):.0f}" for i, r in rows.iterrows())
+    return hashlib.md5(raw.encode()).hexdigest()[:12] if len(rows) else ""
+
+def analysis_fingerprint(raw_fp, actions):
+    import hashlib, json
+    payload = {"algorithm": "score-input-v3", "raw": raw_fp, "actions": actions.get("items") or [],
+               "coverage": actions.get("complete", False), "window": local_market_cache.KEEP_DAYS,
+               "deduction_days": MA_DEDUCTION_DAYS, "flat_ratio": 0.0002,
+               "settings": {k: v for k, v in globals().items() if k.isupper() and isinstance(v, (int, float, str, bool))
+                            and any(x in k for x in ("ZONE", "PROFILE", "MA_", "PRICE_DAYS"))}}
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
+def source_stamp(code):
+    actions = local_market_cache.get_state(f"corporate_snapshot_v2_{code}", {})
+    actions = actions or (_CORP_CACHE.get(str(code)) or ("", None))[1] or {}
+    return analysis_fingerprint(local_market_cache.bars_fingerprint(code), actions)
+
+def score_basis(tech):
+    basis = str(tech.get("signal_status") or "")
+    if tech.get("input_fp"):
+        basis += "｜fp=" + tech["input_fp"]
+    if tech.get("source_fp"):
+        basis += "｜src=" + tech["source_fp"]
+    return basis

@@ -1400,3 +1400,12 @@ def usage_summary(day: str = "") -> Dict[str, Any]:
         "routes": dict(sorted(routes.items(), key=lambda x: -x[1])),
         "busiest_hour": max(hours.items(), key=lambda x: x[1])[0] + ":00" if hours else "",
     }
+
+
+def ranking_revision() -> str:
+    """Cheap persistent cache stamp; membership/account writes do not invalidate rankings."""
+    with _db() as conn:
+        values = [conn.execute("SELECT MAX(updated_at), COUNT(*) FROM " + table).fetchone()
+                  for table in ("daily_bars", "pattern_scores")]
+        values.append(conn.execute("SELECT MAX(updated_at), COUNT(*) FROM kv WHERE key LIKE 'corporate_snapshot_v2_%'").fetchone())
+    return hashlib.sha256(repr(values).encode()).hexdigest()[:16]

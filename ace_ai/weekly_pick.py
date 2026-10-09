@@ -427,7 +427,10 @@ def pattern_rule_version(config: Optional["WeeklyPickConfig"] = None) -> str:
     """型態評分規則版本：新規則開關全關＝舊規則（空字串，相容既有分數）；否則依所有評分設定雜湊。"""
     import hashlib
     c = config or WeeklyPickConfig()
-    if not (c.near_zone_support or c.support_merge_pct > 0 or c.ma5_limit_support or c.support_card_distance or c.deduction_path_score):
+    legacy = dict(near_ma20_pct=5.0, extended_ma20_pct=12.0, surge_5d_pct=15.0,
+                  overhead_zone_pct=5.0, support_zone_pct=8.0, near_zone_support=False,
+                  support_merge_pct=0.0, ma5_limit_support=False, support_card_distance=False, deduction_path_score=False)
+    if all(getattr(c, k) == v for k, v in legacy.items()):
         return ""
     raw = "pattern-v2|" + "|".join(f"{k}={getattr(c, k)}" for k in _RULE_FIELDS)
     return "p2-" + hashlib.md5(raw.encode("utf-8")).hexdigest()[:8]
@@ -744,6 +747,8 @@ def build_pattern_scorecard(
     pattern = score_pattern(tech, vp, extras, config)
     try:
         import local_market_cache
+        if not tech.get("input_fp") or not tech.get("source_fp"):
+            raise ValueError("計分來源指紋不足，不寫正式排行")
         if not str(tech.get("signal_status") or "").startswith("收盤確認"):
             raise ValueError("盤中／盤後暫定分數不進正式排行")   # 10-08
         if pattern_rule_version(config) != local_market_cache.PATTERN_RULE:
@@ -752,7 +757,7 @@ def build_pattern_scorecard(
             str(tech.get("stock_code") or vp.get("stock_code") or ""),
             str(tech.get("data_date") or vp.get("data_date") or ""),
             pattern["score"], pattern_grade(pattern["score"]), pattern.get("components"),
-            str(tech.get("signal_status") or ""), rule=pattern_rule_version(config),
+            tools.score_basis(tech), rule=pattern_rule_version(config),
         )
     except Exception:
         pass
