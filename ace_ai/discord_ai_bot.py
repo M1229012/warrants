@@ -3057,6 +3057,78 @@ class FactSheet:
         for result in results:
             if result.ok and isinstance(result.data, dict):
                 self._add_result(result.name, result.data)
+        self.chart_triangles: Dict[str, Dict[str, Any]] = {}
+        self.chart_line_numbers: Dict[str, Dict[str, Set[str]]] = {}
+        self._add_chart_triangles(payload.get("chart_context") or {})
+
+    def _add_chart_triangles(self, context: Dict[str, Any]) -> None:
+        """Only admit current, visible chart lines; retain per-stock numeric ownership."""
+        for code, stock in (context.get("stocks") or {}).items():
+            code = str(code)
+            view = stock.get("triangle") or {}
+            if code not in self.stocks:
+                continue
+            self.chart_triangles[code] = view
+            day = member_pattern.date_key(view.get("data_date"))
+            if (not view.get("visible") or day is None or
+                    day != member_pattern.date_key((stock.get("last_bar") or {}).get("date")) or
+                    view.get("current_position") == "not_applicable"):
+                continue
+            try:
+                upper, lower = float(view["upper"]), float(view["lower"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not (math.isfinite(upper) and math.isfinite(lower) and upper > lower > 0):
+                continue
+            numbers = set()
+            by_side = {}
+            for side, price in (("上緣", upper), ("下緣", lower)):
+                side_numbers = {str(price), f"{price:g}"}
+                for digits in (1, 2):
+                    side_numbers.update((f"{price:.{digits}f}", f"{round(price, digits):g}"))
+                by_side[side] = side_numbers
+                numbers.update(side_numbers)
+            self.chart_line_numbers[code] = by_side
+            self.market.update(numbers)
+            self.stock_numbers.setdefault(code, set()).update(numbers)
+            self.user_only.difference_update(numbers)
+
+    def _triangle_issues(self, sentence: str, code: str) -> List[str]:
+        """Candidate line crossing is never a formal breakout, including hypotheticals."""
+        view = getattr(self, "chart_triangles", {}).get(code) or {}
+        issues = []
+        lines = getattr(self, "chart_line_numbers", {}).get(code) or {}
+        triangle_talk = bool(re.search(r"三角|候選(?:線|上緣|下緣)", sentence))
+        other_boundary = r"大量區|量區|布林|均線|MA\d|通道|楔形|旗形|箱形"
+        for clause in re.split(r"[，,。；;\n]", sentence):
+            if not lines or not triangle_talk or re.search(r"歷史|先前|前一組", clause):
+                continue
+            if re.search(other_boundary, clause):
+                continue
+            # Numeric grounding alone cannot detect swapped upper/lower labels.
+            for side, number in re.findall(r"(上緣|下緣)\s*[：:為約在]*\s*(\d+(?:\.\d+)?)", clause):
+                if number not in lines.get(side, set()):
+                    issues.append(f"三角{side}價位不符")
+            for number, side in re.findall(r"(\d+(?:\.\d+)?)\s*(?:元\s*的?|的)(?:三角(?:收斂)?(?:候選)?|候選)?(上緣|下緣)", clause):
+                if number not in lines.get(side, set()):
+                    issues.append(f"三角{side}價位不符")
+        if not view.get("candidate"):
+            return issues
+        claim = re.compile(r"(?:正式|確認|成功|有效|已經|已)(?:向[上下])?(?:突破|跌破)|"
+                           r"三角(?:收斂)?(?:向[上下])?(?:突破|跌破)|突破(?:成功|確認|成立)")
+        for clause in re.split(r"[，,。；;\n]", sentence):
+            if not triangle_talk or re.search(other_boundary, clause):
+                continue
+            if re.search(r"歷史|先前(?:另一組|一組)|前一組", clause):
+                continue
+            for match in claim.finditer(clause):
+                prefix = clause[:match.start()]
+                if re.search(r"(?:尚未|未|沒有|並非|不是|不算|不代表|不等於|不能(?:直接)?(?:視為|算作|稱為)?|不可(?:視為|算作|稱為)?)(?:正式)?\s*$", prefix):
+                    continue
+                if re.search(r"候選.*(?:確認成立|確認為正式|成立為正式).*後", prefix):
+                    continue
+                return issues + ["候選越線不能寫成正式三角突破"]
+        return issues
 
     def _add_result(self, name: str, data: Dict[str, Any]) -> None:
         code = str(data.get("stock_code") or "")
@@ -3118,12 +3190,13 @@ class FactSheet:
         subject = codes[0] if len(codes) == 1 else (current if not codes else "")
         if not subject and len(self.stocks) == 1 and not codes:
             subject = next(iter(self.stocks))
-        issues += self._number_issues(sentence, codes)
+        issues += self._number_issues(sentence, codes or ([subject] if subject else []))
         if subject:
             issues += self._ma_value_issues(sentence, subject)
             issues += self._direction_issues(sentence, subject)
             issues += self._alignment_issues(sentence, subject)
             issues += self._pattern_issues(sentence, subject)
+            issues += self._triangle_issues(sentence, subject)
         return issues
 
     def _pattern_issues(self, sentence: str, code: str) -> List[str]:
@@ -5676,7 +5749,7 @@ class AceQueryEngine:
             text=text, route="rule_spot_branch", gemini_calls=stats.gemini_calls, elapsed=elapsed,
             cacheable=llm_ok and chart.ok, panels=panels, image_title=title,
             errors=([] if chart.ok else [f"get_chart_panel：{chart.error or chart.user_message}"])
-                   + ([] if llm_ok else ["Gemini 最終回答失敗"]),
+                   + ([] if llm_ok else [self._compose_error()]),
             input_tokens=stats.input_tokens, output_tokens=stats.output_tokens,
             total_tokens=stats.total_tokens, token_source=stats.token_source)
         full = report.get("available_days", 0) >= report.get("requested_days", spot_chip.REQUESTED_DAYS)
@@ -7166,7 +7239,7 @@ class AceQueryEngine:
             elapsed=elapsed,
             cacheable=llm_ok and all(r.ok for r in combined),
             errors=[f"{r.name}：{r.error or r.user_message}" for r in combined if not r.ok]
-                   + (["Gemini 最終回答失敗"] if plan.need_final_llm and not llm_ok else []),
+                   + ([self._compose_error()] if plan.need_final_llm and not llm_ok else []),
             panels=panels,
             input_tokens=stats.input_tokens,
             output_tokens=stats.output_tokens,
@@ -7460,9 +7533,14 @@ class AceQueryEngine:
             hit,_=self._answer_cache.get(key)
             if not hit:self._answer_cache.set(key,completed,seconds)
 
+    def _compose_error(self) -> str:
+        return getattr(getattr(self, "_request_local", None), "compose_failure", None) or "Gemini 最終回答失敗"
+
     def _compose(self, question: str, plan: QueryPlan, results: List[tools.ToolResult], stats: AnswerStats) -> Tuple[str, bool]:
         """回傳 (回答文字, 是否可快取)；AI 解讀卡另存在 _request_local.ai_card，由 _answer_uncached 取走。"""
         self._set_ai_card(None)
+        if getattr(self, "_request_local", None) is not None:
+            self._request_local.compose_failure = None
         if getattr(self,'_request_local',None) is not None:self._request_local.late_ai = None
         # 有圖卡的回答（K 線、評分卡、分點標註、法人卡…）：AI 不在時文字只留「圖上沒有的」（新聞、台指期、取不到的資料），
         # 不再把圖上數字整段重打一次（圖片變很長、內容跟圖重複）
@@ -7487,6 +7565,8 @@ class AceQueryEngine:
         self._perf_add("gemini", time.perf_counter() - gemini_started)
         stats.record_gemini(result)
         if not result.ok:
+            if getattr(self, "_request_local", None) is not None:
+                self._request_local.compose_failure = "Gemini 最終回答失敗"
             if getattr(result, "late_future", None) is not None:
                 import copy
                 self._request_local.late_ai = dict(future=result.late_future,
@@ -7506,12 +7586,16 @@ class AceQueryEngine:
 
     def _finish_compose(self, question, plan, results, payload, result, rule_answer):
         """Validate normal and late AI output identically; never call Gemini again."""
+        if getattr(self, "_request_local", None) is not None:
+            self._request_local.compose_failure = "AI 內容核對未通過"
         rule_answer = member_pattern.without_unverified_positions(rule_answer, payload.get("chart_context") or {})
         facts = FactSheet(question, results, payload)
         card = parse_ai_card(result.text)
         if card is not None:
             self.log(f"AI語氣｜style={card.get('response_style')}｜route={plan.route}")
         if card is None and str(result.text or "").lstrip().startswith("{"):
+            if getattr(self, "_request_local", None) is not None:
+                self._request_local.compose_failure = "AI 回覆格式異常"
             self.log("AI 解讀卡 JSON 無法解析，改用規則式回答")
             return f"（AI 回覆格式異常，這次不附 AI 解讀）\n\n{rule_answer}", False
         if card is not None:
@@ -7557,6 +7641,8 @@ class AceQueryEngine:
                 card["scenarios"] = [s for s in card["scenarios"] if s["text"]]
                 card["scenario_title"] = "突破與防守觀察" if any(v.get("triangle") for v in context.get("stocks", {}).values()) else "後續觀察重點"
             self._set_ai_card(card)
+            if getattr(self, "_request_local", None) is not None:
+                self._request_local.compose_failure = None
             text = ai_card_text(card)
             return f"{text}\n\n{time_line}\n\n{DISCLAIMER}" if time_line else f"{text}\n\n{DISCLAIMER}", True
         answer = result.text
@@ -7579,6 +7665,8 @@ class AceQueryEngine:
             time_line = build_data_time_line(results)
             if time_line:
                 answer = f"{answer}\n\n{time_line}"
+        if getattr(self, "_request_local", None) is not None:
+            self._request_local.compose_failure = None
         return f"{answer}\n\n{DISCLAIMER}", True
 
 
@@ -7770,7 +7858,8 @@ def alert_reason(result: "AnswerResult") -> Optional[Tuple[str, str]]:
     if result.route == "error":
         return "資料錯誤", result.text
     if result.errors:
-        kind = "Gemini 失敗" if any(e.startswith("Gemini") for e in result.errors) else "資料錯誤"
+        kind = ("Gemini 失敗" if any(e.startswith("Gemini") for e in result.errors) else
+                "AI 內容核對" if any(e.startswith("AI ") for e in result.errors) else "資料錯誤")
         return kind, "；".join(result.errors)
     return None
 
