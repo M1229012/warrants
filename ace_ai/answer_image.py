@@ -46,7 +46,7 @@ BAND_LABELS = {'BB_UPPER': '布林上軌', 'BB_MID': '中軌 MA20', 'BB_LOWER': 
 # 均量線：避開紅綠量柱的顏色。
 MV_COLORS = {'MV5': '#E0A030', 'MV20': '#5B6BBF'}
 # 分點買賣標註：K 線上下各留一條標籤帶（▲／▼＋最多 3 列編號圓圈），不和 K 棒重疊。
-# 每個分點一個顏色：K 線上的三角形與編號都用這個顏色，圖例才看得出誰是誰。
+# 分點圖例使用各自顏色；K 線交易標記統一紅買綠賣，和明細表一致。
 BRANCH_COLORS = ('#C2410C', '#1D4ED8', '#047857', '#7C3AED', '#B45309', '#BE185D')
 MARK_LANE = 104
 MARK_BADGE_R = 11
@@ -434,7 +434,7 @@ def mark_legend(draw, panel: dict, top: float, dry: bool) -> int:
     h += 44
 
     if mode == 'flow':
-        # 週精選／明確詢問買賣超點位：一個分點一個顏色，圖例直接對應 K 線上的編號。
+        # 分點圖例保留名稱與編號，交易方向統一紅買綠賣。
         palette = _branch_palette(events)
         rows = []
         for name, color in palette.items():
@@ -455,10 +455,10 @@ def mark_legend(draw, panel: dict, top: float, dry: bool) -> int:
         if not dry:
             sy = top + h + 7
             half = 7
-            draw.polygon([(x0 + half, sy - half), (x0, sy + half), (x0 + 2 * half, sy + half)], fill=MUTED)
+            draw.polygon([(x0 + half, sy - half), (x0, sy + half), (x0 + 2 * half, sy + half)], fill=UP)
             draw.text((x0 + 22, sy), '買超', font=font(18), fill=INK, anchor='lm')
             sx = x0 + 110
-            draw.polygon([(sx, sy - half), (sx + 2 * half, sy - half), (sx + half, sy + half)], fill=MUTED)
+            draw.polygon([(sx, sy - half), (sx + 2 * half, sy - half), (sx + half, sy + half)], fill=DOWN)
             draw.text((sx + 22, sy), '賣超', font=font(18), fill=INK, anchor='lm')
             draw.text((x0 + 232, sy), '編號＝A～E 事件；賣出標的編號＝當天被清掉的那幾筆；無編號＝減碼或零星賣出',
                       font=font(18), fill=MUTED, anchor='lm')
@@ -1036,13 +1036,12 @@ def draw_marks(draw, panel: dict, px, py, step: float, price_top: float, price_b
     mode = str(((panel or {}).get('marks') or {}).get('mode') or 'event')
     half = max(5, min(9, step * 0.45))
     if mode == 'flow' or not events:
-        palette = _branch_palette(events)
         buy_badges, sell_badges = list(trade_buys), list(trade_sells)
         for e in events:
             i = index.get(e.get('action_date') or '')
             if i is None:
                 continue
-            color = palette.get(str(e.get('branch') or '').strip())
+            color = UP if e.get('action') == 'buy' else DOWN
             numbers = _mark_numbers(e)
             # 一次清掉多筆（no='1、2'）拆成各自的圓圈；沒編號的減碼仍是單一個三角形
             items = (_split_badges(px(i), numbers, color=color) if numbers
