@@ -1429,12 +1429,22 @@ def _level_rows(card: dict) -> list[tuple[str, str, float, float | None]]:
     return sorted(rows, key=lambda r: (-float(r[2]), order[r[0]]))
 
 
+def public_ma_condition(info: dict) -> str:
+    """對外只使用已算好的明日合法價位；不沿用舊版推算文案。"""
+    price = _finite(info.get('rise_price_tomorrow'))
+    now = info.get('direction_now')
+    if price is not None and price > 0:
+        value = f'{price:,.2f}'.rstrip('0').rstrip('.')
+        return f'明天收至少 {value} ' + ('才續揚' if now == '上揚' else '才轉揚')
+    # 舊快取沒有合法門檻時只呈現當前方向，不能拿失敗值代替合法價位。
+    return {'上揚': '目前上揚', '下彎': '目前下彎', '走平': '目前走平'}.get(now, '扣抵條件待更新')
+
+
 def _deduction_outlook(info: dict) -> tuple[str, str]:
-    """（推算文字, 顏色）：收盤維持不變時均線會不會轉向。"""
-    if info.get('turn'):
-        day = info.get('turn_day')
-        text = info.get('turn_text') or f"{ {1: '明天起', 2: '後天起'}.get(day, f'第 {day} 個交易日起') }{info['turn']}"
-        return text, DOWN if info['turn'] == '轉下彎' else UP          # 台股慣例：往上紅、往下綠
+    """（明日條件或當前方向, 顏色），不顯示內部極端價格判斷。"""
+    if info.get('turn_text') or info.get('limit_proof'):
+        risk = info.get('change_dir') == '下彎' or (info.get('direction_now') == '上揚' and info.get('change_dir') == '走平')
+        return public_ma_condition(info), DOWN if risk else UP
     return {'上揚': ('續揚', INK), '下彎': ('續彎', INK)}.get(info.get('direction_now'), ('走平', MUTED))
 
 
@@ -1442,14 +1452,8 @@ def _level_note(label: str, card: dict) -> tuple[str, str]:
     """關鍵價位「說明」欄：均線寫方向與扣抵推算，量區／布林寫價位性質。"""
     info = (card.get('ma_deduction') or {}).get('MA20' if label == '布林中軌' else label)
     if info:
-        outlook, color = _deduction_outlook(info)
-        plain = {'續揚': '持續上揚', '續彎': '持續下彎'}.get(outlook, outlook)
-        role = str(info.get('role_text') or '')
-        # 白話一行：「持續上揚，5 天後支撐上移到 34.92」（收盤不變推算）
-        tail = f"，5 天後{role.replace('至 ', '到 ')}" if role else ''
-        if info.get('limit_proof'):      # 失敗值比跌停還低：跌停也續揚（強支撐）
-            return f"{'MA20 ' if label == '布林中軌' else ''}{info['limit_proof']}（失敗值 {info['fail_price']:,.2f}）{tail}", UP
-        return f"{'MA20 ' if label == '布林中軌' else ''}{plain}{tail}", color
+        _, color = _deduction_outlook(info)
+        return f"{'MA20 ' if label == '布林中軌' else ''}{public_ma_condition(info)}", color
     if '量區' in label:
         return '成交密集區邊緣（籌碼成本區）', MUTED
     if '布林' in label:
@@ -1533,7 +1537,7 @@ def _deduction_chips(draw, x, y, width, card, dry) -> int:
     deduction = card.get('ma_deduction') or {}
     if not deduction:
         return 0
-    label = '均線扣抵（收盤不變推算）'
+    label = '均線扣抵'
     chips = []
     for key, info in deduction.items():
         outlook, color = _deduction_outlook(info)
@@ -1545,9 +1549,8 @@ def _deduction_chips(draw, x, y, width, card, dry) -> int:
     start = x + font(20, True).getlength(label) + 16
     rows = _flow_rows(widths, width - (start - x), 10)
     # 未來 3 日維持上揚門檻（扣抵價）：只列 MA5／MA20，收盤要高於這些價，均線才繼續往上
-    holds = [f"{k} {'、'.join(number(v) for v in deduction[k]['hold_prices_3d'])}"
-             for k in ('MA5', 'MA20') if (deduction.get(k) or {}).get('hold_prices_3d')]
-    hold_lines = wrap('未來 3 天收盤守住這些價，均線就會繼續往上：' + '｜'.join(holds), 19, width) if holds else []
+    # 10-08：轉向的均線已在標籤寫明天條件，不再另列 3 日價位（後兩日依賴收盤不變假設）
+    hold_lines: list[str] = []
     if not dry:
         draw.text((x, y + 17), label, font=font(20, True), fill=INK, anchor='lm')
         cx, cy = start, y

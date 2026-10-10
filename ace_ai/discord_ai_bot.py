@@ -2500,7 +2500,7 @@ AI_CARD_SCHEMA = {
 
 FINAL_CARD_FORMAT = """輸出格式（艾斯 AI 解讀）：只輸出符合 schema 的 JSON，不要 Markdown、不要星號或條列符號。你是在「解讀」，不是在整理資料：K 線、均線、評分卡與關鍵價位表已經在圖上，文字要說明這些訊號代表什麼。
 - answer：這段會以粗體呈現，只放1～2句短結論，通常30～60字、最多80字；複合問題直接點出各面向的判斷與最重要限制，不把所有依據塞在這裡。數字只有關鍵價位才引用，不逐項報均線、量比或分點名單；詳情放why。從這題最重要的處境或訊號切入，不固定以結構偏強弱開頭，不保證漲跌、不替人決定買賣。
-- 支撐／壓力依距離由近到遠寫，最近的先講（含「近價大量區」），不可跳過近的直接講季線；均線扣抵不可寫「跌停也續揚」「漲停也續彎」字樣，要提就寫「MA20 失敗值 955」（fail_price：上揚均線明天收盤要高於它才續揚、下彎均線要低於它才續彎，等於或在附近＝走平）；limit_proof 有值只代表失敗值離現價很遠、扣抵條件強，不等於股價一定守住這條線，不可寫成強支撐。turn_text／rise_price_tomorrow 是明天的確切條件；path 是假設收盤不變的逐日模擬，後面幾天依賴這個假設，只能寫成條件，不可寫成確定預測；目前下彎的均線寫「轉揚」，不寫「續揚」。
+- 支撐／壓力依距離由近到遠寫，最近的先講（含「近價大量區」），不可跳過近的直接講季線。均線扣抵只能引用 turn_text 的明日條件，例如「MA20 明天收至少 955 才續揚」；目前下彎或走平寫「才轉揚」。不可寫「跌停也續揚」「漲停也續彎」「5天後支撐上移」，不列未來3天維持價位、不寫未來方向序列，也不把扣抵條件當成股價必然守住的強支撐。fail_price 是含走平容差的內部門檻，不能當成第一個合法價位；path 是假設收盤不變的內部模擬，不作確定預測。沒有 rise_price_tomorrow 時只說當前方向，不自行補價位。
 - 語氣方向跟著結構走：多頭排列、量增、沿上軌等偏強結構先寫偏強；偏弱先寫偏弱；多空抵銷才寫中性。風險寫成條件（若跌破／若量縮…），不可讓風險蓋過主要判斷，summary 方向和 answer 一致。不寫空泛警語：「風險不容忽視」「需謹慎」「宜保守」「而非追價」「不宜追高」「短期波動風險」這類沒有價位條件的提醒都不要。不可寫「假突破／假跌破」「突破成功／失敗」「型態失效」這類結論。
 - why：按需要解釋關鍵證據如何支持答案；若answer已說清楚可留空。型態與趨勢只能引用kline_patterns，不重報評分或所有指標。
 - scenarios：依原問句選擇0～2個有必要的觀察條件，可留空，不強制多空各一個。title用短標直接點出本題要觀察的變化，不套固定情境名稱；text 用「若收盤…／若跌破…，代表…」的條件式，30～70 字，要有具體觀察價位。只陳述條件與意義，不預測漲跌、不給買賣指令；使用者問操作策略／進出場／停損時也一樣，不寫「建議買進／賣出／停損設在…」，改成要觀察的價位與條件。從K線型態、支撐壓力、量價、均線與布林中選擇能回答本題的證據，不固定順序；why只談真正影響本題答案的面向，不為了湊數羅列指標。K 線型態名稱（箱型、三角收斂、上升／下降趨勢、缺口、紅三兵、吞噬、晨星、十字線、長上／下影線等）只能引用 kline_patterns 有列出的，不可自己判斷；突破狀態照原文的客觀事實描述（價格在上下緣的哪裡、突破後第幾天）；「○○ 起形成」是型態起點、「○○ 收盤向上突破」是突破日，兩個日期不可混用或互換，kline_patterns 有「創近 N 日新高／新低」「越過前高／跌破前低」「脫離近 N 日盤整區」時，與本題相關才在answer或why解釋，用詞照原文（越過、脫離、創高），價位與日期照抄；不可自行下「突破成功／失敗」「假突破／假跌破」「型態失效」這類結論，也不可解讀成偏多或偏空；recent_bars_10（近 10 日 日期 開 高 低 收）與 ma_recent_3d 只用來描述近期走勢與均線方向。answer 第一句要直接回答使用者問的事。均線排列一定照資料寫：MA5<MA10<MA20<MA60 是空頭排列，不可說成多方架構強勢、多方掌控；反之亦然；單日紅K或帶量不等於結構轉多。情境要和目前結構一致：均線空頭排列時，偏多情境寫成「轉強條件」（例「若收盤站穩季線並突破布林上軌，才有機會扭轉空頭排列」），不可寫「多方續攻」「開啟新一波漲勢」這種已經轉多或預測漲勢的說法；均線多頭排列時，偏空情境同理寫成「轉弱條件」。新聞、三大法人或沒有可觀察價位的問題給空陣列。
@@ -2613,10 +2613,12 @@ def _compact_tool_data(name: str, data: Dict[str, Any], has_scorecard: bool) -> 
             data["kd"] = {"signals": (data.get("kd") or {}).get("signals")}
             data["macd"] = {"signals": (data.get("macd") or {}).get("signals"), "osc_trend": (data.get("macd") or {}).get("osc_trend")}
         else:
-            data["ma_deduction"] = {k: {f: v.get(f) for f in ("direction_now", "turn_text", "fail_price", "rise_price_tomorrow", "next_deduction_price", "path", "outlook")}
+            data["ma_deduction"] = {k: {f: v.get(f) for f in ("direction_now", "fail_price", "rise_price_tomorrow", "next_deduction_price", "path", "outlook")}
+                                    | {"turn_text": answer_image.public_ma_condition(v)}
                                     for k, v in (data.get("ma_deduction") or {}).items() if k in ("MA20", "MA60")}
     elif name == "get_pattern_scorecard":
-        data["ma_deduction"] = {k: {f: v.get(f) for f in ("direction_now", "turn_text", "fail_price", "rise_price_tomorrow", "next_deduction_price", "path", "outlook")}
+        data["ma_deduction"] = {k: {f: v.get(f) for f in ("direction_now", "fail_price", "rise_price_tomorrow", "next_deduction_price", "path", "outlook")}
+                                | {"turn_text": answer_image.public_ma_condition(v)}
                                 for k, v in (data.get("ma_deduction") or {}).items()}
         data["plus_reasons"] = (data.get("plus_reasons") or [])[:4]
         data["minus_reasons"] = (data.get("minus_reasons") or [])[:4]
@@ -4640,7 +4642,7 @@ REQUIRED_MODULE_API = {
     "discord_access": ("_CHIP_WORD_RE", "require_sector"),
     "warrant_ai_tools": ("get_market_institutional", "prefetch_sheet_tables", "_reserve_fugle_slot", "check_sheet_version", "err_text",
                          "chart_marks_for_stock"),
-    "answer_image": ("wrap_cell",),
+    "answer_image": ("wrap_cell", "public_ma_condition"),
     "weekly_pick": ("layout_card", "verify_layout"),
     "market_data": ("RECENT_DAYS",),
     "warrant_store": ("StoreShrunk",),
@@ -5237,7 +5239,7 @@ class AceQueryEngine:
         # 快取鍵值用「補完股票之後」的問題，避免 A 使用者的「那它的壓力在哪」拿到 B 使用者的答案；籌碼類型分開快取。
         # 族群追問（「那哪檔最強」）要帶族群名稱與模式，不同族群的同一句追問不能共用答案
         sector = parsed.sector or {}
-        key = "|".join(['技術70現股30融資管理員v18型態核對K線需求',compact, ",".join(c for c, _ in parsed.stocks), str(parsed.cost_price or ""), ",".join(parsed.branches),
+        key = "|".join(['技術70現股30融資管理員v19扣抵明日價位',compact, ",".join(c for c, _ in parsed.stocks), str(parsed.cost_price or ""), ",".join(parsed.branches),
                         "chip=" + parsed.chip,
                         "sector=" + str(sector.get("name") or sector.get("industry") or "") + ":" + str(sector.get("mode") or "")])
         key = self._access_cache_key(key)
