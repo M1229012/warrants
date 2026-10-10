@@ -4632,7 +4632,7 @@ def quota_exempt_ids() -> Set[str]:
 
 # 各檔案「這一批」才有的函式：少了代表那個檔案沒有一起上傳（還是舊版）
 REQUIRED_MODULE_API = {
-    "local_market_cache": ("accumulate_state", "recent_states", "stock_market", "stock_markets"),
+    "local_market_cache": ("accumulate_state", "recent_states", "stock_market", "stock_markets", "bars_fingerprint"),
     "discord_access": ("_CHIP_WORD_RE", "require_sector"),
     "warrant_ai_tools": ("get_market_institutional", "prefetch_sheet_tables", "_reserve_fugle_slot", "check_sheet_version", "err_text",
                          "chart_marks_for_stock"),
@@ -4648,7 +4648,7 @@ REQUIRED_MODULE_API = {
 
 
 def module_version_problems() -> List[str]:
-    """回傳「檔案.py 缺少 a、b」清單；空清單＝全部是同一批。"""
+    """回傳必要模組介面缺漏；空清單表示介面完整，不代表所有檔案版本相同。"""
     import importlib
     problems = []
     for name, attrs in REQUIRED_MODULE_API.items():
@@ -8415,12 +8415,13 @@ def run_discord_bot(config: BotConfig) -> None:
             f"debug={config.debug}",
             flush=True,
         )
+        print(f"📦 市場底庫實際載入：{local_market_cache.__file__}", flush=True)
         stale = module_version_problems()
         if stale:
             # 只上傳部分檔案：新舊版混用，某些功能會在執行時才壞掉（09-27 AI 回答失敗就是這樣）
             notify_admin("❌ 檔案版本不一致，請把 ace_ai 資料夾整批重新上傳：" + "；".join(stale))
         else:
-            print("✅ 檔案版本檢查：ace_ai 各檔案是同一批", flush=True)
+            print("✅ 必要模組介面檢查通過", flush=True)
 
     async def handle_question(interaction: "discord.Interaction", question: str, admin_mode: bool,
                               attachment=None) -> None:
