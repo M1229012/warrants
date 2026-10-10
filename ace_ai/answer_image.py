@@ -554,11 +554,18 @@ def _draw_mark_table(draw, x: float, y: float, width: float, events: list[dict])
         cx = x
         for label, w in columns:
             if label == '編號':
-                _draw_badge(draw, cx + w / 2, mid, e.get('no', ''), UP)
+                number = e.get('no')
+                if number is not None and str(number).strip():
+                    _draw_badge(draw, cx + w / 2, mid, number, UP)
+                else:
+                    draw.text((cx + w / 2, mid), '—', font=font(17), fill=MUTED, anchor='mm')
             elif label == '事件':
-                code = str(e.get('event', ''))
-                draw.rounded_rectangle((cx + 8, mid - 13, cx + 38, mid + 13), radius=6, fill=ACCENT_BG)
-                draw.text((cx + 23, mid), code, font=font(17, True), fill=ACCENT, anchor='mm')
+                code = str(e.get('event') or '').strip()
+                if code:
+                    draw.rounded_rectangle((cx + 8, mid - 13, cx + 38, mid + 13), radius=6, fill=ACCENT_BG)
+                    draw.text((cx + 23, mid), code, font=font(17, True), fill=ACCENT, anchor='mm')
+                else:
+                    draw.text((cx + 23, mid), '—', font=font(17), fill=MUTED, anchor='mm')
             elif label == '後續動作' and (e.get('exit_date') or e.get('reduce_date')):
                 # 和 K 線上方同一個記號：出清＝綠圈同編號、減碼＝綠色 ▼，一眼對得起來。
                 if e.get('exit_date'):
@@ -999,7 +1006,11 @@ def _mark_numbers(mark: dict) -> list:
 
 def _draw_badge(draw, cx, cy, number_text, color):
     """一次清掉多筆時編號會是「1、3」，膠囊要跟著加寬，字才不會被圓圈切掉。"""
-    text = str(number_text)
+    if number_text is None:
+        return
+    text = str(number_text).strip()
+    if not text:
+        return
     size = 14 if len(text) < 2 else (12 if len(text) < 4 else 11)
     half = _badge_half(text)
     draw.rounded_rectangle((cx - half, cy - MARK_BADGE_R, cx + half, cy + MARK_BADGE_R),
