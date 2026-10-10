@@ -469,6 +469,9 @@ def bars_fingerprint(stock_code: str, limit: int = KEEP_DAYS) -> str:
     return hashlib.md5(raw.encode("utf-8")).hexdigest()[:12] if rows else ""
 
 
+MARKET_SESSIONS_KEY = "official_market_sessions_v1"
+
+
 def latest_pattern_score_basis(codes: Iterable[str]) -> Dict[str, Tuple[str, str]]:
     """{代號: (最新分數日期, basis)}，只看目前規則版本。"""
     out: Dict[str, Tuple[str, str]] = {}
@@ -1409,3 +1412,50 @@ def ranking_revision() -> str:
                   for table in ("daily_bars", "pattern_scores")]
         values.append(conn.execute("SELECT MAX(updated_at), COUNT(*) FROM kv WHERE key LIKE 'corporate_snapshot_v2_%'").fetchone())
     return hashlib.sha256(repr(values).encode()).hexdigest()[:16]
+
+
+def save_market_sessions(first, last, sessions, source):
+    """保存既有官方交易日快照；只取代這次官方資料涵蓋的區間。"""
+    first, last = pd.Timestamp(first).normalize(), pd.Timestamp(last).normalize()
+    dates = sorted({pd.Timestamp(x).strftime('%Y-%m-%d') for x in sessions
+                    if first <= pd.Timestamp(x).normalize() <= last})
+    if not dates:
+        raise ValueError('官方交易日資料空白，不記成完整日曆')
+    old = get_state(MARKET_SESSIONS_KEY, {}) or {}
+    if old and first <= pd.Timestamp(old['last']) and last >= pd.Timestamp(old['first']):
+        dates = sorted(set(dates) | {x for x in old.get('sessions', [])
+                       if pd.Timestamp(x) < first or pd.Timestamp(x) > last})
+        first, last = min(first, pd.Timestamp(old['first'])), max(last, pd.Timestamp(old['last']))
+    set_state(MARKET_SESSIONS_KEY, {'first': first.strftime('%Y-%m-%d'), 'last': last.strftime('%Y-%m-%d'),
+                                  'sessions': dates, 'source': source})
+
+
+def market_sessions_between(first, last):
+    """None表示官方日曆未涵蓋查詢區間；空清單表示已核實該區間沒有交易日。"""
+    saved = get_state(MARKET_SESSIONS_KEY, {}) or {}
+    first, last = pd.Timestamp(first).normalize(), pd.Timestamp(last).normalize()
+    if not saved or first < pd.Timestamp(saved['first']) or last > pd.Timestamp(saved['last']):
+        return None
+    keys = [d.strftime('%Y-%m-%d') for d in pd.date_range(first, last)]
+    closed = set(market_closed_days(keys))
+    return [d for d in saved['sessions'] if first <= pd.Timestamp(d) <= last and d not in closed]
+
+
+def market_close_status(now, ready_minute):
+    """沿用原日曆與兩市場完成狀態判斷；不依賴另外部署market_calendar.py。"""
+    day = pd.Timestamp(now.date())
+    if now.hour * 60 + now.minute < ready_minute:
+        day -= pd.Timedelta(days=1)
+    first = day - pd.Timedelta(days=25)
+    sessions = market_sessions_between(first, day)
+    if sessions is None:
+        closed = set(market_closed_days([d.strftime('%Y-%m-%d') for d in pd.date_range(first, day)]))
+        while day.weekday() >= 5 or day.strftime('%Y-%m-%d') in closed:
+            day -= pd.Timedelta(days=1)
+    elif sessions:
+        day = pd.Timestamp(sessions[-1])
+    else:
+        raise ValueError('官方日曆範圍內沒有收盤交易日')
+    status = market_status([day.strftime('%Y-%m-%d')])[day.strftime('%Y-%m-%d')]
+    return {'expected_date': day, 'calendar_verified': sessions is not None,
+            'markets_complete': all(status[m] == 'complete' for m in MARKETS), 'market_status': status}

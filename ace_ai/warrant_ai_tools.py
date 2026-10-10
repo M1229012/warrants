@@ -2287,8 +2287,7 @@ DAILY_READY_MINUTE = _env_int("DISCORD_AI_DAILY_READY_MINUTE", 15 * 60 + 30)   #
 
 def expected_last_close(now: Any = None) -> pd.Timestamp:
     """Independent official calendar plus both-market completion; unavailable coverage stays explicit."""
-    import market_calendar
-    return market_calendar.close_status(now or taipei_now(), DAILY_READY_MINUTE)["expected_date"]
+    return local_market_cache.market_close_status(now or taipei_now(), DAILY_READY_MINUTE)["expected_date"]
 
 
 def _missing_trading_days(df: pd.DataFrame) -> List[str]:
@@ -2298,9 +2297,8 @@ def _missing_trading_days(df: pd.DataFrame) -> List[str]:
     日曆取不到時回傳空清單，不因為檢查失敗而擋住回答。
     """
     if getattr(_LOCAL_ONLY, "on", False):
-        import market_calendar
         if df is None or len(df) < 2: return []
-        sessions = market_calendar.sessions_between(df.index[0], df.index[-1])
+        sessions = local_market_cache.market_sessions_between(df.index[0], df.index[-1])
         if sessions is None: return []
         have = {pd.Timestamp(x).strftime("%Y-%m-%d") for x in df.index}
         return [d for d in sessions if d not in have]
@@ -2311,9 +2309,8 @@ def _missing_trading_days(df: pd.DataFrame) -> List[str]:
         first, last = index[max(0, len(index) - 70)], index[-1]
         have = set(index)
         sessions = [pd.Timestamp(x).normalize() for x in core()._get_official_trading_dates(first, last)]
-        import market_calendar
         if sessions:
-            market_calendar.save_sessions(first, last, sessions, "既有官方交易日查詢")
+            local_market_cache.save_market_sessions(first, last, sessions, "既有官方交易日查詢")
         return [d.strftime("%Y-%m-%d") for d in sessions if d not in have]
     except Exception as exc:   # 休市表失敗時照常回答，只是少了這道檢查
         print(f"⚠️ 交易日連續性檢查略過：{type(exc).__name__}: {exc}", flush=True)
@@ -2559,11 +2556,10 @@ def _load_price_bundle(stock_code: str, spot_history_mode: bool = False) -> Dict
         result = bundles[key]
     else:
         result = _cached(f"{prefix}{code}_{source_stamp(code)}" + ("_spot_year_v4" if locals().get("spot_history_mode", False) else ""), ttl, build)
-    import market_calendar
-    sessions = market_calendar.sessions_between(result["closed_df"].index[0], result["closed_df"].index[-1])
+    sessions = local_market_cache.market_sessions_between(result["closed_df"].index[0], result["closed_df"].index[-1])
     if sessions is not None:
         result["closed_df"].attrs["trading_sessions"] = sessions
-    result["freshness"] = market_calendar.close_status(taipei_now(), DAILY_READY_MINUTE)
+    result["freshness"] = local_market_cache.market_close_status(taipei_now(), DAILY_READY_MINUTE)
     raw = result.get("raw_closed_df")
     if raw is not None:
         result["input_fp"] = frame_fingerprint(raw)
@@ -3092,11 +3088,9 @@ def _kline_patterns(df: pd.DataFrame, code: str = "", provisional_today: bool = 
         import kline_patterns
         events = get_corporate_actions(code) if code else None
         result = kline_patterns.detect(df, events, provisional_today, include_debug=True, state_key=f"tri_state_{code}" if code else "")
-        out = {k: result.get(k) for k in ("summary", "names", "levels", "flags", "atr20")}
-        shape = (result.get("observations") or {}).get("structure")
-        if shape and "candidate" in shape:          # 10-07：三角正式／候選身分與完整事件紀錄給 AI
-            out["triangle"] = {k: shape.get(k) for k in ("kind", "candidate", "candidate_reasons", "validity", "state",
-                                                          "current_position", "pattern_events", "near_tip")}
+        clean_frame = df.dropna(subset=["Open", "High", "Low", "Close"]).sort_index()
+        out = kline_patterns.ai_pattern_facts(result, data_date=_fmt_date(clean_frame.index[-1]) if not clean_frame.empty else "",
+                                              day=len(clean_frame) - 1)
         import member_pattern
         basis = member_pattern.price_basis(result, df, events)
         if basis:
@@ -3106,11 +3100,12 @@ def _kline_patterns(df: pd.DataFrame, code: str = "", provisional_today: bool = 
         if result.get("triangle"):
             import member_pattern
             out["member_view"] = member_pattern.geometry(result, source_frame=df, events=events)
-            out["triangle"] = dict(shape or {}, first_break=result["triangle"].get("first_break"))
+            if out.get("triangle"):
+                out["triangle"]["first_break"] = result["triangle"].get("first_break")
         return out
     except Exception as exc:                       # 型態判斷失敗不影響其他技術資料
         print(f"⚠️ K 線型態判斷略過｜{err_text(exc)}", flush=True)
-        return {}
+        return {"triangle_validation": {"status": "unavailable"}, "triangle": None}
 
 
 def get_technical_analysis(stock_code: str) -> Dict[str, Any]:

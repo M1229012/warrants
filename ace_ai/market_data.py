@@ -251,12 +251,11 @@ def sync(target_days: int = HISTORY_DAYS, budget_seconds: float = 600.0,
     started = time.monotonic()
     # Warm official sessions outside offline score recomputation; failures never imply no holidays.
     try:
-        import market_calendar
         end_day = tools.taipei_now().date()
         first_day = end_day - timedelta(days=max(250, int(target_days * 2)))
-        if market_calendar.sessions_between(first_day, end_day) is None:
+        if local_market_cache.market_sessions_between(first_day, end_day) is None:
             sessions = tools.core()._get_official_trading_dates(pd.Timestamp(first_day), pd.Timestamp(end_day))
-            market_calendar.save_sessions(first_day, end_day, sessions, "既有官方交易日查詢")
+            local_market_cache.save_market_sessions(first_day, end_day, sessions, "既有官方交易日查詢")
     except Exception as exc:
         log(f"官方交易日曆未更新：{tools.err_text(exc)}")
     candidates = _candidate_days(int(target_days * 1.5))

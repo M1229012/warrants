@@ -457,10 +457,10 @@ def mark_legend(draw, panel: dict, top: float, dry: bool) -> int:
         if not dry:
             sy = top + h + 7
             half = 7
-            draw.polygon([(x0 + half, sy - half), (x0, sy + half), (x0 + 2 * half, sy + half)], fill=MUTED)
+            draw.polygon([(x0 + half, sy - half), (x0, sy + half), (x0 + 2 * half, sy + half)], fill=UP)
             draw.text((x0 + 22, sy), '買超', font=font(18), fill=INK, anchor='lm')
             sx = x0 + 110
-            draw.polygon([(sx, sy - half), (sx + 2 * half, sy - half), (sx + half, sy + half)], fill=MUTED)
+            draw.polygon([(sx, sy - half), (sx + 2 * half, sy - half), (sx + half, sy + half)], fill=DOWN)
             draw.text((sx + 22, sy), '賣超', font=font(18), fill=INK, anchor='lm')
             draw.text((x0 + 232, sy), '編號＝A～E 事件；賣出標的編號＝當天被清掉的那幾筆；無編號＝減碼或零星賣出',
                       font=font(18), fill=MUTED, anchor='lm')
@@ -556,11 +556,18 @@ def _draw_mark_table(draw, x: float, y: float, width: float, events: list[dict])
         cx = x
         for label, w in columns:
             if label == '編號':
-                _draw_badge(draw, cx + w / 2, mid, e.get('no', ''), UP)
+                number = e.get('no')
+                if number is not None and str(number).strip():
+                    _draw_badge(draw, cx + w / 2, mid, number, UP)
+                else:
+                    draw.text((cx + w / 2, mid), '—', font=font(17), fill=MUTED, anchor='mm')
             elif label == '事件':
-                code = str(e.get('event', ''))
-                draw.rounded_rectangle((cx + 8, mid - 13, cx + 38, mid + 13), radius=6, fill=ACCENT_BG)
-                draw.text((cx + 23, mid), code, font=font(17, True), fill=ACCENT, anchor='mm')
+                code = str(e.get('event') or '').strip()
+                if code:
+                    draw.rounded_rectangle((cx + 8, mid - 13, cx + 38, mid + 13), radius=6, fill=ACCENT_BG)
+                    draw.text((cx + 23, mid), code, font=font(17, True), fill=ACCENT, anchor='mm')
+                else:
+                    draw.text((cx + 23, mid), '—', font=font(17), fill=MUTED, anchor='mm')
             elif label == '後續動作' and (e.get('exit_date') or e.get('reduce_date')):
                 # 和 K 線上方同一個記號：出清＝綠圈同編號、減碼＝綠色 ▼，一眼對得起來。
                 if e.get('exit_date'):
@@ -1078,7 +1085,11 @@ def _mark_numbers(mark: dict) -> list:
 
 def _draw_badge(draw, cx, cy, number_text, color):
     """一次清掉多筆時編號會是「1、3」，膠囊要跟著加寬，字才不會被圓圈切掉。"""
-    text = str(number_text)
+    if number_text is None:
+        return
+    text = str(number_text).strip()
+    if not text:
+        return
     size = 14 if len(text) < 2 else (12 if len(text) < 4 else 11)
     half = _badge_half(text)
     draw.rounded_rectangle((cx - half, cy - MARK_BADGE_R, cx + half, cy + MARK_BADGE_R),
@@ -1115,13 +1126,12 @@ def draw_marks(draw, panel: dict, px, py, step: float, price_top: float, price_b
     mode = str(((panel or {}).get('marks') or {}).get('mode') or 'event')
     half = max(5, min(9, step * 0.45))
     if mode == 'flow' or not events:
-        palette = _branch_palette(events)
         buy_badges, sell_badges = list(trade_buys), list(trade_sells)
         for e in events:
             i = index.get(e.get('action_date') or '')
             if i is None:
                 continue
-            color = palette.get(str(e.get('branch') or '').strip())
+            color = UP if e.get('action') == 'buy' else DOWN
             numbers = _mark_numbers(e)
             # 一次清掉多筆（no='1、2'）拆成各自的圓圈；沒編號的減碼仍是單一個三角形
             items = (_split_badges(px(i), numbers, color=color) if numbers
@@ -1564,10 +1574,15 @@ def _level_rows(card: dict) -> list[tuple[str, str, float, float | None]]:
 
 
 def _deduction_outlook(info: dict) -> tuple[str, str]:
-    """（推算文字, 顏色）：收盤維持不變時均線會不會轉向。"""
-    if info.get('turn_text'):          # 10-08：只寫明天的確切條件（後天起依實際收盤而變）
+    """（明日條件或當前方向, 顏色），不顯示內部極端價格判斷。"""
+    if info.get('turn_text') or info.get('limit_proof'):
         risk = info.get('change_dir') == '下彎' or (info.get('direction_now') == '上揚' and info.get('change_dir') == '走平')
-        return info['turn_text'], DOWN if risk else UP          # 台股慣例：往上紅、往下綠
+        price = _finite(info.get('rise_price_tomorrow'))
+        if price is None or price <= 0:
+            # Legacy cache has no computed tomorrow threshold: present only
+            # today's direction with its original down/flat/up color.
+            return public_ma_condition(info), {'下彎': DOWN, '走平': MUTED}.get(info.get('direction_now'), UP)
+        return public_ma_condition(info), DOWN if risk else UP
     return {'上揚': ('續揚', INK), '下彎': ('續彎', INK)}.get(info.get('direction_now'), ('走平', MUTED))
 
 
@@ -1575,13 +1590,8 @@ def _level_note(label: str, card: dict) -> tuple[str, str]:
     """關鍵價位「說明」欄：均線寫方向與扣抵推算，量區／布林寫價位性質。"""
     info = (card.get('ma_deduction') or {}).get('MA20' if label == '布林中軌' else label)
     if info:
-        outlook, color = _deduction_outlook(info)
-        plain = {'續揚': '持續上揚', '續彎': '持續下彎'}.get(outlook, outlook)
-        # 10-08：拿掉「5 天後支撐上移到…」（收盤不變推算，股價一變就誤導，也太長）
-        tail = ''
-        if info.get('limit_proof'):      # 失敗值比跌停還低：只寫失敗值（10-08 使用者：不寫「跌停也續揚」）
-            return f"{'MA20 ' if label == '布林中軌' else ''}失敗值 {info['fail_price']:,.2f}{tail}", (UP if info['limit_proof'] == '跌停也續揚' else DOWN)
-        return f"{'MA20 ' if label == '布林中軌' else ''}{plain}{tail}", color
+        _, color = _deduction_outlook(info)
+        return f"{'MA20 ' if label == '布林中軌' else ''}{public_ma_condition(info)}", color
     if '三角' in label:
         return '固定型態參考線；需配合候選／越線／確認狀態', MUTED
     if '量區' in label:
@@ -3694,3 +3704,14 @@ def make_locked_attachment(*, max_bytes=7_500_000):
 
 def make_attachment(question: str, answer: str, panels=None, *, max_bytes=7_500_000):
     return encode_image(render_answer(question, answer, panels), max_bytes)
+
+
+def public_ma_condition(info: dict) -> str:
+    """對外只使用已算好的明日合法價位；不沿用舊版推算文案。"""
+    price = _finite(info.get('rise_price_tomorrow'))
+    now = info.get('direction_now')
+    if price is not None and price > 0:
+        value = f'{price:,.2f}'.rstrip('0').rstrip('.')
+        return f'明天收至少 {value} ' + ('才續揚' if now == '上揚' else '才轉揚')
+    # 舊快取沒有合法門檻時只呈現當前方向，不能拿失敗值代替合法價位。
+    return {'上揚': '目前上揚', '下彎': '目前下彎', '走平': '目前走平'}.get(now, '扣抵條件待更新')

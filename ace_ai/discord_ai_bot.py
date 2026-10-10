@@ -660,6 +660,24 @@ class QueryPlan:
             self.tool_calls.append(call)
 
 
+def chart_codes_for_plan(plan: QueryPlan, codes: Sequence[str]) -> List[str]:
+    """Resolved needs govern chart inclusion; never keyword-match the question."""
+    unique = list(dict.fromkeys(codes))
+    if plan.needs is None:
+        return unique
+    per_stock = plan.needs.get("per_stock")
+    if isinstance(per_stock, dict):
+        return [code for code in unique if set(per_stock.get(code) or []) &
+                {"analysis", "technical", "cost", "price", "institutional", "warrant"}]
+    # Compatibility for plans assembled outside _answer_uncached_impl: derive
+    # from actual scheduled tools, not parsed stocks or the original question.
+    visual = {"get_stock_overview", "get_technical_analysis", "get_pattern_scorecard",
+              "get_volume_profile", "get_cost_position_context", "get_institutional_flow"} | WARRANT_TOOLS
+    scheduled = {str(call.kwargs.get("stock_code") or "") for call in plan.tool_calls if call.name in visual}
+    return [code for code in unique if code in scheduled]
+
+
+
 HELP_MESSAGE = (
     "我可以幫你查股票、族群與權證分點資料，請用 `/ask 問題`，例如：\n"
     "• `/ask 2330現在型態好嗎`\n"
@@ -2493,7 +2511,7 @@ AI_CARD_SCHEMA = {
 
 FINAL_CARD_FORMAT = """輸出格式（艾斯 AI 解讀）：只輸出符合 schema 的 JSON，不要 Markdown、不要星號或條列符號。你是在「解讀」，不是在整理資料：K 線、均線、評分卡與關鍵價位表已經在圖上，文字要說明這些訊號代表什麼。
 - answer：這段會以粗體呈現，只放1～2句結論，通常30～60字、最多80字，先講使用者現在最需要注意的事；複合問題直接點出各面向的判斷與最重要限制，不把所有依據塞在這裡。數字只有關鍵價位才引用，不逐項報均線、量比或分點名單；詳情放why。從這題最重要的處境或訊號切入，不固定以結構偏強弱開頭，不保證漲跌、不替人決定買賣。
-- 支撐／壓力依距離由近到遠寫，最近的先講（含「近價大量區」），不可跳過近的直接講季線；均線扣抵不可寫「跌停也續揚」「漲停也續彎」字樣，要提就寫「MA20 失敗值 955」（fail_price：上揚均線明天收盤要高於它才續揚、下彎均線要低於它才續彎，等於或在附近＝走平）；limit_proof 有值只代表失敗值離現價很遠、扣抵條件強，不等於股價一定守住這條線，不可寫成強支撐。turn_text／rise_price_tomorrow 是明天的確切條件；path 是假設收盤不變的逐日模擬，後面幾天依賴這個假設，只能寫成條件，不可寫成確定預測；目前下彎的均線寫「轉揚」，不寫「續揚」。均線扣抵只寫成價位條件，照 turn_text 寫（例「MA20 明天收至少 1,115 才續揚」），不可寫「收盤不變會轉下彎」「5 天後支撐上移到…」這類推算。
+- 支撐／壓力依距離由近到遠寫，最近的先講（含「近價大量區」），不可跳過近的直接講季線。均線扣抵只能引用 turn_text 的明日條件，例如「MA20 明天收至少 955 才續揚」；目前下彎或走平寫「才轉揚」。不可寫「跌停也續揚」「漲停也續彎」「5天後支撐上移」，不列未來3天維持價位、不寫未來方向序列，也不把扣抵條件當成股價必然守住的強支撐。fail_price 是含走平容差的內部門檻，不能當成第一個合法價位；path 是假設收盤不變的內部模擬，不作確定預測。沒有 rise_price_tomorrow 時只說當前方向，不自行補價位。
 - 語氣方向跟著結構走：多頭排列、量增、沿上軌等偏強結構先寫偏強；偏弱先寫偏弱；多空抵銷才寫中性。風險寫成條件（若跌破／若量縮…），不可讓風險蓋過主要判斷，summary 方向和 answer 一致。不寫空泛警語：「風險不容忽視」「需謹慎」「宜保守」「而非追價」「不宜追高」「短期波動風險」這類沒有價位條件的提醒都不要。不可寫「假突破／假跌破」「突破成功／失敗」「型態失效」這類結論。
 - why：重點不要少，說法要精簡：圖上值得講的訊號（均線、型態、量區支撐壓力、扣抵、KD／MACD、布林、法人與分點）挑與本題相關的都可以講，通常 3～4 句、約 120～180 字；用歸納代替列舉（寫「站上所有均線」不寫「站上5日、10日、20日及60日均線」；寫「統一、台新等分點持續買進」不逐家報張數與成本），同方向的證據合併成一句（例「站上所有均線且投信連買 6 日」），不逐項報指標數值。圖上已有的數字（均線值、KD／MACD 數值、分點成本與張數）不要重抄，只在當作關鍵價位時引用 1～2 個。不寫「從技術面來看」「籌碼方面」這類開場詞。若answer已說清楚可留空。型態與趨勢只能引用kline_patterns，不重報評分或所有指標。
 - scenarios：依原問句選擇0～2個有必要的觀察條件，可留空，不強制多空各一個。title用短標直接點出本題要觀察的變化，不套固定情境名稱；text 用「若收盤…／若跌破…，代表…」的條件式，25～45 字，要有具體觀察價位，不重複 why 已講過的理由。只陳述條件與意義，不預測漲跌、不給買賣指令；使用者問操作策略／進出場／停損時也一樣，不寫「建議買進／賣出／停損設在…」，改成要觀察的價位與條件。從K線型態、支撐壓力、量價、均線與布林中選擇能回答本題的證據，不固定順序；why只談真正影響本題答案的面向，不為了湊數羅列指標。K 線型態名稱（箱型、三角收斂、上升／下降趨勢、缺口、紅三兵、吞噬、晨星、十字線、長上／下影線等）只能引用 kline_patterns 有列出的，不可自己判斷；突破狀態照原文的客觀事實描述（價格在上下緣的哪裡、突破後第幾天）；「○○ 起形成」是型態起點、「○○ 收盤向上突破」是突破日，兩個日期不可混用或互換，kline_patterns 有「創近 N 日新高／新低」「越過前高／跌破前低」「脫離近 N 日盤整區」時，與本題相關才在answer或why解釋，用詞照原文（越過、脫離、創高），價位與日期照抄；不可自行下「突破成功／失敗」「假突破／假跌破」「型態失效」這類結論，也不可解讀成偏多或偏空；recent_bars_10（近 10 日 日期 開 高 低 收）與 ma_recent_3d 只用來描述近期走勢與均線方向。answer 第一句要直接回答使用者問的事。均線排列一定照資料寫：MA5<MA10<MA20<MA60 是空頭排列，不可說成多方架構強勢、多方掌控；反之亦然；單日紅K或帶量不等於結構轉多。情境要和目前結構一致：均線空頭排列時，偏多情境寫成「轉強條件」（例「若收盤站穩季線並突破布林上軌，才有機會扭轉空頭排列」），不可寫「多方續攻」「開啟新一波漲勢」這種已經轉多或預測漲勢的說法；均線多頭排列時，偏空情境同理寫成「轉弱條件」。新聞、三大法人或沒有可觀察價位的問題給空陣列。
@@ -2585,10 +2603,13 @@ def _compact_tool_data(name: str, data: Dict[str, Any], has_scorecard: bool) -> 
     data = dict(data)
     if name == "get_technical_analysis":
         data["bollinger"] = {k: v for k, v in (data.get("bollinger") or {}).items() if k in _BOLLINGER_KEEP}
-        data_full_patterns = data.get("kline_patterns") or {}
+        import kline_patterns
+        data_full_patterns = kline_patterns.ai_pattern_facts(data.get("kline_patterns") or {},
+                                                            data_date=str(data.get("data_date") or ""))
         data.pop("member_view", None)
+        data["triangle_validation"] = data_full_patterns["triangle_validation"]
         data["kline_patterns"] = (data_full_patterns.get("summary") or []) + [f"資料旗標：{f}" for f in data_full_patterns.get("flags") or []]   # 白話結論＋旗標（§12）
-        triangle_structure = data_full_patterns.get("triangle")   # 10-07：三角正式／候選身分與完整事件，不能被摘要掉
+        triangle_structure = data_full_patterns.get("triangle")   # 同次驗證結果；不採舊型態名稱作證據
         if triangle_structure:
             data["triangle_structure"] = triangle_structure
         if has_scorecard:
@@ -2596,6 +2617,7 @@ def _compact_tool_data(name: str, data: Dict[str, Any], has_scorecard: bool) -> 
             data = {k: data.get(k) for k in ("stock_code", "data_date", "signal_status", "intraday_observation", "kd", "macd", "bollinger",
                                              "ma20_cross_recent_3_days", "ma_kline_signals", "recent_bars_10", "ma_recent_3d")}
             data["kline_patterns"] = ((data_full_patterns or {}).get("summary") or []) + [f"資料旗標：{f}" for f in (data_full_patterns or {}).get("flags") or []]
+            data["triangle_validation"] = data_full_patterns["triangle_validation"]
             if triangle_structure:
                 data["triangle_structure"] = triangle_structure
             b = data.get("bollinger") or {}
@@ -2603,10 +2625,12 @@ def _compact_tool_data(name: str, data: Dict[str, Any], has_scorecard: bool) -> 
             data["kd"] = {"signals": (data.get("kd") or {}).get("signals")}
             data["macd"] = {"signals": (data.get("macd") or {}).get("signals"), "osc_trend": (data.get("macd") or {}).get("osc_trend")}
         else:
-            data["ma_deduction"] = {k: {f: v.get(f) for f in ("direction_now", "turn_text", "fail_price", "rise_price_tomorrow", "next_deduction_price", "path", "outlook")}
+            data["ma_deduction"] = {k: {f: v.get(f) for f in ("direction_now", "fail_price", "rise_price_tomorrow", "next_deduction_price", "path", "outlook")}
+                                    | {"turn_text": answer_image.public_ma_condition(v)}
                                     for k, v in (data.get("ma_deduction") or {}).items() if k in ("MA20", "MA60")}
     elif name == "get_pattern_scorecard":
-        data["ma_deduction"] = {k: {f: v.get(f) for f in ("direction_now", "turn_text", "fail_price", "rise_price_tomorrow", "next_deduction_price", "path", "outlook")}
+        data["ma_deduction"] = {k: {f: v.get(f) for f in ("direction_now", "fail_price", "rise_price_tomorrow", "next_deduction_price", "path", "outlook")}
+                                    | {"turn_text": answer_image.public_ma_condition(v)}
                                 for k, v in (data.get("ma_deduction") or {}).items()}
         data["plus_reasons"] = (data.get("plus_reasons") or [])[:4]
         data["minus_reasons"] = (data.get("minus_reasons") or [])[:4]
@@ -2804,6 +2828,12 @@ def build_final_prompt(payload: Dict[str, Any]) -> str:
         sections.append(FINAL_NEEDS_RULES)
     if names & {"get_technical_analysis", "get_pattern_scorecard", "get_volume_profile"}:
         sections.append(FINAL_TECH_RULES)
+        sections.append("型態驗證為唯一整理型態依據：triangle_validation.status=none 表示未偵測到合格三角；"
+                        "unavailable 表示無法核實，兩者都不可說已形成三角、給三角上下緣或突破日期。"
+                        "candidate 必須明講候選，線外僅代表越過候選線，不能寫正式突破。"
+                        "formal 才能依 triangle_structure 的原始事件/日期/目前位置描述；歷史越線不等於目前仍在線外，"
+                        "盤中不寫收盤確認。舊整理型態、評分名稱、均線、布林、量區或使用者假設不能替代三角驗證。"
+                        "沒有三角仍可解讀均線、量區、布林、趨勢與已提供的K線特徵。多股解讀須標明股票。")
     if "get_recent_news" in names:
         sections.append(FINAL_NEWS_RULES)
     if "get_sheet_stock_chips" in names:
@@ -3050,6 +3080,7 @@ class FactSheet:
         self.ma_aux: Dict[str, Dict[str, List[float]]] = {}
         self.closed_pos: Dict[str, Dict[str, str]] = {}
         self.live_pos: Dict[str, Dict[str, str]] = {}
+        self.triangle_validation: Dict[str, Dict[str, Any]] = {}
         self.patterns: Dict[str, Set[str]] = {}          # 程式判斷到的 K 線型態（AI 只能講這些）
         tool_results = payload.get("tool_results") or {}
         self.market = _variants_of(json.dumps(_strip_keys(tool_results, _USER_INPUT_KEYS), ensure_ascii=False, default=str))
@@ -3121,15 +3152,68 @@ class FactSheet:
                 by_side[side] = side_numbers
                 numbers.update(side_numbers)
             self.chart_line_numbers[code] = by_side
+            # Old payloads can lack the validation object. Admit only the
+            # kind of this verified drawn pair, never legacy summary labels.
+            if (self.triangle_validation.get(code) or {}).get("status") == "unavailable" and view.get("kind"):
+                self.patterns.setdefault(code, set()).add(str(view["kind"]))
             self.market.update(numbers)
             self.stock_numbers.setdefault(code, set()).update(numbers)
             self.user_only.difference_update(numbers)
 
+    def _validation_triangle_issues(self, sentence: str, code: str) -> List[str]:
+        """Do not promote absent/candidate triangles to actual formations/events."""
+        record = self.triangle_validation.get(code)
+        if not record or "三角" not in sentence:
+            return []
+        status = record.get("status")
+        clauses = re.split(r"[，,；;。\n]", sentence)
+        negative = r"(?:沒有|未有|尚無|無明確|未(?:偵測|辨識|判斷|確認|形成|出現)到?|不是|並非|不代表|不能視為|無法(?:判定|核實))"
+        for clause in clauses:
+            if "三角" not in clause:
+                continue
+            if status in ("none", "unavailable"):
+                # Only explicit negatives or hypothetical future formation;
+                # '若突破三角上緣' still presupposes an existing triangle.
+                future = re.search(r"(?:若|如果|假如|倘若).*?(?:未來|之後|後續).*?形成", clause)
+                if not future and not re.search(negative + r"[^，；。]{0,18}三角", clause):
+                    return ["三角不符：型態驗證未提供合格三角，不可宣稱成立或引用邊界"]
+            elif status == "candidate":
+                no_break = re.search(r"(?:尚未|未曾|未|沒有|不代表).{0,6}(?:突破|跌破)", clause)
+                claimed_break = re.search(r"(?:已|正式|確認).{0,6}(?:突破|跌破)", clause) and not no_break
+                if ("候選" not in sentence or claimed_break) and not re.search(negative, clause):
+                    return ["三角不符：僅候選，不可說成正式型態或已確認突破"]
+        shape = record.get("structure") or {}
+        if status == "formal":
+            event_types = {x.get("type") for x in shape.get("events") or []}
+            for clause in clauses:
+                # A Bollinger/volume-zone breakout in the next clause is not a
+                # triangle breakout; a trailing '若...' cannot excuse a prior claim.
+                if "三角" not in clause:
+                    continue
+                plain = _CONDITIONAL_RE.split(clause)[0]
+                for verb, event in (("突破", "break_up"), ("跌破", "break_down")):
+                    if (re.search(r"(?:已|收盤|確認).{0,8}" + verb, plain)
+                            and not re.search(r"(?:尚未|未曾|未|沒有).{0,6}" + verb, plain)
+                            and event not in event_types and shape.get("state") != event):
+                        return ["三角事件不符：驗證結果沒有對應的正式越線事件"]
+            if shape.get("is_provisional") and re.search(r"今日.*收盤.*確認", sentence):
+                return ["三角事件不符：盤中觀察不能寫成今日收盤確認"]
+        return []
+
+
     def _triangle_issues(self, sentence: str, code: str) -> List[str]:
         """Candidate line crossing is never a formal breakout, including hypotheticals."""
         view = getattr(self, "chart_triangles", {}).get(code) or {}
-        issues = []
         lines = getattr(self, "chart_line_numbers", {}).get(code) or {}
+        record = self.triangle_validation.get(code) or {}
+        # Older technical payloads may omit validation. A verified same-day
+        # drawn pair still supplies facts; an explicit negative result cannot
+        # be overridden by chart data.
+        if record.get("status") != "unavailable" or not lines:
+            validation_issues = self._validation_triangle_issues(sentence, code)
+            if validation_issues:
+                return validation_issues
+        issues = []
         triangle_talk = bool(re.search(r"三角|候選(?:線|上緣|下緣)", sentence))
         other_boundary = r"大量區|量區|布林|均線|MA\d|通道|楔形|旗形|箱形"
         for clause in re.split(r"[，,。；;\n]", sentence):
@@ -3221,7 +3305,9 @@ class FactSheet:
                     closed.setdefault(label, position)
         if isinstance(data.get("kline_patterns"), dict):
             import kline_patterns
-            self.patterns.setdefault(code, set()).update(kline_patterns.names(data["kline_patterns"]))
+            canonical = kline_patterns.ai_pattern_facts(data["kline_patterns"], data_date=str(data.get("data_date") or ""))
+            self.patterns[code] = set(canonical["names"])
+            self.triangle_validation[code] = dict(canonical["triangle_validation"], structure=canonical.get("triangle") or {})
         live = (data.get("intraday_observation") or {}).get("ma_positions") or {}
         if live:
             self.live_pos.setdefault(code, {}).update({k: v for k, v in live.items() if v in ("站上", "跌破", "持平")})
@@ -3279,6 +3365,8 @@ class FactSheet:
                     issues += self._direction_issues(clause, target)
                     issues += self._alignment_issues(clause, target)
                     issues += self._triangle_issues(clause, target)
+        if not subject and not codes and "三角" in sentence and self.triangle_validation:
+            issues.append("三角敘述未指明股票，無法對應驗證結果")
         return issues
 
     def _pattern_issues(self, sentence: str, code: str) -> List[str]:
@@ -4841,18 +4929,22 @@ def quota_exempt_ids() -> Set[str]:
 
 # 各檔案「這一批」才有的函式：少了代表那個檔案沒有一起上傳（還是舊版）
 REQUIRED_MODULE_API = {
-    "local_market_cache": ("accumulate_state", "recent_states", "stock_market", "stock_markets"),
+    "local_market_cache": ("accumulate_state", "recent_states", "stock_market", "stock_markets", "bars_fingerprint",
+                           "save_market_sessions", "market_sessions_between", "market_close_status"),
+    "request_runtime": ("state", "new_state", "check_budget", "reserve_call", "scope", "CLOCK", "_LOCK"),
+    "price_adjustment": ("adjust_shares", "event_from_row"),
+    "corporate_action_sources": ("twse_events",),
     "discord_access": ("_CHIP_WORD_RE", "require_sector"),
     "warrant_ai_tools": ("get_market_institutional", "prefetch_sheet_tables", "_reserve_fugle_slot", "check_sheet_version", "err_text",
                          "chart_marks_for_stock"),
-    "answer_image": ("wrap_cell", "observed_mark_layout", "CHIP_LAYOUT_VERSION"),
+    "answer_image": ("wrap_cell", "observed_mark_layout", "CHIP_LAYOUT_VERSION", "public_ma_condition"),
     "chip_event_backtest": ("event_marks", "branch_card", "VERSION"),
     "weekly_pick": ("layout_card", "verify_layout"),
     "market_data": ("RECENT_DAYS",),
     "warrant_store": ("StoreShrunk",),
     "spot_history": ("VERSION", "active", "maintain", "load_prices"),
     "spot_chip": ("_official_trading_dates", "remember_history", "prefetch_history"),
-    "kline_patterns": ("detect", "names"),
+    "kline_patterns": ("detect", "names", "ai_pattern_facts"),
     "sector_analysis": ("live_group_ranking",),
     "market_scan": ("value_liquid_codes", "EXCLUDED_NAMES"),
 }
@@ -5454,7 +5546,7 @@ class AceQueryEngine:
         # 快取鍵值用「補完股票之後」的問題，避免 A 使用者的「那它的壓力在哪」拿到 B 使用者的答案；籌碼類型分開快取。
         # 族群追問（「那哪檔最強」）要帶族群名稱與模式，不同族群的同一句追問不能共用答案
         sector = parsed.sector or {}
-        key = "|".join([member_pattern.VERSION,'現股分點精簡排版v10價格歸屬v1',compact, ",".join(c for c, _ in parsed.stocks), str(parsed.cost_price or ""), ",".join(parsed.branches),
+        key = "|".join([member_pattern.VERSION,'現股分點精簡排版v10價格歸屬v1_正式共用修正1011',compact, ",".join(c for c, _ in parsed.stocks), str(parsed.cost_price or ""), ",".join(parsed.branches),
                         "chip=" + parsed.chip,
                         "sector=" + str(sector.get("name") or sector.get("industry") or "") + ":" + str(sector.get("mode") or "")])
         key = self._access_cache_key(key)
@@ -6383,7 +6475,7 @@ class AceQueryEngine:
         return None
 
     def _answer_weekly_draft(self, question: str, context_key: str, started: float) -> AnswerResult:
-        """管理員：從 Top10 選一檔，先產生可人工修改的週精選純文字。"""
+        """管理員：指定任意股票，產生可人工修改的週精選純文字。"""
         stats = AnswerStats()
         code = weekly_pick.extract_stock_code(question)
         if not code:
@@ -6428,8 +6520,7 @@ class AceQueryEngine:
             self.log(f"套用文字時取得候選失敗：{type(exc).__name__}: {exc}")
             candidate = None
         if not candidate:
-            return AnswerResult(text=f"{code} 不在當期本週精選 Top 10，沒有對應的權證分點資料可以畫圖。"
-                                     "可以先用「本週精選排名」確認候選股。",
+            return AnswerResult(text=f"{code} 的資料目前無法取得，請確認股票代號或稍後重試。",
                                 route="weekly_manual_draft", gemini_calls=0, elapsed=time.perf_counter()-started)
         session = {
             "stock_code": candidate["stock_code"], "stock_name": candidate.get("stock_name", ""),
@@ -7126,9 +7217,8 @@ class AceQueryEngine:
                 self.log(f"完整點位：K 線拉長到 {lookback} 根（涵蓋 {chart_branch} 在 {codes[0]} 的事件，最多回推 180 天）")
             except Exception as exc:   # 查不到事件就維持 70 根，不影響回答
                 self.log(f"完整點位略過：{type(exc).__name__}: {exc}")
-        chart_codes = codes if plan.needs is None else [c for c in codes
-                       if set((plan.needs.get("per_stock") or {}).get(c, [])) &
-                          {"analysis", "technical", "cost", "price", "institutional", "warrant"}]
+        chart_codes = chart_codes_for_plan(plan, codes)
+        self.log(f"K 線排程｜預期股票={','.join(chart_codes) or '無（依需求）'}")
         for c in chart_codes:
             kwargs = {"stock_code": c, "mark_mode": mark_mode, "flow_source": "sheet"}
             if lookback:
@@ -7148,8 +7238,15 @@ class AceQueryEngine:
         results = [r for r in combined if r.name != "get_chart_panel"]
         chart_results = [r for r in combined if r.name == "get_chart_panel"]
         panels = []
-        for code, chart in zip(chart_codes, chart_results):
-            panel = dict(chart.data) if chart.ok else {"stock_code": code, "error": "K 線資料暫時無法取得；以下保留已取得的分析。"}
+        requested_charts = run_results[len(planned_calls):]
+        for index, code in enumerate(chart_codes):
+            chart = requested_charts[index] if index < len(requested_charts) else None
+            valid_chart = bool(chart and chart.ok and chart.data.get("bars")
+                               and str(chart.data.get("stock_code") or code) == code)
+            panel = dict(chart.data, stock_code=code) if valid_chart else {
+                "stock_code": code, "error": "K 線資料暫時無法取得；以下保留已取得的分析。"}
+            if not valid_chart:
+                self.log(f"K 線未完成｜{code}｜{getattr(chart, 'error', '') or '空白或股票不符'}")
             if not warrant_ok:
                 panel["marks"] = {}  # 圖上不畫分點標記
             else:
@@ -7352,7 +7449,9 @@ class AceQueryEngine:
             route=plan.route,
             gemini_calls=stats.gemini_calls,
             elapsed=elapsed,
-            cacheable=llm_ok and all(r.ok for r in combined),
+            cacheable=llm_ok and all(r.ok for r in combined)
+                      and all(any(p.get("stock_code") == code and p.get("bars") for p in panels)
+                              for code in chart_codes),
             errors=[f"{r.name}：{r.error or r.user_message}" for r in combined if not r.ok]
                    + ([self._compose_error()] if plan.need_final_llm and not llm_ok else []),
             panels=panels,
@@ -7595,7 +7694,11 @@ class AceQueryEngine:
 
         card = dict(card)
         card["answer"], card["why"], card["summary"] = clean(card["answer"]), clean(card.get("why", "")), clean(card.get("summary", ""))
-        card["scenarios"] = [dict(s, text=clean(s["text"])) for s in card.get("scenarios") or []]
+        for key in ("cost_basis", "scenario_title", "notice", "response_style"):
+            if isinstance(card.get(key), str):
+                card[key] = clean(card[key])
+        card["scenarios"] = [dict(s, title=clean(s.get("title", "")), text=clean(s["text"]))
+                             for s in card.get("scenarios") or []]
         card["scenarios"] = [s for s in card["scenarios"] if s["text"]]
         if not card["answer"] and card["summary"]:
             card["answer"], card["summary"] = card["summary"], ""     # 標題句被刪：改用一句話總結當標題，不整張丟掉
@@ -7617,7 +7720,7 @@ class AceQueryEngine:
     def _bind_late_cache(self, result, key, eligible=True):
         job=result.late_ai
         access=self._access()
-        if job and eligible and not (access and access.simulation) and all(r.ok for r in job['results']):
+        if job and eligible and not (access and access.simulation) and all(r.ok for r in job['results']) and not any(p.get('error') for p in result.panels or []):
             job['targets'].append((key,self.config.answer_cache_seconds))
 
     def finish_late_ai(self, original, raw):

@@ -1720,3 +1720,64 @@ def detect(df: pd.DataFrame, events: Optional[Dict[str, Any]] = None, provisiona
 def names(result: Dict[str, Any]) -> List[str]:
     """程式判斷到的型態名稱（事實核對用：AI 只能講這些）。"""
     return list(result.get("names") or [])
+
+
+def ai_pattern_facts(result: Dict[str, Any], *, data_date: str = "",
+                     day: Optional[int] = None) -> Dict[str, Any]:
+    """AI only consumes the selected validation triangle, never legacy formations.
+
+    This is a projection of detect(), not another detector or scoring rule.
+    An explicit negative result survives payload compaction. Missing/old data
+    remains unavailable rather than being mistaken for a negative result.
+    """
+    result = result or {}
+    stored = result.get("triangle_validation") or {}
+    tri = result.get("triangle")
+    legacy = ("箱型整理", "上升楔形", "下降楔形", "上升通道", "下降通道")
+
+    def structural(text):
+        return "三角" in str(text) or any(x in str(text) for x in legacy)
+
+    out = {k: result.get(k) for k in ("summary", "names", "levels", "flags", "atr20")}
+    for key in ("summary", "names", "levels"):
+        out[key] = [x for x in result.get(key) or [] if not structural(x)]
+    status = ("candidate" if tri.get("candidate") else "formal") if tri else (
+        stored.get("status", "none" if "triangle" in result else "unavailable"))
+    date = str(stored.get("data_date") or data_date)
+    if data_date and date and data_date != date:
+        status, tri = "unavailable", None
+    validation = {"status": status, "data_date": date,
+                  "rule_version": stored.get("rule_version") or TRI_STATE_VERSION}
+    if tri:
+        shape = (result.get("observations") or {}).get("structure") or {}
+        if ("candidate" not in shape or shape.get("kind") != tri.get("kind")
+                or bool(shape.get("candidate")) != bool(tri.get("candidate"))):
+            shape = tri
+        fields = ("kind", "candidate", "candidate_reasons", "validity", "state",
+                  "current_position", "pattern_events", "events", "near_tip",
+                  "formation_date", "event_date", "event_age", "event_direction",
+                  "is_provisional", "upper_price", "lower_price")
+        out["triangle"] = {k: shape[k] for k in fields if k in shape}
+        out["triangle"].update(kind=tri.get("kind"), candidate=bool(tri.get("candidate")))
+        if day is not None and tri.get("upper") is not None and tri.get("lower") is not None:
+            out["triangle"].update(upper_price=_p(_at(tri["upper"], day)),
+                                   lower_price=_p(_at(tri["lower"], day)))
+        # Full detect results have an exact selected-triangle text. Previously
+        # projected results retain only their already validated summaries.
+        selected_text = tri.get("text")
+        if selected_text:
+            out["summary"].insert(0, selected_text)
+        elif stored:
+            out["summary"] = list(result.get("summary") or [])
+        label = str(tri.get("kind") or "三角") + ("候選" if tri.get("candidate") else "")
+        out["names"].insert(0, label)
+        if day is not None:
+            # The exact selected lines were already emitted by detect().
+            out["levels"] += [x for x in result.get("levels") or []
+                              if label in str(x)]
+        elif stored:
+            out["levels"] = list(result.get("levels") or [])
+    else:
+        out["triangle"] = None
+    out["triangle_validation"] = validation
+    return out
