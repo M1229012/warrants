@@ -6,7 +6,7 @@ import re
 from urllib.parse import urlparse
 from datetime import date
 
-VERSION = "member_pattern_v8_balanced_chart_facts"
+VERSION = "member_pattern_v9_adjusted_levels_tracking"
 
 def date_key(value):
     """Calendar date key; retain display format and never change trading indices."""
@@ -55,7 +55,7 @@ def geometry(result, source_frame=None, events=None):
         up = tri["upper"][0] * i + tri["upper"][1]
         lo = tri["lower"][0] * i + tri["lower"][1]
         rows.append({"date": str(day)[:10], "ohlc": [float(bar[k]) for k in ("Open", "High", "Low", "Close")],
-                     "upper": float(up), "lower": float(lo), "applicable": up > lo,
+                     "upper": float(up), "lower": float(lo), "adjusted_upper": float(up), "adjusted_lower": float(lo), "applicable": up > lo,
                      "show_upper": i >= min(anchors.get("upper") or [tri["start"]]),
                      "show_lower": i >= min(anchors.get("lower") or [tri["start"]]),
                      "reference": tri.get("reference_until") is not None and i < tri["reference_until"],
@@ -85,6 +85,125 @@ def geometry(result, source_frame=None, events=None):
             "rows": rows, "basis_valid": basis_valid,
             "historical_conversion": bool(verified_events)}
 
+def price_basis(result, source_frame, events):
+    """Use the exact detector frame; validate cash factors rather than infer them."""
+    frame = (result.get("debug") or {}).get("frame")
+    if frame is None or source_frame is None or frame.empty:
+        return None
+    import pandas as pd
+    source = {date_key(day): [float(bar[k]) for k in ("Open", "High", "Low", "Close")]
+              for day, bar in source_frame.iterrows()}
+    applied = {e["date"] for e in frame.attrs.get("share_adjustments") or []}
+    cash = []
+    if events and events.get("status") == "ok":
+        for e in events.get("items") or []:
+            day = date_key(e.get("date"))
+            if (day and date_key(frame.index[0]) < day <= date_key(frame.index[-1])
+                    and e.get("date") not in applied and e.get("kind") in {"息", "除息"}):
+                try:
+                    factor = float(e.get("factor"))
+                except (TypeError, ValueError):
+                    return None
+                if not math.isfinite(factor) or factor <= 0:
+                    return None
+                cash.append((day, factor))
+    close = pd.to_numeric(frame["Close"], errors="coerce")
+    mas = {f"MA{n}": close.rolling(n).mean() for n in (5, 10, 20, 60)}
+    rows = []
+    for i, (day, bar) in enumerate(frame.iterrows()):
+        key = date_key(day); original = source.get(key)
+        ohlc = [float(bar[k]) for k in ("Open", "High", "Low", "Close")]
+        factor = math.prod(f for event_day, f in cash if key < event_day)
+        if not original or not all(math.isfinite(a) and a > 0 and math.isclose(a, b*factor, abs_tol=1e-5, rel_tol=1e-6)
+                                   for a, b in zip(ohlc, original)):
+            return None
+        rows.append({"date": key, "source_ohlc": original,
+                     **dict(zip(("Open", "High", "Low", "Close"), ohlc)),
+                     "Volume": float(bar.get("Volume", 0)) if pd.notna(bar.get("Volume", 0)) else 0.,
+                     **{k: float(v.iloc[i]) if pd.notna(v.iloc[i]) else None for k, v in mas.items()}})
+    return {"data_date": rows[-1]["date"], "adjusted": bool(cash), "rows": rows,
+            "events": [{"date": d, "factor": f} for d, f in cash]}
+
+
+def apply_price_basis(panel, basis, profile_builder):
+    """Atomic display-only conversion; recompute the same 40-bin profile after validation."""
+    if not basis or not basis.get("adjusted"):
+        return False
+    bars = panel.get("bars") or []
+    if not bars or date_key(bars[-1].get("date")) != basis.get("data_date"):
+        raise ValueError("還原圖表截至日與型態資料不同")
+    by_day = {r["date"]: r for r in basis["rows"]}
+    converted = []
+    previous = None
+    for bar in bars:
+        day = date_key(bar.get("date")); row = by_day.get(day)
+        if not row or (previous is not None and day <= previous):
+            raise ValueError("還原圖表日期缺漏或重複")
+        previous = day
+        for actual, key in zip(row["source_ohlc"], ("Open", "High", "Low", "Close")):
+            if not math.isclose(float(bar[key]), actual, abs_tol=1e-5, rel_tol=1e-6):
+                raise ValueError("還原圖表行情與型態行情不一致")
+        converted.append(dict(bar, **{k: row[k] for k in ("Open", "High", "Low", "Close", "MA5", "MA10", "MA20", "MA60")}))
+    import pandas as pd
+    work = pd.DataFrame(converted)
+    work.index = pd.to_datetime(work.pop("date"))
+    stats = profile_builder(work, n_bins=40)
+    if not stats:
+        raise ValueError("還原價大量區無法計算，保留原圖價格基準")
+    profile = {"bins": list(map(float, stats["bins"])), "profile": list(map(float, stats["profile"])),
+               "max_idx": int(stats["max_idx"]), "second_idx": int(stats["second_idx"])}
+    previous_close = basis["rows"][-2]["Close"] if len(basis["rows"]) > 1 else None
+    panel.update(bars=converted, volume_profile=profile, pattern_adjusted_basis=True,
+                 change_pct=(converted[-1]["Close"]/previous_close-1)*100 if previous_close else None,
+                 price_basis_note="歷史股價已依核實除息參考價還原；均線、大量區、三角採同一基準")
+    return True
+
+
+def chart_zones(panel, ratio=.5):
+    """Same grouped half-maximum nearby zones, from the profile actually drawn."""
+    p = panel.get("volume_profile") or {}; bins, volumes = p.get("bins") or [], p.get("profile") or []
+    if not volumes or len(bins) != len(volumes)+1:
+        return {}
+    a, b = int(p["max_idx"]), int(p["second_idx"])
+    if not 0 <= a < len(volumes) or not 0 <= b < len(volumes):
+        return {}
+    zone = lambda i: {"price_low": bins[i], "price_high": bins[i+1]}
+    groups, current = [], []
+    for i, v in enumerate(volumes):
+        if v > 0 and v >= volumes[a]*ratio:
+            current.append(i)
+        elif current:
+            groups.append(current); current = []
+    if current: groups.append(current)
+    groups = [g for g in groups if a not in g and b not in g]
+    close = float(panel["bars"][-1]["Close"])
+    below, above = [g for g in groups if bins[g[0]] <= close], [g for g in groups if bins[g[0]] > close]
+    nearby = ([max(below, key=lambda g: bins[g[0]])] if below else []) + ([min(above, key=lambda g: bins[g[0]])] if above else [])
+    return {"maximum_volume_zone": zone(a), "second_volume_zone": zone(b),
+            "near_volume_zones": [{"price_low": bins[g[0]], "price_high": bins[g[-1]+1]} for g in nearby]}
+
+
+def levels_card(panel, technical, key_price_levels, ratio=.5):
+    """Visible prices without calculating or exposing a hidden pattern score."""
+    bar = panel["bars"][-1]
+    tech = {"close": bar["Close"], "moving_averages": {k: {"value": bar.get(k)} for k in ("MA5", "MA10", "MA20", "MA60")}}
+    levels = key_price_levels(tech, chart_zones(panel, ratio))
+    view = panel.get("member_triangle") or {}
+    if view.get("visible") and view.get("current_position") != "not_applicable":
+        # Broken/candidate lines remain references; do not call them guaranteed support.
+        for edge, label in (("upper", "三角上緣"), ("lower", "三角下緣")):
+            price = view[edge]
+            pool = levels["supports"] if price <= bar["Close"] else levels["resistances"]
+            pool.append({"label": label, "price": price, "source": "triangle",
+                         "distance_from_close_pct": (price/bar["Close"]-1)*100})
+    basis = (technical.get("kline_patterns") or {}).get("member_basis") or {}
+    deduction = basis.get("ma_deduction") if panel.get("pattern_adjusted_basis") else technical.get("ma_deduction")
+    return {"levels_only": True, "hide_score": True, "show_tracked_branches": False,
+            "close": bar["Close"], "stock_code": panel["stock_code"], "ma_deduction": deduction or {},
+            "resistances_above_close": sorted(levels["resistances"], key=lambda x: x["price"]),
+            "supports_below_close": sorted(levels["supports"], key=lambda x: -x["price"])}
+
+
 def overlay(panel, view):
     """Fail closed when chart OHLC differs from the detector's price basis."""
     if not view or not panel.get("bars"):
@@ -108,7 +227,7 @@ def overlay(panel, view):
         if row is None or (previous is not None and key <= previous):
             return unavailable(view, "三角線資料日期與圖表不同，暫不疊線", date=bar.get("date"), reason="missing_or_unordered_date")
         previous = key
-        for actual, key in zip(row.get("chart_ohlc", row["ohlc"]), ("Open", "High", "Low", "Close")):
+        for actual, key in zip(row["ohlc"] if panel.get("pattern_adjusted_basis") else row.get("chart_ohlc", row["ohlc"]), ("Open", "High", "Low", "Close")):
             value = bar.get(key)
             try:
                 matches = math.isfinite(float(value)) and math.isclose(float(value), actual, abs_tol=0.00001, rel_tol=0.000001)
@@ -117,10 +236,13 @@ def overlay(panel, view):
             if not matches:
                 return unavailable(view, "三角線與圖表價格基準不同，暫不疊線", date=bar.get("date"), field=key, expected=actual, actual=value)
         points.append(dict(row, date=bar["date"]))
+    if panel.get("pattern_adjusted_basis"):
+        points = [dict(r, upper=r.get("adjusted_upper", r["upper"]*r.get("basis_factor", 1.)), lower=r.get("adjusted_lower", r["lower"]*r.get("basis_factor", 1.)),
+                       chart_ohlc=r["ohlc"], basis_factor=1.) for r in points]
     last = points[-1]
     close = last.get("chart_ohlc", last["ohlc"])[3]
     position = ("above" if close > last["upper"] else "below" if close < last["lower"] else "inside") if last["applicable"] else "not_applicable"
-    return dict(view, rows=points, visible=True, detector_position=view.get("current_position"),
+    return dict(view, rows=points, visible=True, adjusted_display=bool(panel.get("pattern_adjusted_basis")), detector_position=view.get("current_position"),
                 current_position=position, data_date=last["date"], upper=last["upper"], lower=last["lower"])
 
 def chart_label(view):
@@ -133,7 +255,7 @@ def chart_label(view):
         return "三角歷史線｜上下緣已交會，目前位置不適用"
     name = view["kind"] + ("候選" if view.get("candidate") else "")
     tip = "｜接近尖端" if view.get("near_tip") else ""
-    basis = "｜歷史段按除息換算" if view.get("historical_conversion") else ""
+    basis = ("｜全圖同一還原基準" if view.get("adjusted_display") else "｜歷史段按除息換算") if view.get("historical_conversion") else ""
     return f"{name}｜橘上緣 {view['upper']:,.2f}、藍下緣 {view['lower']:,.2f}（當日）｜虛線：候選／參考／延伸{tip}{basis}"
 
 def needs_for(parsed, plan, code):
@@ -220,7 +342,9 @@ def chart_context(panels, compound=False):
         if not p.get("bars"): continue
         stock = {"last_bar": deepcopy(p["bars"][-1]), "intraday": deepcopy(p.get("intraday") or {}),
                  "volume_profile": deepcopy(p.get("volume_profile") or {}), "show_score": bool(p.get("scorecard")),
-                 "stock_name": p.get("stock_name", ""), "show_bollinger": not p.get("hide_bollinger", False)}
+                 "stock_name": p.get("stock_name", ""), "show_bollinger": not p.get("hide_bollinger", False),
+                 "adjusted_basis": bool(p.get("pattern_adjusted_basis")), "volume_zones": chart_zones(p),
+                 "key_levels": deepcopy(p.get("key_levels") or {})}
         if not stock["show_bollinger"]:
             stock["last_bar"] = {k: v for k, v in stock["last_bar"].items() if not k.startswith("BB_")}
         bar = stock["last_bar"]
@@ -262,6 +386,14 @@ def scoped_payload(payload, context):
         stock = context.get("stocks", {}).get(data.get("stock_code"), {}) if isinstance(data, dict) else {}
         if stock and not stock.get("show_bollinger", True):
             data = _without_bollinger(data)
+            payload["tool_results"][key] = data
+        if stock.get("adjusted_basis") and key.split(":")[0] == "get_volume_profile":
+            payload["tool_results"][key] = {"stock_code": data.get("stock_code"), "data_date": data.get("data_date"),
+                                            "close": stock["last_bar"]["Close"], **deepcopy(stock["volume_zones"])}
+            continue
+        if stock.get("adjusted_basis") and key.split(":")[0] == "get_technical_analysis":
+            data = dict(data, moving_averages={k: {"value": stock["last_bar"].get(k)} for k in ("MA5", "MA10", "MA20", "MA60")},
+                        ma_deduction=deepcopy((stock.get("key_levels") or {}).get("ma_deduction") or {}))
             payload["tool_results"][key] = data
         view = stock.get("triangle")
         if view:

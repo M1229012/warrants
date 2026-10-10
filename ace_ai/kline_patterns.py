@@ -785,7 +785,7 @@ def _tri_line(P, B, Q, C, A, s: float, k: float, i0: int, last: int, sg: int, re
     contact = {d: ev for ev in events for d in ev["days"]}
     near = lambda m: m in contact and (P[m] - line(m)) * sg >= -TRI_TOUCH * A[m] and (B[m] - line(m)) * sg <= TRI_TOUCH * A[m]
     touched = {m for m in mj if near(m)}
-    actual_mtouch = len(touched)   # 排序用實際貼線；不改既有成立門檻與借用規則
+    actual_mtouch = sum((P[m] - line(m))*sg <= TRI_MAJOR_POKE*A[m] for m in touched)   # 穿過主要影線的接觸不加外緣排序支持
     borrowed = 0
     if src_major is not None and src_major in mj and events and events[0]["rep"] == i0 and src_major not in touched:
         if TRI_SPLIT_BORROWED:
@@ -798,7 +798,7 @@ def _tri_line(P, B, Q, C, A, s: float, k: float, i0: int, last: int, sg: int, re
     err = float(np.mean([min(zone(d) for d in ev["days"]) for ev in events]))
     body_excess = (B[i0:F + 1] - C[i0:F + 1]) * sg - inside[i0:F + 1]
     body_cover = 1. - float(np.mean(np.clip(body_excess / A[i0:F + 1], 0., 1.)))
-    return {"body_cover": body_cover, "s": float(s), "k": float(k), "i0": int(i0), "a": [ev["rep"] for ev in events], "events": events,
+    return {"boundary_penalty": _tri_boundary_penalty(P, A, {"i0": i0, "s": s, "k": k}, sg, F), "body_cover": body_cover, "s": float(s), "k": float(k), "i0": int(i0), "a": [ev["rep"] for ev in events], "events": events,
             "major": len(touched) - len(pierced), "mtouch": len(touched), "actual_mtouch": actual_mtouch, "borrowed": borrowed, "reacted": reacted, "fakes": fakes,
             "peaks": sum(1 for ev in events if turns.intersection(ev["days"])), "err": err,
             "turn_events": sum(1 for ev in events if (turns | set(mj)).intersection(ev["days"])),
@@ -876,7 +876,7 @@ def _tri_diverse_lines(lines, lo, F, A):
             -min(3, r.get("actual_mtouch", r["mtouch"])),
             -min(3, r["reacted"]), r["fakes"], r["err"],
             -min(4, len(r["a"])), r["src"], r["s"], r["k"]))
-        enclosure = sorted(bucket, key=lambda r: (-r.get("body_cover", 1.),
+        enclosure = sorted(bucket, key=lambda r: (r.get("boundary_penalty", 0.), -r.get("body_cover", 1.),
             r["fakes"], -min(3, r["reacted"]), r["err"], r["src"], r["s"], r["k"]))
         # Interleave the support and enclosure lists, sharing the 10 slots.
         # A clean outer line can therefore reach pairing with fewer contacts.
@@ -893,6 +893,17 @@ def _tri_diverse_lines(lines, lo, F, A):
                 break
         result.extend(chosen)
     return result
+
+
+def _tri_boundary_penalty(P, A, line, sg, F):
+    """Whole-side confirmed turning-point envelope; today's bar is never used.
+
+    Excursions within the existing major-wick tolerance remain allowed.
+    A worst excursion cannot disappear in a long-period average.
+    """
+    days = _tri_turns(P, sg, line["i0"], F)
+    excess = [max(0., (P[t] - (line["s"]*t + line["k"]))*sg / A[t] - TRI_MAJOR_POKE) for t in days]
+    return round(max(excess, default=0.), 6)
 
 
 def _tri_pair_quality(H, L, O, C, A, u, d, joint, F):
@@ -925,7 +936,10 @@ def _tri_pair_quality(H, L, O, C, A, u, d, joint, F):
     fit = 1. - min(1., (u["err"] + d["err"]) / 2.)
     score = (4. * body_cover + wick_cover + 2. * support + 2. * reaction
              + 2. * coverage + alternating + fit - .5 * (u["fakes"] + d["fakes"]))
-    return {"score": round(score, 6), "body_cover": round(body_cover, 6),
+    upper_penalty = u["boundary_penalty"] if "boundary_penalty" in u else _tri_boundary_penalty(H, A, u, 1, F)
+    lower_penalty = d["boundary_penalty"] if "boundary_penalty" in d else _tri_boundary_penalty(L, A, d, -1, F)
+    boundary = max(upper_penalty, lower_penalty)
+    return {"boundary_penalty": boundary, "score": round(score, 6), "body_cover": round(body_cover, 6),
             "wick_cover": round(wick_cover, 6), "actual_support": round(support, 6),
             "reaction_balance": round(reaction, 6), "common_coverage": round(coverage, 6),
             "common_alternation": round(alternating, 6), "contact_fit": round(fit, 6),
@@ -1016,17 +1030,18 @@ def _tri_form(H, L, O, C, A, lo: int, F: int, piv, confirm: bool = True, local: 
             quality = None
             if TRI_SELECTION_MODE == "balanced-v1":
                 quality = _tri_pair_quality(H, L, O, C, A, u, d, joint, F)
-                key = (quality["score"], quality["body_cover"], quality["common_coverage"], key)
-                ranked_pairs.append(quality["score"])
+                key = (-quality["boundary_penalty"], quality["score"], quality["body_cover"], quality["common_coverage"], key)
+                ranked_pairs.append((quality["boundary_penalty"], quality["score"]))
             if best is None or key > best[0]:
                 best = (key, u, d, start, joint, w0, wF, hgt, quality)
     if not best:
         return None
     _, u, d, start, joint, w0, wF, hgt, quality = best
-    scores = sorted(ranked_pairs, reverse=True)
+    scores = sorted(ranked_pairs, key=lambda x: (-x[0], x[1]), reverse=True)
     selection = {"mode": TRI_SELECTION_MODE, "quality": quality,
                  "qualified_pairs": len(scores),
-                 "margin": round(scores[0] - scores[1], 6) if len(scores) > 1 else None}
+                 "boundary_gap": round(scores[1][0]-scores[0][0], 6) if len(scores)>1 else None,
+                 "margin": round(scores[0][1]-scores[1][1], 6) if len(scores)>1 and scores[0][0]==scores[1][0] else None}
     return {"selection": selection, "u": u, "d": d, "F": F, "start": start, "joint": joint, "R_geom": float(A[joint]), "w0": w0, "wF": wF,
             "height": hgt, "near_tip": wF < TRI_TIP * w0, "joint_days": F - joint, "candidate": not confirm or local,
             "reasons": (["主要轉折支持不足，局部轉折支持"] if local else [])
@@ -1091,7 +1106,7 @@ def _tri_track(df, C, A, snap, end: int) -> Dict[str, Any]:
 TRI_SELECTION_MODE = os.getenv("DISCORD_AI_KLINE_TRI_SELECTION_MODE", "balanced-v1").strip().lower()
 if TRI_SELECTION_MODE not in ("baseline", "balanced-v1"):
     raise ValueError("DISCORD_AI_KLINE_TRI_SELECTION_MODE must be baseline or balanced-v1")
-TRI_STATE_VERSION = "tri-v10-primary" if TRI_SELECTION_MODE == "baseline" else "tri-v12-balanced-1"
+TRI_STATE_VERSION = "tri-v10-primary" if TRI_SELECTION_MODE == "baseline" else "tri-v13-envelope-tracking-1"
 TRI_INIT_REPLAY = int(_env("TRI_INIT_REPLAY", 20))   # 冷重播設定；實際至少 TRI_TRACK_DAYS+1 日
 TRI_TRACK_DAYS = int(_env("TRI_TRACK_DAYS", 20))     # 已突破型態沿固定線追蹤最多 20 日（或交會）就結束
 TRI_CONFIRM2 = int(_env("TRI_CONFIRM2", 0))          # 10-08：1＝文字顯示兩日確認（比較驗證前預設關；欄位一律計算）
@@ -1245,6 +1260,7 @@ def _user_triangle(df, atr_prev, end, state=None, out_state=None, replay_days=No
     start_X = max(first_valid + 31, end - replay_span)   # 冷重播至少涵蓋完整追蹤期及前一日形成資料
     reconstructed = True                          # 沒有有效快照：從固定起點重建，紀錄標「回溯辨識」
     held_records = []
+    state_loaded = False
     if state and compatible_sig(state.get("sig")) and state.get("as_of") in pos and pos[state["as_of"]] <= end:
         a = pos[state["as_of"]]
         fp = state.get("fingerprint") or {}
@@ -1262,7 +1278,31 @@ def _user_triangle(df, atr_prev, end, state=None, out_state=None, replay_days=No
                     records.append({"snap": snap, "recognized": pos[r["recognized"]],
                                     "reconstructed_at": r.get("reconstructed_at"), "detected_on": r.get("detected_on")})
             start_X, reconstructed = a + 1, False
+            state_loaded = True
+    formation = None
+    saved_formation = (state or {}).get("formation")
+    if TRI_SELECTION_MODE == "balanced-v1" and saved_formation and state_loaded:
+        fday = saved_formation.get("F_date")
+        if fday in pos and pos[fday] < start_X:
+            candidate = _shift_snap(saved_formation["snap"], pos[fday])
+            anchors = [candidate[e]["i0"] for e in ("u", "d")] + candidate["u"]["a"] + candidate["d"]["a"]
+            if not candidate.get("candidate") and min(anchors + [candidate["start"], candidate["joint"]]) >= 0:
+                formation = candidate
     run_day = dates[end]
+
+    def formation_live(snap, X):
+        return (snap is not None and X-snap["F"] <= TRI_TRACK_DAYS
+                and (snap["u"]["s"]-snap["d"]["s"])*X + snap["u"]["k"]-snap["d"]["k"] > 0)
+
+    def outside(snap, X):
+        if not formation_live(snap, X) or np.isnan(A[X]):
+            return False
+        u, d = snap["u"], snap["d"]
+        return C[X] > u["s"]*X+u["k"]+TRI_OUT*A[X] or C[X] < d["s"]*X+d["k"]-TRI_OUT*A[X]
+
+    def add_record(snap, X):
+        records.append({"snap": snap, "recognized": X, "reconstructed_at": run_day if reconstructed else None,
+                        "detected_on": None if reconstructed else run_day})
 
     def expired(r, X):                            # 1) 追蹤結束：辨識後超過 TRI_TRACK_DAYS，或兩線在 X 日前已交會
         u, d = r["snap"]["u"], r["snap"]["d"]
@@ -1290,6 +1330,14 @@ def _user_triangle(df, atr_prev, end, state=None, out_state=None, replay_days=No
         check_budget()
         held_records = [r for r in held_records if not expired(held_snap(r), X)]
         records = [r for r in records if not expired(r, X)]   # 每天先清過期紀錄，再判斷新突破（逐日＝一次補算）
+        primary, held = active_record()
+        if not formation_live(formation, X):
+            formation = None
+        # Check the previously observed formal boundaries before searching replacement lines.
+        if formation is not None and outside(formation, X):
+            if primary is None or new_consolidation(formation, primary, held, X):
+                add_record(formation, X)
+            formation = None
         F = X - 1
         pick = form(F)                            # 10-08 提速：候選／補充候選必為 candidate、不建紀錄，歷史日不必搜尋（結果相同）
         if pick is None or pick.get("candidate"):
@@ -1300,18 +1348,28 @@ def _user_triangle(df, atr_prev, end, state=None, out_state=None, replay_days=No
         u, d = pick["u"], pick["d"]
         o = TRI_OUT * A[X]
         if C[X] > u["s"] * X + u["k"] + o or C[X] < d["s"] * X + d["k"] - o:
-            records.append({"snap": pick, "recognized": X,      # 當天主流程真的發出突破，才建立正式紀錄
-                            "reconstructed_at": run_day if reconstructed else None,
-                            "detected_on": None if reconstructed else run_day})
+            add_record(pick, X)
+            formation = None
+        elif TRI_SELECTION_MODE == "balanced-v1":
+            formation = pick   # Save evidence for a later break, without freezing unbroken daily selection.
     records = [r for r in records if not expired(r, end)]
     held_records = [r for r in held_records if not expired(held_snap(r), end)]
     # 追蹤結束：超過 TRI_TRACK_DAYS 或已過交會點
     tracks = {id(r): _tri_track(df, C, A, r["snap"], end) for r in records}
+    live = list(records)
+    pick = form(last) or form(last, False) or (None if live or held_records else form(last, True, True))
+    primary, held = active_record()
+    if (TRI_SELECTION_MODE == "balanced-v1" and pick is not None and not pick.get("candidate") and not outside(pick, end)
+            and (primary is None or new_consolidation(pick, primary, held, end))):
+        formation = pick
+    if not formation_live(formation, end) or outside(formation, end):
+        formation = None
     if out_state is not None:
         out_state.clear()
     if out_state is not None:
         out_state.update(_jsonable({
             "sig": sig, "as_of": dates[end],
+            "formation": {"F_date": dates[formation["F"]], "snap": _shift_snap(formation, -formation["F"])} if formation is not None else None,
             "fingerprint": {dates[i]: bar_hash(i) for i in range(0, end + 1)},
             "records": [{"F_date": dates[r["snap"]["F"]], "recognized": dates[r["recognized"]],
                          "reconstructed_at": r.get("reconstructed_at"), "detected_on": r.get("detected_on"),
@@ -1323,17 +1381,15 @@ def _user_triangle(df, atr_prev, end, state=None, out_state=None, replay_days=No
         if previous:
             out_state["previous_rules_state"] = _jsonable(previous)
     keep_from = end - TRI_BREAK_RECENT
-    live = list(records)                          # 迴圈已清掉過期（>TRI_TRACK_DAYS 或交會）＝全部仍在追蹤
-    pick = form(last) or form(last, False) or (None if live or held_records else form(last, True, True))   # 補充候選不和仍在追蹤的正式突破競爭
     own = None
     primary, held = active_record()
-    if primary is not None and pick is not None and not new_consolidation(pick, primary, held, end):
+    if primary is not None and (pick is None or not new_consolidation(pick, primary, held, end)):
         own = None if held else primary
         main = None if held else primary["snap"]   # 先用仍在追蹤的正式紀錄；窗口不足只保留、不誤畫替代線
     elif pick is not None:
         main = pick
     else:                                         # 今天沒有形成型態：只用保留期限內、仍在追蹤的已突破型態
-        recent = [r for r in records if r["recognized"] >= keep_from]   # 當主型態只用保留期限內辨識的（舊紀錄不因存在就當成目前成立）
+        recent = records   # 有效突破沿原線追蹤20日；5日只限制其他歷史事件摘要
         own = None if held else (recent[-1] if recent else None)
         main = own["snap"] if own else None
     if main is None:
@@ -1655,6 +1711,8 @@ def detect(df: pd.DataFrame, events: Optional[Dict[str, Any]] = None, provisiona
         # Admin-only caller consumes the exact calculation frame; never redraw from raw prices.
         result["debug"] = {"frame": adj.copy(), "trend": tr, "invalid": state.get("invalid"),
                            "last_official": last_official, "atr_prev": atr_prev.copy(),
+                           "triangle_state": _jsonable(new_state), "triangle_state_read_only": not state_write or provisional_today,
+                           "triangle_loaded_rules": (tri_state or {}).get("sig"),
                            "break_multiplier": BREAK, "retest_multiplier": RETEST_ZONE}
     return result
 

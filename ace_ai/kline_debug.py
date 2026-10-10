@@ -69,8 +69,20 @@ def load_panel(code: str) -> dict[str, Any]:
     return build_panel(frame, events, code, name, state_key=f"tri_state_{code}", state_write=False)
 
 
-def _state_summary(state_key: str) -> str:
+def _state_summary(state_key: str, computed=None, read_only=False, loaded_rules=None) -> str:
     """三角存檔摘要（重啟前後比對用）：as_of、revision、正式紀錄數、各筆首次突破（辨識）日。"""
+    if computed is not None:
+        if not computed:
+            return "三角本次計算：資料不足，未建立快照；不是資料庫舊紀錄"
+        recs = computed.get("records") or []
+        firsts = []
+        for r in recs:
+            # Recognized date is the stored trigger, not an invented confirmation date.
+            firsts.append(r.get("recognized", "")[5:] + ("（回溯）" if r.get("reconstructed_at") else ""))
+        saved = "；含待突破形成快照" if computed.get("formation") else ""
+        rules = str(computed.get("sig") or "").split("|")[0]
+        loaded = str(loaded_rules or "無").split("|")[0]
+        return f"三角本次計算：as_of {computed.get('as_of')}｜{rules}｜正式紀錄 {len(recs)} 筆｜辨識日 {'、'.join(firsts) or '無'}｜{'只讀' if read_only else '讀寫'}；載入規則 {loaded}{saved}"
     store = kline_patterns._tri_store()
     if store is None:
         return "三角存檔：未啟用（不是正式資料庫，未讀寫）"
@@ -107,7 +119,7 @@ def build_panel(frame: pd.DataFrame, events: dict | None, code: str, name: str =
                             "formation": result.get("formation"), "ended": result.get("ended"),
                             "invalid": snapshot.get("invalid"), "trend": snapshot.get("trend"),
                             "summary": result["summary"],
-                            "flags": (result.get("flags") or []) + ([_state_summary(state_key)] if state_key else []),
+                            "flags": (result.get("flags") or []) + ([_state_summary(state_key, snapshot.get("triangle_state"), snapshot.get("triangle_state_read_only", False), snapshot.get("triangle_loaded_rules"))] if state_key else []),
                             "atr20": result.get("atr20"), "break_multiplier": snapshot["break_multiplier"],
                             "retest_multiplier": snapshot["retest_multiplier"]}}
 

@@ -1540,7 +1540,7 @@ def _level_rows(card: dict) -> list[tuple[str, str, float, float | None]]:
             if price is None:
                 continue
             key = (label, float(price))
-            if '量區' in label and key not in seen:
+            if ('量區' in label or '三角' in label) and key not in seen:
                 picked.append(lv)
                 seen.add(key)
         return picked
@@ -1582,6 +1582,8 @@ def _level_note(label: str, card: dict) -> tuple[str, str]:
         if info.get('limit_proof'):      # 失敗值比跌停還低：只寫失敗值（10-08 使用者：不寫「跌停也續揚」）
             return f"{'MA20 ' if label == '布林中軌' else ''}失敗值 {info['fail_price']:,.2f}{tail}", (UP if info['limit_proof'] == '跌停也續揚' else DOWN)
         return f"{'MA20 ' if label == '布林中軌' else ''}{plain}{tail}", color
+    if '三角' in label:
+        return '固定型態參考線；需配合候選／越線／確認狀態', MUTED
     if '量區' in label:
         return '成交密集區邊緣（籌碼成本區）', MUTED
     if '布林' in label:
@@ -1739,6 +1741,8 @@ def scorecard(draw, y: float, card: dict, dry: bool) -> int:
     if not dry:
         draw.rounded_rectangle((x0, y, x1, y + scorecard(None, 0, card, True)), radius=20, fill='white', outline=LINE)
     h = 30
+    if card.get('levels_only'):
+        return _scorecard_tail(draw, y, h, px, width, card, dry)
     basis = str(card.get('score_basis') or '收盤確認')
     # hide_score＝覆盤的「持股狀態」卡：同一套價位／扣抵／盤中觀察，但不顯示分數、五大項與得分失分
     hide_score = bool(card.get('hide_score'))
@@ -1830,11 +1834,11 @@ def scorecard(draw, y: float, card: dict, dry: bool) -> int:
 def _scorecard_tail(draw, y: float, h: float, px: float, width: float, card: dict, dry: bool) -> int:
     """均線扣抵＋關鍵價位＋追蹤分點；型態評分卡與覆盤持股狀態卡共用。"""
     compact = bool(card.get('compact'))
-    if not compact:   # 整合頁（型態＋籌碼）不放均線扣抵列
+    if not compact and not card.get('levels_only'):   # 價位表保留均線說明，不重複扣抵列
         h += _deduction_chips(draw, px, y + h, width, card, dry) + 18
 
     levels = _level_rows(card)
-    note = ('離收盤最近的壓力與支撐' if compact
+    note = ('均線、大量區與三角參考線；突破後原支撐可能轉為壓力' if card.get('levels_only') else '離收盤最近的壓力與支撐' if compact
             else '均線、附近大量區與布林上下軌中，離收盤最近的壓力與支撐（大量區太遠時省略）')
     h += _sub_heading(draw, px, y + h, '關鍵價位', note, width, dry)
     if levels:
@@ -1846,6 +1850,8 @@ def _scorecard_tail(draw, y: float, h: float, px: float, width: float, card: dic
             text_at(draw, (px, y + h), '目前沒有可用的價位資料', 21, MUTED)
         h += 34 + 34
 
+    if card.get('levels_only'):
+        return math.ceil(h + 12)
     branches = (card.get('tracked_branches') or [])[:BRANCH_MAX_ROWS]
     show_tracked = bool(card.get('show_tracked_branches', True))
     if show_tracked:
@@ -3237,7 +3243,7 @@ def price_footer(panels: list[dict] | None) -> str:
 
 
 def panel_block_height(panel: dict) -> int:
-    card = panel.get('scorecard')
+    card = panel.get('scorecard') or panel.get('key_levels')
     return panel_height(panel) + 24 + (scorecard(None, 0, card, True) + 24 if card else 0)
 
 
@@ -3411,9 +3417,10 @@ def render_answer(question: str, answer: str, panels: list[dict] | None = None,
     for panel in panels:
         draw_chart(draw, y, panel)
         y += panel_height(panel) + 24
-        if panel.get('scorecard') and not compare:
-            scorecard(draw, y, panel['scorecard'], False)
-            y += scorecard(None, 0, panel['scorecard'], True) + 24
+        price_card = panel.get('scorecard') or panel.get('key_levels')
+        if price_card and not compare:
+            scorecard(draw, y, price_card, False)
+            y += scorecard(None, 0, price_card, True) + 24
     if compare:
         y += compare_card(draw, y, panels, False) + 24
     for panel in contribution_panels:

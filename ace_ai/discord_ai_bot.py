@@ -7233,11 +7233,20 @@ class AceQueryEngine:
                 panel["hide_bollinger"] = True   # 第二輪：型態圖保留所有均線與大量區，只省略布林顯示
                 code = panel["stock_code"]
                 technical = next((r.data for r in results if r.ok and r.name == "get_technical_analysis" and r.data.get("stock_code") == code), {})
+                basis = (technical.get("kline_patterns") or {}).get("member_basis")
+                if basis and basis.get("adjusted"):
+                    try:
+                        member_pattern.apply_price_basis(panel, basis, tools.core()._calculate_weighted_volume_profile_stats)
+                    except Exception as exc:
+                        self.log(f"{code} 還原圖表略過｜{type(exc).__name__}: {exc}")
                 view = member_pattern.overlay(panel, (technical.get("kline_patterns") or {}).get("member_view"))
                 if view:
                     panel["member_triangle"] = view
                     if not view.get("visible"):
                         self.log(f"{code} 三角疊線未通過｜{view.get('notice')}｜{json.dumps(view.get('diagnostic') or {}, ensure_ascii=False, default=str)}")
+                panel["key_levels"] = member_pattern.levels_card(panel, technical, tools.key_price_levels, tools.NEAR_ZONE_RATIO)
+                if parsed.cost_price is not None:
+                    panel["key_levels"]["cost_price"] = parsed.cost_price
                 panel["disable_compare"] = not member_pattern.comparing(plan)
                 if TEST_SHOW_SCORECARD and (not view or member_pattern.wants_score(parsed, plan, code)):
                     # 10-08：正式版還有評分卡，測試版先照正式版顯示，方便比對評分修正；整飾板拿掉時設 0

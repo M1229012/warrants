@@ -3097,6 +3097,12 @@ def _kline_patterns(df: pd.DataFrame, code: str = "", provisional_today: bool = 
         if shape and "candidate" in shape:          # 10-07：三角正式／候選身分與完整事件紀錄給 AI
             out["triangle"] = {k: shape.get(k) for k in ("kind", "candidate", "candidate_reasons", "validity", "state",
                                                           "current_position", "pattern_events", "near_tip")}
+        import member_pattern
+        basis = member_pattern.price_basis(result, df, events)
+        if basis:
+            if basis["adjusted"]:
+                basis["ma_deduction"] = analyze_ma_deduction(result["debug"]["frame"])
+            out["member_basis"] = basis
         if result.get("triangle"):
             import member_pattern
             out["member_view"] = member_pattern.geometry(result, source_frame=df, events=events)
