@@ -4632,7 +4632,11 @@ def quota_exempt_ids() -> Set[str]:
 
 # 各檔案「這一批」才有的函式：少了代表那個檔案沒有一起上傳（還是舊版）
 REQUIRED_MODULE_API = {
-    "local_market_cache": ("accumulate_state", "recent_states", "stock_market", "stock_markets", "bars_fingerprint"),
+    "local_market_cache": ("accumulate_state", "recent_states", "stock_market", "stock_markets", "bars_fingerprint",
+                           "save_market_sessions", "market_sessions_between", "market_close_status"),
+    "request_runtime": ("state", "new_state", "check_budget", "reserve_call", "scope", "CLOCK", "_LOCK"),
+    "price_adjustment": ("adjust_shares", "event_from_row"),
+    "corporate_action_sources": ("twse_events",),
     "discord_access": ("_CHIP_WORD_RE", "require_sector"),
     "warrant_ai_tools": ("get_market_institutional", "prefetch_sheet_tables", "_reserve_fugle_slot", "check_sheet_version", "err_text",
                          "chart_marks_for_stock"),

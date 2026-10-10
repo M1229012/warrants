@@ -2287,8 +2287,7 @@ DAILY_READY_MINUTE = _env_int("DISCORD_AI_DAILY_READY_MINUTE", 15 * 60 + 30)   #
 
 def expected_last_close(now: Any = None) -> pd.Timestamp:
     """Independent official calendar plus both-market completion; unavailable coverage stays explicit."""
-    import market_calendar
-    return market_calendar.close_status(now or taipei_now(), DAILY_READY_MINUTE)["expected_date"]
+    return local_market_cache.market_close_status(now or taipei_now(), DAILY_READY_MINUTE)["expected_date"]
 
 
 def _missing_trading_days(df: pd.DataFrame) -> List[str]:
@@ -2298,9 +2297,8 @@ def _missing_trading_days(df: pd.DataFrame) -> List[str]:
     日曆取不到時回傳空清單，不因為檢查失敗而擋住回答。
     """
     if getattr(_LOCAL_ONLY, "on", False):
-        import market_calendar
         if df is None or len(df) < 2: return []
-        sessions = market_calendar.sessions_between(df.index[0], df.index[-1])
+        sessions = local_market_cache.market_sessions_between(df.index[0], df.index[-1])
         if sessions is None: return []
         have = {pd.Timestamp(x).strftime("%Y-%m-%d") for x in df.index}
         return [d for d in sessions if d not in have]
@@ -2311,9 +2309,8 @@ def _missing_trading_days(df: pd.DataFrame) -> List[str]:
         first, last = index[max(0, len(index) - 70)], index[-1]
         have = set(index)
         sessions = [pd.Timestamp(x).normalize() for x in core()._get_official_trading_dates(first, last)]
-        import market_calendar
         if sessions:
-            market_calendar.save_sessions(first, last, sessions, "既有官方交易日查詢")
+            local_market_cache.save_market_sessions(first, last, sessions, "既有官方交易日查詢")
         return [d.strftime("%Y-%m-%d") for d in sessions if d not in have]
     except Exception as exc:   # 休市表失敗時照常回答，只是少了這道檢查
         print(f"⚠️ 交易日連續性檢查略過：{type(exc).__name__}: {exc}", flush=True)
@@ -2548,11 +2545,10 @@ def _load_price_bundle(stock_code: str) -> Dict[str, Any]:
         result = bundles[key]
     else:
         result = _cached(f"{prefix}{code}_{source_stamp(code)}" + ("_spot_year_v4" if locals().get("spot_history_mode", False) else ""), ttl, build)
-    import market_calendar
-    sessions = market_calendar.sessions_between(result["closed_df"].index[0], result["closed_df"].index[-1])
+    sessions = local_market_cache.market_sessions_between(result["closed_df"].index[0], result["closed_df"].index[-1])
     if sessions is not None:
         result["closed_df"].attrs["trading_sessions"] = sessions
-    result["freshness"] = market_calendar.close_status(taipei_now(), DAILY_READY_MINUTE)
+    result["freshness"] = local_market_cache.market_close_status(taipei_now(), DAILY_READY_MINUTE)
     raw = result.get("raw_closed_df")
     if raw is not None:
         result["input_fp"] = frame_fingerprint(raw)

@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import json
+import pandas as pd
 import re
 import time
 from datetime import date as _date, timedelta
@@ -248,6 +249,15 @@ def sync(target_days: int = HISTORY_DAYS, budget_seconds: float = 600.0,
     """把底庫補到 target_days 個交易日。上市、上櫃分開判斷：兩邊都 complete（或都確認休市）才跳過，
     只有一邊成功的日子下一輪只重抓失敗的那一邊。"""
     started = time.monotonic()
+    # Warm official sessions outside offline score recomputation; failures never imply no holidays.
+    try:
+        end_day = tools.taipei_now().date()
+        first_day = end_day - timedelta(days=max(250, int(target_days * 2)))
+        if local_market_cache.market_sessions_between(first_day, end_day) is None:
+            sessions = tools.core()._get_official_trading_dates(pd.Timestamp(first_day), pd.Timestamp(end_day))
+            local_market_cache.save_market_sessions(first_day, end_day, sessions, "既有官方交易日查詢")
+    except Exception as exc:
+        log(f"官方交易日曆未更新：{tools.err_text(exc)}")
     candidates = _candidate_days(int(target_days * 1.5))
     keys = [d.strftime("%Y-%m-%d") for d in candidates]
     status = local_market_cache.market_status(keys)
