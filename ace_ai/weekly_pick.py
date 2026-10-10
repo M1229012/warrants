@@ -8,7 +8,7 @@
 勝率優先使用 Sheet 已存在的精確複合事件（如 A+C）；找不到時才退回單事件資料，
 總勝率只保留為背景資訊。
 
-操作流程：先以「本週精選排名」取得 Top10；管理員再指定「3034 幫我生成週精選文字」，
+操作流程：管理員可直接指定任意股票，例如「3034 幫我生成週精選文字」，不必先查排名；
 人工修改確認後輸入「這版確認，生成圖片」。排名階段 0 次 Gemini，AI 只負責文字解讀與改寫。
 """
 
@@ -56,6 +56,15 @@ class WeeklyPickConfig:
     surge_5d_pct: float = tools._env_float("WEEKLY_PICK_SURGE_5D_PCT", 15.0)
     overhead_zone_pct: float = tools._env_float("WEEKLY_PICK_OVERHEAD_ZONE_PCT", 5.0)
     support_zone_pct: float = tools._env_float("WEEKLY_PICK_SUPPORT_ZONE_PCT", 8.0)
+    # 10-08 支撐修正（比較版本，確認前預設關）：近價大量區算支撐；整群最高／最低差 ≤ support_merge_pct 合併（0＝不合併）
+    near_zone_support: bool = os.getenv("WEEKLY_PICK_NEAR_ZONE_SUPPORT", "0").strip().lower() in ("1", "true", "yes", "on")
+    support_merge_pct: float = tools._env_float("WEEKLY_PICK_SUPPORT_MERGE_PCT", 0.0)
+    # B 組：MA5 在現價下方且「跌停也續揚」才算支撐
+    ma5_limit_support: bool = os.getenv("WEEKLY_PICK_MA5_LIMIT_SUPPORT", "0").strip().lower() in ("1", "true", "yes", "on")
+    # 支撐距離改成和圖卡相同：(現價−支撐)÷現價（原本 現價÷支撐−1）
+    support_card_distance: bool = os.getenv("WEEKLY_PICK_SUPPORT_CARD_DISTANCE", "0").strip().lower() in ("1", "true", "yes", "on")
+    # 均線方向改看逐日模擬 path（未來只有走平＝新中間級距；原本跳過走平、用今天容差）
+    deduction_path_score: bool = os.getenv("WEEKLY_PICK_DEDUCTION_PATH_SCORE", "0").strip().lower() in ("1", "true", "yes", "on")
     high_confidence_win_rate: float = tools._env_float("WEEKLY_PICK_HIGH_CONFIDENCE_WIN_RATE", 65.0)
     high_confidence_sample: int = tools._env_int("WEEKLY_PICK_HIGH_CONFIDENCE_SAMPLE", 30)
     unresolved_high_ratio: float = tools._env_float("WEEKLY_PICK_UNRESOLVED_HIGH_RATIO", 0.30)
@@ -410,6 +419,23 @@ PATTERN_COMPONENTS = (("均線趨勢", 30), ("價格位置", 20), ("量區結構
 PATTERN_COMPONENT_WEIGHTS = {"均線趨勢": 25, "價格位置": 15, "量區結構": 25, "下方支撐": 25, "布林": 10}
 
 
+_RULE_FIELDS = ("near_ma20_pct", "extended_ma20_pct", "surge_5d_pct", "overhead_zone_pct", "support_zone_pct",
+                "near_zone_support", "support_merge_pct", "ma5_limit_support", "support_card_distance", "deduction_path_score")
+
+
+def pattern_rule_version(config: Optional["WeeklyPickConfig"] = None) -> str:
+    """型態評分規則版本：新規則開關全關＝舊規則（空字串，相容既有分數）；否則依所有評分設定雜湊。"""
+    import hashlib
+    c = config or WeeklyPickConfig()
+    legacy = dict(near_ma20_pct=5.0, extended_ma20_pct=12.0, surge_5d_pct=15.0,
+                  overhead_zone_pct=5.0, support_zone_pct=8.0, near_zone_support=False,
+                  support_merge_pct=0.0, ma5_limit_support=False, support_card_distance=False, deduction_path_score=False)
+    if all(getattr(c, k) == v for k, v in legacy.items()):
+        return ""
+    raw = "pattern-v2|" + "|".join(f"{k}={getattr(c, k)}" for k in _RULE_FIELDS)
+    return "p2-" + hashlib.md5(raw.encode("utf-8")).hexdigest()[:8]
+
+
 def weekly_technical_score(pattern_score_100: Any) -> float:
     """把唯一的 100 分型態評分等比例換算成週精選技術面 50 分。
 
@@ -423,24 +449,87 @@ def weekly_technical_score(pattern_score_100: Any) -> float:
     return round(value * PATTERN_WEIGHT / 100.0, 2)
 
 
-def _direction_points(d: Dict[str, Any], full: float) -> Tuple[float, str]:
-    """均線方向＋扣抵推算：上揚且扣抵後不轉彎＝滿分；上揚但將轉下彎＝一半以下；下彎＝0。"""
+def _direction_points(d: Dict[str, Any], full: float, config: Optional["WeeklyPickConfig"] = None) -> Tuple[float, str]:
+    """均線方向＋扣抵推算：上揚且扣抵後不轉彎＝滿分；上揚但將轉下彎＝一半以下；下彎＝0。
+    文字用 turn_text（明天的確切條件）；deduction_path_score 開啟時改看逐日模擬 path（只有走平＝中間級距）。"""
     now, turn, day = d.get("direction_now"), d.get("turn"), d.get("turn_day")
+    when = str(d.get("turn_text") or f"收盤不變{tools.turn_phrase(turn, day)}")
+    path = d.get("path") if config is not None and config.deduction_path_score else None
     if not now:
         return full / 2, "資料不足，給一半"
+    if path is not None:
+        down, up, flat = "下彎" in path, "上揚" in path, "走平" in path
+        if now == "上揚":
+            if down:
+                return round(full * 0.4, 1), f"上揚，但扣抵價偏高，{when}"
+            if flat:
+                return round(full * 0.7, 1), f"上揚，但扣抵後可能走平，{when}"
+            return full, "上揚，扣抵後仍續揚"
+        if now == "下彎":
+            if up:
+                return round(full * 0.5, 1), f"下彎，但扣抵價偏低，{when}"
+            return 0.0, "下彎" + ("，且在股價上方形成壓力" if d.get("ma_above_close") else "")
+        if up and not down:
+            return round(full * 0.7, 1), f"走平，{when}"
+        if down:
+            return round(full * 0.2, 1), f"走平，{when}"
+        return full / 2, "走平"
     if now == "上揚":
         if turn == "轉下彎":
-            return round(full * 0.4, 1), f"上揚，但扣抵價偏高，收盤不變{tools.turn_phrase(turn, day)}"
+            return round(full * 0.4, 1), f"上揚，但扣抵價偏高，{when}"
         return full, "上揚，扣抵後仍續揚"
     if now == "下彎":
         if turn == "轉上揚":
-            return round(full * 0.5, 1), f"下彎，但扣抵價偏低，收盤不變{tools.turn_phrase(turn, day)}"
+            return round(full * 0.5, 1), f"下彎，但扣抵價偏低，{when}"
         return 0.0, "下彎" + ("，且在股價上方形成壓力" if d.get("ma_above_close") else "")
     if turn == "轉上揚":
-        return round(full * 0.7, 1), f"走平，收盤不變{tools.turn_phrase(turn, day)}"
+        return round(full * 0.7, 1), f"走平，{when}"
     if turn == "轉下彎":
-        return round(full * 0.2, 1), f"走平，收盤不變{tools.turn_phrase(turn, day)}"
+        return round(full * 0.2, 1), f"走平，{when}"
     return full / 2, "走平"
+
+
+def _support_levels(close: Optional[float], values: Dict[str, Optional[float]], deduction: Dict[str, Any],
+                    vp: Dict[str, Any], config: WeeklyPickConfig) -> List[Tuple[float, str]]:
+    """現價下方的支撐 [(距離%, 名稱)]：MA10／20／60、兩大量區、近價大量區（MA5 只在 B 組條件下）。
+
+    彼此相近的支撐合併成一道：由近到遠分群，整群最高／最低差 ≤ support_merge_pct（不會 100→100.9→101.8 一路串），
+    先依價位排序，結果不受輸入順序影響。
+    """
+    if not close:
+        return []
+    raw: List[Tuple[float, str]] = []   # (支撐價位, 名稱)；股價在量區內時價位＝現價
+    keys = (("MA5",) if config.ma5_limit_support else ()) + ("MA10", "MA20", "MA60")
+    for label in keys:
+        level = values.get(label)
+        if not level or level > close:
+            continue
+        strong = (deduction.get(label) or {}).get("limit_proof") == "跌停也續揚"
+        if label == "MA5" and not strong:
+            continue       # MA5 只有跌停也續揚才算（扣抵條件強不等於價格守得住，所以另要在現價下方）
+        raw.append((level, f"{label}（扣抵條件強）" if strong else label))
+    zones = [vp.get("maximum_volume_zone") or {}, vp.get("second_volume_zone") or {}]
+    if config.near_zone_support:
+        zones += list(vp.get("near_volume_zones") or [])
+    for zone in zones:
+        low, high = _f(zone.get("price_low")), _f(zone.get("price_high"))
+        if low is None or high is None:
+            continue
+        name = zone.get("label") or "大量區"
+        if high <= close:
+            raw.append((high, f"{name}上緣"))
+        elif low <= close:
+            raw.append((close, f"{name}（股價在區內）"))
+    raw.sort(key=lambda r: (-r[0], r[1]))
+    groups: List[List[Tuple[float, str]]] = []
+    for level, label in raw:
+        top = groups[-1][0][0] if groups else None
+        if top is not None and config.support_merge_pct > 0 and (top / level - 1) * 100 <= config.support_merge_pct:
+            groups[-1].append((level, label))
+        else:
+            groups.append([(level, label)])
+    dist = (lambda lv: (1 - lv / close) * 100) if config.support_card_distance else (lambda lv: (close / lv - 1) * 100)
+    return [(dist(g[0][0]), "＋".join(lb for _, lb in g)) for g in groups]
 
 
 def score_pattern(tech: Dict[str, Any], vp: Dict[str, Any], extras: Dict[str, Any], config: WeeklyPickConfig) -> Dict[str, Any]:
@@ -473,7 +562,7 @@ def score_pattern(tech: Dict[str, Any], vp: Dict[str, Any], extras: Dict[str, An
         add("均線趨勢", "均線排列", 4, 12, "均線糾結")
     deduction = tech.get("ma_deduction") or {}
     for key, full in (("MA20", 10), ("MA60", 8)):
-        points, note = _direction_points(deduction.get(key) or {}, full)
+        points, note = _direction_points(deduction.get(key) or {}, full, config)
         add("均線趨勢", f"{key} 方向", points, full, f"{key} {note}")
 
     # ---------- 價格位置 20：距 MA20 12＋站上 MA60 4＋追高風險 4 ----------
@@ -565,20 +654,7 @@ def score_pattern(tech: Dict[str, Any], vp: Dict[str, Any], extras: Dict[str, An
         add("量區結構", "上方量區壓力", 4, 6, f"上方{overhead[1]} {overhead[2]:g} 距離 {overhead[0]:.1f}%")
 
     # ---------- 下方支撐 15：最近支撐距離 11＋8% 內支撐數 4 ----------
-    supports = []
-    if close:
-        for label, level in (("MA10", values["MA10"]), ("MA20", values["MA20"]), ("MA60", values["MA60"])):
-            if level and level <= close:
-                supports.append(((close / level - 1) * 100, label))
-        for key in ("maximum_volume_zone", "second_volume_zone"):
-            zone = vp.get(key) or {}
-            low, high = _f(zone.get("price_low")), _f(zone.get("price_high"))
-            if low is None or high is None:
-                continue
-            if high <= close:
-                supports.append(((close / high - 1) * 100, f"{zone.get('label') or '大量區'}上緣"))
-            elif low <= close:
-                supports.append((0.0, f"{zone.get('label') or '大量區'}（股價在區內）"))
+    supports = _support_levels(close, values, deduction, vp, config)
     if supports:
         gap, label = min(supports)
         points = 11 if gap <= 3 else 9 if gap <= 5 else 6 if gap <= config.support_zone_pct else 3 if gap <= 12 else 1
@@ -671,11 +747,17 @@ def build_pattern_scorecard(
     pattern = score_pattern(tech, vp, extras, config)
     try:
         import local_market_cache
+        if not tech.get("input_fp") or not tech.get("source_fp"):
+            raise ValueError("計分來源指紋不足，不寫正式排行")
+        if not str(tech.get("signal_status") or "").startswith("收盤確認"):
+            raise ValueError("盤中／盤後暫定分數不進正式排行")   # 10-08
+        if pattern_rule_version(config) != local_market_cache.PATTERN_RULE:
+            raise ValueError("自訂評分設定不寫正式分數（同股同日會覆寫正式規則的分數）")   # 10-08
         local_market_cache.save_pattern_score(
             str(tech.get("stock_code") or vp.get("stock_code") or ""),
             str(tech.get("data_date") or vp.get("data_date") or ""),
             pattern["score"], pattern_grade(pattern["score"]), pattern.get("components"),
-            str(tech.get("signal_status") or ""),
+            tools.score_basis(tech), rule=pattern_rule_version(config),
         )
     except Exception:
         pass
@@ -852,12 +934,13 @@ class WeeklyPickEngine:
 
         behavior: Dict[str, Any] = {"found": False}
         try:
-            behavior = tools.get_branch_recent_behavior(
-                lead["branch"], code,
-                lookback_days=config.recent_behavior_days,
-                recent_case_count=config.recent_case_count,
-                include_live_flow=config.live_flow_enable,
-            )
+            if lead.get("branch"):
+                behavior = tools.get_branch_recent_behavior(
+                    lead["branch"], code,
+                    lookback_days=config.recent_behavior_days,
+                    recent_case_count=config.recent_case_count,
+                    include_live_flow=config.live_flow_enable,
+                )
         except Exception as exc:  # 近期行為失敗只影響 B 分數
             behavior = {"found": False, "reason": f"{type(exc).__name__}: {exc}"}
             flags.add("recent_behavior_unavailable")
@@ -1042,7 +1125,7 @@ def _perf_brief(m: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def candidate_payload(stock: Dict[str, Any]) -> Dict[str, Any]:
-    """TOP5 單檔交給 Gemini 的精簡 JSON。"""
+    """單檔週精選交給 Gemini 的精簡 JSON；指定股可以沒有排名或權證資料。"""
     lead = stock["lead"]
     behavior = stock.get("behavior") or {}
     same = behavior.get("same_stock") or {}
@@ -1051,7 +1134,7 @@ def candidate_payload(stock: Dict[str, Any]) -> Dict[str, Any]:
     tech = stock.get("technical") or {}
     vp = stock.get("volume_profile") or {}
     mas = tech.get("moving_averages") or {}
-    return {
+    payload = {
         "rank": stock["rank"],
         "stock_code": stock["stock_code"],
         "stock_name": stock.get("stock_name", ""),
@@ -1164,6 +1247,22 @@ def candidate_payload(stock: Dict[str, Any]) -> Dict[str, Any]:
         "pattern_reasons": (stock.get("score_reasons") or {}).get("pattern"),
         "quality_notes": [_FLAG_TEXT.get(f, f) for f in stock["quality_flags"]],
     }
+
+    if stock.get("draft_source") == "direct_stock":
+        payload["selection_source"] = "管理員指定股票，未參與本週排名"
+        payload["data_notes"] = stock.get("draft_data_notes") or []
+        if not stock.get("pairs"):
+            # 沒取得權證資料不是零持倉，也不能把空白分點的0分當作股票排名。
+            payload["branch"] = None
+            payload["other_high_quality_branches"] = []
+            payload["warrant"] = None
+            payload["recent_behavior"] = None
+            payload["score"] = None
+            payload["score_summary"]["warrant_score_50"] = None
+            payload["score_breakdown"] = {"pattern_score": stock.get("technical_score_50")}
+            payload["quality_notes"] = [_FLAG_TEXT.get(f, f) for f in stock["quality_flags"]
+                if f not in ("low_sample", "below_event_win_rate_threshold", "recent_flow_unavailable")]
+    return payload
 
 
 WEEKLY_PICK_SYSTEM_PROMPT = """你是我的私人台股研究助理。
@@ -1386,7 +1485,7 @@ SCORE_PARTS = (
 def mark_branches(stock: Dict[str, Any]) -> List[str]:
     """候選股可用的權證分點清單；正式週精選圖片仍會再依最終文章內容過濾。"""
     names = [stock["lead"]["branch"]] + [p["branch"] for p in stock.get("pairs") or []]
-    return list(dict.fromkeys(names))[:4]
+    return list(dict.fromkeys(name for name in names if name))[:4]
 
 
 def mentioned_branches(draft: str, stock: Dict[str, Any]) -> List[str]:
@@ -1753,7 +1852,7 @@ WEEKLY_DRAFT_SYSTEM_PROMPT = """你是「權證分點觀察｜週精選」文字
    - 股價接近大量區、剛突破/回踩大量區時，大量區應成為文章重點並寫出相關價位。
    - 均線排列、扣抵、布林、量能若沒有特別訊號，不必每篇都寫。
    - 若某一項才是這檔最重要的技術特徵，可以多寫一點，不必維持固定順序。
-5. 權證分點也是依重要性選材。文章提到幾個分點，就可以分別寫各自的事件勝率、樣本、平均持有天數、加權報酬或目前部位，但只挑對這篇有意義的數據，不需要每個欄位全部列出。
+5. 指定股票不必在Top10內；rank為空不代表表現差，也不得聲稱有排名。權證資料為空時省略該段，不得推論零持倉；data_notes的不足須如實處理。權證分點也是依重要性選材。文章提到幾個分點，就可以分別寫各自的事件勝率、樣本、平均持有天數、加權報酬或目前部位，但只挑對這篇有意義的數據，不需要每個欄位全部列出。
 6. 若有精確複合事件統計（例如 A+C），優先使用該組合。若只有單事件資料可參考，直接用自然文字說明是哪幾個事件的歷史表現，不要寫「依單一事件資料綜合觀察」這種系統語句，也不能假裝有不存在的複合事件統計。
 7. 總勝率只作背景；若本次事件勝率更有代表性，就以本次事件為主。
 8. 精選五分點只代表標記，不代表比較高分，不要寫成因為是精選分點所以更好。
@@ -1830,23 +1929,71 @@ def build_weekly_draft_prompt(candidate: Dict[str, Any], instruction: str = "", 
 
 
 def find_weekly_candidate(stock_code: str, log: Callable[[str], None] = print, config: Optional[WeeklyPickConfig] = None) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
-    """依目前 Top10 規則找指定股票；只允許對當期排名候選生成正式週精選草稿。
-
-    排名很貴（近百檔完整評分），所以先吃當期快取；快取沒有才重算。
-    """
+    """指定股不受Top10／排名資格限制；有現成排名資料就沿用，否則只取該檔資料。"""
     config = config or WeeklyPickConfig()
-    filters = WeeklyPickFilters()
-    cache_key = rank_cache_key(config, filters)
-    cached = _load_cache(config, cache_key)
-    result = (cached or {}).get("result") if isinstance(cached, dict) else None
-    if not isinstance(result, dict) or not result.get("top"):
-        result = WeeklyPickEngine(config, log).run(filters)
-        _save_cache(config, cache_key, {"result": result, "ai_ok": True})
-    else:
-        log("週精選草稿：沿用當期排名快取，未重新計算")
     code = tools.core()._normalize_stock_name_code_key(stock_code)
-    stock = next((s for s in result.get("top") or [] if s.get("stock_code") == code), None)
-    return stock, result
+    cached = _load_cache(config, rank_cache_key(config, WeeklyPickFilters()))
+    ranking = (cached or {}).get("result") if isinstance(cached, dict) else None
+    if isinstance(ranking, dict):
+        stock = next((s for s in ranking.get("top") or [] if s.get("stock_code") == code), None)
+        if stock:
+            log("週精選草稿：沿用當期排名快取，未重新計算")
+            return stock, ranking
+
+    # 不跑全市場排名，不套排名的排除股票、勝率／樣本或Top N門檻。
+    engine = WeeklyPickEngine(config, log)
+    columns = ["branch", "stock_code", "event_date", "event_code", "buy_amount", "status"]
+    window = pd.DataFrame(columns=columns)
+    notes, metadata = [], {"source": "direct_stock", "stock_code": code}
+    perf = {"branches": {}}
+    try:
+        bundle = tools.load_abcde_event_rows()
+        events, latest = bundle["events"], bundle.get("latest_event_date")
+        if latest is not None and not events.empty:
+            start, end = tools._recent_event_dates(latest, config.event_window_trading_days, events)
+            metadata.update(window_start=tools._fmt_date(start), window_end=tools._fmt_date(end))
+            window = events[(events["stock_code"].astype(str) == code)
+                & (events["event_date"] >= start) & (events["event_date"] <= end)
+                & (events["buy_amount"].fillna(0) > 0)].copy()
+        if bundle.get("errors"):
+            notes.append("部分權證事件來源未完整取得；以下僅使用已取得資料。")
+    except tools.ToolDataError as exc:
+        notes.append("權證事件資料暫時無法取得，本次不推論權證部位。")
+        log(f"週精選指定股 {code}：權證資料略過｜{type(exc).__name__}: {exc}")
+    if not window.empty:
+        try:
+            perf = tools.read_branch_event_performance()
+        except tools.ToolDataError as exc:
+            notes.append("權證歷史績效暫時無法取得；不補寫勝率。")
+            log(f"週精選指定股 {code}：歷史績效略過｜{type(exc).__name__}: {exc}")
+    pairs = []
+    for branch, rows in window.groupby("branch"):
+        pair = evaluate_pair(branch, code, rows, perf, config, config.min_event_win_rate)
+        if not pair.get("active_pair"):
+            continue
+        pair["event_score"], pair["event_score_reasons"] = score_event_performance(pair, config, config.min_event_win_rate)
+        pairs.append(pair)
+    pairs.sort(key=lambda p: (p["event_score"], p["event_buy_amount"]), reverse=True)
+    if pairs:
+        lead = pairs[0]
+    else:
+        lead = evaluate_pair("", code, pd.DataFrame(columns=columns), {"branches": {}}, config, config.min_event_win_rate)
+        lead["event_score"], lead["event_score_reasons"] = 0.0, ["未取得有效權證事件資料"]
+        notes.append("本次事件視窗未取得有效未出清權證事件；可撰寫技術面，不代表沒有任何權證持倉。")
+    high_quality = [p for p in pairs if p["primary"] and (p["matched_included_count"] or 0) >= config.min_event_sample]
+    stock = {"stock_code": code, "rank": None, "draft_source": "direct_stock", "draft_data_notes": notes,
+        "pairs": pairs, "lead": lead, "high_quality_pairs": high_quality,
+        "event_buy_amount_total": float(sum(p["event_buy_amount"] for p in pairs)),
+        "active_branch_count": len(pairs), "high_quality_amount": float(sum(p["event_buy_amount"] for p in high_quality)),
+        "high_quality_branch_count": len(high_quality),
+        "max_high_quality_single": max((p["event_buy_amount"] for p in high_quality), default=0.0),
+        "has_primary": any(p["primary"] for p in pairs)}
+    stock = engine.enrich_and_score(stock, config.min_event_win_rate)
+    if not stock.get("technical") and not stock.get("pairs"):
+        metadata["reason"] = f"{code} 的行情及權證資料目前無法取得，請確認股票代號或稍後重試。"
+        return None, metadata
+    log(f"週精選草稿：直接取得 {code} 資料，未執行排名、未寫入排名快取")
+    return stock, metadata
 
 
 def weekly_article_parts(draft: str, stock_code: str, stock_name: str = "") -> Dict[str, Any]:
@@ -2199,7 +2346,7 @@ def generate_weekly_draft(
     if not stock:
         return {
             "ok": False,
-            "reason": f"{stock_code} 目前不在本週 Top10 候選內；請先查看本週精選排名，再選擇候選股。",
+            "reason": ranking.get("reason") or f"{stock_code} 的資料目前無法取得，請確認代號或稍後重試。",
             "ranking": ranking,
         }
     prompt, facts = build_weekly_draft_prompt(stock, instruction=instruction, previous_draft=previous_draft, admin_notes=[])
@@ -2369,3 +2516,10 @@ def extract_admin_moneydj_branch(text: str) -> str:
 
 def is_weekly_admin_feature_question(text: str) -> bool:
     return is_weekly_pick_question(text) or is_weekly_draft_question(text) or is_weekly_image_question(text) or is_admin_moneydj_image_question(text)
+
+
+try:   # 10-08：分數存讀都帶規則版本（正式版新規則全關＝空字串＝舊分數照用）
+    import local_market_cache as _lmc
+    _lmc.PATTERN_RULE = pattern_rule_version()
+except Exception:
+    pass
