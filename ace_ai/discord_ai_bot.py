@@ -2722,6 +2722,7 @@ MEMBER_PATTERN_RULES = """會員型態圖：chart_context.stocks 是圖上實際
 三角不需使用者點名，依triangle_structure的正式／候選與事件解讀；候選線外不等於正式突破，0.15ATR越線不等於突破已確認。歷史事件與目前型態分開，回到線內、反向、接近尖端與過交會点要照實說明。
 圖上上緣／下緣都是當日參考價，不說是明天確定價位。圖線visible=false時明說無法核對，不引用該線作防守；已突破的原線不是自動有效支撐，必須回測與結構證據支持。
 圖線visible=false時，禁止判斷目前位於三角內／外或使用上下緣價位；triangle_history僅為歷史紀錄，不能證明今日位置。改以圖上可核對的均線、量區與價格解讀。
+均線位置依last_bar的收盤與MA5/MA10/MA20/MA60數值及ma_positions逐項核對；不把站上MA60寫成低於全部均線，不把短期空頭排列說成四條均線完整空頭排列。圖上的上下緣是本次主要整理，不用局部支撐失守推論整個三角跌破。
 目前價格位置以chart_context中的current_position與last_bar為準；triangle_structure舊位置只作辨識紀錄，不把候選在線外或盤中越線寫成正式突破事件。
 why用約180～260字解釋型態是否成立、目前位置、關鍵風險。scenarios最多2個，寫具體條件：若收盤有效越線及延續／回測守住會代表什麼，若收回型態內或跌破觀察位置如何重新評估。用條件式觀察，不替用戶下買賣指令、不保證獲利、不設定個人停損比例。沒有量能數據不捏造放量。
 不要重複報所有均線／價位；summary留空。"""
@@ -3080,6 +3081,14 @@ class FactSheet:
                 if not math.isfinite(value) or value <= 0:
                     continue
                 self.ma_values.setdefault(code, {})[key] = [value]
+                # Do not trust a missing/stale tool position or the supplied
+                # ma_positions label: recompute using the actual drawn close.
+                try:
+                    close = float(bar["Close"])
+                except (KeyError, TypeError, ValueError):
+                    close = float("nan")
+                if math.isfinite(close) and close > 0:
+                    self.closed_pos.setdefault(code, {})[key] = "站上" if close > value else "跌破" if close < value else "持平"
                 numbers = _variants_of(str(value))
                 self.market.update(numbers)
                 self.stock_numbers.setdefault(code, set()).update(numbers)
@@ -3135,6 +3144,34 @@ class FactSheet:
             for number, side in re.findall(r"(\d+(?:\.\d+)?)\s*(?:元\s*的?|的)(?:三角(?:收斂)?(?:候選)?|候選)?(上緣|下緣)", clause):
                 if number not in lines.get(side, set()):
                     issues.append(f"三角{side}價位不符")
+        # Current position and confirmation must come from this drawn pair.
+        # Hypothetical conditions and explicitly separate historical groups
+        # remain allowed; they cannot prove the current triangle is confirmed.
+        if lines and triangle_talk:
+            present = _CONDITIONAL_RE.split(sentence)[0]
+            for clause in re.split(r"[，,。；;\n]", present):
+                if re.search(other_boundary, clause) or re.search(r"歷史|先前|前一組", clause):
+                    continue
+                position = view.get("current_position")
+                claims = ((r"(?:位於|處於|仍在|仍位於|回到)(?:目前)?(?:三角(?:收斂)?(?:候選)?(?:型態)?|型態|候選線|線)內", "inside"),
+                          (r"(?:收盤|股價)?(?:已|目前)?(?:高於|站上|越過)(?:三角(?:收斂)?(?:候選)?|候選)?上緣", "above"),
+                          (r"(?:收盤|股價)?(?:已|目前)?(?:低於|跌破)(?:三角(?:收斂)?(?:候選)?|候選)?下緣", "below"))
+                for pattern, claimed in claims:
+                    for match in re.finditer(pattern, clause):
+                        if not re.search(r"未|尚未|不代表|不能|沒有|並非|不宜", clause[:match.start()]):
+                            if position and position != claimed:
+                                issues.append("目前三角位置與圖上收盤不符")
+                if "first_break" in view and re.search(r"(?:已確認|確認(?:向[上下])?(?:突破|跌破)|突破(?:已)?確認|突破成功)", clause):
+                    if not re.search(r"未|尚未|不代表|不能|沒有|並非", clause):
+                        breaks = [h for h in view.get("history") or [] if h.get("type") in ("break_up", "break_down")]
+                        event = breaks[-1] if breaks else view.get("first_break") or {}
+                        if view.get("candidate") or event.get("confirm") != "確認":
+                            issues.append("三角越線尚未通過兩日確認")
+                if "first_break" in view and re.search(r"(?:正式|已經|已)(?:向[上下])?(?:突破|跌破)", clause):
+                    if not re.search(r"未|尚未|不代表|不能|沒有|並非", clause):
+                        breaks = [h for h in view.get("history") or [] if h.get("type") in ("break_up", "break_down")]
+                        if not breaks and not view.get("first_break"):
+                            issues.append("目前三角沒有可核對的越線事件")
         if not view.get("candidate"):
             return issues
         claim = re.compile(r"(?:正式|確認|成功|有效|已經|已)(?:向[上下])?(?:突破|跌破)|"
@@ -3220,6 +3257,28 @@ class FactSheet:
             issues += self._alignment_issues(sentence, subject)
             issues += self._pattern_issues(sentence, subject)
             issues += self._triangle_issues(sentence, subject)
+        elif len(codes) > 1:
+            # A compound sentence must not bypass directional checks simply
+            # because it names two stocks. Keep explicit cross-stock value
+            # comparisons separate from collective "both above/below" claims.
+            carry = current
+            for clause in re.split(r"[，,；;]", sentence):
+                owners = self.mentioned(clause)
+                if len(owners) == 1:
+                    carry = owners[0]
+                    targets = owners
+                elif not owners and carry:
+                    targets = [carry]
+                elif len(owners) > 1 and re.search(r"都|皆|全數|兩檔|两檔|兩支", clause):
+                    targets = owners
+                    carry = ""
+                else:
+                    targets = []
+                    carry = ""
+                for target in targets:
+                    issues += self._direction_issues(clause, target)
+                    issues += self._alignment_issues(clause, target)
+                    issues += self._triangle_issues(clause, target)
         return issues
 
     def _pattern_issues(self, sentence: str, code: str) -> List[str]:
@@ -3347,7 +3406,7 @@ class FactSheet:
                 intraday_ok = bool(live) and bool(_INTRADAY_WORD_RE.search(sentence))
                 for key in keys:
                     actual = closed.get(key)
-                    if actual not in ("站上", "跌破") or actual == claimed:
+                    if actual not in ("站上", "跌破", "持平") or actual == claimed:
                         continue
                     if intraday_ok and live.get(key) == claimed:
                         continue

@@ -6,7 +6,7 @@ import re
 from urllib.parse import urlparse
 from datetime import date
 
-VERSION = "member_pattern_v6_formation_no_bollinger"
+VERSION = "member_pattern_v8_balanced_chart_facts"
 
 def date_key(value):
     """Calendar date key; retain display format and never change trading indices."""
@@ -79,6 +79,7 @@ def geometry(result, source_frame=None, events=None):
             "candidate_reasons": tri.get("candidate_reasons") or [],
             "current_position": tri.get("current_position"), "near_tip": bool(tri.get("near_tip")),
             "state": tri.get("state", ""), "first_break": deepcopy(tri.get("first_break")),
+            "history": deepcopy(tri.get("history") or []),
             "formation_date": rows[max(0, int(tri.get("joint_start", tri["start"])))]["date"],
             "data_date": last["date"], "upper": last["upper"], "lower": last["lower"],
             "rows": rows, "basis_valid": basis_valid,
@@ -222,6 +223,19 @@ def chart_context(panels, compound=False):
                  "stock_name": p.get("stock_name", ""), "show_bollinger": not p.get("hide_bollinger", False)}
         if not stock["show_bollinger"]:
             stock["last_bar"] = {k: v for k, v in stock["last_bar"].items() if not k.startswith("BB_")}
+        bar = stock["last_bar"]
+        stock["ma_positions"] = {}
+        try:
+            close = float(bar["Close"])
+        except (KeyError, TypeError, ValueError):
+            close = float("nan")
+        for key in ("MA5", "MA10", "MA20", "MA60"):
+            try:
+                ma = float(bar[key])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if math.isfinite(close) and math.isfinite(ma) and close > 0 and ma > 0:
+                stock["ma_positions"][key] = "站上" if close > ma else "跌破" if close < ma else "持平"
         view = p.get("member_triangle")
         if view:
             stock["triangle"] = ({k: deepcopy(v) for k, v in view.items() if k not in ("rows", "detector_position", "diagnostic")}
