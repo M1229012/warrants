@@ -1210,12 +1210,13 @@ def draw_marks(draw, panel: dict, px, py, step: float, price_top: float, price_b
 # K 線卡片
 # ============================================================
 
-def draw_value_tiles(draw, x: float, y: float, width: float, last: dict) -> None:
+def draw_value_tiles(draw, x: float, y: float, width: float, last: dict, show_bollinger: bool = True) -> None:
     """均線 4 格＋布林上下軌 2 格數值卡：色線圖例、數值、收盤相對位置（站上／跌破、高於／低於）。"""
-    tiles = ([(k, 'MA20／中軌' if k == 'MA20' else k, c, False) for k, c in MA_COLORS.items()]
-             + [(k, BAND_LABELS[k], BAND_COLORS[k], True) for k in TILE_BANDS])
+    tiles = ([(k, 'MA20／中軌' if k == 'MA20' and show_bollinger else k, c, False) for k, c in MA_COLORS.items()]
+             + ([(k, BAND_LABELS[k], BAND_COLORS[k], True) for k in TILE_BANDS] if show_bollinger else []))
     gap, group_gap = 10, 28
-    w = (width - group_gap - gap * (len(tiles) - 2)) / len(tiles)
+    group_extra = group_gap - gap if show_bollinger else 0
+    w = (width - gap * (len(tiles) - 1) - group_extra) / len(tiles)
     close = _finite(last.get('Close'))
     tx = x
     for i, (key, label, color, dashed) in enumerate(tiles):
@@ -1321,7 +1322,8 @@ def draw_chart(draw, y: int, panel: dict) -> None:
         chip_w = font(22, True).getlength(chip) + 28
         draw.rounded_rectangle((chip_x, y + 80, chip_x + chip_w, y + 116), radius=18, fill=UP_BG if change >= 0 else DOWN_BG)
         draw.text((chip_x + chip_w / 2, y + 98), chip, font=font(22, True), fill=color, anchor='mm')
-    draw_value_tiles(draw, x0 + 32, y + 136, CONTENT - 64, last)
+    show_bollinger = not panel.get("hide_bollinger", False)
+    draw_value_tiles(draw, x0 + 32, y + 136, CONTENT - 64, last, show_bollinger)
     if panel.get('member_triangle'):
         import member_pattern
         label = member_pattern.chart_label(panel['member_triangle'])
@@ -1378,7 +1380,7 @@ def draw_chart(draw, y: int, panel: dict) -> None:
             draw.line(segment, fill=line_color, width=2)
     # Dashed upper/lower bands (the middle band is the MA20 line) use report-supplied values.
     # A missing rolling value breaks the line instead of joining across a gap.
-    for key in TILE_BANDS:
+    for key in (TILE_BANDS if show_bollinger else ()):
         band_color = BAND_COLORS[key]
         for i in range(1, len(bars)):
             a, b = bars[i-1].get(key), bars[i].get(key)
@@ -1412,9 +1414,11 @@ def draw_chart(draw, y: int, panel: dict) -> None:
     # 成交量標題列：今日量＋均量線圖例（單位張，Volume 為股數）。
     if not panel.get('clean_display'):
         legend = '價量分布｜紅：最大量區  /  橘：第二大量區  /  藍：其他價位' if profile_rectangles else '價量分布暫無有效資料'
-        text_at(draw, (left, bottom + 40), legend + '  /  虛線：布林軌道', 17, MUTED)
+        text_at(draw, (left, bottom + 40), legend + ('  /  虛線：布林軌道' if show_bollinger else ''), 17, MUTED)
         basis = panel.get('price_basis_note', '')
-        state = ('還原股價｜' if '已依核實參考價還原' in basis else '') + '布林｜' + '；'.join((panel.get('bollinger') or {}).get('signals', ['資料不足'])[:3])
+        state = ('還原股價｜' if '已依核實參考價還原' in basis else '')
+        if show_bollinger:
+            state += '布林｜' + '；'.join((panel.get('bollinger') or {}).get('signals', ['資料不足'])[:3])
         state, state_size = fit(state, 20, CONTENT - 80, False, 16)
         text_at(draw, (left, bottom + 66), state, state_size, INK)
     bottom += 0 if panel.get("clean_display") else CAPTION_H

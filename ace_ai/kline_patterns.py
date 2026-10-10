@@ -796,7 +796,8 @@ def _tri_line(P, B, Q, C, A, s: float, k: float, i0: int, last: int, sg: int, re
     zone = lambda d: max(0.0, (line(d) - P[d]) * sg, (B[d] - line(d)) * sg) / A[d]   # 線落在影線區間內＝0
     err = float(np.mean([min(zone(d) for d in ev["days"]) for ev in events]))
     return {"s": float(s), "k": float(k), "i0": int(i0), "a": [ev["rep"] for ev in events], "events": events,
-            "major": len(touched) - len(pierced), "mtouch": len(touched), "borrowed": borrowed, "reacted": reacted, "fakes": fakes,
+            "major": len(touched) - len(pierced), "mtouch": len(touched), "borrowed": borrowed,
+            "actual_major_days": sorted(m for m in mj if near(m)), "reacted": reacted, "fakes": fakes,
             "peaks": sum(1 for ev in events if turns.intersection(ev["days"])), "err": err,
             "turn_events": sum(1 for ev in events if (turns | set(mj)).intersection(ev["days"])),
             "density": len(contact), "score": reacted, "brk": None, "R_line": float(A[i0]), "pending": pending,
@@ -834,7 +835,7 @@ def _tri_lines(P, B, Q, C, A, lo: int, F: int, sg: int, majors: List[Tuple[int, 
             if r:
                 r.update(src=(x1, src1, x2, src2))
                 out.append(r)
-    out.sort(key=(lambda r: (-r["major"], -r["borrowed"], -len(r["a"]), -r["peaks"], -r["reacted"], r["err"], r["src"])) if TRI_SPLIT_BORROWED
+    out.sort(key=(lambda r: (-r["major"], -len(r["a"]), -r["peaks"], -r["reacted"], r["borrowed"], r["err"], r["src"])) if TRI_SPLIT_BORROWED
              else (lambda r: (-r["major"], -len(r["a"]), -r["peaks"], -r["reacted"], r["err"], r["src"])))
     uniq: List[Dict[str, Any]] = []
     for r in out:
@@ -846,10 +847,8 @@ def _tri_lines(P, B, Q, C, A, lo: int, F: int, sg: int, majors: List[Tuple[int, 
             uniq.append(r)
         if len(uniq) >= 30:
             break
-    # 分層：主要轉折與最高差 1 以內，層內碰線與最多者差 1 以內
-    layer = [x for x in uniq if x["major"] >= uniq[0]["major"] - 1] if uniq else []
-    top = max((len(x["a"]) for x in layer), default=0)
-    return [x for x in layer if len(x["a"]) >= top - 1]
+    # 保留原本最多 30 條去重線，交由上下線配對後評共同期間；不先按單側歷史次數淘汰。
+    return uniq
 
 
 def _tri_sequence(u, d) -> List[Tuple[int, str]]:
@@ -895,6 +894,40 @@ def _tri_height(H, L, O, C, A, u, d) -> Optional[Dict[str, Any]]:
             "contacts": [(int(t), x) for t, x in pick]}
 
 
+
+def _tri_joint_line(line, joint, F, P, B, Q, C, A, sg, majors):
+    """只評上下線共同期間內的接觸；共同期之前的反應、借用轉折不能充數。"""
+    events = []
+    for old in line["events"]:
+        days = [t for t in old["days"] if joint <= t <= F]
+        if not days:
+            continue
+        sep = old.get("sep")
+        if events and (sep is None or sep < joint):
+            events[-1]["days"].extend(days)
+            events[-1]["fake"] = events[-1]["fake"] or old.get("fake", False)
+        else:
+            events.append(dict(old, rep=days[0], days=days, sep=sep if sep is not None and sep >= joint else None, react=None))
+    contact = {t for ev in events for t in ev["days"]}
+    turns = set(_tri_turns(P, sg, joint, F))
+    mj = {m for m, cf in majors if joint <= m <= F and cf <= F}
+    actual = {m for m in mj if m in contact and
+              (P[m] - (line["s"] * m + line["k"])) * sg >= -TRI_TOUCH * A[m] and
+              (B[m] - (line["s"] * m + line["k"])) * sg <= TRI_TOUCH * A[m]}
+    for ev in events:
+        ev["fake"] = any((C[t] - (line["s"] * t + line["k"])) * sg > TRI_OUT * A[t] for t in ev["days"])
+        ev["react"] = next((t for t in range(ev["days"][-1] + 1, min(ev["days"][-1] + 6, F + 1))
+                            if (line["s"] * t + line["k"] - Q[t]) * sg >= TRI_REACT * A[t]), None)
+    zone = lambda t: max(0.0, ((line["s"] * t + line["k"]) - P[t]) * sg,
+                          (B[t] - (line["s"] * t + line["k"])) * sg) / A[t]
+    return dict(line, a=[ev["rep"] for ev in events], events=events,
+                major=len(actual), mtouch=len(actual), actual_major_days=sorted(actual),
+                reacted=sum(ev["react"] is not None for ev in events),
+                peaks=sum(bool(turns.intersection(ev["days"])) for ev in events),
+                turn_events=sum(bool((turns | mj).intersection(ev["days"])) for ev in events),
+                fakes=sum(bool(ev.get("fake")) for ev in events), density=len(contact),
+                err=float(np.mean([min(zone(t) for t in ev["days"]) for ev in events])) if events else float("inf"))
+
 def _tri_form(H, L, O, C, A, lo: int, F: int, piv, confirm: bool = True, local: bool = False) -> Optional[Dict[str, Any]]:
     """形成截止日 F 的三角快照（只用 F 時已知資料）。confirm=False＝三角候選（未確認接觸也算）。
     local=True＝補充候選：主要轉折支持不足時，改要求每側 ≥2 個含已確認局部／主要轉折的接觸事件、且至少 1 個主要轉折。"""
@@ -909,15 +942,26 @@ def _tri_form(H, L, O, C, A, lo: int, F: int, piv, confirm: bool = True, local: 
     ups = _tri_lines(H, top, L, C, A, lo, F, 1, mh, confirm)
     dns = _tri_lines(L, bot, H, C, A, lo, F, -1, ml, confirm) if ups else []
     best = None
-    for u in ups:
-        for d in dns:
+    joint_cache = {}
+    def common(line, joint, side):
+        key = (id(line), joint, side)
+        if key not in joint_cache:
+            joint_cache[key] = _tri_joint_line(line, joint, F, H if side == 1 else L,
+                                              top if side == 1 else bot, L if side == 1 else H,
+                                              C, A, side, mh if side == 1 else ml)
+        return joint_cache[key]
+    for upper in ups:
+        check_budget()
+        for lower in dns:
+            joint = max(upper["i0"], lower["i0"])
+            u, d = common(upper, joint, 1), common(lower, joint, -1)
             support = (min(u["turn_events"], d["turn_events"]) >= 2 and min(u["mtouch"], d["mtouch"]) >= 1) if local \
                 else min(u["mtouch"], d["mtouch"]) >= 2
-            if not support or len(u["a"]) + len(d["a"]) < 5:
+            if not support or min(u["reacted"], d["reacted"]) < 1 or len(u["a"]) + len(d["a"]) < 5:
                 continue                          # 每側 2 個主要轉折、合計 5 次碰線事件
             start = min(u["a"][0], d["a"][0])     # formation_start：兩側有效首接觸較早者
             joint = max(u["i0"], d["i0"])         # joint_start：兩線都開始的共同幾何起點
-            if F - start < 15:
+            if F - joint < 15:
                 continue
             hgt = _tri_height(H, L, O, C, A, u, d)
             if hgt is None or hgt["H"] < TRI_MIN_HEIGHT * hgt["R"]:
@@ -930,7 +974,8 @@ def _tri_form(H, L, O, C, A, lo: int, F: int, piv, confirm: bool = True, local: 
                 continue
             n = len(u["a"]) + len(d["a"])
             key = (min(u["major"], d["major"]), u["major"] + d["major"], min(len(u["a"]), len(d["a"])), n,
-                   u["reacted"] + d["reacted"], -(u["fakes"] + d["fakes"]), -round(u["err"] + d["err"], 3),
+                   _tri_alternations(u, d), u["reacted"] + d["reacted"], -(u["fakes"] + d["fakes"]),
+                   -(u.get("borrowed", 0) + d.get("borrowed", 0)), -round(u["err"] + d["err"], 3),
                    tuple(-x if isinstance(x, int) else 0 for x in u["src"] + d["src"]))
             if best is None or key > best[0]:
                 best = (key, u, d, start, joint, w0, wF, hgt)
@@ -997,12 +1042,13 @@ def _tri_track(df, C, A, snap, end: int) -> Dict[str, Any]:
             "reversed": any(a["type"] != b["type"] for a, b in zip(breaks, breaks[1:]))}
 
 
-TRI_STATE_VERSION = "tri-v10-primary"   # 第一輪：追蹤中的正式紀錄優先；同段替代線不得新增突破
+TRI_STATE_VERSION = "tri-v11-formation-joint"   # 第二輪：正式未突破快照固定、共同期間實際支持
 TRI_INIT_REPLAY = int(_env("TRI_INIT_REPLAY", 20))   # 冷重播設定；實際至少 TRI_TRACK_DAYS+1 日
 TRI_TRACK_DAYS = int(_env("TRI_TRACK_DAYS", 20))     # 已突破型態沿固定線追蹤最多 20 日（或交會）就結束
 TRI_CONFIRM2 = int(_env("TRI_CONFIRM2", 0))          # 10-08：1＝文字顯示兩日確認（比較驗證前預設關；欄位一律計算）
-TRI_SPLIT_BORROWED = int(_env("TRI_SPLIT_BORROWED", 0))   # 10-08：1＝借用旁邊 K 棒的主要轉折不算實際貼線支持（另計排序）
+TRI_SPLIT_BORROWED = int(_env("TRI_SPLIT_BORROWED", 1))   # 10-08：1＝借用旁邊 K 棒的主要轉折不算實際貼線支持（另計排序）
 
+TRI_FORM_MAX_DAYS = int(_env("TRI_FORM_MAX_DAYS", TRI_DAYS))   # 未突破快照最長等待交易 K 數；交會則提前結束
 
 def _tri_params_sig() -> str:
     # 10-08：原本只收 TRI_*，改 ZIGZAG_ATR 等參數後仍沿用舊快照；改成所有大寫數值參數
@@ -1022,6 +1068,7 @@ def _shift_snap(snap: Dict[str, Any], delta: int) -> Dict[str, Any]:
         ln["events"] = [dict(e, rep=sh(e["rep"]), days=[sh(x) for x in e["days"]], sep=sh(e.get("sep")),
                              react=sh(e.get("react"))) for e in ln["events"]]
         ln["pending"] = [sh(x) for x in ln.get("pending", [])]
+        ln["actual_major_days"] = [sh(x) for x in ln.get("actual_major_days", [])]
         ln["src"] = tuple(sh(x) if isinstance(x, (int, np.integer)) else x for x in ln.get("src", ()))
         out[side] = ln
     for key in ("F", "start", "joint"):
@@ -1060,13 +1107,13 @@ def _tri_status(tr: Dict[str, Any]) -> str:
 
 def user_triangle(df: pd.DataFrame, atr_prev, end: int, state: Optional[Dict[str, Any]] = None,
                   out_state: Optional[Dict[str, Any]] = None, replay_days: Optional[int] = None) -> Optional[Dict[str, Any]]:
-    """end＝今天。單日選擇流程依日期執行，正式突破紀錄以「狀態快照」跨日保存：
+    """end＝今天。單日選擇流程依日期執行，正式形成與突破紀錄以「狀態快照」跨日保存：
       state＝前次保存的快照（同規則版本、價格指紋相符才用），從它的截至日隔天補跑；沒有就從固定起點重播 TRI_INIT_REPLAY 日。
       out_state（dict）會被填入新的快照（呼叫端決定是否寫入；盤中不寫）。
     X 日：型態＝F=X−1 的正式快照（搜尋起點 lo_F＝max(first_valid, F−TRI_DAYS)），不成立看三角候選；
           已固定紀錄優先；沒有有效紀錄或另起新整理時，正式型態收盤穿出 0.15×A[X] 才建立紀錄。
     目前有型態時優先用仍在追蹤的正式紀錄；所有錨點及接觸日均在首次越線後才允許新整理取代。
-    今天沒有形成型態時，仍只用 5 日內辨識的紀錄，不把舊歷史冒充新型態。"""
+    未突破正式型態固定到交會或等待期到期；越線後沿同組線追蹤 TRI_TRACK_DAYS。候選不固定。"""
     _TRI_LOCAL.turns = {}
     _TRI_LOCAL.turns["on"] = True
     try:
@@ -1075,7 +1122,7 @@ def user_triangle(df: pd.DataFrame, atr_prev, end: int, state: Optional[Dict[str
         import copy, hashlib, json
         raw = pd.util.hash_pandas_object(df[[c for c in ("Open", "High", "Low", "Close", "Volume") if c in df]], index=True).values.tobytes()
         key = hashlib.sha256(raw + np.asarray(atr_prev, dtype=float).tobytes() + json.dumps(
-            [end, {k: state.get(k) for k in ("sig", "as_of", "fingerprint", "records", "previous_rules_state")} if isinstance(state, dict) else state, replay_days, _tri_params_sig(), TRI_STATE_VERSION, df.attrs.get("trading_sessions")], sort_keys=True, default=str).encode()).digest()
+            [end, {k: state.get(k) for k in ("sig", "as_of", "fingerprint", "records", "formation", "previous_rules_state")} if isinstance(state, dict) else state, replay_days, _tri_params_sig(), TRI_STATE_VERSION, df.attrs.get("trading_sessions")], sort_keys=True, default=str).encode()).digest()
         cacheable = getattr(_tri_form, "__module__", "") == __name__
         with _TRI_MEMO_LOCK:
             cached = _TRI_MEMO.get(key) if cacheable else None
@@ -1134,107 +1181,167 @@ def _user_triangle(df, atr_prev, end, state=None, out_state=None, replay_days=No
     sig = TRI_STATE_VERSION + "|" + _tri_params_sig()
     bar_hash = lambda i: _bar_hash(O[i], H[i], L[i], C[i])
     records: List[Dict[str, Any]] = []
-    replay_span = max(TRI_TRACK_DAYS + 1, TRI_INIT_REPLAY if replay_days is None else max(0, int(replay_days)))
-    start_X = max(first_valid + 31, end - replay_span)   # 冷重播至少涵蓋完整追蹤期及前一日形成資料
-    reconstructed = True                          # 沒有有效快照：從固定起點重建，紀錄標「回溯辨識」
-    held_records = []
+    formation, held_formation = None, None
+    # 冷重建也要涵蓋未突破快照的完整等待期，避免每次重啟都換成最新排名第一。
+    replay_span = max(TRI_TRACK_DAYS + 1, TRI_FORM_MAX_DAYS + 1,
+                      TRI_INIT_REPLAY if replay_days is None else max(0, int(replay_days)))
+    start_X = max(first_valid + 31, end - replay_span)
+    reconstructed = True
+    held_records, virtual_pos = [], dict(pos)
+    compatible_state = False
     if state and state.get("sig") == sig and state.get("as_of") in pos and pos[state["as_of"]] <= end:
         a = pos[state["as_of"]]
         fp = state.get("fingerprint") or {}
         mine = [d for d in dates[:a + 1] if d >= min(fp, default="9")]
         if fp and mine == [d for d in sorted(fp) if d >= dates[0]] and all(bar_hash(pos[d]) == fp[d] for d in mine):
+            compatible_state = True
             historical_dates = sorted(set(fp) | set(dates))
             origin = historical_dates.index(dates[0])
             virtual_pos = {d: i - origin for i, d in enumerate(historical_dates)}
+            def load_saved(r, is_formation=False):
+                if r.get("F_date") not in virtual_pos:
+                    return None, True
+                snap = _shift_snap(r["snap"], virtual_pos[r["F_date"]])
+                indices = [snap["F"], snap["start"], snap["joint"]]
+                for side in ("u", "d"):
+                    line = snap[side]
+                    indices += [line["i0"]] + line["a"] + line.get("pending", []) + line.get("actual_major_days", [])
+                    indices += [t for ev in line.get("events", []) for t in ev.get("days", [])]
+                    indices += [t for ev in line.get("events", []) for t in (ev.get("sep"), ev.get("react")) if t is not None]
+                    indices += [t for t in line.get("src", ()) if isinstance(t, (int, np.integer))]
+                indices += [t for t, _ in snap.get("height", {}).get("contacts", [])]
+                if not is_formation:
+                    if r.get("recognized") not in virtual_pos:
+                        return None, True
+                    indices.append(virtual_pos[r["recognized"]])
+                if min(indices) < 0:
+                    return None, True
+                loaded = dict(r, snap=snap)
+                if not is_formation:
+                    loaded["recognized"] = virtual_pos[r["recognized"]]
+                return loaded, False
             for r in state.get("records", []):
-                if r["F_date"] in virtual_pos and r["recognized"] in virtual_pos:
-                    snap = _shift_snap(r["snap"], virtual_pos[r["F_date"]])
-                    if min([snap["start"], snap["joint"], snap["u"]["i0"], snap["d"]["i0"]] + snap["u"]["a"] + snap["d"]["a"]) < 0:
+                loaded, held = load_saved(r)
+                if held:
+                    if r.get("F_date") in virtual_pos and r.get("recognized") in virtual_pos:
                         held_records.append(r)
-                        continue                  # 10-08：形成期間超出目前資料窗口（不代表紀錄失效）
-                    records.append({"snap": snap, "recognized": pos[r["recognized"]],
-                                    "reconstructed_at": r.get("reconstructed_at"), "detected_on": r.get("detected_on")})
+                else:
+                    records.append(loaded)
+            saved_formation = state.get("formation")
+            if saved_formation:
+                formation, held = load_saved(saved_formation, True)
+                if held and saved_formation.get("F_date") in virtual_pos:
+                    held_formation = saved_formation
             start_X, reconstructed = a + 1, False
     run_day = dates[end]
 
-    def expired(r, X):                            # 1) 追蹤結束：辨識後超過 TRI_TRACK_DAYS，或兩線在 X 日前已交會
-        u, d = r["snap"]["u"], r["snap"]["d"]
-        return X - r["recognized"] > TRI_TRACK_DAYS or (u["s"] - d["s"]) * X + u["k"] - d["k"] <= 0
     def held_snap(r):
-        return {"snap": _shift_snap(r["snap"], virtual_pos[r["F_date"]]),
-                "recognized": virtual_pos[r["recognized"]]}
+        value = {"snap": _shift_snap(r["snap"], virtual_pos[r["F_date"]])}
+        if r.get("recognized") is not None:
+            value["recognized"] = virtual_pos[r["recognized"]]
+        return value
+    def expired(r, X, waiting=False):
+        u, d = r["snap"]["u"], r["snap"]["d"]
+        age = X - (r["snap"]["F"] if waiting else r["recognized"])
+        limit = TRI_FORM_MAX_DAYS if waiting else TRI_TRACK_DAYS
+        return age > limit or (u["s"] - d["s"]) * X + u["k"] - d["k"] <= 0
     def active_record():
-        # 窗口外紀錄仍有優先權；不可因錨點不在本次輸入就讓替代線搶主圖。
         all_live = [(r, False, r["recognized"]) for r in records]
         all_live += [(r, True, virtual_pos[r["recognized"]]) for r in held_records]
         return max(all_live, key=lambda x: x[2], default=(None, False, -1))[:2]
-
     def new_consolidation(pick, record, held, X):
         if pick is None or pick.get("candidate"):
             return False
         old = held_snap(record) if held else record
-        # 第一筆越線當天已觸發門檻；窗口縮短時也能用辨識日期作安全下限。
         tr = None if held else _tri_track(df, C, A, old["snap"], X)
         crossed = tr["breaks"][0]["idx"] if tr and tr["breaks"] else old["recognized"]
         return _tri_is_new_consolidation(pick, crossed)
+    def freeze(pick, X):
+        return {"snap": pick, "fixed_on": dates[X],
+                "reconstructed_at": run_day if reconstructed else None,
+                "detected_on": None if reconstructed else run_day}
 
     for X in range(start_X, end + 1):
         from request_runtime import check_budget
         check_budget()
         held_records = [r for r in held_records if not expired(held_snap(r), X)]
-        records = [r for r in records if not expired(r, X)]   # 每天先清過期紀錄，再判斷新突破（逐日＝一次補算）
-        F = X - 1
-        pick = form(F)                            # 10-08 提速：候選／補充候選必為 candidate、不建紀錄，歷史日不必搜尋（結果相同）
-        if pick is None or pick.get("candidate"):
-            continue
+        records = [r for r in records if not expired(r, X)]
+        if formation and expired(formation, X, True):
+            formation = None
+        if held_formation and expired(held_snap(held_formation), X, True):
+            held_formation = None
         primary, held = active_record()
-        if primary is not None and not new_consolidation(pick, primary, held, X):
-            continue                             # 同一整理期間的重新畫法：不取代、不另建突破紀錄
-        u, d = pick["u"], pick["d"]
+        fixed = held_snap(held_formation)["snap"] if held_formation else formation["snap"] if formation else None
+        # 等待中的正式線禁止被重畫，因此只延伸／判越線，不做沒有用途的重新選線。
+        # 越線後、無快照或快照到期時仍逐日搜尋新正式型態；候選不建快照。
+        pick = None if fixed is not None else form(X - 1)
+        if primary is not None and fixed is not None and not new_consolidation(fixed, primary, held, X):
+            formation, held_formation, fixed = None, None, None
+        if fixed is None and pick is not None and not pick.get("candidate") and (
+                primary is None or new_consolidation(pick, primary, held, X)):
+            formation = freeze(pick, X)
+            fixed = formation["snap"]
+        if fixed is None:
+            continue
+        u, d = fixed["u"], fixed["d"]
         o = TRI_OUT * A[X]
         if C[X] > u["s"] * X + u["k"] + o or C[X] < d["s"] * X + d["k"] - o:
-            records.append({"snap": pick, "recognized": X,      # 當天主流程真的發出突破，才建立正式紀錄
-                            "reconstructed_at": run_day if reconstructed else None,
-                            "detected_on": None if reconstructed else run_day})
+            if held_formation:
+                held_records.append(dict(held_formation, recognized=dates[X],
+                                         reconstructed_at=run_day if reconstructed else None,
+                                         detected_on=None if reconstructed else run_day))
+                held_formation = None
+            else:
+                records.append(dict(formation, recognized=X,
+                                    reconstructed_at=run_day if reconstructed else None,
+                                    detected_on=None if reconstructed else run_day))
+                formation = None
     records = [r for r in records if not expired(r, end)]
     held_records = [r for r in held_records if not expired(held_snap(r), end)]
-    # 追蹤結束：超過 TRI_TRACK_DAYS 或已過交會點
+    if formation and expired(formation, end, True):
+        formation = None
+    if held_formation and expired(held_snap(held_formation), end, True):
+        held_formation = None
     tracks = {id(r): _tri_track(df, C, A, r["snap"], end) for r in records}
+    def serialized(r):
+        saved = {k: v for k, v in r.items() if k not in ("snap", "recognized", "F_date")}
+        saved.update(F_date=dates[r["snap"]["F"]], snap=_shift_snap(r["snap"], -r["snap"]["F"]))
+        if "recognized" in r:
+            saved["recognized"] = dates[r["recognized"]]
+        return saved
     if out_state is not None:
+        fingerprint = {dates[i]: bar_hash(i) for i in range(0, end + 1)}
+        if compatible_state and (held_records or held_formation):
+            # 短窗口連續查詢仍需舊日期座標；不可下一次就悄悄丟掉保存中的錨點。
+            fingerprint = {**{d: v for d, v in state["fingerprint"].items() if d <= dates[end]}, **fingerprint}
         out_state.clear()
-    if out_state is not None:
-        out_state.update(_jsonable({
-            "sig": sig, "as_of": dates[end],
-            "fingerprint": {dates[i]: bar_hash(i) for i in range(0, end + 1)},
-            "records": [{"F_date": dates[r["snap"]["F"]], "recognized": dates[r["recognized"]],
-                         "reconstructed_at": r.get("reconstructed_at"), "detected_on": r.get("detected_on"),
-                         "snap": _shift_snap(r["snap"], -r["snap"]["F"])} for r in records] + held_records}))
-        # 規則變更採原子存檔一起保留上一版快照；只讀入口不會寫入。
+        out_state.update(_jsonable({"sig": sig, "as_of": dates[end], "fingerprint": fingerprint,
+                                   "records": [serialized(r) for r in records] + held_records,
+                                   "formation": serialized(formation) if formation else held_formation}))
         previous = (state or {}).get("previous_rules_state")
         if state and state.get("sig") and state["sig"] != sig:
-            previous = {k: state[k] for k in ("sig", "as_of", "revision", "fingerprint", "records") if k in state}
+            previous = {k: state[k] for k in ("sig", "as_of", "revision", "fingerprint", "records", "formation") if k in state}
         if previous:
             out_state["previous_rules_state"] = _jsonable(previous)
     keep_from = end - TRI_BREAK_RECENT
-    live = list(records)                          # 迴圈已清掉過期（>TRI_TRACK_DAYS 或交會）＝全部仍在追蹤
-    pick = form(last) or form(last, False) or (None if live or held_records else form(last, True, True))   # 補充候選不和仍在追蹤的正式突破競爭
-    own = None
     primary, held = active_record()
-    if primary is not None and pick is not None and not new_consolidation(pick, primary, held, end):
+    own = None
+    if held_formation:
+        main = None                              # 保存但不以負索引畫圖、不讓替代線搶走主圖
+    elif formation:
+        main = formation["snap"]
+    elif primary is not None:
         own = None if held else primary
-        main = None if held else primary["snap"]   # 先用仍在追蹤的正式紀錄；窗口不足只保留、不誤畫替代線
-    elif pick is not None:
-        main = pick
-    else:                                         # 今天沒有形成型態：只用保留期限內、仍在追蹤的已突破型態
-        recent = [r for r in records if r["recognized"] >= keep_from]   # 當主型態只用保留期限內辨識的（舊紀錄不因存在就當成目前成立）
-        own = None if held else (recent[-1] if recent else None)
-        main = own["snap"] if own else None
+        main = None if held else primary["snap"]
+    else:
+        main = form(last, False) or form(last, True, True)
     if main is None:
         return None
     tr = tracks.get(id(own)) if own is not None else _tri_track(df, C, A, main, end)
     u, d, F = main["u"], main["d"], main["F"]
     kind = _tri_kind(main)
     up, dn = u["s"] * end + u["k"], d["s"] * end + d["k"]
+    main = dict(main, near_tip=0 < up - dn < TRI_TIP * main["w0"])
     breaks, posn = tr["breaks"], tr["pos"]
     cand = bool(main.get("candidate"))
     if cand:                                      # 候選：只描述價格相對候選線的位置，不產生正式突破
@@ -1489,7 +1596,8 @@ def detect(df: pd.DataFrame, events: Optional[Dict[str, Any]] = None, provisiona
     if f3_recent or (ev and f3_window(ev["bday"], 20)) or f3_window(today, 5):
         flag_text.append("股數基準變動，量比可比性受限")
     tri_state, new_state = None, {}
-    store = _tri_store() if state_key else None   # 三角正式突破紀錄的跨日狀態快照；盤中只讀不寫
+    store = _tri_store() if state_key else None   # 正式形成／突破快照；盤中、管理員與族群只讀
+    tri_saved = False
     if store is not None:
         try:
             tri_state = store.get_state(state_key)
@@ -1504,6 +1612,7 @@ def detect(df: pd.DataFrame, events: Optional[Dict[str, Any]] = None, provisiona
         new_state["revision"] = rev + 1
         try:
             if store.set_state_if_newer(state_key, new_state, "as_of", expect_revision=rev):
+                tri_saved = True
                 break
             latest = store.get_state(state_key)        # 期間被別的請求更新：行情相同才重讀、重算一次
             if (attempt or not latest or str(latest.get("as_of") or "") > str(new_state.get("as_of") or "")
@@ -1539,6 +1648,18 @@ def detect(df: pd.DataFrame, events: Optional[Dict[str, Any]] = None, provisiona
     result = {"summary": summary, "names": names, "levels": levels, "flags": flag_text, "triangle": tri,
             "atr20": _p(atr_prev[last_official]) if not np.isnan(atr_prev[last_official]) else None,
             "pivots": piv, "formation": ev or cur, "ended": ended}
+    if state_key:
+        trace = {"rule": TRI_STATE_VERSION, "as_of": _d(adj.index[last_official]),
+                 "input_start": _d(adj.index[0]), "input_bars": last_official + 1,
+                 "store_enabled": store is not None, "read_only": provisional_today or not state_write,
+                 "saved": tri_saved, "waiting_fixed": bool(new_state.get("formation")),
+                 "fixed_on": (new_state.get("formation") or {}).get("fixed_on"),
+                 "candidate": bool(tri and tri.get("candidate")),
+                 "first_cross": ((tri or {}).get("first_break") or {}).get("date"),
+                 "upper": _at(tri["upper"], last_official) if tri else None,
+                 "lower": _at(tri["lower"], last_official) if tri else None}
+        result["triangle_state_meta"] = trace
+        print("ℹ️ 三角核對｜" + state_key + "｜" + __import__("json").dumps(trace, ensure_ascii=False), flush=True)
     result["observations"] = {
         "structure": shape_observation,
         "trend": trend_observation(tr, c, atr_prev, last_official, provisional_today),

@@ -2717,7 +2717,7 @@ def question_focus(question: str) -> List[str]:
     return labels
 
 
-MEMBER_PATTERN_RULES = """會員型態圖：chart_context.stocks 是圖上實際內容。三角圖沒有分數時禁止談分數、評等、排名、加扣分；不因其他股票有分數而替此股補分。
+MEMBER_PATTERN_RULES = """會員型態圖：chart_context.stocks 是圖上實際內容。show_bollinger=false 的股票，圖上未顯示布林軌道、數值或狀態，不引用布林作為圖上證據；所有均線與大量區仍可解讀。三角圖沒有分數時禁止談分數、評等、排名、加扣分；不因其他股票有分數而替此股補分。
 先回答原問句，再解釋圖上型態、目前位置與關鍵價位；不討論未顯示的KD/MACD、分點、隱藏扣抵或內部明細。新聞、持倉或籌碼另有明確需求時仍逐項回答。
 三角不需使用者點名，依triangle_structure的正式／候選與事件解讀；候選線外不等於正式突破，0.15ATR越線不等於突破已確認。歷史事件與目前型態分開，回到線內、反向、接近尖端與過交會点要照實說明。
 圖上上緣／下緣都是當日參考價，不說是明天確定價位。圖線visible=false時明說無法核對，不引用該線作防守；已突破的原線不是自動有效支撐，必須回測與結構證據支持。
@@ -7171,6 +7171,7 @@ class AceQueryEngine:
             # 會員型態頁疊上同次判斷的三角；評分與分點回測依本題需求顯示。
             for panel in [p for p in panels if p.get("stock_code") and p.get("bars")]:
                 panel.pop("scorecard", None)
+                panel["hide_bollinger"] = True   # 第二輪：型態圖保留所有均線與大量區，只省略布林顯示
                 code = panel["stock_code"]
                 technical = next((r.data for r in results if r.ok and r.name == "get_technical_analysis" and r.data.get("stock_code") == code), {})
                 view = member_pattern.overlay(panel, (technical.get("kline_patterns") or {}).get("member_view"))
@@ -7600,7 +7601,7 @@ class AceQueryEngine:
             return rule_answer, True
         payload = build_final_payload(question, results)
         context = getattr(getattr(self, "_request_local", None), "member_chart_context", None)
-        if context and (context.get("compound") or any(v.get("triangle") for v in context.get("stocks", {}).values())):
+        if context and (context.get("compound") or any(v.get("triangle") or not v.get("show_bollinger", True) for v in context.get("stocks", {}).values())):
             payload = member_pattern.scoped_payload(payload, context)
         if plan.needs:
             payload["needs"] = plan.needs        # 10-08：需求表真的傳到最後回答

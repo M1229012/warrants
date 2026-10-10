@@ -6,7 +6,7 @@ import re
 from urllib.parse import urlparse
 from datetime import date
 
-VERSION = "member_pattern_v5_primary_priority"
+VERSION = "member_pattern_v6_formation_no_bollinger"
 
 def date_key(value):
     """Calendar date key; retain display format and never change trading indices."""
@@ -219,7 +219,9 @@ def chart_context(panels, compound=False):
         if not p.get("bars"): continue
         stock = {"last_bar": deepcopy(p["bars"][-1]), "intraday": deepcopy(p.get("intraday") or {}),
                  "volume_profile": deepcopy(p.get("volume_profile") or {}), "show_score": bool(p.get("scorecard")),
-                 "stock_name": p.get("stock_name", "")}
+                 "stock_name": p.get("stock_name", ""), "show_bollinger": not p.get("hide_bollinger", False)}
+        if not stock["show_bollinger"]:
+            stock["last_bar"] = {k: v for k, v in stock["last_bar"].items() if not k.startswith("BB_")}
         view = p.get("member_triangle")
         if view:
             stock["triangle"] = ({k: deepcopy(v) for k, v in view.items() if k not in ("rows", "detector_position", "diagnostic")}
@@ -228,6 +230,15 @@ def chart_context(panels, compound=False):
         out["stocks"][p["stock_code"]] = stock
     return out
 
+def _without_bollinger(value):
+    """Remove hidden Bollinger fields from AI evidence, leaving MA20 and all volume zones intact."""
+    if isinstance(value, dict):
+        return {k: _without_bollinger(v) for k, v in value.items()
+                if not str(k).startswith("BB_") and str(k).lower() not in {"bollinger", "bollinger_bands"}}
+    if isinstance(value, list):
+        return [_without_bollinger(v) for v in value if not isinstance(v, str) or "布林" not in v]
+    return value
+
 def scoped_payload(payload, context):
     """Do not expose hidden score/KD/MACD facts as visible chart evidence."""
     payload = deepcopy(payload); payload["chart_context"] = deepcopy(context)
@@ -235,6 +246,9 @@ def scoped_payload(payload, context):
         if context.get("compound") and key.split(":")[0] == "get_recent_news" and isinstance(data, dict):
             data["articles"] = news_panel(data)["news_articles"]
         stock = context.get("stocks", {}).get(data.get("stock_code"), {}) if isinstance(data, dict) else {}
+        if stock and not stock.get("show_bollinger", True):
+            data = _without_bollinger(data)
+            payload["tool_results"][key] = data
         view = stock.get("triangle")
         if view:
             tool = key.split(":")[0]
