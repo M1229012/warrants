@@ -1,6 +1,6 @@
 """K 線型態描述器 v1（規格：docs/kline_spec_v1.md，條號標在註解）。
 
-用途：描述「今天」的技術結構給 AI；不計分、不回測、不保存逐日狀態、圖卡不顯示。
+用途：描述技術結構給 AI；三角正式越線紀錄以固定快照跨日追蹤，圖卡沿用同次結果。
 輸入日 K（Open／High／Low／Close／Volume，index 為日期）＋公司行動事件；純計算、不打 API。
 """
 from __future__ import annotations
@@ -997,8 +997,8 @@ def _tri_track(df, C, A, snap, end: int) -> Dict[str, Any]:
             "reversed": any(a["type"] != b["type"] for a, b in zip(breaks, breaks[1:]))}
 
 
-TRI_STATE_VERSION = "tri-v9"   # 10-08：指紋含 ZIGZAG_ATR 等全部參數、窗口外紀錄不載入、兩日確認欄位
-TRI_INIT_REPLAY = int(_env("TRI_INIT_REPLAY", 20))   # 沒有狀態快照時，從固定起點（今天往回 20 日）重播建立
+TRI_STATE_VERSION = "tri-v10-primary"   # 第一輪：追蹤中的正式紀錄優先；同段替代線不得新增突破
+TRI_INIT_REPLAY = int(_env("TRI_INIT_REPLAY", 20))   # 冷重播設定；實際至少 TRI_TRACK_DAYS+1 日
 TRI_TRACK_DAYS = int(_env("TRI_TRACK_DAYS", 20))     # 已突破型態沿固定線追蹤最多 20 日（或交會）就結束
 TRI_CONFIRM2 = int(_env("TRI_CONFIRM2", 0))          # 10-08：1＝文字顯示兩日確認（比較驗證前預設關；欄位一律計算）
 TRI_SPLIT_BORROWED = int(_env("TRI_SPLIT_BORROWED", 0))   # 10-08：1＝借用旁邊 K 棒的主要轉折不算實際貼線支持（另計排序）
@@ -1064,8 +1064,9 @@ def user_triangle(df: pd.DataFrame, atr_prev, end: int, state: Optional[Dict[str
       state＝前次保存的快照（同規則版本、價格指紋相符才用），從它的截至日隔天補跑；沒有就從固定起點重播 TRI_INIT_REPLAY 日。
       out_state（dict）會被填入新的快照（呼叫端決定是否寫入；盤中不寫）。
     X 日：型態＝F=X−1 的正式快照（搜尋起點 lo_F＝max(first_valid, F−TRI_DAYS)），不成立看三角候選；
-          與已固定紀錄當日判定同型態就沿用固定線；正式型態、尚無紀錄、X 日收盤穿出 0.15×A[X] → 建立紀錄。
-    目前型態＝今天形成的正式／候選型態（同型態沿用固定線）；沒有時才用保留期限內、仍在追蹤的已突破型態。"""
+          已固定紀錄優先；沒有有效紀錄或另起新整理時，正式型態收盤穿出 0.15×A[X] 才建立紀錄。
+    目前有型態時優先用仍在追蹤的正式紀錄；所有錨點及接觸日均在首次越線後才允許新整理取代。
+    今天沒有形成型態時，仍只用 5 日內辨識的紀錄，不把舊歷史冒充新型態。"""
     _TRI_LOCAL.turns = {}
     _TRI_LOCAL.turns["on"] = True
     try:
@@ -1074,7 +1075,7 @@ def user_triangle(df: pd.DataFrame, atr_prev, end: int, state: Optional[Dict[str
         import copy, hashlib, json
         raw = pd.util.hash_pandas_object(df[[c for c in ("Open", "High", "Low", "Close", "Volume") if c in df]], index=True).values.tobytes()
         key = hashlib.sha256(raw + np.asarray(atr_prev, dtype=float).tobytes() + json.dumps(
-            [end, {k: state.get(k) for k in ("sig", "as_of", "fingerprint", "records")} if isinstance(state, dict) else state, replay_days, _tri_params_sig(), TRI_STATE_VERSION, df.attrs.get("trading_sessions")], sort_keys=True, default=str).encode()).digest()
+            [end, {k: state.get(k) for k in ("sig", "as_of", "fingerprint", "records", "previous_rules_state")} if isinstance(state, dict) else state, replay_days, _tri_params_sig(), TRI_STATE_VERSION, df.attrs.get("trading_sessions")], sort_keys=True, default=str).encode()).digest()
         cacheable = getattr(_tri_form, "__module__", "") == __name__
         with _TRI_MEMO_LOCK:
             cached = _TRI_MEMO.get(key) if cacheable else None
@@ -1094,6 +1095,17 @@ def user_triangle(df: pd.DataFrame, atr_prev, end: int, state: Optional[Dict[str
         return result
     finally:
         _TRI_LOCAL.turns = {}
+
+
+def _tri_is_new_consolidation(pick, first_cross: int) -> bool:
+    """正式新整理：兩線起點、全部錨點及支持接觸日均晚於前組首次越線。"""
+    if pick is None or pick.get("candidate"):
+        return False
+    support = [pick[e]["i0"] for e in ("u", "d")]
+    for e in ("u", "d"):
+        support += pick[e]["a"]
+        support += [t for event in pick[e].get("events", []) for t in event.get("days", [])]
+    return bool(support) and min(support) > first_cross
 
 
 def _user_triangle(df, atr_prev, end, state=None, out_state=None, replay_days=None):
@@ -1118,19 +1130,14 @@ def _user_triangle(df, atr_prev, end, state=None, out_state=None, replay_days=No
                 forms[(F, confirm, local)] = _tri_form(H, L, O, C, A, lo_F, F, piv, confirm, local)
         return forms[(F, confirm, local)]
 
-    def same_shape(x, y, X: int) -> bool:         # 當日判定：共同有效期間起點與 X 日，上下緣都在 0.5 ATR 內
-        t0 = max(x["u"]["i0"], x["d"]["i0"], y["u"]["i0"], y["d"]["i0"])
-        return all(abs((x[e]["s"] - y[e]["s"]) * t + x[e]["k"] - y[e]["k"]) <= 0.5 * A[t]
-                   for e in ("u", "d") for t in (t0, X))
-
-    # 載入狀態快照：規則版本、參數、價格指紋（截至日前 30 根收盤）都要相符
+    # 載入狀態快照：規則版本、參數、價格指紋（截至日的重疊 OHLC 與日期清單）都要相符
     sig = TRI_STATE_VERSION + "|" + _tri_params_sig()
     bar_hash = lambda i: _bar_hash(O[i], H[i], L[i], C[i])
     records: List[Dict[str, Any]] = []
-    start_X = max(first_valid + 31, end - (TRI_INIT_REPLAY if replay_days is None else max(0, int(replay_days))))   # 族群總覽等大量呼叫可設 0（只看今天）
+    replay_span = max(TRI_TRACK_DAYS + 1, TRI_INIT_REPLAY if replay_days is None else max(0, int(replay_days)))
+    start_X = max(first_valid + 31, end - replay_span)   # 冷重播至少涵蓋完整追蹤期及前一日形成資料
     reconstructed = True                          # 沒有有效快照：從固定起點重建，紀錄標「回溯辨識」
     held_records = []
-    window_dropped = False                        # 有紀錄因資料窗口較短無法載入：這次只顯示、不寫回（避免把仍有效的紀錄洗掉）
     if state and state.get("sig") == sig and state.get("as_of") in pos and pos[state["as_of"]] <= end:
         a = pos[state["as_of"]]
         fp = state.get("fingerprint") or {}
@@ -1143,7 +1150,6 @@ def _user_triangle(df, atr_prev, end, state=None, out_state=None, replay_days=No
                 if r["F_date"] in virtual_pos and r["recognized"] in virtual_pos:
                     snap = _shift_snap(r["snap"], virtual_pos[r["F_date"]])
                     if min([snap["start"], snap["joint"], snap["u"]["i0"], snap["d"]["i0"]] + snap["u"]["a"] + snap["d"]["a"]) < 0:
-                        window_dropped = True
                         held_records.append(r)
                         continue                  # 10-08：形成期間超出目前資料窗口（不代表紀錄失效）
                     records.append({"snap": snap, "recognized": pos[r["recognized"]],
@@ -1157,6 +1163,21 @@ def _user_triangle(df, atr_prev, end, state=None, out_state=None, replay_days=No
     def held_snap(r):
         return {"snap": _shift_snap(r["snap"], virtual_pos[r["F_date"]]),
                 "recognized": virtual_pos[r["recognized"]]}
+    def active_record():
+        # 窗口外紀錄仍有優先權；不可因錨點不在本次輸入就讓替代線搶主圖。
+        all_live = [(r, False, r["recognized"]) for r in records]
+        all_live += [(r, True, virtual_pos[r["recognized"]]) for r in held_records]
+        return max(all_live, key=lambda x: x[2], default=(None, False, -1))[:2]
+
+    def new_consolidation(pick, record, held, X):
+        if pick is None or pick.get("candidate"):
+            return False
+        old = held_snap(record) if held else record
+        # 第一筆越線當天已觸發門檻；窗口縮短時也能用辨識日期作安全下限。
+        tr = None if held else _tri_track(df, C, A, old["snap"], X)
+        crossed = tr["breaks"][0]["idx"] if tr and tr["breaks"] else old["recognized"]
+        return _tri_is_new_consolidation(pick, crossed)
+
     for X in range(start_X, end + 1):
         from request_runtime import check_budget
         check_budget()
@@ -1166,8 +1187,9 @@ def _user_triangle(df, atr_prev, end, state=None, out_state=None, replay_days=No
         pick = form(F)                            # 10-08 提速：候選／補充候選必為 candidate、不建紀錄，歷史日不必搜尋（結果相同）
         if pick is None or pick.get("candidate"):
             continue
-        if any(same_shape(r["snap"], pick, X) for r in records) or any(same_shape(held_snap(r)["snap"], pick, X) for r in held_records):
-            continue
+        primary, held = active_record()
+        if primary is not None and not new_consolidation(pick, primary, held, X):
+            continue                             # 同一整理期間的重新畫法：不取代、不另建突破紀錄
         u, d = pick["u"], pick["d"]
         o = TRI_OUT * A[X]
         if C[X] > u["s"] * X + u["k"] + o or C[X] < d["s"] * X + d["k"] - o:
@@ -1187,17 +1209,25 @@ def _user_triangle(df, atr_prev, end, state=None, out_state=None, replay_days=No
             "records": [{"F_date": dates[r["snap"]["F"]], "recognized": dates[r["recognized"]],
                          "reconstructed_at": r.get("reconstructed_at"), "detected_on": r.get("detected_on"),
                          "snap": _shift_snap(r["snap"], -r["snap"]["F"])} for r in records] + held_records}))
+        # 規則變更採原子存檔一起保留上一版快照；只讀入口不會寫入。
+        previous = (state or {}).get("previous_rules_state")
+        if state and state.get("sig") and state["sig"] != sig:
+            previous = {k: state[k] for k in ("sig", "as_of", "revision", "fingerprint", "records") if k in state}
+        if previous:
+            out_state["previous_rules_state"] = _jsonable(previous)
     keep_from = end - TRI_BREAK_RECENT
     live = list(records)                          # 迴圈已清掉過期（>TRI_TRACK_DAYS 或交會）＝全部仍在追蹤
     pick = form(last) or form(last, False) or (None if live or held_records else form(last, True, True))   # 補充候選不和仍在追蹤的正式突破競爭
-    own = next((r for r in records if pick is not None and same_shape(r["snap"], pick, end)), None)
-    if own is not None:
-        main = own["snap"]                        # 今天的型態就是先前已突破的那組：沿用固定線與首次日期
+    own = None
+    primary, held = active_record()
+    if primary is not None and pick is not None and not new_consolidation(pick, primary, held, end):
+        own = None if held else primary
+        main = None if held else primary["snap"]   # 先用仍在追蹤的正式紀錄；窗口不足只保留、不誤畫替代線
     elif pick is not None:
         main = pick
     else:                                         # 今天沒有形成型態：只用保留期限內、仍在追蹤的已突破型態
         recent = [r for r in records if r["recognized"] >= keep_from]   # 當主型態只用保留期限內辨識的（舊紀錄不因存在就當成目前成立）
-        own = recent[-1] if recent else None
+        own = None if held else (recent[-1] if recent else None)
         main = own["snap"] if own else None
     if main is None:
         return None
