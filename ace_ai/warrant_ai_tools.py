@@ -264,9 +264,28 @@ FINMIND_BACKGROUND_MIN_REMAINING = float(os.getenv("DISCORD_AI_FINMIND_BACKGROUN
 _FM_BG_LOGGED = {"day": ""}
 
 
+_LOCAL_ONLY = threading.local()
+
+
+@contextmanager
+def local_only():
+    """10-08：背景重算型態分數只用本地底庫，整條呼叫鏈（日K、公司行動）都不打 FinMind。"""
+    old = getattr(_LOCAL_ONLY, "on", False)
+    previous_bundles = getattr(_LOCAL_ONLY, "bundles", None)
+    _LOCAL_ONLY.bundles = {}
+    _LOCAL_ONLY.on = True
+    try:
+        yield
+    finally:
+        _LOCAL_ONLY.on = old
+        _LOCAL_ONLY.bundles = previous_bundles
+
+
 def finmind_background_allowed() -> bool:
     """背景作業（補資料、算分數）只在目前 Token 還剩一半以上額度時才用 FinMind（10-04：會員優先）。
-    第一支用到一半就停，第二支完整留給會員；查不到用量時保守不用。"""
+    第一支用到一半就停，第二支完整留給會員；查不到用量時保守不用。local_only() 內一律不用。"""
+    if getattr(_LOCAL_ONLY, "on", False):
+        return False
     tokens = finmind_tokens()
     if tokens and current_finmind_token() != tokens[0]:
         return False                              # 10-07：背景只用第一支；第一支冷卻後第二、三支完整留給會員
@@ -352,6 +371,10 @@ _CORE_LOCK = threading.Lock()
 
 class ToolDataError(RuntimeError):
     """Tool 取得資料失敗；訊息會轉成 Discord 可讀的中文說明。"""
+
+
+class ToolSourceError(ToolDataError):
+    """資料來源暫時失敗（網路、服務錯誤）：和「資料不足／額度保留」不同，背景可以稍後重試。"""
 
 
 class SheetUnavailableError(ToolDataError):
@@ -624,6 +647,7 @@ class TTLCache:
     def __init__(self, namespace: str = "discord_ai") -> None:
         self.namespace = namespace
         self._data: Dict[str, Tuple[float, Any]] = {}
+        self._owner: Dict[str, int] = {}      # key → 建立它的執行緒（背景只清自己的）
         self._lock = threading.Lock()
         self._key_locks: Dict[str, threading.Lock] = {}
 
@@ -656,6 +680,7 @@ class TTLCache:
             doomed = [k for k in self._data if k.startswith(heads)]
             for k in doomed:
                 del self._data[k]
+                self._owner.pop(k, None)
         return len(doomed)
 
     def remaining(self, key: str) -> float:
@@ -666,7 +691,9 @@ class TTLCache:
 
     def set(self, key: str, value: Any, ttl_seconds: float) -> None:
         with self._lock:
-            self._data[self._full_key(key)] = (time.time() + max(1.0, float(ttl_seconds)), value)
+            full_key = self._full_key(key)
+            self._data[full_key] = (time.time() + max(1.0, float(ttl_seconds)), value)
+            self._owner[full_key] = threading.get_ident()
             if len(self._data) > self.MAX_ENTRIES:
                 self._evict()
 
@@ -675,11 +702,13 @@ class TTLCache:
             return set(self._data)
 
     def drop_new_since(self, before: set) -> int:
-        """刪掉 before 之後才新增的 key（背景批次算完就釋放記憶體，不碰會員查詢原本就有的快取）。"""
+        """刪掉 before 之後才新增、且由目前執行緒建立的 key（10-08：同時段會員查詢建立的快取不刪）。"""
+        me = threading.get_ident()
         with self._lock:
-            doomed = [k for k in self._data if k not in before]
+            doomed = [k for k in self._data if k not in before and self._owner.get(k) == me]
             for k in doomed:
                 del self._data[k]
+                self._owner.pop(k, None)
         return len(doomed)
 
     def _evict(self) -> None:
@@ -687,10 +716,12 @@ class TTLCache:
         now = time.time()
         for k in [k for k, (exp, _) in self._data.items() if exp < now]:
             del self._data[k]
+            self._owner.pop(k, None)
         extra = len(self._data) - int(self.MAX_ENTRIES * 0.9)
         if extra > 0:
             for k, _ in sorted(self._data.items(), key=lambda kv: kv[1][0])[:extra]:
                 del self._data[k]
+                self._owner.pop(k, None)
         for k in [k for k, lock in self._key_locks.items() if k not in self._data and not lock.locked()]:
             del self._key_locks[k]
 
@@ -2251,6 +2282,13 @@ def get_retail_futures(days: int = 0) -> Dict[str, Any]:
 
 # 已確認來源沒有更新資料的股票（停牌等）：code -> (日期, 本地最後一根 K 棒日期)，當天不再重抓。
 _STALE_CHECKED: Dict[str, Tuple[str, str]] = {}
+DAILY_READY_MINUTE = _env_int("DISCORD_AI_DAILY_READY_MINUTE", 15 * 60 + 30)   # 收盤日K通常此時已入底庫
+
+
+def expected_last_close(now: Any = None) -> pd.Timestamp:
+    """Independent official calendar plus both-market completion; unavailable coverage stays explicit."""
+    import market_calendar
+    return market_calendar.close_status(now or taipei_now(), DAILY_READY_MINUTE)["expected_date"]
 
 
 def _missing_trading_days(df: pd.DataFrame) -> List[str]:
@@ -2259,15 +2297,24 @@ def _missing_trading_days(df: pd.DataFrame) -> List[str]:
     均線、布林、KD 都是「往前數 N 根」算的，缺一天不會報錯只會算錯，所以這一關要擋在出圖前面。
     日曆取不到時回傳空清單，不因為檢查失敗而擋住回答。
     """
+    if getattr(_LOCAL_ONLY, "on", False):
+        import market_calendar
+        if df is None or len(df) < 2: return []
+        sessions = market_calendar.sessions_between(df.index[0], df.index[-1])
+        if sessions is None: return []
+        have = {pd.Timestamp(x).strftime("%Y-%m-%d") for x in df.index}
+        return [d for d in sessions if d not in have]
     try:
         if df is None or len(df) < 2:
             return []
         index = pd.DatetimeIndex(df.index).normalize()
         first, last = index[max(0, len(index) - 70)], index[-1]
         have = set(index)
-        return [d.strftime("%Y-%m-%d") for d in
-                (pd.Timestamp(x).normalize() for x in core()._get_official_trading_dates(first, last))
-                if d not in have]
+        sessions = [pd.Timestamp(x).normalize() for x in core()._get_official_trading_dates(first, last)]
+        import market_calendar
+        if sessions:
+            market_calendar.save_sessions(first, last, sessions, "既有官方交易日查詢")
+        return [d.strftime("%Y-%m-%d") for d in sessions if d not in have]
     except Exception as exc:   # 休市表失敗時照常回答，只是少了這道檢查
         print(f"⚠️ 交易日連續性檢查略過：{type(exc).__name__}: {exc}", flush=True)
         return []
@@ -2373,6 +2420,15 @@ def _load_price_bundle(stock_code: str) -> Dict[str, Any]:
         return _load_index_bundle(str(stock_code).strip().upper())
     code = kf._normalize_stock_name_code_key(stock_code)
 
+    import request_runtime
+    request = request_runtime.state()
+    request_key = (code, locals().get("spot_history_mode", False), getattr(_LOCAL_ONLY, "on", False), intraday_session_now())
+    if request is not None:
+        with request_runtime._LOCK:
+            cached_request = request.setdefault("price_bundles", {}).get(request_key)
+        if cached_request is not None:
+            return cached_request
+
     def daily() -> Tuple[pd.DataFrame, str, str]:
         # 先讀 Persistent Volume / 本機 SQLite 的最近 70 日。只要資料仍夠新，就不再打 FinMind。
         persistent = local_market_cache.load_bars(code, limit=max(70, local_market_cache.KEEP_DAYS))
@@ -2382,7 +2438,8 @@ def _load_price_bundle(stock_code: str) -> Dict[str, Any]:
             local_last = pd.Timestamp(persistent["last_date"]).strftime("%Y-%m-%d")
             gap = (pd.Timestamp(taipei_now().date()) - persistent["last_date"]).days
             # 停牌股永遠 gap>5，每次都重抓 FinMind 也拿不到新的；今天確認過一次就不再問。
-            if gap <= 5 or _STALE_CHECKED.get(code) == (today, local_last):
+            stale_key = f"{today} {taipei_now().hour}"     # 停牌／資料源還沒更新：同一小時只問一次
+            if persistent["last_date"] >= expected_last_close() or _STALE_CHECKED.get(code) == (stale_key, local_last):
                 return persistent["df"], str(persistent.get("market") or ""), "本地69日歷史快取"
         if current_api_priority() == "background" and not finmind_background_allowed():
             # 10-07：背景（型態分數底庫等）抓日K原本不受額度保護，冷門股湊不滿 69 根就每輪打 FinMind，部署後一次吃光 3 支 Token。
@@ -2399,7 +2456,7 @@ def _load_price_bundle(stock_code: str) -> Dict[str, Any]:
             if stock_df is not None and not stock_df.empty:
                 _save_daily_cache(code, stock_df, market=str(market or ""), source="FinMind", confirmed=True)
                 if local_last and pd.Timestamp(stock_df.index[-1]).strftime("%Y-%m-%d") <= local_last:
-                    _STALE_CHECKED[code] = (today, local_last)
+                    _STALE_CHECKED[code] = (f"{today} {taipei_now().hour}", local_last)
                 return stock_df, str(market or ""), "FinMind 日K"
             error: Exception = ToolDataError(f"{code} FinMind 沒有股價資料")
         except Exception as exc:  # FinMind 失敗時才以富果歷史日K備援；正常盤中不拿富果做歷史預抓。
@@ -2407,7 +2464,7 @@ def _load_price_bundle(stock_code: str) -> Dict[str, Any]:
             error = exc
         if not (FUGLE_API_KEYS or FUGLE_API_KEY):
             print(f"⚠️ {code} 股價取得失敗（無富果備援）：{type(error).__name__}: {error}", flush=True)
-            raise ToolDataError(f"{code} 暫時取不到股價資料")   # 細節只寫 Log，不外漏給會員
+            raise ToolSourceError(f"{code} 暫時取不到股價資料")   # 細節只寫 Log，不外漏給會員
         print(f"⚠️ {code} FinMind 股價失敗，才改用富果歷史日K備援：{type(error).__name__}: {error}", flush=True)
         days = int(re.search(r"\d+", PRICE_FETCH_PERIOD).group(0)) if re.search(r"\d+", PRICE_FETCH_PERIOD) else 180
         frame = _drop_invalid_bars(code, fetch_fugle_daily(code, days), "富果日K")
@@ -2416,7 +2473,7 @@ def _load_price_bundle(stock_code: str) -> Dict[str, Any]:
         return frame, "", "富果日K備援"
 
     def build() -> Dict[str, Any]:
-        daily_df, market, daily_source = _cached(f"price_daily_{code}", TTL_PRICE_SECONDS, daily)
+        daily_df, market, daily_source = daily() if getattr(_LOCAL_ONLY, "on", False) else _cached(f"price_daily_{code}_{source_stamp(code)}", TTL_PRICE_SECONDS, daily)
         daily_df = _formal_daily_frame(daily_df)
         merged, intraday = _append_intraday_bar(code, daily_df, market)
         gaps = _missing_trading_days(merged)
@@ -2481,7 +2538,29 @@ def _load_price_bundle(stock_code: str) -> Dict[str, Any]:
     # 背景掃描的結果不含盤中 K 棒，另存一個 key，免得使用者接著問同一檔時
     # 拿到背景剛寫進去、沒有即時價的版本。
     prefix = "price_closed_" if current_api_priority() == "background" else "price_"
-    return _cached(f"{prefix}{code}", ttl, build)
+    from request_runtime import check_budget
+    check_budget()
+    if getattr(_LOCAL_ONLY, "on", False):
+        bundles = _LOCAL_ONLY.bundles
+        key = (code, locals().get("spot_history_mode", False))
+        if key not in bundles:
+            bundles[key] = build()
+        result = bundles[key]
+    else:
+        result = _cached(f"{prefix}{code}_{source_stamp(code)}" + ("_spot_year_v4" if locals().get("spot_history_mode", False) else ""), ttl, build)
+    import market_calendar
+    sessions = market_calendar.sessions_between(result["closed_df"].index[0], result["closed_df"].index[-1])
+    if sessions is not None:
+        result["closed_df"].attrs["trading_sessions"] = sessions
+    result["freshness"] = market_calendar.close_status(taipei_now(), DAILY_READY_MINUTE)
+    raw = result.get("raw_closed_df")
+    if raw is not None:
+        result["input_fp"] = frame_fingerprint(raw)
+        result["source_fp"] = analysis_fingerprint(result["input_fp"], result.get("corporate_actions") or {})
+    if request is not None:
+        with request_runtime._LOCK:
+            result = request.setdefault("price_bundles", {}).setdefault(request_key, result)
+    return result
 
 
 def closed_frame(bundle: Dict[str, Any]) -> pd.DataFrame:
@@ -2637,6 +2716,9 @@ def get_stock_overview(stock_code: str) -> Dict[str, Any]:
         "market": bundle["market"],
         "data_date": _fmt_date(df.index[-1]),
         "data_source": price_source_note(bundle),
+        "input_fp": bundle.get("input_fp", ""),
+        "source_fp": bundle.get("source_fp", ""),
+        "freshness": bundle.get("freshness", {}),
         "intraday": bundle.get("intraday") or {},
         "open": _num(latest.get("Open")),
         "high": _num(latest.get("High")),
@@ -2719,6 +2801,46 @@ def _bollinger_position(close: Optional[float], upper: Optional[float], mid: Opt
 MA_DEDUCTION_DAYS = _env_int("DISCORD_AI_MA_DEDUCTION_DAYS", 5)
 
 
+def tick_size(price: float) -> float:
+    """台股升降單位（證交所／櫃買普通股）。"""
+    p = abs(float(price))
+    return 0.01 if p < 10 else 0.05 if p < 50 else 0.1 if p < 100 else 0.5 if p < 500 else 1.0 if p < 1000 else 5.0
+
+
+def tick_above(x: float) -> float:
+    """嚴格高於 x 的第一個合法價位（「收至少 X」的 X）。"""
+    t = tick_size(x)
+    v = (math.floor(x / t + 1e-9) + 1) * t
+    return round(v, 2)
+
+
+def limit_prices(ref: float) -> Tuple[float, float]:
+    """（跌停價, 漲停價）：參考價 ±10%，依升降單位往內捨入（一般情況；除權息參考價另計）。"""
+    down, up = ref * 0.9, ref * 1.1
+    td, tu = tick_size(down), tick_size(up)
+    return round(math.ceil(down / td - 1e-9) * td, 2), round(math.floor(up / tu + 1e-9) * tu, 2)
+
+
+def tomorrow_condition(now: str, rise_at: float) -> str:
+    """圖卡只寫明天的確切條件（後天以後依前一天實際收盤而變，不寫成確定門檻）。"""
+    p = tick_above(rise_at)
+    text = f"{p:,.2f}".rstrip("0").rstrip(".")
+    return f"明天收至少 {text} " + ("才續揚" if now == "上揚" else "才轉揚")
+
+
+FLAT_RATIO = 0.0002   # 均線一天變動小於 MA 的 0.02%＝走平（direction 與失敗值共用）
+
+
+def ma_flip_prices(deduction: float, n: int, ma: float) -> Tuple[float, float]:
+    """明天收盤的方向門檻（與 direction 同一套分類，走平容許範圍以明天的新均線計）。
+
+    明天變化 c＝(收盤−扣抵價)/n、新均線＝ma+c；上揚要 c > FLAT×(ma+c)，下彎要 c < −FLAT×(ma+c)。
+    回傳（收盤「高於」它才上揚, 收盤「低於」它才下彎）；落在兩者之間（含剛好等於扣抵價）＝走平。
+    """
+    m = abs(ma)
+    return deduction + n * FLAT_RATIO * m / (1 - FLAT_RATIO), deduction - n * FLAT_RATIO * m / (1 + FLAT_RATIO)
+
+
 def analyze_ma_deduction(df: pd.DataFrame, periods: Sequence[int] = (5, 10, 20, 60), days: int = MA_DEDUCTION_DAYS) -> Dict[str, Any]:
     """均線扣抵：明天的 MA_n 會移除 n 個交易日前那根收盤（扣抵價）。
 
@@ -2735,22 +2857,33 @@ def analyze_ma_deduction(df: pd.DataFrame, periods: Sequence[int] = (5, 10, 20, 
             continue
         start = len(closes) - n
         ma = float(closes.iloc[start:].mean())
-        flat = abs(ma) * 0.0002
+        flat = abs(ma) * FLAT_RATIO
         k = max(1, min(days, n))
         deductions = [float(v) for v in closes.iloc[start:start + k]]
         dates = [_fmt_date(d) for d in closes.index[start:start + k]]
         changes = [(close - d) / n for d in deductions]
+        rise_at, fall_at = ma_flip_prices(deductions[0], n, ma)
 
         def direction(change: float) -> str:
             return "上揚" if change > flat else "下彎" if change < -flat else "走平"
 
         now = direction((close - float(closes.iloc[start - 1])) / n)
-        turn, turn_day = "", None
+        turn, turn_day = "", None                # 舊評分用（略過走平、用今天容差）；新評分改看 path
         for day, change in enumerate(changes, 1):
             future = direction(change)
             if future != "走平" and future != now:
                 turn, turn_day = ("轉下彎" if future == "下彎" else "轉上揚"), day
                 break
+        # 10-08 逐日模擬（收盤不變）：每天先算當天新均線，再用新均線的 FLAT_RATIO 判向；門檻用前一日均線解
+        sim, path, rises = ma, [], []
+        for dprice in deductions:
+            rises.append(ma_flip_prices(dprice, n, sim)[0])
+            new = sim + (close - dprice) / n
+            ch, tol = new - sim, FLAT_RATIO * abs(new)
+            path.append("上揚" if ch > tol else "下彎" if ch < -tol else "走平")
+            sim = new
+        first_change = next((i for i, x in enumerate(path, 1) if x != now), None)
+        turn_text = tomorrow_condition(now, rise_at) if (first_change or now != "上揚") else ""
         projected = ma + sum(changes)
         high, low = max(deductions), min(deductions)
         above_close = ma > close
@@ -2760,6 +2893,8 @@ def analyze_ma_deduction(df: pd.DataFrame, periods: Sequence[int] = (5, 10, 20, 
         elif turn == "轉上揚":
             signal = (f"MA{n} 目前{now}，未來 {k} 日扣抵價最低 {low:,.2f} 低於現價；收盤若維持 {close:,.2f}，"
                       f"{turn_phrase(turn, turn_day)}")
+        elif now == "上揚" and "走平" in path:
+            signal = f"MA{n} 上揚，但收盤不變時第 {path.index('走平') + 1} 日起可能走平；{turn_text}"
         elif now == "上揚":
             signal = f"MA{n} 上揚，未來 {k} 日扣抵價（{low:,.2f}～{high:,.2f}）不高於現價，收盤維持不變時仍續揚"
         elif now == "下彎":
@@ -2780,11 +2915,17 @@ def analyze_ma_deduction(df: pd.DataFrame, periods: Sequence[int] = (5, 10, 20, 
             "projected_value_if_close_unchanged": _num(projected),
             "turn": turn,
             "turn_day": turn_day,
-            "turn_text": turn_phrase(turn, turn_day),
+            "turn_text": turn_text,
+            "path": path,                                   # 未來 days 日方向（收盤不變模擬；後面幾天依賴假設）
+            "first_change_day": first_change,
+            "change_dir": path[first_change - 1] if first_change else "",
+            "first_down_day": next((i for i, x in enumerate(path, 1) if x == "下彎"), None),
+            "rise_price_tomorrow": _num(tick_above(rise_at)),
             # 失敗值＝明天要扣掉的價格：上揚均線收盤低於它才轉彎；比跌停價還低＝跌停也續揚（強支撐）
-            "fail_price": _num(deductions[0]),
-            "limit_proof": ("跌停也續揚" if now == "上揚" and deductions[0] < close * 0.9
-                            else "漲停也續彎" if now == "下彎" and deductions[0] > close * 1.1 else ""),
+            # 失敗值＝方向翻轉的門檻：上揚均線收盤要「高於」它才續揚；下彎均線收盤要「低於」它才續彎
+            "fail_price": _num(rise_at if now == "上揚" else fall_at if now == "下彎" else deductions[0]),
+            "limit_proof": ("跌停也續揚" if now == "上揚" and limit_prices(close)[0] > rise_at
+                            else "漲停也續彎" if now == "下彎" and limit_prices(close)[1] < fall_at else ""),
             "ma_above_close": above_close,
             "signal": signal,
         }
@@ -2804,7 +2945,7 @@ def analyze_ma_deduction(df: pd.DataFrame, periods: Sequence[int] = (5, 10, 20, 
         result[f"MA{n}"].update({
             "deduct_trend": trend,
             "role_text": f"{role}至 {projected:,.2f}",
-            "hold_prices_3d": [_num(v) for v in deductions[:3]],       # 未來 3 日各自要收高於這價，均線才維持上揚
+            "hold_prices_3d": [_num(tick_above(r)) for r in rises[:3]],   # 10-08：真正續揚門檻（逐日模擬；後兩日依賴收盤不變假設）
             "outlook": f"未來 {k} 日{trend}，{role}至 {projected:,.2f}（收盤不變推算）",
         })
     return result
@@ -2840,6 +2981,16 @@ def _get_corporate_actions_locked(code: str) -> Dict[str, Any]:
         result = cached[1]
         if result.get('complete') or time.monotonic() < result.get('_retry_at', 0):
             return result
+    if getattr(_LOCAL_ONLY, "on", False):
+        cached = _CORP_CACHE.get(str(code))
+        saved = local_market_cache.get_state(f"corporate_snapshot_v2_{code}", {}) or {}
+        if cached and cached[0] == taipei_now().strftime("%Y-%m-%d"):
+            return dict(cached[1])
+        if saved:
+            return dict(saved)
+        verified = local_market_cache.get_state(f"corporate_verified_v1_{code}", []) or []
+        return {"status": "unverified", "items": verified, "complete": False,
+                "coverage": ["離線：僅使用已保存公司行動；完整事件涵蓋範圍尚未核實"]}
     kf = core()
     start = (taipei_now() - timedelta(days=400)).strftime("%Y-%m-%d")
     import price_adjustment
@@ -2894,12 +3045,15 @@ def _get_corporate_actions_locked(code: str) -> Dict[str, Any]:
               "coverage": coverage, "complete": successes == 3,
               "_retry_at": time.monotonic() + 60}
     record_api_event("FinMindData", status=200 if successes else 500)
+    local_market_cache.set_state(f"corporate_snapshot_v2_{code}", result)
     _CORP_CACHE[code] = (today, result)
     return result
 
 
 def _recover_corporate_reference(code, actions):
     """斷層警示後再查官方資料，使用原始日K重算；來源仍不足就繼續拒絕分析。"""
+    if getattr(_LOCAL_ONLY, "on", False):
+        raise ToolDataError("公司行動參考價尚未核實；離線重算延後")
     import corporate_action_sources
     today = taipei_now().strftime('%Y-%m-%d')
     start = (taipei_now() - timedelta(days=400)).strftime('%Y-%m-%d')
@@ -2914,6 +3068,7 @@ def _recover_corporate_reference(code, actions):
             if not items.get(key, {}).get('factor'):
                 items[key] = event
         result.update(status='ok', items=sorted(items.values(), key=lambda e: e['date']))
+        local_market_cache.set_state(f"corporate_snapshot_v2_{code}", result)
         _CORP_CACHE[code] = (today, result)
         verified = [e for e in result['items'] if e.get('factor') and math.isfinite(float(e['factor'])) and float(e['factor']) > 0]
         local_market_cache.set_state(f'corporate_verified_v1_{code}', verified)
@@ -2925,11 +3080,14 @@ def _kline_patterns(df: pd.DataFrame, code: str = "", provisional_today: bool = 
     try:
         import kline_patterns
         events = get_corporate_actions(code) if code else None
-        result = kline_patterns.detect(df, events, provisional_today, replay_days=kline_patterns.TRI_BREAK_RECENT)   # 10-08：正式版無三角存檔，只重播最近 5 日
-        return {k: result.get(k) for k in ("summary", "names", "levels", "flags", "atr20")}
+        result = kline_patterns.detect(df, events, provisional_today, state_key=f"tri_state_{code}" if code else "")   # 10-08：三入口共用跨日三角存檔（沒有存檔＝同一套冷重播）
+        # 與管理員驗證圖同一個 detect 結果；舊通道/楔形/箱型不再替三角提供證據。
+        clean_frame = df.dropna(subset=["Open", "High", "Low", "Close"]).sort_index()
+        date = _fmt_date(clean_frame.index[-1]) if not clean_frame.empty else ""
+        return kline_patterns.ai_pattern_facts(result, data_date=date, day=len(clean_frame) - 1)
     except Exception as exc:                       # 型態判斷失敗不影響其他技術資料
         print(f"⚠️ K 線型態判斷略過｜{err_text(exc)}", flush=True)
-        return {}
+        return {"triangle_validation": {"status": "unavailable"}, "triangle": None}
 
 
 def get_technical_analysis(stock_code: str) -> Dict[str, Any]:
@@ -2970,6 +3128,9 @@ def get_technical_analysis(stock_code: str) -> Dict[str, Any]:
         "stock_name": name,
         "data_date": _fmt_date(df.index[-1]),
         "data_source": price_source_note(bundle),
+        "input_fp": bundle.get("input_fp", ""),
+        "source_fp": bundle.get("source_fp", ""),
+        "freshness": bundle.get("freshness", {}),
         "intraday": intraday,
         "signal_status": (f"盤後暫定（{_fmt_date(df.index[-1])}；將再次確認收盤）" if intraday.get("post_close_provisional")
                           else f"盤中暫定（{_fmt_date(df.index[-1])} {intraday.get('time','')}；最終以收盤為準）" if use_live and intraday.get("is_live")
@@ -3812,7 +3973,7 @@ def fetch_cnyes_news(code: str, name: str) -> List[Dict[str, Any]]:
     return articles
 
 
-def get_recent_news(stock_code: str, limit: int = NEWS_MAX_ITEMS) -> Dict[str, Any]:
+def get_recent_news(stock_code: str, limit: int = NEWS_MAX_ITEMS, days: Optional[int] = None) -> Dict[str, Any]:
     """近期公司新聞：鉅亨網（有內文）優先，再補既有六來源新聞標題；不抓一般網站原文（曾卡住 Discord 心跳）。"""
     kf = core()
     code, name = _stock_identity(stock_code)
@@ -3861,7 +4022,13 @@ def get_recent_news(stock_code: str, limit: int = NEWS_MAX_ITEMS) -> Dict[str, A
                 "event_key": kf._news_article_event_key(article, code, name),
             })
         with_body = [a for a in cnyes if a["content"]]
-        items = (with_body + [a for a in cnyes if not a["content"]] + others)[: max(1, int(limit))]
+        articles_all = with_body + [a for a in cnyes if not a["content"]] + others
+        if days is not None:
+            since = pd.Timestamp(taipei_now().date()) - pd.Timedelta(days=max(1, min(250, int(days))) - 1)
+            articles_all = [a for a in articles_all if pd.notna(pd.to_datetime(a.get("date"), errors="coerce"))
+                            and since <= pd.Timestamp(a["date"]).tz_localize(None).normalize() <= pd.Timestamp(taipei_now().date())]
+            cached_points = []
+        items = articles_all[:max(1, int(limit))]
         print(f"📰 {code} 新聞｜鉅亨 {len(cnyes)} 篇（有內文 {len(with_body)} 篇）｜六來源標題 {len(others)} 篇｜採用 {len(items)} 篇", flush=True)
         return {
             "stock_code": code,
@@ -3872,7 +4039,9 @@ def get_recent_news(stock_code: str, limit: int = NEWS_MAX_ITEMS) -> Dict[str, A
             "articles": items,
         }
 
-    data = _cached(f"news_{code}", TTL_NEWS_SECONDS, build)
+    data = _cached(f"news_{code}_{days}_{limit}", TTL_NEWS_SECONDS, build)
+    data = dict(data, requested_days=days, coverage_note="僅列來源實際取得的新聞；不代表指定期間全部新聞均已涵蓋",
+                actual_dates=sorted({a.get("date") for a in data.get("articles", []) if a.get("date")}))
     return {**data, "available": bool(data["summary_points"] or data["articles"])}
 
 
@@ -6680,3 +6849,33 @@ _TOOL_FAILURE_MESSAGES.update({
     "detect_current_branch_events": "分點目前事件資料無法取得",
     "get_branch_recent_behavior": "分點近期操作資料無法取得",
 })
+
+
+def frame_fingerprint(frame):
+    """Hash the exact confirmed raw OHLCV window actually consumed by scoring."""
+    import hashlib
+    rows = frame.sort_index().iloc[::-1]
+    raw = "|".join(f"{pd.Timestamp(i).strftime('%Y-%m-%d')},{float(r['Open']):.4f},{float(r['High']):.4f},{float(r['Low']):.4f},{float(r['Close']):.4f},{float(r.get('Volume', 0)):.0f}" for i, r in rows.iterrows())
+    return hashlib.md5(raw.encode()).hexdigest()[:12] if len(rows) else ""
+
+def analysis_fingerprint(raw_fp, actions):
+    import hashlib, json
+    payload = {"algorithm": "score-input-v3", "raw": raw_fp, "actions": actions.get("items") or [],
+               "coverage": actions.get("complete", False), "window": local_market_cache.KEEP_DAYS,
+               "deduction_days": MA_DEDUCTION_DAYS, "flat_ratio": 0.0002,
+               "settings": {k: v for k, v in globals().items() if k.isupper() and isinstance(v, (int, float, str, bool))
+                            and any(x in k for x in ("ZONE", "PROFILE", "MA_", "PRICE_DAYS"))}}
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
+def source_stamp(code):
+    actions = local_market_cache.get_state(f"corporate_snapshot_v2_{code}", {})
+    actions = actions or (_CORP_CACHE.get(str(code)) or ("", None))[1] or {}
+    return analysis_fingerprint(local_market_cache.bars_fingerprint(code), actions)
+
+def score_basis(tech):
+    basis = str(tech.get("signal_status") or "")
+    if tech.get("input_fp"):
+        basis += "｜fp=" + tech["input_fp"]
+    if tech.get("source_fp"):
+        basis += "｜src=" + tech["source_fp"]
+    return basis

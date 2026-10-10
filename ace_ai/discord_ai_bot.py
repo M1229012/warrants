@@ -657,6 +657,23 @@ class QueryPlan:
             self.tool_calls.append(call)
 
 
+def chart_codes_for_plan(plan: QueryPlan, codes: Sequence[str]) -> List[str]:
+    """Resolved needs govern chart inclusion; never keyword-match the question."""
+    unique = list(dict.fromkeys(codes))
+    if plan.needs is None:
+        return unique
+    per_stock = plan.needs.get("per_stock")
+    if isinstance(per_stock, dict):
+        return [code for code in unique if set(per_stock.get(code) or []) &
+                {"analysis", "technical", "cost", "price", "institutional", "warrant"}]
+    # Compatibility for plans assembled outside _answer_uncached_impl: derive
+    # from actual scheduled tools, not parsed stocks or the original question.
+    visual = {"get_stock_overview", "get_technical_analysis", "get_pattern_scorecard",
+              "get_volume_profile", "get_cost_position_context", "get_institutional_flow"} | WARRANT_TOOLS
+    scheduled = {str(call.kwargs.get("stock_code") or "") for call in plan.tool_calls if call.name in visual}
+    return [code for code in unique if code in scheduled]
+
+
 HELP_MESSAGE = (
     "我可以幫你查股票、族群與權證分點資料，請用 `/ask 問題`，例如：\n"
     "• `/ask 2330現在型態好嗎`\n"
@@ -2575,8 +2592,11 @@ def _compact_tool_data(name: str, data: Dict[str, Any], has_scorecard: bool) -> 
     data = dict(data)
     if name == "get_technical_analysis":
         data["bollinger"] = {k: v for k, v in (data.get("bollinger") or {}).items() if k in _BOLLINGER_KEEP}
-        data_full_patterns = data.get("kline_patterns") or {}
+        import kline_patterns
+        data_full_patterns = kline_patterns.ai_pattern_facts(
+            data.get("kline_patterns") or {}, data_date=str(data.get("data_date") or ""))
         data["kline_patterns"] = (data_full_patterns.get("summary") or []) + [f"資料旗標：{f}" for f in data_full_patterns.get("flags") or []]   # 白話結論＋旗標（§12）
+        data["triangle_validation"] = data_full_patterns["triangle_validation"]
         triangle_structure = data_full_patterns.get("triangle")   # 10-08 自測試版移植：三角正式／候選身分與完整事件，不能被摘要掉
         if triangle_structure:
             data["triangle_structure"] = triangle_structure
@@ -2585,6 +2605,7 @@ def _compact_tool_data(name: str, data: Dict[str, Any], has_scorecard: bool) -> 
             data = {k: data.get(k) for k in ("stock_code", "data_date", "signal_status", "intraday_observation", "kd", "macd", "bollinger",
                                              "ma20_cross_recent_3_days", "ma_kline_signals", "recent_bars_10", "ma_recent_3d")}
             data["kline_patterns"] = ((data_full_patterns or {}).get("summary") or []) + [f"資料旗標：{f}" for f in (data_full_patterns or {}).get("flags") or []]
+            data["triangle_validation"] = data_full_patterns["triangle_validation"]
             if triangle_structure:
                 data["triangle_structure"] = triangle_structure
             b = data.get("bollinger") or {}
@@ -2739,6 +2760,12 @@ def build_final_prompt(payload: Dict[str, Any]) -> str:
         sections.append(FINAL_FOCUS_RULES)
     if names & {"get_technical_analysis", "get_pattern_scorecard", "get_volume_profile"}:
         sections.append(FINAL_TECH_RULES)
+        sections.append("型態驗證為唯一整理型態依據：triangle_validation.status=none 表示未偵測到合格三角；"
+                        "unavailable 表示無法核實，兩者都不可說已形成三角、給三角上下緣或突破日期。"
+                        "candidate 必須明講候選，線外僅代表越過候選線，不能寫正式突破。"
+                        "formal 才能依 triangle_structure 的原始事件/日期/目前位置描述；歷史越線不等於目前仍在線外，"
+                        "盤中不寫收盤確認。舊整理型態、評分名稱、均線、布林、量區或使用者假設不能替代三角驗證。"
+                        "沒有三角仍可解讀均線、量區、布林、趨勢與已提供的K線特徵。多股解讀須標明股票。")
     if "get_recent_news" in names:
         sections.append(FINAL_NEWS_RULES)
     if "get_sheet_stock_chips" in names:
@@ -2976,6 +3003,7 @@ class FactSheet:
         self.ma_aux: Dict[str, Dict[str, List[float]]] = {}
         self.closed_pos: Dict[str, Dict[str, str]] = {}
         self.live_pos: Dict[str, Dict[str, str]] = {}
+        self.triangle_validation: Dict[str, Dict[str, Any]] = {}
         self.patterns: Dict[str, Set[str]] = {}          # 程式判斷到的 K 線型態（AI 只能講這些）
         tool_results = payload.get("tool_results") or {}
         self.market = _variants_of(json.dumps(_strip_keys(tool_results, _USER_INPUT_KEYS), ensure_ascii=False, default=str))
@@ -3016,7 +3044,12 @@ class FactSheet:
                     closed.setdefault(label, position)
         if isinstance(data.get("kline_patterns"), dict):
             import kline_patterns
-            self.patterns.setdefault(code, set()).update(kline_patterns.names(data["kline_patterns"]))
+            canonical = kline_patterns.ai_pattern_facts(
+                data["kline_patterns"], data_date=str(data.get("data_date") or ""))
+            # A later result replaces rather than unions stale pattern names.
+            self.patterns[code] = set(canonical["names"])
+            self.triangle_validation[code] = dict(canonical["triangle_validation"],
+                                                  structure=canonical.get("triangle") or {})
         live = (data.get("intraday_observation") or {}).get("ma_positions") or {}
         if live:
             self.live_pos.setdefault(code, {}).update({k: v for k, v in live.items() if v in ("站上", "跌破", "持平")})
@@ -3051,7 +3084,50 @@ class FactSheet:
             issues += self._direction_issues(sentence, subject)
             issues += self._alignment_issues(sentence, subject)
             issues += self._pattern_issues(sentence, subject)
+            issues += self._triangle_issues(sentence, subject)
+        elif re.search(r"三角", sentence) and self.triangle_validation:
+            issues.append("三角敘述未指明股票，無法對應驗證結果")
         return issues
+
+    def _triangle_issues(self, sentence: str, code: str) -> List[str]:
+        """Do not promote absent/candidate triangles to actual formations/events."""
+        record = self.triangle_validation.get(code)
+        if not record or "三角" not in sentence:
+            return []
+        status = record.get("status")
+        clauses = re.split(r"[，,；;。\n]", sentence)
+        negative = r"(?:沒有|未有|尚無|無明確|未(?:偵測|辨識|判斷|確認|形成|出現)到?|不是|並非|不代表|不能視為|無法(?:判定|核實))"
+        for clause in clauses:
+            if "三角" not in clause:
+                continue
+            if status in ("none", "unavailable"):
+                # Only explicit negatives or hypothetical future formation;
+                # '若突破三角上緣' still presupposes an existing triangle.
+                future = re.search(r"(?:若|如果|假如|倘若).*?(?:未來|之後|後續).*?形成", clause)
+                if not future and not re.search(negative + r"[^，；。]{0,18}三角", clause):
+                    return ["三角不符：型態驗證未提供合格三角，不可宣稱成立或引用邊界"]
+            elif status == "candidate":
+                no_break = re.search(r"(?:尚未|未曾|未|沒有|不代表).{0,6}(?:突破|跌破)", clause)
+                claimed_break = re.search(r"(?:已|正式|確認).{0,6}(?:突破|跌破)", clause) and not no_break
+                if ("候選" not in sentence or claimed_break) and not re.search(negative, clause):
+                    return ["三角不符：僅候選，不可說成正式型態或已確認突破"]
+        shape = record.get("structure") or {}
+        if status == "formal":
+            event_types = {x.get("type") for x in shape.get("events") or []}
+            for clause in clauses:
+                # A Bollinger/volume-zone breakout in the next clause is not a
+                # triangle breakout; a trailing '若...' cannot excuse a prior claim.
+                if "三角" not in clause:
+                    continue
+                plain = _CONDITIONAL_RE.split(clause)[0]
+                for verb, event in (("突破", "break_up"), ("跌破", "break_down")):
+                    if (re.search(r"(?:已|收盤|確認).{0,8}" + verb, plain)
+                            and not re.search(r"(?:尚未|未曾|未|沒有).{0,6}" + verb, plain)
+                            and event not in event_types and shape.get("state") != event):
+                        return ["三角事件不符：驗證結果沒有對應的正式越線事件"]
+            if shape.get("is_provisional") and re.search(r"今日.*收盤.*確認", sentence):
+                return ["三角事件不符：盤中觀察不能寫成今日收盤確認"]
+        return []
 
     def _pattern_issues(self, sentence: str, code: str) -> List[str]:
         """K 線型態名稱只能用程式判斷到的（條件句「若形成…」不查）；沒有型態資料的題目不查。"""
@@ -3060,7 +3136,8 @@ class FactSheet:
         plain = _CONDITIONAL_RE.split(_PAREN_RE.sub("", sentence))[0]
         known = self.patterns[code]
         return [f"型態不符：寫「{m.group()}」，程式沒有判斷到" for m in _PATTERN_NAME_RE.finditer(plain)
-                if not any(m.group() in k or k.startswith(m.group()) for k in known)]
+                if "三角" not in m.group()
+                and not any(m.group() in k or k.startswith(m.group()) for k in known)]
 
     def _alignment_issues(self, sentence: str, code: str) -> List[str]:
         """均線排列：實際空頭排列（MA5<MA10<MA20<MA60）卻寫多頭排列／多方架構強勢，或反過來 → 不符。"""
@@ -4564,7 +4641,7 @@ REQUIRED_MODULE_API = {
     "market_data": ("RECENT_DAYS",),
     "warrant_store": ("StoreShrunk",),
     "spot_chip": ("_official_trading_dates", "remember_history", "prefetch_history"),
-    "kline_patterns": ("detect", "names"),
+    "kline_patterns": ("detect", "names", "ai_pattern_facts"),
     "sector_analysis": ("live_group_ranking",),
     "market_scan": ("value_liquid_codes", "EXCLUDED_NAMES"),
 }
@@ -5156,7 +5233,7 @@ class AceQueryEngine:
         # 快取鍵值用「補完股票之後」的問題，避免 A 使用者的「那它的壓力在哪」拿到 B 使用者的答案；籌碼類型分開快取。
         # 族群追問（「那哪檔最強」）要帶族群名稱與模式，不同族群的同一句追問不能共用答案
         sector = parsed.sector or {}
-        key = "|".join(['技術70現股30融資管理員v17',compact, ",".join(c for c, _ in parsed.stocks), str(parsed.cost_price or ""), ",".join(parsed.branches),
+        key = "|".join(['技術70現股30融資管理員v18型態核對K線需求',compact, ",".join(c for c, _ in parsed.stocks), str(parsed.cost_price or ""), ",".join(parsed.branches),
                         "chip=" + parsed.chip,
                         "sector=" + str(sector.get("name") or sector.get("industry") or "") + ":" + str(sector.get("mode") or "")])
         key = self._access_cache_key(key)
@@ -6685,8 +6762,10 @@ class AceQueryEngine:
             if needs is None:
                 return AnswerResult(text="需求與排除条件暫時無法確認，請分開描述各檔要查的項目。", route="clarify",
                                     gemini_calls=stats.gemini_calls, elapsed=time.perf_counter()-started)
-            plan = self._plan_from_needs(parsed, self._apply_needs(needs, parsed), stats)
-            plan.needs = needs
+            per_stock = self._apply_needs(needs, parsed)
+            plan = self._plan_from_needs(parsed, per_stock, stats)
+            # 畫圖和工具共用已解析、已套排除条件的逐檔需求；不能再讀原始JSON的不存在欄位。
+            plan.needs = dict(needs, per_stock={code: sorted(want) for code, want in per_stock.items()})
         elif (plan.route in ("help", "rule_stock_bundle") or plan.uncertain) and not (unknown_codes(parsed) and not parsed.stocks):
             # 規則沒把握（看不懂，或認得股票但看不出要問什麼）→ 1 次 Gemini 用「完整原句」分類，程式再檢查；
             # 寫了代號但名冊查不到（0000）：直接說查不到，不花 1 次 Gemini 去猜
@@ -6764,9 +6843,8 @@ class AceQueryEngine:
                 self.log(f"完整點位：K 線拉長到 {lookback} 根（涵蓋 {chart_branch} 在 {codes[0]} 的事件，最多回推 180 天）")
             except Exception as exc:   # 查不到事件就維持 70 根，不影響回答
                 self.log(f"完整點位略過：{type(exc).__name__}: {exc}")
-        chart_codes = codes if plan.needs is None else [c for c in codes
-                       if set((plan.needs.get("per_stock") or {}).get(c, [])) &
-                          {"analysis", "technical", "cost", "price", "institutional", "warrant"}]
+        chart_codes = chart_codes_for_plan(plan, codes)
+        self.log(f"K 線排程｜預期股票={','.join(chart_codes) or '無（依需求）'}")
         for c in chart_codes:
             kwargs = {"stock_code": c, "mark_mode": mark_mode, "flow_source": "sheet"}
             if lookback:
@@ -6786,8 +6864,17 @@ class AceQueryEngine:
         results = [r for r in combined if r.name != "get_chart_panel"]
         chart_results = [r for r in combined if r.name == "get_chart_panel"]
         panels = []
-        for code, chart in zip(chart_codes, chart_results):
-            panel = dict(chart.data) if chart.ok else {"stock_code": code, "error": "K 線資料暫時無法取得；以下保留已取得的分析。"}
+        # Align only charts this block requested; planner-provided chart calls
+        # cannot shift another stock's panel. Missing/empty results stay visible.
+        requested_charts = run_results[len(planned_calls):]
+        for index, code in enumerate(chart_codes):
+            chart = requested_charts[index] if index < len(requested_charts) else None
+            valid_chart = bool(chart and chart.ok and chart.data.get("bars")
+                               and str(chart.data.get("stock_code") or code) == code)
+            panel = dict(chart.data, stock_code=code) if valid_chart else {
+                "stock_code": code, "error": "K 線資料暫時無法取得；以下保留已取得的分析。"}
+            if not valid_chart:
+                self.log(f"K 線未完成｜{code}｜{getattr(chart, 'error', '') or '空白或股票不符'}")
             if not warrant_ok:
                 panel["marks"] = {}  # 圖上不畫分點標記
             else:
@@ -6951,7 +7038,9 @@ class AceQueryEngine:
             route=plan.route,
             gemini_calls=stats.gemini_calls,
             elapsed=elapsed,
-            cacheable=llm_ok and all(r.ok for r in combined),
+            cacheable=llm_ok and all(r.ok for r in combined)
+                      and all(any(p.get("stock_code") == code and p.get("bars") for p in panels)
+                              for code in chart_codes),
             errors=[f"{r.name}：{r.error or r.user_message}" for r in combined if not r.ok]
                    + (["Gemini 最終回答失敗"] if plan.need_final_llm and not llm_ok else []),
             panels=panels,
@@ -7121,7 +7210,11 @@ class AceQueryEngine:
 
         card = dict(card)
         card["answer"], card["why"], card["summary"] = clean(card["answer"]), clean(card.get("why", "")), clean(card.get("summary", ""))
-        card["scenarios"] = [dict(s, text=clean(s["text"])) for s in card.get("scenarios") or []]
+        for key in ("cost_basis", "scenario_title", "notice", "response_style"):
+            if isinstance(card.get(key), str):
+                card[key] = clean(card[key])
+        card["scenarios"] = [dict(s, title=clean(s.get("title", "")), text=clean(s["text"]))
+                             for s in card.get("scenarios") or []]
         card["scenarios"] = [s for s in card["scenarios"] if s["text"]]
         if not card["answer"] and card["summary"]:
             card["answer"], card["summary"] = card["summary"], ""     # 標題句被刪：改用一句話總結當標題，不整張丟掉
@@ -7143,7 +7236,7 @@ class AceQueryEngine:
     def _bind_late_cache(self, result, key, eligible=True):
         job=result.late_ai
         access=self._access()
-        if job and eligible and not (access and access.simulation) and all(r.ok for r in job['results']):
+        if job and eligible and not (access and access.simulation) and all(r.ok for r in job['results']) and not any(p.get('error') for p in result.panels or []):
             job['targets'].append((key,self.config.answer_cache_seconds))
 
     def finish_late_ai(self, original, raw):
