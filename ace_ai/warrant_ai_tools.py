@@ -2432,6 +2432,11 @@ def _load_price_bundle(stock_code: str, spot_history_mode: bool = False) -> Dict
     def daily() -> Tuple[pd.DataFrame, str, str]:
         # 先讀 Persistent Volume / 本機 SQLite 的最近 70 日。只要資料仍夠新，就不再打 FinMind。
         persistent = local_market_cache.load_bars(code, limit=max(70, local_market_cache.KEEP_DAYS))
+        if getattr(_LOCAL_ONLY, "on", False):
+            # 10-11：local_only（族群總覽、背景重算）一律不連網；本地底庫不足就跳過這檔
+            if persistent and persistent.get("count", 0) >= 30:
+                return persistent["df"], str(persistent.get("market") or ""), "本地市場底庫（離線）"
+            raise ToolDataError(f"{code} 本地日K不足，離線模式略過")
         today = taipei_now().strftime("%Y-%m-%d")
         local_last = ""
         if persistent and persistent.get("count", 0) >= 69:

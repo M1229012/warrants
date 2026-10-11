@@ -40,6 +40,7 @@ class WeeklyPickConfig:
     """本週精選所有門檻與權重參數集中在這裡，全部可用環境變數覆寫。"""
 
     event_window_trading_days: int = tools._env_int("WEEKLY_PICK_EVENT_WINDOW_DAYS", 60)
+    min_remaining_ratio: float = tools._env_float("WEEKLY_PICK_MIN_REMAINING_RATIO", 0.5)   # 減碼後剩餘＜50％＝已出場
     min_event_win_rate: float = tools._env_float("WEEKLY_PICK_MIN_EVENT_WIN_RATE", 60.0)
     min_event_sample: int = tools._env_int("WEEKLY_PICK_MIN_EVENT_SAMPLE", 10)
     shortlist_size: int = tools._env_int("WEEKLY_PICK_SHORTLIST_SIZE", 0)  # 0＝所有符合資格股票公平進入完整評分
@@ -201,6 +202,13 @@ def evaluate_pair(
     """
     records = perf["branches"].get(branch, {})
     active = pair_events[pair_events.get("status", "") != "已出清"].copy() if "status" in pair_events else pair_events.copy()
+    original_amount = float(pd.to_numeric(active["buy_amount"], errors="coerce").fillna(0).sum()) if not active.empty else 0.0
+    if not active.empty and "reduce_amount" in active:
+        # 10-11：減碼後只算剩餘金額；剩不到 min_remaining_ratio 視為大致出場，不再當主力在場
+        bought = pd.to_numeric(active["buy_amount"], errors="coerce").fillna(0)
+        sold = pd.to_numeric(active["reduce_amount"], errors="coerce").fillna(0).clip(lower=0)
+        active["buy_amount"] = (bought - sold).clip(lower=0)
+        active = active[(bought <= 0) | (active["buy_amount"] >= bought * getattr(config, "min_remaining_ratio", 0.5))]
     # 每週精選的定位是找「權證大戶仍在場」的股票；已全數出清的 pair 留作紀錄但不進候選。
     active_pair = not active.empty
     basis = active if active_pair else pair_events.sort_values("event_date").tail(1)
@@ -282,6 +290,8 @@ def evaluate_pair(
         "event_dates": sorted({tools._fmt_date(d) for d in basis["event_date"]}) if not basis.empty else [],
         "event_buy_amount": total_amount,
         "event_buy_amount_text": tools._money_text(total_amount),
+        "event_original_buy_amount": original_amount,
+        "reduced_pct": round((1 - total_amount / original_amount) * 100, 1) if active_pair and original_amount > 0 else 0.0,
         "event_performance": matched,
         "matched_raw_win_rate": _round(raw, 2),
         "matched_adjusted_win_rate": _round(adjusted, 2),
@@ -945,7 +955,7 @@ class WeeklyPickEngine:
             behavior = {"found": False, "reason": f"{type(exc).__name__}: {exc}"}
             flags.add("recent_behavior_unavailable")
         lead_live = ((behavior.get("same_stock") or {}).get("live_flow") or {}) if behavior.get("found") else {}
-        if config.live_flow_enable and not lead_live.get("available"):
+        if config.live_flow_enable and lead.get("branch") and not lead_live.get("available"):   # 10-11：沒有分點的指定股不標流水缺漏
             flags.add("recent_flow_unavailable")
 
         for pair in stock["high_quality_pairs"][:4]:
@@ -1150,7 +1160,8 @@ def candidate_payload(stock: Dict[str, Any]) -> Dict[str, Any]:
         },
         "branch": {
             "name": lead["branch"],
-            "event_buy_amount_in_window_text": lead["event_buy_amount_text"],
+            "event_buy_amount_in_window_text": lead["event_buy_amount_text"],   # 10-11：減碼後的剩餘金額
+            "reduced_pct": lead.get("reduced_pct", 0.0),
             "net_buy_5d_text": live.get("net_buy_5d_text") if live.get("has_trades") else None,
             "event_dates": lead["event_dates"],
             "triggered_events": lead["triggered_events"],
@@ -1774,7 +1785,7 @@ def rank_cache_key(config: "WeeklyPickConfig", filters: "WeeklyPickFilters") -> 
     except Exception:
         bar_day = ""
     return "|".join([
-        "weekly_pick_rank_v9", tools._fmt_date(bundle["latest_event_date"]), str(perf.get("sheet_updated_at", "")),
+        "weekly_pick_rank_v10", tools._fmt_date(bundle["latest_event_date"]), str(perf.get("sheet_updated_at", "")),
         bar_day, tools.taipei_now().strftime("%Y-%m-%d"),
         filters.signature(), str(config.event_window_trading_days), str(config.top_n),
     ])
@@ -1932,7 +1943,11 @@ def find_weekly_candidate(stock_code: str, log: Callable[[str], None] = print, c
     """指定股不受Top10／排名資格限制；有現成排名資料就沿用，否則只取該檔資料。"""
     config = config or WeeklyPickConfig()
     code = tools.core()._normalize_stock_name_code_key(stock_code)
-    cached = _load_cache(config, rank_cache_key(config, WeeklyPickFilters()))
+    try:
+        cached = _load_cache(config, rank_cache_key(config, WeeklyPickFilters()))
+    except tools.ToolDataError as exc:          # 10-11：Sheet 斷線時排名鍵值算不出來，改走指定股流程
+        log(f"週精選指定股 {code}：排名快取略過｜{type(exc).__name__}: {exc}")
+        cached = None
     ranking = (cached or {}).get("result") if isinstance(cached, dict) else None
     if isinstance(ranking, dict):
         stock = next((s for s in ranking.get("top") or [] if s.get("stock_code") == code), None)

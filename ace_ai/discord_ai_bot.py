@@ -6893,6 +6893,12 @@ class AceQueryEngine:
                     if hit:
                         parsed.sector_context = {"industry": hit["industry"], "name": hit["name"],
                                                  "mode": "technical" if item["type"] == "rank" else "members"}
+                    elif item["type"] == "members" and parsed.sector_context is None:
+                        # 10-11：「1815族群」＝對象是股票 → 反查這檔所屬族群（與「2330屬於什麼族群」同一路）
+                        stock = resolve(str(target).strip())
+                        if stock:
+                            parsed.sector_context = {"mode": "belongs", "industry": "", "name": stock[0],
+                                                     "stock_code": stock[0]}
         per_stock: Dict[str, Set[str]] = {}
         untargeted: Set[str] = set()
         for n in items:
@@ -6964,6 +6970,9 @@ class AceQueryEngine:
                     period = getattr(parsed, "needs_periods", {}).get((code, "news"))
                     if period: kwargs["days"] = period
                 merged.add(call.name, **kwargs)
+        if not merged.tool_calls and not merged.pattern:
+            # 10-11：需求表排完沒有任何可查項目（例如只剩接不上的族群需求）→ 請使用者補充，不出空白圖卡
+            return QueryPlan(route="clarify", clarification="這題的需求暫時無法對應到可查的項目，請補充要看的內容（例如型態、籌碼或所屬族群）。")
         return merged
 
     @staticmethod

@@ -1605,12 +1605,20 @@ def _deduction_outlook(info: dict) -> tuple[str, str]:
     return {'上揚': ('續揚', INK), '下彎': ('續彎', INK)}.get(info.get('direction_now'), ('走平', MUTED))
 
 
+def level_ma_note(info: dict) -> str:
+    """關鍵價位說明欄：只寫失敗值（10-11 使用者要求）；沒有失敗值才寫目前方向。"""
+    fail = _finite(info.get('fail_price'))
+    if fail is not None and fail > 0:
+        return f'失敗值 {fail:,.2f}'
+    return {'上揚': '目前上揚', '下彎': '目前下彎', '走平': '目前走平'}.get(info.get('direction_now'), '扣抵條件待更新')
+
+
 def _level_note(label: str, card: dict) -> tuple[str, str]:
-    """關鍵價位「說明」欄：均線寫方向與扣抵推算，量區／布林寫價位性質。"""
+    """關鍵價位「說明」欄：均線只寫失敗值，量區／布林寫價位性質。"""
     info = (card.get('ma_deduction') or {}).get('MA20' if label == '布林中軌' else label)
     if info:
         _, color = _deduction_outlook(info)
-        return f"{'MA20 ' if label == '布林中軌' else ''}{public_ma_condition(info)}", color
+        return f"{'MA20 ' if label == '布林中軌' else ''}{level_ma_note(info)}", color
     if '三角' in label:
         return '固定型態參考線；需配合候選／越線／確認狀態', MUTED
     if '量區' in label:
