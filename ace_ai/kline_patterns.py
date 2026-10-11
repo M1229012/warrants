@@ -996,7 +996,13 @@ ENV_CLOSE_MAX = _env("ENV_CLOSE_MAX", 1.0)    # 收盤穿線超過 1 ATR＝這�
 ENV_WICK = _env("ENV_WICK", 0.5)              # 影線刺穿 0.5 ATR 以上＝刺穿（少量允許、扣分）
 ENV_RECENT = int(_env("ENV_RECENT", 30))      # 最後一次碰線要在 30 根內
 ENV_SLOPE = _env("ENV_SLOPE", 0.06)           # 上緣每根上升／下緣每根下降不超過 0.06 ATR（三角不是通道）
-ENV_INSIDE = _env("ENV_INSIDE", 0.85)         # 共同期間收盤在兩線間的比例
+ENV_INSIDE = _env("ENV_INSIDE", 0.85)
+ENV_W_INSIDE = _env("ENV_W_INSIDE", 3.0)        # 兩線間收盤比例加分
+ENV_CLOSE_FRAC = _env("ENV_CLOSE_FRAC", 0.08)  # 收盤穿線最多占線長 8%
+ENV_WICK_FRAC = _env("ENV_WICK_FRAC", 0.15)    # 影線刺穿最多占線長 15%
+ENV_W_LEN = _env("ENV_W_LEN", 0.15)            # 線長加分（每根）
+ENV_W_CLOSE = _env("ENV_W_CLOSE", 1.5)         # 每根收盤穿線扣分
+ENV_W_WICK = _env("ENV_W_WICK", 0.5)           # 每根影線刺穿扣分         # 共同期間收盤在兩線間的比例
 ENV_NARROW = _env("ENV_NARROW", 0.8)          # F 時寬度 ≤ 共同起點 80%＝收斂
 
 
@@ -1030,21 +1036,24 @@ def _tri_form_envelope(H, L, O, C, A, lo: int, F: int) -> Optional[Dict[str, Any
                     t = np.arange(i, F + 1)
                     val = s * t + k
                     dc = sign * (C[t] - val) / At[t]
-                    if dc.max() > ENV_CLOSE_MAX:
-                        continue
+                    dw = sign * (wick[t] - val) / At[t]
+                    db = sign * (body[t] - val) / At[t]
                     close_bad = int((dc > ENV_CLOSE).sum())
-                    wick_bad = int((sign * (wick[t] - val) / At[t] > ENV_WICK).sum())
-                    if close_bad > max(1, 0.05 * len(t)) or wick_bad > 3:
+                    wick_bad = int((dw > ENV_WICK).sum())
+                    far_bad = int((dc > ENV_CLOSE_MAX).sum())
+                    # 使用者 20 張截圖實測：有效段約 57 根，收盤穿線中位 2、九成 ≤4；影線刺穿 0.4ATR 中位 3、九成 ≤7
+                    if close_bad > max(2, ENV_CLOSE_FRAC * len(t)) or wick_bad > max(3, ENV_WICK_FRAC * len(t)) or far_bad > 2:
                         continue
+                    near = (np.abs(dw) <= ENV_TOUCH) | (np.abs(db) <= ENV_TOUCH)
+                    touch_bars = int(near.sum())
                     touch, last = [], -99
                     for p in pts:
-                        if p >= i and min(abs(wick[p] - (s * p + k)), abs(body[p] - (s * p + k))) <= ENV_TOUCH * At[p] \
-                                and p - last >= 4:
+                        if p >= i and near[p - i] and p - last >= 4:
                             touch.append(p)
                             last = p
                     if len(touch) < 2 or F - touch[-1] > ENV_RECENT:
                         continue
-                    score = len(touch) + 0.5 * (F - i) / max(1, F - lo) - 0.5 * wick_bad - 1.0 * close_bad
+                    score = (touch_bars + ENV_W_LEN * len(t) - ENV_W_CLOSE * close_bad - ENV_W_WICK * wick_bad)
                     out.append((score, {"s": s, "k": k, "i0": i, "a": touch, "src": (i, kind, j, kind),
                                         "R_line": float(At[i]), "pending": [], "close_bad": close_bad, "wick_bad": wick_bad,
                                         "events": [dict(rep=p, days=[p], sep=None, react=None, fake=False) for p in touch]}))
@@ -1067,7 +1076,7 @@ def _tri_form_envelope(H, L, O, C, A, lo: int, F: int) -> Optional[Dict[str, Any
             inside = float(((C[t] <= uu + ENV_CLOSE * At[t]) & (C[t] >= dd - ENV_CLOSE * At[t])).mean())
             if inside < ENV_INSIDE:
                 continue
-            score = us[id(u)] + ds[id(d)] + 2 * inside
+            score = us[id(u)] + ds[id(d)] + ENV_W_INSIDE * inside
             if best is None or score > best[0]:
                 best = (score, u, d, joint, w0, wF, inside)
     if not best:
@@ -1119,7 +1128,10 @@ def _tri_form(H, L, O, C, A, lo: int, F: int, piv, confirm: bool = True, local: 
             if _tri_alternations(u, d) < 3:
                 continue
             n = len(u["a"]) + len(d["a"])
-            key = (min(u["major"], d["major"]), u["major"] + d["major"], min(len(u["a"]), len(d["a"])), n,
+            span = (F - u["i0"]) + (F - d["i0"])        # 10-11 實驗：TRI_PREFER_LONG＝1 時，碰線證據相同下偏好時間較長的線
+            key = (min(u["major"], d["major"]), u["major"] + d["major"],
+                   (span // max(1, TRI_PREFER_LONG_STEP)) if TRI_PREFER_LONG else 0,
+                   min(len(u["a"]), len(d["a"])), n,
                    u["reacted"] + d["reacted"], -(u["fakes"] + d["fakes"]), -round(u["err"] + d["err"], 3),
                    tuple(-x if isinstance(x, int) else 0 for x in u["src"] + d["src"]))
             quality = None
@@ -1209,6 +1221,8 @@ TRI_LOCK_DAYS = int(_env("TRI_LOCK_DAYS", 0))        # 0＝不鎖線（預設）
 TRI_LOCK_IDLE = int(_env("TRI_LOCK_IDLE", 30))       # 鎖住後超過 N 個交易日沒有新碰線就結束
 TRI_FULL_REPLAY = int(_env("TRI_FULL_REPLAY", 0))    # 1＝從資料起點逐日重播（實測 3034 會改變 v10 結果，預設關）
 TRI_SHOW_DAYS = int(_env("TRI_SHOW_DAYS", 69))       # 越線後持續畫到越線日移出 70 根圖為止
+TRI_PREFER_LONG = int(_env("TRI_PREFER_LONG", 0))   # 實驗開關：1＝同證據偏好較長線
+TRI_PREFER_LONG_STEP = int(_env("TRI_PREFER_LONG_STEP", 10))
 TRI_FAIL_DAYS = int(_env("TRI_FAIL_DAYS", 3))        # 越線後 N 天沒有延續＝失敗越線，撤銷紀錄
 TRI_FAIL_ATR = float(_env("TRI_FAIL_ATR", 1.0))    # 延續門檻：往越線方向再走 1 ATR（1608 實測 0.5 太鬆）
 TRI_TRACK_DAYS = int(_env("TRI_TRACK_DAYS", 20))     # 已突破型態沿固定線追蹤最多 20 日（或交會）就結束
@@ -1891,7 +1905,12 @@ def detect(df: pd.DataFrame, events: Optional[Dict[str, Any]] = None, provisiona
         except Exception as exc:
             print(f"⚠️ 三角狀態寫入失敗｜{state_key}｜{type(exc).__name__}: {exc}", flush=True)
             break
-    if state_key and replay_days != 0 and __import__("log_switch").enabled("tri"):   # 10-11：開「三角紀錄」才印（族群總覽不印）
+    def _background():                            # 背景型態分數掃描不印（只印使用者問的題目）
+        try:
+            return __import__("warrant_ai_tools").current_api_priority() == "background"
+        except Exception:
+            return False
+    if state_key and replay_days != 0 and __import__("log_switch").enabled("tri") and not _background():   # 10-11：開「三角紀錄」才印（族群總覽不印）
         info = getattr(LAST_TRI_INFO, "info", {}) or {}
         dates_ = adj.index
         line = (f"🔺 三角核對｜{state_key.replace('tri_state_', '')}｜截至 {_d(dates_[last_official])}｜{info.get('version', TRI_STATE_VERSION)}"
