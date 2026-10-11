@@ -151,6 +151,12 @@ def line_specs(data: dict) -> list[dict]:
                           "fit_end": formation["end"], "stop": stop,
                           "anchors": (formation.get("anchors") or {}).get(edge, []),
                           "color": "#87909E" if historical else color, "historical": historical})
+    for h in (triangle or {}).get("history_lines") or []:   # 10-12 歷史越線三角：灰線，原係數畫到交會點或圖右端
+        for edge in ("upper", "lower"):
+            anchors = list(h["anchors"][edge])
+            lines.append({"label": "歷史線", "coef": h[edge], "start": anchors[0] if anchors else h["start"],
+                          "fit_end": anchors[-1] if anchors else h["start"], "stop": min(last, h["stop"]),
+                          "anchors": [], "color": "#87909E", "historical": True})
     tr = data.get("trend")
     if tr and tr.get("line_coefficients"):
         points = tr["points"]
