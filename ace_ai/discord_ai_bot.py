@@ -2835,6 +2835,10 @@ def build_final_prompt(payload: Dict[str, Any]) -> str:
                         "formal 才能依 triangle_structure 的原始事件/日期/目前位置描述；歷史越線不等於目前仍在線外，"
                         "盤中不寫收盤確認。舊整理型態、評分名稱、均線、布林、量區或使用者假設不能替代三角驗證。"
                         "沒有三角仍可解讀均線、量區、布林、趨勢與已提供的K線特徵。多股解讀須標明股票。")
+        if payload.get("pattern_focus") is False:
+            # 10-11：使用者問的不是型態，三角只帶一句，篇幅留給本題
+            sections.append("本題不是問型態：有正式或候選三角時只用一句帶過（例如「目前在三角收斂內」或「先前已跌破三角」），"
+                            "不展開上下緣價位、碰線次數與事件日期；沒有三角就不提。篇幅以使用者所問的內容為主。")
     if "get_recent_news" in names:
         sections.append(FINAL_NEWS_RULES)
     if "get_sheet_stock_chips" in names:
@@ -7786,6 +7790,7 @@ class AceQueryEngine:
         if not plan.need_final_llm or not any(r.ok for r in results):
             return rule_answer, True
         payload = build_final_payload(question, results)
+        payload["pattern_focus"] = bool(plan.route == "rule_pattern" or plan.pattern)
         context = getattr(getattr(self, "_request_local", None), "member_chart_context", None)
         if context and (context.get("compound") or any(v.get("triangle") or not v.get("show_bollinger", True) for v in context.get("stocks", {}).values())):
             payload = member_pattern.scoped_payload(payload, context)
