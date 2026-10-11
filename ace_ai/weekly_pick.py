@@ -2512,6 +2512,8 @@ def is_weekly_session_followup(text: str, current_stock_code: str = "") -> bool:
     code = _code_in_edit_text(compact)
     if code and current_stock_code and code != str(current_stock_code):
         return False          # 明確問另一檔股票
+    if is_weekly_pick_question(compact) and not is_weekly_draft_question(compact):
+        return False          # 10-11：「每周精選」等排名指令不能被當成改稿
     if _STRONG_EDIT_RE.search(compact):
         return True           # 明確的改稿語氣（「把新光的勝率補上」「權證那段短一點」）
     if _QUESTION_RE.search(compact):

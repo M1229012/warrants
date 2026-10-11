@@ -1982,7 +1982,8 @@ GEMINI_OVERLOAD_RETRY_WAIT = max(0.0, tools._env_float("DISCORD_AI_GEMINI_OVERLO
 GEMINI_CALL_TIMEOUT_MS = max(5000, tools._env_int("DISCORD_AI_GEMINI_CALL_TIMEOUT_MS", 12000))   # 10-03：一次卡 148 秒；10-07：504 塞車白等 20 秒→12 秒就換金鑰／模型（正常回答約 6～8 秒）
 GEMINI_MAX_ATTEMPTS = max(1, tools._env_int("DISCORD_AI_GEMINI_MAX_ATTEMPTS", 5))      # 10-08：一次呼叫換金鑰／模型總次數上限
 GEMINI_MIN_CALL_SECONDS = 3.0                                                                  # 剩不到 3 秒就不再啟動新呼叫
-QUESTION_DEADLINE_SECONDS = max(15.0, tools._env_float("DISCORD_AI_QUESTION_DEADLINE_SECONDS", 50.0))   # 整題（解析＋排隊＋工具＋AI）
+QUESTION_DEADLINE_SECONDS = max(15.0, tools._env_float("DISCORD_AI_QUESTION_DEADLINE_SECONDS", 50.0))
+WEEKLY_PICK_DEADLINE_SECONDS = max(QUESTION_DEADLINE_SECONDS, tools._env_float("DISCORD_AI_WEEKLY_PICK_DEADLINE_SECONDS", 240.0))   # 10-11：本週精選排名   # 整題（解析＋排隊＋工具＋AI）
 IMAGE_RESERVE_SECONDS = 4.0                                                                    # 留給產生圖卡
 _QUESTION_CLOCK = __import__("request_runtime").CLOCK                                                            # 目前這題的截止時間（monotonic）
 QUESTION_MAX_GEMINI_CALLS = max(1, tools._env_int("DISCORD_AI_QUESTION_MAX_GEMINI_CALLS", 8))   # 整題 Gemini 呼叫總數上限
@@ -8980,11 +8981,14 @@ def run_discord_bot(config: BotConfig) -> None:
     async def handle_question_with_quote_policy(interaction: "discord.Interaction", question: str, admin_mode: bool,
                                                attachment=None) -> None:
         import request_runtime
-        state = request_runtime.new_state(QUESTION_DEADLINE_SECONDS)
+        # 10-11：管理員本週精選全市場排名約 80 秒，50 秒整題期限會把算完的結果丟掉 → 給較長期限
+        deadline = (WEEKLY_PICK_DEADLINE_SECONDS if admin_mode and is_weekly_pick_question(question)
+                    else QUESTION_DEADLINE_SECONDS)
+        state = request_runtime.new_state(deadline)
         try:
             with request_runtime.scope(state):
                 await asyncio.wait_for(_handle_question_impl(interaction, question, admin_mode, attachment),
-                                       timeout=QUESTION_DEADLINE_SECONDS)
+                                       timeout=deadline)
         except asyncio.TimeoutError:
             state["cancelled"] = True
             try:
