@@ -989,11 +989,106 @@ def _tri_height(H, L, O, C, A, u, d) -> Optional[Dict[str, Any]]:
             "contacts": [(int(t), x) for t, x in pick]}
 
 
+ENV_R = int(_env("ENV_R", 3))                 # 轉折點：前後 3 根內最高／最低（idx+3 日才確認）
+ENV_TOUCH = _env("ENV_TOUCH", 0.4)            # 碰線：影線或實體距線 0.4 ATR 內
+ENV_CLOSE = _env("ENV_CLOSE", 0.15)           # 收盤穿線 0.15 ATR 以上＝收盤違規（扣分）
+ENV_CLOSE_MAX = _env("ENV_CLOSE_MAX", 1.0)    # 收盤穿線超過 1 ATR＝這條線不成立
+ENV_WICK = _env("ENV_WICK", 0.5)              # 影線刺穿 0.5 ATR 以上＝刺穿（少量允許、扣分）
+ENV_RECENT = int(_env("ENV_RECENT", 30))      # 最後一次碰線要在 30 根內
+ENV_SLOPE = _env("ENV_SLOPE", 0.06)           # 上緣每根上升／下緣每根下降不超過 0.06 ATR（三角不是通道）
+ENV_INSIDE = _env("ENV_INSIDE", 0.85)         # 共同期間收盤在兩線間的比例
+ENV_NARROW = _env("ENV_NARROW", 0.8)          # F 時寬度 ≤ 共同起點 80%＝收斂
+
+
+def _tri_form_envelope(H, L, O, C, A, lo: int, F: int) -> Optional[Dict[str, Any]]:
+    """10-11 使用者畫法（eval/tri_truth 22 張截圖歸納）：整段 K 棒沿著走的線。
+    碰線次數多、時間長、少量影線刺穿可接受、收盤穿線扣分；下緣可從起漲前低點拉起，上下緣不必同一天開始。
+    全部門檻用 ATR 倍數，不針對個股。只用 F 以前已確認的轉折。"""
+    from request_runtime import check_budget
+    check_budget()
+    r = ENV_R
+    top, bot = np.maximum(O, C), np.minimum(O, C)
+    At = np.where(np.isnan(A), np.nanmean(A[lo:F + 1]), A)
+    idx = range(max(lo, r), F - r + 1)
+    sh = [i for i in idx if H[i] >= H[i - r:i + r + 1].max()]
+    sl = [i for i in idx if L[i] <= L[i - r:i + r + 1].min()]
+    if len(sh) < 2 or len(sl) < 2:
+        return None
+    a_mean = float(np.nanmean(At[lo:F + 1]))
+
+    def lines(pts, wick, body, sign):
+        out = []
+        for x, i in enumerate(pts):
+            for j in pts[x + 1:]:
+                if j - i < 5:
+                    continue
+                for pi, pj, kind in ((wick[i], wick[j], "wick"), (body[i], body[j], "body")):
+                    s = (pj - pi) / (j - i)
+                    if sign * s > ENV_SLOPE * a_mean:
+                        continue
+                    k = pi - s * i
+                    t = np.arange(i, F + 1)
+                    val = s * t + k
+                    dc = sign * (C[t] - val) / At[t]
+                    if dc.max() > ENV_CLOSE_MAX:
+                        continue
+                    close_bad = int((dc > ENV_CLOSE).sum())
+                    wick_bad = int((sign * (wick[t] - val) / At[t] > ENV_WICK).sum())
+                    if close_bad > max(1, 0.05 * len(t)) or wick_bad > 3:
+                        continue
+                    touch, last = [], -99
+                    for p in pts:
+                        if p >= i and min(abs(wick[p] - (s * p + k)), abs(body[p] - (s * p + k))) <= ENV_TOUCH * At[p] \
+                                and p - last >= 4:
+                            touch.append(p)
+                            last = p
+                    if len(touch) < 2 or F - touch[-1] > ENV_RECENT:
+                        continue
+                    score = len(touch) + 0.5 * (F - i) / max(1, F - lo) - 0.5 * wick_bad - 1.0 * close_bad
+                    out.append((score, {"s": s, "k": k, "i0": i, "a": touch, "src": (i, kind, j, kind),
+                                        "R_line": float(At[i]), "pending": [], "close_bad": close_bad, "wick_bad": wick_bad,
+                                        "events": [dict(rep=p, days=[p], sep=None, react=None, fake=False) for p in touch]}))
+        return [ln for _, ln in sorted(out, key=lambda x: -x[0])[:25]], {id(ln): sc for sc, ln in out}
+
+    ups, us = lines(sh, H, top, 1)
+    dns, ds = lines(sl, L, bot, -1) if ups else ([], {})
+    best = None
+    for u in ups:
+        for d in dns:
+            if len(u["a"]) + len(d["a"]) < 4:
+                continue
+            joint = max(u["i0"], d["i0"])
+            w0 = (u["s"] - d["s"]) * joint + u["k"] - d["k"]
+            wF = (u["s"] - d["s"]) * F + u["k"] - d["k"]
+            if w0 < 2.5 * At[joint] or wF <= 0 or wF > ENV_NARROW * w0:
+                continue
+            t = np.arange(joint, F + 1)
+            uu, dd = u["s"] * t + u["k"], d["s"] * t + d["k"]
+            inside = float(((C[t] <= uu + ENV_CLOSE * At[t]) & (C[t] >= dd - ENV_CLOSE * At[t])).mean())
+            if inside < ENV_INSIDE:
+                continue
+            score = us[id(u)] + ds[id(d)] + 2 * inside
+            if best is None or score > best[0]:
+                best = (score, u, d, joint, w0, wF, inside)
+    if not best:
+        return None
+    score, u, d, joint, w0, wF, inside = best
+    start = min(u["a"][0], d["a"][0])
+    contacts = sorted([(t, "U") for t in u["a"]] + [(t, "D") for t in d["a"]])
+    return {"selection": {"mode": "envelope", "quality": {"score": round(score, 3), "inside": round(inside, 3)},
+                          "qualified_pairs": None, "boundary_gap": None, "margin": None},
+            "u": u, "d": d, "F": F, "start": start, "joint": joint, "R_geom": float(At[joint]), "w0": w0, "wF": wF,
+            "height": {"H": float(w0), "R": float(At[joint]), "contacts": contacts}, "near_tip": wF < TRI_TIP * w0,
+            "joint_days": F - joint, "candidate": False, "reasons": []}
+
+
 def _tri_form(H, L, O, C, A, lo: int, F: int, piv, confirm: bool = True, local: bool = False) -> Optional[Dict[str, Any]]:
     """形成截止日 F 的三角快照（只用 F 時已知資料）。confirm=False＝三角候選（未確認接觸也算）。
     local=True＝補充候選：主要轉折支持不足時，改要求每側 ≥2 個含已確認局部／主要轉折的接觸事件、且至少 1 個主要轉折。"""
     from request_runtime import check_budget
     check_budget()
+    if TRI_SELECTION_MODE == "envelope":           # 10-11：使用者畫法；不另出候選
+        return _tri_form_envelope(H, L, O, C, A, lo, F) if confirm and not local else None
     top, bot = np.maximum(O, C), np.minimum(O, C)
     mh = [(p["idx"], p["confirm"]) for p in piv if p["type"] == "H"]
     ml = [(p["idx"], p["confirm"]) for p in piv if p["type"] == "L"]
@@ -1105,15 +1200,17 @@ def _tri_track(df, C, A, snap, end: int) -> Dict[str, Any]:
 # baseline is an explicit comparison mode, not a stock-dependent switch.
 # 10-11 第一步：預設回到第一輪 v10 選線（唯一驗證過 3034 的版本），加上逐日重播＋正式鎖線＋越線後持續顯示。
 TRI_SELECTION_MODE = os.getenv("DISCORD_AI_KLINE_TRI_SELECTION_MODE", "baseline").strip().lower()
-if TRI_SELECTION_MODE not in ("baseline", "balanced-v1"):
-    raise ValueError("DISCORD_AI_KLINE_TRI_SELECTION_MODE must be baseline or balanced-v1")
-TRI_LOCK = TRI_SELECTION_MODE == "baseline"
-TRI_STATE_VERSION = "tri-v14-v10-show" if TRI_LOCK else "tri-v13-envelope-tracking-1"
+if TRI_SELECTION_MODE not in ("baseline", "balanced-v1", "envelope"):
+    raise ValueError("DISCORD_AI_KLINE_TRI_SELECTION_MODE must be baseline, balanced-v1 or envelope")
+TRI_LOCK = TRI_SELECTION_MODE in ("baseline", "envelope")
+TRI_STATE_VERSION = {"baseline": "tri-v14-v10-show", "envelope": "tri-v15-user-envelope"}.get(TRI_SELECTION_MODE, "tri-v13-envelope-tracking-1")
 TRI_INIT_REPLAY = int(_env("TRI_INIT_REPLAY", 20))   # balanced 模式冷重播天數；鎖線模式一律從資料起點逐日重播
 TRI_LOCK_DAYS = int(_env("TRI_LOCK_DAYS", 0))        # 0＝不鎖線（預設）；2＝連續 2 天同一組線才鎖住。3034 實測鎖線會卡住較早的畫法，預設關
 TRI_LOCK_IDLE = int(_env("TRI_LOCK_IDLE", 30))       # 鎖住後超過 N 個交易日沒有新碰線就結束
 TRI_FULL_REPLAY = int(_env("TRI_FULL_REPLAY", 0))    # 1＝從資料起點逐日重播（實測 3034 會改變 v10 結果，預設關）
 TRI_SHOW_DAYS = int(_env("TRI_SHOW_DAYS", 69))       # 越線後持續畫到越線日移出 70 根圖為止
+TRI_FAIL_DAYS = int(_env("TRI_FAIL_DAYS", 3))        # 越線後 N 天沒有延續＝失敗越線，撤銷紀錄
+TRI_FAIL_ATR = float(_env("TRI_FAIL_ATR", 1.0))    # 延續門檻：往越線方向再走 1 ATR（1608 實測 0.5 太鬆）
 TRI_TRACK_DAYS = int(_env("TRI_TRACK_DAYS", 20))     # 已突破型態沿固定線追蹤最多 20 日（或交會）就結束
 TRI_CONFIRM2 = int(_env("TRI_CONFIRM2", 0))          # 10-08：1＝文字顯示兩日確認（比較驗證前預設關；欄位一律計算）
 TRI_SPLIT_BORROWED = int(_env("TRI_SPLIT_BORROWED", 0))   # 10-08：1＝借用旁邊 K 棒的主要轉折不算實際貼線支持（另計排序）
@@ -1230,7 +1327,7 @@ def _tri_is_new_consolidation(pick, first_cross: int) -> bool:
 
 
 def _user_triangle(df, atr_prev, end, state=None, out_state=None, replay_days=None):
-    lock_mode = TRI_SELECTION_MODE == "baseline"   # 測試可 patch 模式
+    lock_mode = TRI_SELECTION_MODE in ("baseline", "envelope")   # 測試可 patch 模式
     H, L, O, C = (df[k].to_numpy(dtype=float) for k in ("High", "Low", "Open", "Close"))
     A = np.asarray(atr_prev, dtype=float)
     last = end - 1
@@ -1345,6 +1442,15 @@ def _user_triangle(df, atr_prev, end, state=None, out_state=None, replay_days=No
         return (snap is not None and (snap["u"]["s"]-snap["d"]["s"])*X + snap["u"]["k"]-snap["d"]["k"] > 0
                 and X - last_touch(snap) <= TRI_LOCK_IDLE)
 
+    def failed_break(r, X):                       # 越線日後 TRI_FAIL_DAYS 天，收盤沒有再往越線方向多走 0.5 ATR＝失敗
+        b = r["recognized"]
+        if X - b < TRI_FAIL_DAYS or X - b > TRI_TRACK_DAYS or np.isnan(A[b]):
+            return False
+        up = C[b] > r["snap"]["u"]["s"] * b + r["snap"]["u"]["k"]
+        after = C[b + 1:b + TRI_FAIL_DAYS + 1]
+        follow = (after.max() >= C[b] + TRI_FAIL_ATR * A[b]) if up else (after.min() <= C[b] - TRI_FAIL_ATR * A[b])
+        return not follow
+
     def same_lines(x, y, X):                      # 兩組線在共同起點與 X 日都相差 0.5 ATR 以內＝同一組
         t0 = max(x["u"]["i0"], x["d"]["i0"], y["u"]["i0"], y["d"]["i0"])
         return all(abs((x[e]["s"]-y[e]["s"])*t + x[e]["k"]-y[e]["k"]) <= 0.5*A[min(t, X)]
@@ -1374,6 +1480,8 @@ def _user_triangle(df, atr_prev, end, state=None, out_state=None, replay_days=No
         if lock_mode:                              # 10-11：追蹤期滿的越線紀錄移到「只顯示」清單，不再決定主型態
             shown += [r for r in records if expired(r, X)]
         records = [r for r in records if not expired(r, X)]   # 每天先清過期紀錄，再判斷新突破（逐日＝一次補算）
+        if lock_mode:                             # 10-11：越線後 3 天沒有延續（失敗越線）就撤銷，允許同段新畫法
+            records = [r for r in records if not failed_break(r, X)]
         primary, held = active_record()
         if lock_mode:
             # 10-11 鎖線：已鎖住的型態只沿固定線判斷越線，不再每天重新挑線
@@ -1389,8 +1497,13 @@ def _user_triangle(df, atr_prev, end, state=None, out_state=None, replay_days=No
             F = X - 1
             pick = form(F)
             if pick is None or pick.get("candidate"):
+                cpick = pick or form(F, False) or form(F, True, True)   # 10-11：候選三角越線也記錄，越線後照樣畫
+                if cpick is not None and active_record()[0] is None and beyond(cpick, X):
+                    add_record(dict(cpick, candidate=True), X)
                 continue
             primary, held = active_record()
+            if primary is not None and primary["snap"].get("candidate"):
+                primary = None                    # 候選越線紀錄不擋正式型態
             if primary is not None and not new_consolidation(pick, primary, held, X):
                 continue                         # 同一整理期間的重新畫法：不取代、不另建突破紀錄
             if beyond(pick, X):
@@ -1466,7 +1579,8 @@ def _user_triangle(df, atr_prev, end, state=None, out_state=None, replay_days=No
     source = ""
     if lock_mode and formation is not None:
         main, source = formation, "鎖定"          # 已鎖住的正式型態優先：不因今天重新排名而換線
-    elif primary is not None and (pick is None or not new_consolidation(pick, primary, held, end)):
+    elif primary is not None and (pick is None or not new_consolidation(pick, primary, held, end)) and not (
+            primary["snap"].get("candidate") and pick is not None and not pick.get("candidate")):   # 正式型態優先於候選越線紀錄
         source = "越線紀錄" if not held else "越線紀錄（窗口外）"
         own = None if held else primary
         main = None if held else primary["snap"]   # 先用仍在追蹤的正式紀錄；窗口不足只保留、不誤畫替代線
@@ -1495,6 +1609,10 @@ def _user_triangle(df, atr_prev, end, state=None, out_state=None, replay_days=No
     cand = bool(main.get("candidate"))
     if cand:                                      # 候選：只描述價格相對候選線的位置，不產生正式突破
         state_txt = {"above": "價格位於候選上緣之上", "below": "價格位於候選下緣之下"}.get(posn, "位於候選線之間")
+        if own is not None:                       # 10-11：候選越線紀錄，照實寫日期但不說成正式突破
+            up_b = C[own["recognized"]] > u["s"] * own["recognized"] + u["k"]
+            state_txt = (f"{dates[own['recognized']][5:].replace('-', '/')} 收盤{'突破候選上緣' if up_b else '跌破候選下緣'}"
+                         f"（候選三角，非正式突破）；" + state_txt)
         if tr["crossed"]:
             state_txt = "已過候選線交會點"
         breaks, compat = [], "inside"

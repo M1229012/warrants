@@ -1,0 +1,17 @@
+{
+  "status": "ok",
+  "items": [
+    {
+      "date": "2026-07-10",
+      "kind": "息",
+      "factor": 0.9575645756457565,
+      "volume_factor": null,
+      "before_price": 542.0,
+      "reference_price": 519.0
+    }
+  ],
+  "complete": false,
+  "coverage": [
+    "FinMind TaiwanStockDividendResult及TaiwanStockSplitPrice已核實；TaiwanStockParValueChange回400；減資未涵蓋"
+  ]
+}

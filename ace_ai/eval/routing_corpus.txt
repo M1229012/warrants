@@ -1,0 +1,281 @@
+# 路由題庫（離線、不連網、0 次 Gemini）｜test_routing_corpus.py 會逐題檢查
+# 格式：問題 | 期望路由（多個用 / 分隔）| 期望股票（逗號；空白＝沒有股票；* ＝不檢查）| 其他檢查
+# 其他檢查（空白分隔）：+工具 必須有、-工具 不可有、分點=名稱、成本=數字、@spot/@warrant/@both 權限（預設 both）、
+#                      >上一題（先問這句再問本題，測追問記憶；句中空白用 _）
+# 路由：rule_pattern 型態／技術｜rule_stock 股價、新聞、權證｜rule_institutional 三大法人｜rule_branch* 權證分點｜
+#       chip_spot 現股分點｜chip_combined 現股＋權證｜rule_sector 族群｜rule_radar 族群雷達｜rule_breadth 盤面／貢獻｜
+#       rule_index_compare 大盤 vs 櫃買｜clarify 反問｜help 指令表｜unsupported 沒有這類資料
+
+# ===== 正式環境 Log 的真實問句 =====
+2330型態 | rule_pattern | 2330 | -get_sheet_stock_chips
+3006型態好嗎? | rule_pattern | 3006
+3006現在型態如何 | rule_pattern | 3006
+2330技術面怎麼樣 | rule_pattern | 2330 | +get_technical_analysis
+華邦電現在技術面如何 | rule_pattern | 2344
+6212技術面 | rule_pattern | 6212
+3006現在均線結構怎麼樣 | rule_pattern | 3006
+我2330成本2000怎麼看 | rule_pattern | 2330 | 成本=2000 +get_cost_position_context
+如果我2303成本143你會如何操作想參考 | rule_pattern | 2303 | 成本=143
+1727這一檔適合怎麼操作呢 給我操作策略 | rule_pattern | 1727 | -get_sheet_stock_chips
+2344現在如何 可以買嗎? | rule_pattern | 2344
+2409現在型態好嗎? 現在適合觀望還是可以買? | rule_pattern | 2409
+2409你認為明天漲的機率高嗎? 他今天K棒是先人指路嗎? | rule_pattern | 2409
+00981a型態如何 | rule_pattern | 00981A | -get_sheet_stock_chips
+2344最近有甚麼新聞嗎?偏利多還是利空? | rule_stock | 2344 | +get_recent_news
+3006最近有沒有重大消息 | rule_stock | 3006 | +get_recent_news
+2330三大法人今天買賣超 | rule_institutional | 2330
+2330外資最近買超多少 | rule_institutional | 2330
+3006最近有哪些權證分點 | rule_stock | 3006 | +get_sheet_stock_chips
+想問8103權證籌碼和型態 | rule_pattern | 8103 | +get_sheet_stock_chips +get_technical_analysis
+想問3016權證籌碼和型態 | rule_pattern | 3016 | +get_sheet_stock_chips
+3006最近哪些分點在加碼 | chip_spot | 3006
+3006最近哪些分點在加碼 | rule_stock | 3006 | @warrant +get_sheet_stock_chips
+2330籌碼最近怎麼樣 | chip_spot | 2330
+2303型態和現股籌碼 | rule_pattern | 2303
+大盤今天量縮嗎? | rule_pattern | TAIEX
+大盤現在怎麼看 | rule_pattern | TAIEX
+加權指數目前型態如何 | rule_pattern | TAIEX
+櫃買今天量能如何 | rule_pattern | TPEX
+今天誰讓大盤加最多點 | rule_breadth | *
+櫃買跟大盤相比如何 | rule_index_compare | TAIEX,TPEX
+今天大盤跟櫃買誰強 | rule_index_compare | TAIEX,TPEX
+永豐金內湖勝率 | rule_branch | | 分點=永豐金內湖 +get_branch_performance
+永豐金內湖最近在買什麼 | chip_spot | | 分點=永豐金內湖
+永豐金內湖最近在買什麼 | rule_branch | | @warrant 分點=永豐金內湖 +get_branch_recent_trades
+永豐金內湖最近在買什麼 | chip_spot | | @spot
+永豐金內湖權證最近在買什麼 | rule_branch | | 分點=永豐金內湖 +get_branch_recent_trades
+永豐金內湖現股最近在買什麼 | chip_spot | | 分點=永豐金內湖
+永豐金內湖近況如何 | rule_branch | | @warrant 分點=永豐金內湖
+國票台南在2409的部位還在嗎? | rule_branch_position | 2409 | @warrant 分點=國票台南
+永豐金內湖D事件勝率多少 | rule_branch | | +get_branch_event_performance
+第一金中壢近70日買了哪些權證 | rule_branch | | 分點=第一金中壢 +get_branch_warrant_detail
+第一金中壢近70日有買哪些股票的權證 | rule_branch | | 分點=第一金中壢
+國票台南在2409的部位還在嗎? | rule_branch_position | 2409 | 分點=國票台南
+權證永豐金內湖在3042得買賣超明細 | rule_branch_stock | 3042 | 分點=永豐金內湖
+想看7788松川精密 第一金-中壢分點權證 | rule_branch_stock | 7788 | 分點=第一金中壢
+現在所有族群誰型態最好 | rule_sector |
+今天哪個族群最強 | rule_sector |
+CCL族群最近怎樣 | rule_sector |
+TGV概念股有哪些 | rule_sector |
+友達型態如何，給我一個隔天的操作策略 | rule_pattern | 2409
+4958ECB訂價已完成，對於後續股價的影響，法人與大戶是否買單？ | rule_pattern | 4958 | +get_institutional_flow
+4958法人跟大戶有在買嗎 | rule_institutional | 4958
+電源供應器型態排行 | rule_sector |
+電子通路有誰 | rule_sector |
+有那些族群 | rule_sector |
+哪些族群正在轉強 | rule_radar |
+那這檔上面有壓嗎 | rule_pattern | 2344 | >華邦電技術面
+那這支月線有守住嗎 | rule_pattern | 2344 | >華邦電技術面
+
+# ===== 白話、長句（同一個意思的不同說法）=====
+2330 | rule_pattern | 2330
+台積電 | rule_pattern | 2330
+可以幫我看一下南亞科嗎 | rule_pattern | 2408
+我想知道華邦電現在的線型是不是還在整理，還是已經要突破了 | rule_pattern | 2344
+聯發科的月線跟季線現在是什麼狀況 | rule_pattern | 2454
+奇鋐最近量有出來嗎 | rule_pattern | 3017
+我想問長榮這幾天為什麼一直跌 | rule_pattern | 2603
+台積電和聯發科誰的型態比較好 | rule_pattern | 2330,2454
+2330跟2454哪個比較強 | rule_pattern | 2330,2454
+聯電我套在50塊，現在要停損還是繼續抱 | rule_pattern | 2303 | 成本=50
+我買在143的聯電現在怎麼辦 | rule_pattern | 2303 | 成本=143
+南亞科我成本大概是52左右，現在跌破月線了要不要先賣 | rule_pattern | 2408 | 成本=52
+鴻海今天收盤多少 | rule_stock | 2317 | +get_stock_overview
+2330現在多少錢 | rule_stock | 2330
+台積電最近有什麼新聞 | rule_stock | 2330 | +get_recent_news
+請問台積電最近是不是外資一直在賣 | rule_institutional | 2330
+投信最近是不是一直在買晶豪科 | rule_institutional | 3006
+晶豪科最近有沒有主力在偷偷買權證 | rule_stock | 3006 | +get_sheet_stock_chips
+友達的權證分點最近有人在買嗎 | rule_stock | 2409 | +get_sheet_stock_chips
+永豐金內湖最近在3006有買嗎 | chip_spot | 3006 | 分點=永豐金內湖
+永豐金內湖最近在3006有買嗎 | rule_branch_stock | 3006 | @warrant 分點=永豐金內湖
+永豐金內湖最近在3006的權證有買嗎 | rule_branch_stock | 3006 | 分點=永豐金內湖
+大盤明天會漲嗎 | rule_pattern | TAIEX
+今天盤勢如何 | rule_pattern | TAIEX
+台股今天怎麼樣 | rule_pattern | TAIEX
+2330和2454和2303誰最好 | clarify | *
+
+# ===== 沒有這類資料／看不懂：要反問或說明，不能答別的 =====
+富邦金殖利率多少 | unsupported | 2881
+台積電EPS多少 | unsupported | 2330
+中信金什麼時候除息 | unsupported | 2891
+這檔強嗎 | clarify |
+有什麼股票推薦 | unsupported |
+推薦我幾檔會漲的股票 | unsupported |
+外資今天買超多少 | rule_market_institutional | TAIEX | +get_market_institutional
+技術面怎麼看 | clarify |
+
+# ===== 更多口語問法 =====
+台積電現在可以進場嗎 | rule_pattern | 2330 | -get_sheet_stock_chips
+華邦電跌破季線了嗎 | rule_pattern | 2344
+南亞科最近成交量很大是怎麼回事 | rule_pattern | 2408
+2330 KD黃金交叉了嗎 | rule_pattern | 2330
+2330 MACD翻紅了嗎 | rule_pattern | 2330
+2330布林通道開口了嗎 | rule_pattern | 2330
+2330現在的支撐跟壓力在哪 | rule_pattern | 2330
+2330下面哪裡有支撐 | rule_pattern | 2330
+我在2330套牢了怎麼辦 | rule_pattern | 2330
+2330停損點要設在哪 | rule_pattern | 2330
+2330會不會漲到1500 | rule_pattern | 2330
+聯電現在是不是很超買 | rule_pattern | 2303
+2330的均線是多頭排列嗎 | rule_pattern | 2330
+我想問一下晶豪科跟華邦電哪一個型態比較好，我兩個都有持股 | rule_pattern | 3006,2344
+2330今天為什麼大跌 | rule_pattern | 2330 | +get_recent_news +get_technical_analysis
+大盤今天為什麼跌 | rule_pattern | TAIEX
+2330今天漲多少 | rule_stock | 2330 | +get_stock_overview
+今天大盤漲多少 | rule_stock | TAIEX
+櫃買指數現在型態 | rule_pattern | TPEX
+光寶科最近有利多嗎 | rule_stock | 2301 | +get_recent_news
+2330月營收 | rule_stock | 2330 | +get_recent_news
+2330外資跟投信最近是買還是賣 | rule_institutional | 2330
+2330三大法人連續買幾天了 | rule_institutional | 2330
+外資對台積電的看法 | rule_pattern | 2330 | +get_institutional_flow
+台指期外資空單多少 | rule_futures | TAIEX | +get_futures_positions
+2330的權證誰在買 | rule_stock | 2330 | +get_sheet_stock_chips
+3006有沒有高勝率分點在買 | rule_stock | 3006 | @warrant +get_sheet_stock_chips
+2330現股籌碼 | chip_spot | 2330
+2330的券商分點 | chip_spot | 2330
+2330現股跟權證籌碼一起看 | chip_combined | 2330
+凱基台北在2330的現股買賣超 | chip_spot | 2330
+權證買超金額最大的是誰 | rule_top_warrant |
+目前權證買超前幾名 | rule_top_warrant |
+分點勝率排行 | rule_winrate_rank |
+半導體族群哪檔最強 | rule_sector |
+記憶體股有哪些 | rule_sector |
+2330屬於什麼族群 | rule_sector | *
+鴻海型態 | rule_pattern | 2317
+鴻海今天收盤多少 | rule_stock | 2317
+說明 | help |
+你好 | clarify |
+
+# ===== 反問卡片裡建議的問法（照打一定要能用）=====
+永豐金內湖 權證 最近買什麼 | rule_branch | | 分點=永豐金內湖 +get_branch_recent_trades
+永豐金內湖 現股 最近買什麼 | chip_spot | | 分點=永豐金內湖
+2330 型態好嗎 | rule_pattern | 2330
+2330 三大法人買賣超 | rule_institutional | 2330
+2330 最近有什麼新聞 | rule_stock | 2330 | +get_recent_news
+2330 技術面怎麼樣 | rule_pattern | 2330
+我2330成本600怎麼看 | rule_pattern | 2330 | 成本=600
+2330 量有出來嗎 | rule_pattern | 2330
+2330 股價 | rule_stock | 2330
+2881 型態好嗎 | rule_pattern | 2881
+
+# ===== 一句問兩件事：兩件都要答 =====
+2409國票台南還在嗎？現在型態好嗎？ | rule_branch_position | 2409 | 分點=國票台南 +get_branch_stock_position +get_technical_analysis
+國票台南在2409的部位還在嗎 | rule_branch_position | 2409 | 分點=國票台南 +get_branch_stock_position -get_technical_analysis
+永豐金內湖在3042的權證買賣明細，順便看一下型態 | rule_branch_stock | 3042 | 分點=永豐金內湖 +get_branch_stock_history +get_technical_analysis
+2330型態如何？最近有什麼新聞？ | rule_pattern | 2330 | +get_recent_news +get_technical_analysis
+3006權證分點最近在買嗎？技術面怎麼樣 | rule_pattern | 3006 | +get_sheet_stock_chips +get_technical_analysis
+2330外資在買，型態好嗎 | rule_pattern | 2330 | +get_institutional_flow +get_technical_analysis
+2330三大法人跟最近新聞 | rule_stock | 2330 | +get_recent_news +get_institutional_flow
+
+# ===== 全市場三大法人（上市）=====
+今天三大法人買賣超 | rule_market_institutional | TAIEX | +get_market_institutional
+投信最近連買幾天了 | rule_market_institutional | TAIEX | +get_market_institutional
+外資這禮拜是買超還是賣超 | rule_market_institutional | TAIEX | +get_market_institutional
+台股外資今天買多少 | rule_market_institutional | TAIEX | +get_market_institutional
+大盤外資買超 | rule_market_institutional | TAIEX | +get_market_institutional
+櫃買外資買超 | rule_market_institutional | TPEX | +get_market_institutional
+大盤型態跟外資動向 | rule_pattern | TAIEX | +get_market_institutional +get_technical_analysis
+外資台指期空單多少 | rule_futures | TAIEX | -get_market_institutional
+2330外資今天買超多少 | rule_institutional | 2330 | -get_market_institutional
+上櫃投信最近連買幾天 | rule_market_institutional | TPEX | +get_market_institutional
+櫃買型態跟外資動向 | rule_pattern | TPEX | +get_market_institutional +get_technical_analysis
+投信台指期多單還有多少 | rule_futures | TAIEX | +get_futures_positions
+大盤外資期貨未平倉 | rule_futures | TAIEX | +get_futures_positions
+櫃買型態好嗎 | rule_pattern | TPEX | -get_futures_positions
+大盤型態好嗎 | rule_pattern | TAIEX | +get_futures_positions
+小台散戶多空比 | rule_futures | TAIEX | +get_retail_futures +get_futures_positions
+微台散戶空單多少 | rule_futures | TAIEX | +get_retail_futures
+台指期外資空單跟散戶多空比 | rule_futures | TAIEX | +get_retail_futures
+
+# ===== 第 4 批：打字習慣（全形、空白、標點、錯字、表情、很長的句子）=====
+２３３０型態 | rule_pattern | 2330
+2330 型態 | rule_pattern | 2330
+2330  技術面   怎麼樣？？ | rule_pattern | 2330
+2330!!! | rule_pattern | 2330
+台積電怎麼樣😅 | rule_pattern | 2330
+台積電現在的走勢如何呢～ | rule_pattern | 2330
+請問一下大大 聯發科這幾天一直跌 是不是要破底了 我該停損嗎 我成本在1500 | rule_pattern | 2454 | 成本=1500
+我昨天買了南亞科 買在55塊 今天又跌 想知道支撐在哪 | rule_pattern | 2408 | 成本=55
+華邦電跟南亞科你覺得哪個比較值得留 | rule_pattern | 2344,2408
+台積 型態 | rule_pattern | 2330
+長榮的新聞 | rule_stock | 2603 | +get_recent_news
+長榮有什麼利空嗎 | rule_stock | 2603 | +get_recent_news
+2330 外資 | rule_institutional | 2330
+2330投信 | rule_institutional | 2330
+2330 自營商最近在幹嘛 | rule_institutional | 2330
+晶豪科 權證 | rule_stock | 3006 | +get_sheet_stock_chips
+3006權證有人在買嗎 | rule_stock | 3006 | +get_sheet_stock_chips
+永豐金內湖 | rule_branch | | @warrant 分點=永豐金內湖
+第一金中壢最近買什麼權證 | rule_branch | | 分點=第一金中壢
+大盤 | rule_pattern | TAIEX
+大盤今天怎樣 | rule_pattern | TAIEX
+加權指數會不會破底 | rule_pattern | TAIEX
+櫃買 | rule_pattern | TPEX
+今天外資賣很多嗎 | rule_market_institutional | TAIEX
+外資連賣幾天了 | rule_market_institutional | TAIEX
+投信今天有買嗎 | rule_market_institutional | TAIEX
+上櫃外資 | rule_market_institutional | TPEX
+台指期 | rule_futures | TAIEX
+外資期貨空單增加還減少 | rule_futures | TAIEX
+散戶多空比 | rule_futures | TAIEX
+小台散戶 | rule_futures | TAIEX
+9999 | clarify |
+12345型態 | clarify |
+股票 | clarify |
+？ | clarify |
+
+# ===== 09-30 「比較好／比較適合」是副詞，不是兩檔比較（上一題 6147 → 誤判成 6147 vs 6182）=====
+2344分析主力、分點、籌碼、還有型態，要介入從哪裡介入比較好，還有哪裡是關鍵價位 | chip_spot/rule_pattern | 2344 | >2330型態
+2344現在比較適合觀望嗎 | rule_pattern | 2344 | >2330型態
+那跟2344比較呢 | rule_pattern | 2330,2344 | >2330型態
+2344跟它比起來呢 | rule_pattern | 2330,2344 | >2330型態
+
+# ===== 09-30 「滿足點／目標價／上看多少」＝問上方壓力，走技術分析（原本被當成只問股價）=====
+2330滿足點價格 | rule_pattern | 2330
+2330目標價多少 | rule_pattern | 2330
+2344可以漲到哪 | rule_pattern | 2344
+2344上看多少 | rule_pattern | 2344
+
+# ===== 09-30 Bot 改名「喬巴」：稱呼不可被當成股票／分點／族群 =====
+喬巴幫我看一下 2330 | rule_pattern | 2330
+喬巴 2344型態如何 | rule_pattern | 2344
+喬巴你好 | clarify/help |
+艾斯幫我看一下2330 | rule_pattern | 2330
+
+# ===== 09-30 「那些＝哪些」錯字：要列權證明細（天期／價內外／槓桿）=====
+2409 權證分點第一金中壢買那些權證 | rule_branch | * | 分點=第一金中壢 +get_branch_warrant_detail
+第一金中壢買了那幾檔權證 | rule_branch | | 分點=第一金中壢 +get_branch_warrant_detail
+
+# ===== 10-04 會員宣傳圖「新的問法」六個範例＋天馬行空問法（發布前必過）=====
+台積電現在怎麼看 | rule_pattern | 2330
+6669我買在2875元，現在套住了 | rule_pattern | 6669 | 成本=2875
+友達我9/1買的，現在這樣要注意什麼 | rule_pattern | 2409 | @spot
+聯發科我買在4000最近越看越慌 | rule_pattern | 2454 | 成本=4000
+長榮這艘船最近有風嗎，還是我得自己划？ | rule_pattern | 2603
+台積電我賺了一些，現在還能抱嗎 | rule_pattern | 2330
+鴻海是不是在裝睡 | rule_pattern | 2317
+我被聯電套到懷疑人生 | rule_pattern | 2303
+大立光是不是要起飛了 | rule_pattern | 3008
+陽明這艘船要沉了嗎 | rule_pattern | 2609
+2330我買在1000塊，現在還要繼續放嗎 | rule_pattern | 2330 | 成本=1000
+
+# ===== 10-04 天馬行空問法（比喻／情緒／口語／錯字）=====
+台積電是不是要去月球了 | rule_pattern | 2330
+鴻海你還好嗎 | rule_pattern | 2317
+2330今天是在練瑜珈嗎怎麼一直橫盤 | rule_pattern | 2330
+聯電我抱到快變化石了還不漲 | rule_pattern | 2303
+我老婆叫我把華邦電賣掉怎麼辦 | rule_pattern | 2344
+2603跟2609哪個比較會游泳 | rule_pattern | 2603,2609
+我買3008被套在山頂上看風景 | rule_pattern | 3008
+台積電現在進場是送頭嗎 | rule_pattern | 2330
+2317現在是撿便宜還是接刀 | rule_pattern | 2317
+大盤今天怎麼了 | rule_pattern | TAIEX
+台指期外資今天在幹嘛 | rule_futures | *
+華邦電外資是不是不要它了 | rule_institutional | 2344
+群創的主力是不是跑了 | chip_spot | *
+上禮拜買的鴻海，現在是不是買錯了 | rule_pattern | 2317
+那個做ai伺服器的廣達最近怎樣 | rule_pattern | 2382
+緯創跟廣達誰比較強 | rule_pattern | 3231,2382
+永豐金內湖跟華南永昌台中在聯電的權證 | rule_branch_stock | 2303 | 分點=永豐金內湖

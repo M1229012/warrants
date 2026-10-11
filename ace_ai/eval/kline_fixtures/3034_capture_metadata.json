@@ -1,0 +1,30 @@
+{
+  "endpoint": "https://api.finmindtrade.com/api/v4/data",
+  "captured_at": "2026-10-09T17:37:34.453603+00:00",
+  "datasets": [
+    {
+      "stock_code": "3034",
+      "dataset": "TaiwanStockPrice",
+      "status": 200,
+      "row_count": 152
+    },
+    {
+      "stock_code": "3034",
+      "dataset": "TaiwanStockDividendResult",
+      "status": 200,
+      "row_count": 1
+    },
+    {
+      "stock_code": "3034",
+      "dataset": "TaiwanStockSplitPrice",
+      "status": 200,
+      "row_count": 0
+    },
+    {
+      "stock_code": "3034",
+      "dataset": "TaiwanStockParValueChange",
+      "status": 400,
+      "row_count": 0
+    }
+  ]
+}

@@ -40,7 +40,7 @@ CPO族群結構如何|technical|光通訊
 記憶體今天誰漲最多|momentum|記憶體
 
 # --- 全市場 ---
-現在所有族群誰最強|market_technical|
+現在所有族群誰最強|market_momentum|
 所有族群誰型態最好|market_technical|
 現在哪些族群整體結構最強|market_technical|
 最近型態比較強的族群有哪些|market_technical|
