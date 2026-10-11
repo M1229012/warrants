@@ -727,6 +727,9 @@ ADMIN_HELP_GROUPS = (
     ("本週精選", ("本週精選排名", "3006 幫我生成週精選文字", "這版確認，生成圖片")),
     ("草稿", ("直接說修改需求", "還原上一版", "目前草稿")),
     ("資料維護", ("系統狀態", "用量（含費用估算）", "錯誤紀錄", "更新市場底庫", "更新族群名冊", "匯出狀態／匯入狀態")),
+    ("Log 開關（平常關閉，白話可）", ("log狀態（看目前哪些有開）", "開啟三角紀錄／關閉三角紀錄（三角核對）",
+                                  "開啟用量紀錄（每5分鐘用量報表）", "開啟底庫紀錄（底庫更新進度）",
+                                  "開啟休市紀錄（個股缺日提示）", "全部log關掉")),
     ("現股抓取", ("現股測速 2330（70 日）", "現股改成 8 條", "現股恢復自動", "現股抓取狀態")),
     ("族群", ("族群雷達", "族群別名（清單）", "新增族群別名 TGV=玻璃基板", "刪除族群別名 TGV")),
     ("測試員", ("新增測試員 <ID或@人>", "移除測試員 <ID>", "測試員名單")),
@@ -6347,6 +6350,16 @@ class AceQueryEngine:
                 r"你(?:會|能|可以)(?:做|幫我做)?(?:什麼|哪些)|(?:怎麼|如何)用|說明書?|(?:管理員)?功能(?:表|清單|列表)", compact):
             # 新增管理員指令時，同時加進 ADMIN_HELP_GROUPS（test_admin_help_complete 會檢查有沒有漏）
             return help_result(started, admin=self._show_admin_help(True))
+        log_cmd = __import__("log_switch").parse_command(compact)   # 10-11：Log 開關（白話可）
+        if log_cmd:
+            import log_switch
+            action, cats = log_cmd
+            if action != "status":
+                log_switch.set_many(cats, action == "on")
+                names = "、".join(log_switch.CATEGORIES[c][0] for c in cats)
+                self.log(f"Log 開關｜{names}｜{'開啟' if action == 'on' else '關閉'}")
+            return AnswerResult(text=log_switch.status_text(), route="admin_log_switch", gemini_calls=0,
+                                elapsed=time.perf_counter()-started, cacheable=False, as_text=True)
         if compact in ("目前草稿", "現在草稿", "看草稿"):
             session = self._load_draft_session(context_key)
             text = str((session or {}).get("draft") or "")
@@ -8616,9 +8629,11 @@ def _market_maintenance_loop(stop: threading.Event) -> None:
             # 升級後舊底庫沒有上市／上櫃完整性紀錄（含颱風假是否休市）：補查到全部有紀錄為止
             need_status = int(info.get("unchecked_days") or 0) > 0 and not sector_radar.session_open(now)
             if need_history or need_today or need_status:
-                result = market_data.sync(budget_seconds=MARKET_SYNC_BUDGET, log=lambda m: print(f"🗂️ {m}", flush=True))
-                print(f"🗂️ 市場底庫：{result['days']} 個交易日 × {result['stocks']:,} 檔｜最新 {result['last_day']}｜"
-                      f"本輪 {result['requests']} 個請求、{result['elapsed']:.0f} 秒", flush=True)
+                quiet = not __import__("log_switch").enabled("market")   # 10-11：平常不印底庫進度
+                result = market_data.sync(budget_seconds=MARKET_SYNC_BUDGET, log=lambda m: None if quiet else print(f"🗂️ {m}", flush=True))
+                if not quiet:
+                    print(f"🗂️ 市場底庫：{result['days']} 個交易日 × {result['stocks']:,} 檔｜最新 {result['last_day']}｜"
+                          f"本輪 {result['requests']} 個請求、{result['elapsed']:.0f} 秒", flush=True)
                 if need_today and str(result.get("last_day") or "") < today:
                     next_today_try = time.monotonic() + TODAY_SYNC_RETRY_SECONDS
                     print(f"🗂️ 市場底庫：{today} 行情尚未取得，{TODAY_SYNC_RETRY_SECONDS // 60} 分鐘後重試", flush=True)
@@ -8797,7 +8812,8 @@ def _usage_monitor_loop(engine: "AceQueryEngine", stop: threading.Event) -> None
         for provider in ("FinMindData", "CMoney", "MoneyDJFlow", "GoogleSheet", "Gemini"):
             row = usage.get(provider, {})
             lines.append(f"  {provider}｜60s={row.get('last_60s', 0)}｜10m={row.get('last_10m', 0)}｜process={row.get('process_total', 0)}｜errors={row.get('errors', 0)}｜avg={row.get('avg_latency', 0):.2f}s")
-        print("\n".join(lines), flush=True)
+        if __import__("log_switch").enabled("usage"):   # 10-11：用量報表平常不印，需要時開「用量報表」
+            print("\n".join(lines), flush=True)
         last_log = time.time()
 
 

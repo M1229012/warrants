@@ -6,7 +6,7 @@ import re
 from urllib.parse import urlparse
 from datetime import date
 
-VERSION = "member_pattern_v9_adjusted_levels_tracking"
+VERSION = "member_pattern_v10_round1_show"   # 10-11：三角回到 v10 選線，舊回答快取作廢
 
 def date_key(value):
     """Calendar date key; retain display format and never change trading indices."""

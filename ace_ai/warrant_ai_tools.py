@@ -2514,7 +2514,8 @@ def _load_price_bundle(stock_code: str, spot_history_mode: bool = False) -> Dict
                 # 有證據的缺口（全市場確認休市，或所屬市場收盤快照完整卻沒有這檔＝確定沒成交）才照常分析並標註。
                 _ACCEPTED_GAPS[code] = (today, tuple(gaps))
                 shown = "、".join(gaps) if len(gaps) <= 3 else f"{gaps[0]} 等 {len(gaps)} 天"
-                print(f"⚠️ {code} 日K {shown} 已確認為休市、該股無成交或暫停交易，照常分析", flush=True)
+                if __import__("log_switch").enabled("datawarn"):   # 10-11：平常不印，需要時開「休市提示」
+                    print(f"⚠️ {code} 日K {shown} 已確認為休市、該股無成交或暫停交易，照常分析", flush=True)
         # 底庫與日K快取保持原始價，只在分析入口還原一次。
         import price_adjustment
         raw_closed = daily_df.copy()

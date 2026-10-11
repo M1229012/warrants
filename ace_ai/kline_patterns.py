@@ -1103,11 +1103,17 @@ def _tri_track(df, C, A, snap, end: int) -> Dict[str, Any]:
 
 
 # baseline is an explicit comparison mode, not a stock-dependent switch.
-TRI_SELECTION_MODE = os.getenv("DISCORD_AI_KLINE_TRI_SELECTION_MODE", "balanced-v1").strip().lower()
+# 10-11 第一步：預設回到第一輪 v10 選線（唯一驗證過 3034 的版本），加上逐日重播＋正式鎖線＋越線後持續顯示。
+TRI_SELECTION_MODE = os.getenv("DISCORD_AI_KLINE_TRI_SELECTION_MODE", "baseline").strip().lower()
 if TRI_SELECTION_MODE not in ("baseline", "balanced-v1"):
     raise ValueError("DISCORD_AI_KLINE_TRI_SELECTION_MODE must be baseline or balanced-v1")
-TRI_STATE_VERSION = "tri-v10-primary" if TRI_SELECTION_MODE == "baseline" else "tri-v13-envelope-tracking-1"
-TRI_INIT_REPLAY = int(_env("TRI_INIT_REPLAY", 20))   # 冷重播設定；實際至少 TRI_TRACK_DAYS+1 日
+TRI_LOCK = TRI_SELECTION_MODE == "baseline"
+TRI_STATE_VERSION = "tri-v14-v10-show" if TRI_LOCK else "tri-v13-envelope-tracking-1"
+TRI_INIT_REPLAY = int(_env("TRI_INIT_REPLAY", 20))   # balanced 模式冷重播天數；鎖線模式一律從資料起點逐日重播
+TRI_LOCK_DAYS = int(_env("TRI_LOCK_DAYS", 0))        # 0＝不鎖線（預設）；2＝連續 2 天同一組線才鎖住。3034 實測鎖線會卡住較早的畫法，預設關
+TRI_LOCK_IDLE = int(_env("TRI_LOCK_IDLE", 30))       # 鎖住後超過 N 個交易日沒有新碰線就結束
+TRI_FULL_REPLAY = int(_env("TRI_FULL_REPLAY", 0))    # 1＝從資料起點逐日重播（實測 3034 會改變 v10 結果，預設關）
+TRI_SHOW_DAYS = int(_env("TRI_SHOW_DAYS", 69))       # 越線後持續畫到越線日移出 70 根圖為止
 TRI_TRACK_DAYS = int(_env("TRI_TRACK_DAYS", 20))     # 已突破型態沿固定線追蹤最多 20 日（或交會）就結束
 TRI_CONFIRM2 = int(_env("TRI_CONFIRM2", 0))          # 10-08：1＝文字顯示兩日確認（比較驗證前預設關；欄位一律計算）
 TRI_SPLIT_BORROWED = int(_env("TRI_SPLIT_BORROWED", 0))   # 10-08：1＝借用旁邊 K 棒的主要轉折不算實際貼線支持（另計排序）
@@ -1167,6 +1173,9 @@ def _tri_status(tr: Dict[str, Any]) -> str:
     return "仍在線外" if h is b0 else f"{h['date']} 再次同向"
 
 
+LAST_TRI_INFO = __import__("threading").local()
+
+
 def user_triangle(df: pd.DataFrame, atr_prev, end: int, state: Optional[Dict[str, Any]] = None,
                   out_state: Optional[Dict[str, Any]] = None, replay_days: Optional[int] = None) -> Optional[Dict[str, Any]]:
     """end＝今天。單日選擇流程依日期執行，正式突破紀錄以「狀態快照」跨日保存：
@@ -1189,15 +1198,18 @@ def user_triangle(df: pd.DataFrame, atr_prev, end: int, state: Optional[Dict[str
         with _TRI_MEMO_LOCK:
             cached = _TRI_MEMO.get(key) if cacheable else None
         if cached is not None:
-            result, snapshot = copy.deepcopy(cached)
+            result, snapshot, info = copy.deepcopy(cached)
         else:
             snapshot = {}
+            _TRI_LOCAL.info = {}
             result = _user_triangle(df, atr_prev, end, state, snapshot, replay_days)
+            info = dict(getattr(_TRI_LOCAL, "info", {}) or {})
             if cacheable:
                 with _TRI_MEMO_LOCK:
                     if len(_TRI_MEMO) >= 128:
                         _TRI_MEMO.pop(next(iter(_TRI_MEMO)))
-                    _TRI_MEMO[key] = copy.deepcopy((result, snapshot))
+                    _TRI_MEMO[key] = copy.deepcopy((result, snapshot, info))
+        LAST_TRI_INFO.info = info                 # 10-11：給「三角核對」Log 用（同一執行緒最後一次計算）
         if out_state is not None:
             out_state.clear()
             out_state.update(snapshot)
@@ -1218,6 +1230,7 @@ def _tri_is_new_consolidation(pick, first_cross: int) -> bool:
 
 
 def _user_triangle(df, atr_prev, end, state=None, out_state=None, replay_days=None):
+    lock_mode = TRI_SELECTION_MODE == "baseline"   # 測試可 patch 模式
     H, L, O, C = (df[k].to_numpy(dtype=float) for k in ("High", "Low", "Open", "Close"))
     A = np.asarray(atr_prev, dtype=float)
     last = end - 1
@@ -1256,8 +1269,13 @@ def _user_triangle(df, atr_prev, end, state=None, out_state=None, replay_days=No
         state = archived
     bar_hash = lambda i: _bar_hash(O[i], H[i], L[i], C[i])
     records: List[Dict[str, Any]] = []
-    replay_span = max(TRI_TRACK_DAYS + 1, TRI_INIT_REPLAY if replay_days is None else max(0, int(replay_days)))
-    start_X = max(first_valid + 31, end - replay_span)   # 冷重播至少涵蓋完整追蹤期及前一日形成資料
+    shown: List[Dict[str, Any]] = []         # 追蹤期滿、仍在 70 根圖內的歷史越線（灰線）
+    if lock_mode and TRI_FULL_REPLAY and replay_days is None:
+        start_X = first_valid + 31                # 鎖線模式：從資料起點逐日重播，每天只用當天以前的 K 棒（與有無存檔結果相同）
+    else:
+        replay_span = max(TRI_TRACK_DAYS + 1, TRI_INIT_REPLAY if replay_days is None else max(0, int(replay_days)))
+        start_X = max(first_valid + 31, end - replay_span)   # 冷重播至少涵蓋完整追蹤期及前一日形成資料
+    replay_from = start_X
     reconstructed = True                          # 沒有有效快照：從固定起點重建，紀錄標「回溯辨識」
     held_records = []
     state_loaded = False
@@ -1277,11 +1295,17 @@ def _user_triangle(df, atr_prev, end, state=None, out_state=None, replay_days=No
                         continue                  # 10-08：形成期間超出目前資料窗口（不代表紀錄失效）
                     records.append({"snap": snap, "recognized": pos[r["recognized"]],
                                     "reconstructed_at": r.get("reconstructed_at"), "detected_on": r.get("detected_on")})
+            for r in state.get("shown", []) if lock_mode else []:
+                if r["F_date"] in pos and r["recognized"] in pos:
+                    snap = _shift_snap(r["snap"], pos[r["F_date"]])
+                    if min([snap["start"], snap["u"]["i0"], snap["d"]["i0"]]) >= 0:
+                        shown.append({"snap": snap, "recognized": pos[r["recognized"]],
+                                      "reconstructed_at": r.get("reconstructed_at"), "detected_on": r.get("detected_on")})
             start_X, reconstructed = a + 1, False
             state_loaded = True
     formation = None
     saved_formation = (state or {}).get("formation")
-    if TRI_SELECTION_MODE == "balanced-v1" and saved_formation and state_loaded:
+    if saved_formation and state_loaded:          # 10-11：鎖線模式也載入「已鎖住、尚未越線」的型態
         fday = saved_formation.get("F_date")
         if fday in pos and pos[fday] < start_X:
             candidate = _shift_snap(saved_formation["snap"], pos[fday])
@@ -1307,6 +1331,24 @@ def _user_triangle(df, atr_prev, end, state=None, out_state=None, replay_days=No
     def expired(r, X):                            # 1) 追蹤結束：辨識後超過 TRI_TRACK_DAYS，或兩線在 X 日前已交會
         u, d = r["snap"]["u"], r["snap"]["d"]
         return X - r["recognized"] > TRI_TRACK_DAYS or (u["s"] - d["s"]) * X + u["k"] - d["k"] <= 0
+
+    def beyond(snap, X):                          # 收盤越過固定線（不受追蹤天數限制）
+        u, d = snap["u"], snap["d"]
+        return not np.isnan(A[X]) and (C[X] > u["s"]*X+u["k"]+TRI_OUT*A[X] or C[X] < d["s"]*X+d["k"]-TRI_OUT*A[X])
+
+    def last_touch(snap):
+        days = [snap["F"]] + snap["u"]["a"] + snap["d"]["a"]
+        days += [t for e in ("u", "d") for ev in snap[e].get("events", []) for t in ev.get("days", [])]
+        return max(days)
+
+    def lock_live(snap, X):                       # 鎖住的型態：兩線未交會，且最近碰線距今不超過 TRI_LOCK_IDLE
+        return (snap is not None and (snap["u"]["s"]-snap["d"]["s"])*X + snap["u"]["k"]-snap["d"]["k"] > 0
+                and X - last_touch(snap) <= TRI_LOCK_IDLE)
+
+    def same_lines(x, y, X):                      # 兩組線在共同起點與 X 日都相差 0.5 ATR 以內＝同一組
+        t0 = max(x["u"]["i0"], x["d"]["i0"], y["u"]["i0"], y["d"]["i0"])
+        return all(abs((x[e]["s"]-y[e]["s"])*t + x[e]["k"]-y[e]["k"]) <= 0.5*A[min(t, X)]
+                   for e in ("u", "d") for t in (t0, X))
     def held_snap(r):
         return {"snap": _shift_snap(r["snap"], virtual_pos[r["F_date"]]),
                 "recognized": virtual_pos[r["recognized"]]}
@@ -1329,8 +1371,37 @@ def _user_triangle(df, atr_prev, end, state=None, out_state=None, replay_days=No
         from request_runtime import check_budget
         check_budget()
         held_records = [r for r in held_records if not expired(held_snap(r), X)]
+        if lock_mode:                              # 10-11：追蹤期滿的越線紀錄移到「只顯示」清單，不再決定主型態
+            shown += [r for r in records if expired(r, X)]
         records = [r for r in records if not expired(r, X)]   # 每天先清過期紀錄，再判斷新突破（逐日＝一次補算）
         primary, held = active_record()
+        if lock_mode:
+            # 10-11 鎖線：已鎖住的型態只沿固定線判斷越線，不再每天重新挑線
+            if formation is not None and not lock_live(formation, X):
+                formation = None
+            if formation is not None and beyond(formation, X):
+                if primary is None or new_consolidation(formation, primary, held, X):
+                    add_record(formation, X)
+                formation = None
+                continue
+            if formation is not None:
+                continue
+            F = X - 1
+            pick = form(F)
+            if pick is None or pick.get("candidate"):
+                continue
+            primary, held = active_record()
+            if primary is not None and not new_consolidation(pick, primary, held, X):
+                continue                         # 同一整理期間的重新畫法：不取代、不另建突破紀錄
+            if beyond(pick, X):
+                add_record(pick, X)              # 剛成立當天就越線：直接建立越線紀錄
+                continue
+            prev = form(F - 1)                   # 前一天（只用前一天以前資料）也是同一組正式線才鎖住
+            if TRI_LOCK_DAYS <= 0:
+                continue                         # 0＝不鎖線（只做逐日重播＋越線紀錄）
+            if TRI_LOCK_DAYS == 1 or (prev is not None and not prev.get("candidate") and same_lines(prev, pick, X)):
+                formation = dict(pick, locked_on=dates[X])   # 存日期，跨窗口平移不受影響
+            continue
         if not formation_live(formation, X):
             formation = None
         # Check the previously observed formal boundaries before searching replacement lines.
@@ -1352,6 +1423,9 @@ def _user_triangle(df, atr_prev, end, state=None, out_state=None, replay_days=No
             formation = None
         elif TRI_SELECTION_MODE == "balanced-v1":
             formation = pick   # Save evidence for a later break, without freezing unbroken daily selection.
+    if lock_mode:
+        shown += [r for r in records if expired(r, end)]
+        shown = [r for r in shown if end - r["recognized"] <= TRI_SHOW_DAYS]
     records = [r for r in records if not expired(r, end)]
     held_records = [r for r in held_records if not expired(held_snap(r), end)]
     # 追蹤結束：超過 TRI_TRACK_DAYS 或已過交會點
@@ -1362,7 +1436,10 @@ def _user_triangle(df, atr_prev, end, state=None, out_state=None, replay_days=No
     if (TRI_SELECTION_MODE == "balanced-v1" and pick is not None and not pick.get("candidate") and not outside(pick, end)
             and (primary is None or new_consolidation(pick, primary, held, end))):
         formation = pick
-    if not formation_live(formation, end) or outside(formation, end):
+    if lock_mode:
+        if not lock_live(formation, end) or beyond(formation, end):
+            formation = None
+    elif not formation_live(formation, end) or outside(formation, end):
         formation = None
     if out_state is not None:
         out_state.clear()
@@ -1373,28 +1450,44 @@ def _user_triangle(df, atr_prev, end, state=None, out_state=None, replay_days=No
             "fingerprint": {dates[i]: bar_hash(i) for i in range(0, end + 1)},
             "records": [{"F_date": dates[r["snap"]["F"]], "recognized": dates[r["recognized"]],
                          "reconstructed_at": r.get("reconstructed_at"), "detected_on": r.get("detected_on"),
-                         "snap": _shift_snap(r["snap"], -r["snap"]["F"])} for r in records] + held_records}))
+                         "snap": _shift_snap(r["snap"], -r["snap"]["F"])} for r in records] + held_records,
+            "shown": [{"F_date": dates[r["snap"]["F"]], "recognized": dates[r["recognized"]],
+                       "reconstructed_at": r.get("reconstructed_at"), "detected_on": r.get("detected_on"),
+                       "snap": _shift_snap(r["snap"], -r["snap"]["F"])} for r in shown]}))
         # 規則變更採原子存檔一起保留上一版快照；只讀入口不會寫入。
         previous = (incoming_state or {}).get("previous_rules_state")
         if incoming_state and incoming_state.get("sig") and incoming_state["sig"] != sig:
-            previous = {k: incoming_state[k] for k in ("sig", "as_of", "revision", "fingerprint", "records", "formation") if k in incoming_state}
+            previous = {k: incoming_state[k] for k in ("sig", "as_of", "revision", "fingerprint", "records", "formation", "shown") if k in incoming_state}
         if previous:
             out_state["previous_rules_state"] = _jsonable(previous)
     keep_from = end - TRI_BREAK_RECENT
     own = None
     primary, held = active_record()
-    if primary is not None and (pick is None or not new_consolidation(pick, primary, held, end)):
+    source = ""
+    if lock_mode and formation is not None:
+        main, source = formation, "鎖定"          # 已鎖住的正式型態優先：不因今天重新排名而換線
+    elif primary is not None and (pick is None or not new_consolidation(pick, primary, held, end)):
+        source = "越線紀錄" if not held else "越線紀錄（窗口外）"
         own = None if held else primary
         main = None if held else primary["snap"]   # 先用仍在追蹤的正式紀錄；窗口不足只保留、不誤畫替代線
+    elif (lock_mode and shown and not records and pick is None
+          and (shown[-1]["snap"]["u"]["s"]-shown[-1]["snap"]["d"]["s"])*end + shown[-1]["snap"]["u"]["k"]-shown[-1]["snap"]["d"]["k"] > 0):
+        own = shown[-1]                           # 10-11：越線已超過追蹤期，仍畫到越線日移出 70 根圖
+        main, source = own["snap"], "歷史越線（超過追蹤期）"
     elif pick is not None:
-        main = pick
+        main, source = pick, ("候選" if pick.get("candidate") else "正式（觀察中，未鎖）")
     else:                                         # 今天沒有形成型態：只用保留期限內、仍在追蹤的已突破型態
         recent = records   # 有效突破沿原線追蹤20日；5日只限制其他歷史事件摘要
         own = None if held else (recent[-1] if recent else None)
         main = own["snap"] if own else None
+        source = "越線紀錄" if own else ""
+    _TRI_LOCAL.info = {"source": source or "無", "replay_from": dates[replay_from] if replay_from <= end else "-",
+                       "state_loaded": state_loaded, "records": len(records), "held": len(held_records),
+                       "locked_on": (main or {}).get("locked_on") or (formation or {}).get("locked_on") or "-",
+                       "F": dates[main["F"]] if main else "-", "version": TRI_STATE_VERSION}
     if main is None:
         return None
-    tr = tracks.get(id(own)) if own is not None else _tri_track(df, C, A, main, end)
+    tr = (tracks.get(id(own)) if own is not None else None) or _tri_track(df, C, A, main, end)   # 歷史越線不在 tracks 內
     u, d, F = main["u"], main["d"], main["F"]
     kind = _tri_kind(main)
     up, dn = u["s"] * end + u["k"], d["s"] * end + d["k"]
@@ -1422,6 +1515,8 @@ def _user_triangle(df, atr_prev, end, state=None, out_state=None, replay_days=No
         compat = last_b["type"]
     if tr["crossed"] and not cand:
         state_txt += "（已過上下緣交會點，位置不適用）"
+    if lock_mode and own is not None and end - own["recognized"] > TRI_TRACK_DAYS:
+        state_txt += f"（越線已超過 {TRI_TRACK_DAYS} 日，僅保留圖示，不代表目前型態）"
     rec_out = []
     for r in records:                             # 顯示：保留期限內辨識的紀錄＋目前型態本身的紀錄
         if r["recognized"] < keep_from and r is not own:
@@ -1678,6 +1773,23 @@ def detect(df: pd.DataFrame, events: Optional[Dict[str, Any]] = None, provisiona
         except Exception as exc:
             print(f"⚠️ 三角狀態寫入失敗｜{state_key}｜{type(exc).__name__}: {exc}", flush=True)
             break
+    if state_key and replay_days != 0 and __import__("log_switch").enabled("tri"):   # 10-11：開「三角紀錄」才印（族群總覽不印）
+        info = getattr(LAST_TRI_INFO, "info", {}) or {}
+        dates_ = adj.index
+        line = (f"🔺 三角核對｜{state_key.replace('tri_state_', '')}｜截至 {_d(dates_[last_official])}｜{info.get('version', TRI_STATE_VERSION)}"
+                f"｜來源 {info.get('source', '無')}｜形成截止 {info.get('F', '-')}｜鎖定日 {info.get('locked_on', '-')}"
+                f"｜重播起點 {info.get('replay_from', '-')}｜讀到存檔 {'是' if info.get('state_loaded') else '否'}"
+                f"｜越線紀錄 {info.get('records', 0)} 筆（窗口外 {info.get('held', 0)}）"
+                f"｜{'寫入' if state_write and not provisional_today else '只讀'}")
+        if tri:
+            up = tri["upper"][0] * last_official + tri["upper"][1]
+            dn = tri["lower"][0] * last_official + tri["lower"][1]
+            fb = tri.get("first_break") or {}
+            line += (f"｜{'候選' if tri.get('candidate') else '正式'}｜上緣 {_p(up)}｜下緣 {_p(dn)}"
+                     f"｜位置 {tri.get('current_position')}｜首次越線 {fb.get('date', '-')}｜{tri.get('state', '')}")
+        else:
+            line += "｜無三角"
+        print(line, flush=True)
     # 10-06：三角只認新算法；有新三角時舊算法型態全部讓位，沒有時只拿掉舊算法的三角（楔形、通道、箱型保留）
     old = {"箱型整理", "上升三角", "下降三角", "對稱三角收斂", "上升楔形", "下降楔形", "上升通道", "下降通道"}
     drop = old if tri and not tri.get("candidate") else {"上升三角", "下降三角", "對稱三角收斂"}   # 候選不讓其他已確認型態讓位

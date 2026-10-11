@@ -273,7 +273,7 @@ def score_pending(budget_seconds: float = SCORE_BUDGET, log: Callable[[str], Non
                     if (isinstance(exc, tools.ToolDataError) and not isinstance(exc, tools.ToolSourceError)) or tries >= 3:
                         _FAILED_AT[code] = stamps[code]
         pending = max(0, len(todo) - done - failed)
-        if done or failed:
+        if (done or failed) and __import__("log_switch").enabled("market"):   # 10-11：平常不印
             log(f"📈 型態分數底庫：新增 {done} 檔｜失敗 {failed}｜尚待 {pending}｜{time.monotonic()-started:.0f} 秒")
         local_market_cache.set_state("score_scan", {
             "at": tools.taipei_now().strftime("%Y-%m-%d %H:%M"), "latest": latest,
