@@ -5974,6 +5974,7 @@ def sheet_flow_marks_for_stock(stock_code: str, dates: List[str], branch_name: s
 
     sells = _sell_rows(code)
     sell_amounts: Dict[Tuple[str, pd.Timestamp], float] = {}
+    event_sales: Dict[Tuple[str, pd.Timestamp, pd.Timestamp], float] = {}
     if not sells.empty:
         sells = sells[(sells["_date"] >= start) & (sells["_date"] <= end)]
         if targets:
@@ -5981,6 +5982,12 @@ def sheet_flow_marks_for_stock(stock_code: str, dates: List[str], branch_name: s
         for _, row in sells.iterrows():
             key = (str(row["_branch"]), pd.Timestamp(row["_date"]).normalize())
             sell_amounts[key] = sell_amounts.get(key, 0.0) + float(row.get("_amount") or 0.0)
+            event_day = _parse_sheet_date(row.get("事件日"))
+            if event_day is not None and not pd.isna(event_day):
+                event_day = pd.Timestamp(event_day).normalize()
+                if event_day <= key[1]:
+                    own_key = (key[0], event_day, key[1])
+                    event_sales[own_key] = event_sales.get(own_key, 0.0) + float(row.get("_amount") or 0.0)
 
     def in_chart(day: Any) -> str:
         """回傳圖上對應的日期字串；不在這 70 根 K 棒內就回空字串。"""
@@ -5991,13 +5998,19 @@ def sheet_flow_marks_for_stock(stock_code: str, dates: List[str], branch_name: s
 
     flow_cover_start, _, _ = sell_detail_coverage()
     marks: List[Dict[str, Any]] = []
-    paired_sells: set = set()
+    claimed_amounts: Dict[Tuple[str, pd.Timestamp], float] = {}
+    processed_actions: set = set()
     unverified: List[str] = []
     exit_groups: Dict[Tuple[str, pd.Timestamp], Dict[str, Any]] = {}
     ordered = list(rows.sort_values(["event_date", "branch"]).itertuples())
+    event_numbers: Dict[Tuple[str, pd.Timestamp], List[int]] = {}
+    for number, event in enumerate(ordered, 1):
+        key = (str(event.branch), pd.Timestamp(event.event_date).normalize())
+        event_numbers.setdefault(key, []).append(number)
     # A～E 事件的買進一律給編號；同一筆事件的出清沿用同一個編號。
     for no, row in enumerate(ordered, 1):
         branch = str(row.branch)
+        event_day = pd.Timestamp(row.event_date).normalize()
         event_code = str(getattr(row, "event_code", "") or "")
         buy_day = in_chart(row.event_date)
         if buy_day:
@@ -6009,31 +6022,55 @@ def sheet_flow_marks_for_stock(stock_code: str, dates: List[str], branch_name: s
         exit_day = in_chart(exit_date)
         if exit_day:
             key = (branch, pd.Timestamp(exit_date).normalize())
+            own_key = (branch, event_day, key[1])
             own_exit = _amount_or_zero(getattr(row, "exit_amount", None))
-            amount = own_exit or sell_amounts.get(key, 0.0)
+            amount = event_sales.get(own_key, 0.0) or own_exit
             # 出清要「兩張表都對得上」：A～E 事件表有出清日，每日賣出明細也真的有當天的賣出。
             # 例外是出清日早於賣出明細的涵蓋範圍（那張表只保留近期資料），這種情況依事件表標示。
             if amount <= 0:
                 if flow_cover_start is None or pd.Timestamp(exit_date).normalize() >= flow_cover_start:
                     unverified.append(f"{branch} {exit_day}")
                     continue
-            paired_sells.add(key)
-            # 同一天同一個分點可能一次清掉好幾筆事件：合併成一個標記，編號列出被清掉的那幾筆，
-            # 金額只算一次（當日該分點的賣出合計），否則同一筆賣出會被重複計算。
-            group = exit_groups.setdefault(key, {"nos": [], "codes": [], "day": exit_day, "amount": amount})
+            # 同日出清可合併圖示，但金額依原始事件核對，不混入其他事件的減碼。
+            group = exit_groups.setdefault(key, {"nos": [], "codes": [], "day": exit_day, "amount": 0.0})
+            action_key = (branch, event_day, key[1], "exit")
+            if action_key not in processed_actions:
+                processed_actions.add(action_key)
+                group["amount"] += amount
+                claimed_amounts[key] = claimed_amounts.get(key, 0.0) + amount
             group["nos"].append(no)
             if event_code and event_code not in group["codes"]:
                 group["codes"].append(event_code)
+        # 每日賣出明細的「事件日」對應原始買進；保留後續每一次減碼。
+        reductions = {day: amount for (b, bought, day), amount in event_sales.items()
+                      if b == branch and bought == event_day and in_chart(day) != exit_day}
         reduce_date = getattr(row, "reduce_date", None)
         reduce_day = in_chart(reduce_date)
         if reduce_day and reduce_day != exit_day:
-            key = (branch, pd.Timestamp(reduce_date).normalize())
-            amount = sell_amounts.get(key, 0.0)
-            paired_sells.add(key)
-            # 減碼不是出清 → 不給編號；金額太小的也不畫，避免圖面被零股級賣單塞滿。
+            day = pd.Timestamp(reduce_date).normalize()
+            own_amount = _amount_or_zero(getattr(row, "reduce_amount", None))
+            # 明細窗口不足時只使用這筆事件本身的減碼金額，不借整個分點的日合計。
+            if day not in reductions and own_amount > 0:
+                reductions[day] = own_amount
+        for day, amount in sorted(reductions.items()):
+            day_text = in_chart(day)
+            if not day_text or day < event_day or (exit_date is not None and not pd.isna(exit_date)
+                                                  and day >= pd.Timestamp(exit_date).normalize()):
+                continue
+            action_key = (branch, event_day, day, "reduce")
+            if action_key in processed_actions:
+                continue
+            processed_actions.add(action_key)
+            key = (branch, day)
+            claimed_amounts[key] = claimed_amounts.get(key, 0.0) + amount
+            # 圖上減碼維持綠色 ▼；表格用來源編號連回買進，不能被當成出清。
             if amount >= MIN_SELL_MARK_AMOUNT:
+                linked = event_numbers[(branch, event_day)]
                 marks.append({"no": "", "branch": branch, "event_codes": event_code, "kind": "reduce",
-                              "action": "sell", "action_text": "減碼", "action_date": reduce_day,
+                              "action": "sell", "action_text": "減碼", "action_date": day_text,
+                              "source_event_no": linked[0], "source_event_nos": linked,
+                              "source_event_date": _fmt_date(event_day),
+                              "source_warrants": str(getattr(row, "warrant_list", "") or ""),
                               "net_amount": _num(-amount, 0), "net_amount_text": _money_text(-amount)})
 
     # 出清標記：一個分點、同一天只畫一個 ▼，編號＝當天被清掉的那幾筆買進的號碼。
@@ -6048,7 +6085,8 @@ def sheet_flow_marks_for_stock(stock_code: str, dates: List[str], branch_name: s
 
     known_branches = {str(b) for b in rows["branch"].unique()} if not rows.empty else set()
     for (branch, day), amount in sorted(sell_amounts.items(), key=lambda item: -item[1]):
-        if (branch, day) in paired_sells or amount < MIN_SELL_MARK_AMOUNT:
+        amount = max(0.0, amount - claimed_amounts.get((branch, day), 0.0))
+        if amount < MIN_SELL_MARK_AMOUNT:
             continue
         if targets and branch not in targets:
             continue
@@ -6058,7 +6096,7 @@ def sheet_flow_marks_for_stock(stock_code: str, dates: List[str], branch_name: s
         if not day_text:
             continue
         marks.append({"no": "", "branch": branch, "event_codes": "", "kind": "reduce",
-                      "action": "sell", "action_text": "賣出（非事件）", "action_date": day_text,
+                      "action": "sell", "action_text": "賣出待對帳", "action_date": day_text,
                       "net_amount": _num(-amount, 0), "net_amount_text": _money_text(-amount)})
 
     if not marks:

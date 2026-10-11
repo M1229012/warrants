@@ -1997,24 +1997,33 @@ def find_weekly_candidate(stock_code: str, log: Callable[[str], None] = print, c
 
 
 def weekly_article_parts(draft: str, stock_code: str, stock_name: str = "") -> Dict[str, Any]:
-    """把草稿拆成圖片版面要用的三段：標題、內文、免責。
-
-    圖片上方已經有「權證分點觀察｜週精選」標題，所以這裡不重複；
-    免責兩行移到卡片底部，內文只留正文段落。
-    """
-    lines = [line.rstrip() for line in str(draft or "").splitlines()]
+    """移除獨立標頭或行首標頭，保留同一行的正文與原文段落。"""
+    lines = normalize_draft_text(draft).splitlines()
     code = str(stock_code or "").strip()
+    name = str(stock_name or "").strip()
+    heading = re.compile(r"^權證分點觀察\s*[｜|：:\s]*[週周]精選(?:\s*[｜|：:]\s*)?\s*")
+    stock_heading = None
+    if code:
+        suffix = rf"(?:\s*{re.escape(name)})?" if name else ""
+        stock_heading = re.compile(rf"^(?:📌\s*)*{re.escape(code)}(?!\d){suffix}(?=$|[\s｜|：:])(?:[\s｜|：:]*)")
     body, disclaimers = [], []
     for line in lines:
         stripped = line.strip()
         if not stripped:
             body.append("")
             continue
-        if "權證分點觀察" in stripped and ("週精選" in stripped or "周精選" in stripped):
+        has_heading = bool(heading.match(stripped))
+        if has_heading:
+            stripped = heading.sub("", stripped, count=1).strip()
+            if re.fullmatch(r"(?:📌\s*)*", stripped):
+                continue
+        # 只刪已識別的行首股票標頭；正文中提到代號不能整行刪掉。
+        if stock_heading and (has_heading or stripped.startswith("📌") or
+                              stock_heading.fullmatch(stripped)):
+            stripped = stock_heading.sub("", stripped, count=1).strip()
+        if not stripped:
             continue
-        if code and code in stripped and len(stripped) <= 24:
-            continue                      # 「📌 3006 晶豪科」這種標頭
-        if stripped in ("⚠️ 僅為個人投資筆記", "🧡 非任何買賣建議") or stripped.startswith(("⚠️", "🧡")):
+        if stripped in ("⚠️ 僅為個人投資筆記", "🧡 非任何買賣建議"):
             disclaimers.append(stripped)
             continue
         body.append(stripped)
@@ -2027,7 +2036,7 @@ def weekly_article_parts(draft: str, stock_code: str, stock_name: str = "") -> D
 # 人工文章自動排版：Gemini 只重新分段、加固定小標、把數字整理成資料列；程式逐字核對，不通過就用原文排版
 # ============================================================
 
-WEEKLY_LAYOUT_VERSION = "weekly-note-v2"
+WEEKLY_LAYOUT_VERSION = "weekly-note-v3-preserve-body"
 LAYOUT_HEADINGS = ("技術面", "籌碼面", "操作觀察")
 LAYOUT_SCHEMA = {
     "type": "object",

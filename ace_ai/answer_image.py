@@ -338,7 +338,10 @@ def _mark_action(e: dict) -> tuple[str, str]:
         return '出清待對帳', WARN_INK
     if e.get('reduce_date'):
         amount = str(e.get('reduce_amount_text') or '')
-        return f"{e['reduce_date'][5:]} 減碼 {amount}".strip(), WARN_INK
+        if e.get('reduce_shared_with'):
+            return f"{e['reduce_date'][5:]} 減碼（與編號 {e['reduce_shared_with']} 同筆）", WARN_INK
+        label = '賣出待對帳' if e.get('unmatched_sell') else '減碼'
+        return f"{e['reduce_date'][5:]} {label} {amount}".strip(), WARN_INK
     if status == '已出清':
         return '已出清', DOWN
     if '減碼' in status:
@@ -373,39 +376,55 @@ def _mark_symbol_items() -> list[tuple[str, str, float]]:
 
 
 def _flow_table_rows(events: list[dict]) -> list[dict]:
-    """把 flow 標記（每個動作一筆）折成明細表用的「每個事件一列」。
-
-    週精選和一般問答改用同一張明細表，欄位與判讀規則才會一致；
-    分點配色圖例仍然保留，顏色對應 K 線上的標記。
-    """
+    """按買進事件合併出清／減碼；未對帳的賣出保留獨立列。"""
     rows: dict[int, dict] = {}
     extras: list[dict] = []
+    # 先建買進列，不能因輸入動作順序不同而遺失減碼狀態。
     for e in events:
         numbers = _mark_numbers(e)
-        branch = str(e.get('branch') or '')
         if e.get('action') == 'buy' and numbers:
-            row = rows.setdefault(numbers[0], {'no': numbers[0], 'branch': branch})
-            row.update({'branch': branch, 'event': str(e.get('event_codes') or ''),
-                        'buy_date': str(e.get('action_date') or ''),
-                        'buy_amount_text': str(e.get('net_amount_text') or ''),
-                        'status': row.get('status') or '持有中'})
+            rows[numbers[0]] = {'no': numbers[0], 'branch': str(e.get('branch') or ''),
+                               'event': str(e.get('event_codes') or ''),
+                               'buy_date': str(e.get('action_date') or ''),
+                               'buy_amount_text': str(e.get('net_amount_text') or ''),
+                               'status': '持有中'}
+    for e in events:
+        if e.get('action') == 'buy':
+            continue
+        branch = str(e.get('branch') or '')
+        numbers = _mark_numbers(e)
+        reduction = e.get('kind') == 'reduce' or e.get('action_text') == '減碼'
+        if reduction:
+            linked = e.get('source_event_nos') or ([e['source_event_no']] if e.get('source_event_no') else [])
+            linked = [int(n) for n in linked if str(n).isdigit() and int(n) in rows
+                      and rows[int(n)]['branch'] == branch
+                      and rows[int(n)]['buy_date'] == str(e.get('source_event_date') or '')]
+            if linked:
+                for index, number in enumerate(linked):
+                    row = rows[number]
+                    date = str(e.get('action_date') or '')
+                    row.setdefault('reduce_dates', [])
+                    if date not in row['reduce_dates']:
+                        row['reduce_dates'].append(date)
+                    if date >= str(row.get('reduce_date') or ''):
+                        row.update(reduce_date=date, reduce_amount_text=str(e.get('net_amount_text') or '') if index == 0 else '',
+                                   reduce_shared_with=linked[0] if index else None)
+                    if not row.get('exit_date'):
+                        row['status'] = '已減碼，仍持有'
+                continue
         elif numbers:
-            # 一筆賣出同時清掉好幾個編號時，金額只掛在第一個編號那列，
-            # 其餘列註明「與編號 N 同筆」，避免同一筆金額被重複計算。
             for index, number in enumerate(numbers):
                 row = rows.setdefault(number, {'no': number, 'branch': branch})
-                row['exit_date'] = str(e.get('action_date') or '')
-                row['status'] = '已出清'
-                if index == 0:
-                    row['exit_amount_text'] = str(e.get('net_amount_text') or '')
-                else:
-                    row['exit_amount_text'] = ''
+                row.update(exit_date=str(e.get('action_date') or ''), status='已出清')
+                row['exit_amount_text'] = str(e.get('net_amount_text') or '') if index == 0 else ''
+                if index:
                     row['exit_shared_with'] = numbers[0]
-        else:
-            extras.append({'no': '', 'branch': branch, 'event': '', 'buy_date': '', 'buy_amount_text': '',
-                           'reduce_date': str(e.get('action_date') or ''),
-                           'reduce_amount_text': str(e.get('net_amount_text') or ''),
-                           'status': str(e.get('action_text') or '減碼')})
+            continue
+        extras.append({'no': '', 'branch': branch, 'event': '', 'buy_date': '', 'buy_amount_text': '',
+                       'reduce_date': str(e.get('action_date') or ''),
+                       'reduce_amount_text': str(e.get('net_amount_text') or ''),
+                       'status': str(e.get('action_text') or '賣出待對帳'),
+                       'unmatched_sell': True})
     ordered = [rows[key] for key in sorted(rows)]
     for row in ordered:
         row.setdefault('event', '')
@@ -451,7 +470,7 @@ def mark_legend(draw, panel: dict, top: float, dry: bool) -> int:
                 f"事件買進 {len(buys)} 筆" if buys else "",
                 f"已出清 {len(exits)} 筆" if exits else "",
                 f"持有中 {len(holding)} 筆" if holding else "",
-                f"減碼 {len(plain)} 筆" if plain else "") if x)
+                f"減碼／待對帳 {len(plain)} 筆" if plain else "") if x)
             prefix = "編號 " + "、".join(str(n) for n in numbered) if numbered else "本期無 A～E 事件"
             rows.append((name, color, f"{prefix}｜{detail}" if detail else prefix))
         if not dry:
@@ -462,7 +481,7 @@ def mark_legend(draw, panel: dict, top: float, dry: bool) -> int:
             sx = x0 + 110
             draw.polygon([(sx, sy - half), (sx + 2 * half, sy - half), (sx + half, sy + half)], fill=DOWN)
             draw.text((sx + 22, sy), '賣超', font=font(18), fill=INK, anchor='lm')
-            draw.text((x0 + 232, sy), '編號＝A～E 事件；賣出標的編號＝當天被清掉的那幾筆；無編號＝減碼或零星賣出',
+            draw.text((x0 + 232, sy), '編號＝買進事件；同編號賣出＝出清；減碼對應下表買進，未對應＝待對帳',
                       font=font(18), fill=MUTED, anchor='lm')
             ly = sy + 30
             for name, color, detail in rows:

@@ -6705,6 +6705,12 @@ class AceQueryEngine:
         code = session["stock_code"]
         name = session.get("stock_name", "")
         candidate = session.get("candidate") or {}
+        article = weekly_pick.weekly_article_parts(session.get("draft", ""), code, name)
+        if not article["body"].strip():
+            self.log(f"週精選圖片：{code} 正文為空，保留草稿、停止排版與產圖")
+            return AnswerResult(text="目前草稿只有標題，沒有讀到正文。請重新貼上完整文字，再生成圖片。",
+                                route="weekly_article_image", gemini_calls=0, elapsed=time.perf_counter()-started,
+                                cacheable=False)
         # 最終圖片只顯示「管理員最後確認文字中實際提到」的分點。
         # 不因其他分點金額大、勝率高或屬精選五分點而自動補入。
         branches = weekly_pick.mentioned_branches(session.get("draft", ""), candidate)
@@ -6740,7 +6746,6 @@ class AceQueryEngine:
 
         title = f"權證分點觀察｜週精選｜{code} {name}"
         image_text = weekly_pick.weekly_image_text(session["draft"], code, name)
-        article = weekly_pick.weekly_article_parts(session["draft"], code, name)
         data_date = (candidate.get('technical') or {}).get('data_date', '')
         article["subtitle"] = f"資料日 {data_date}｜僅為個人投資筆記，非買賣建議".strip("｜")
         layout, layout_note, layout_calls = None, "", 0
