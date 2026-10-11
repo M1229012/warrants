@@ -1971,7 +1971,8 @@ GEMINI_OVERLOAD_RETRY_WAIT = max(0.0, tools._env_float("DISCORD_AI_GEMINI_OVERLO
 GEMINI_CALL_TIMEOUT_MS = max(5000, tools._env_int("DISCORD_AI_GEMINI_CALL_TIMEOUT_MS", 12000))   # 10-03：一次卡 148 秒；10-07：504 塞車白等 20 秒→12 秒就換金鑰／模型（正常回答約 6～8 秒）
 GEMINI_MAX_ATTEMPTS = max(1, tools._env_int("DISCORD_AI_GEMINI_MAX_ATTEMPTS", 5))      # 10-08：一次呼叫換金鑰／模型總次數上限
 GEMINI_MIN_CALL_SECONDS = 3.0                                                                  # 剩不到 3 秒就不再啟動新呼叫
-QUESTION_DEADLINE_SECONDS = max(15.0, tools._env_float("DISCORD_AI_QUESTION_DEADLINE_SECONDS", 50.0))   # 整題（解析＋排隊＋工具＋AI）
+QUESTION_DEADLINE_SECONDS = max(15.0, tools._env_float("DISCORD_AI_QUESTION_DEADLINE_SECONDS", 50.0))
+WEEKLY_PICK_DEADLINE_SECONDS = max(QUESTION_DEADLINE_SECONDS, tools._env_float("DISCORD_AI_WEEKLY_PICK_DEADLINE_SECONDS", 240.0))   # 10-11：本週精選排名   # 整題（解析＋排隊＋工具＋AI）
 IMAGE_RESERVE_SECONDS = 4.0                                                                    # 留給產生圖卡
 _QUESTION_CLOCK = __import__("request_runtime").CLOCK                                                            # 目前這題的截止時間（monotonic）
 QUESTION_MAX_GEMINI_CALLS = max(1, tools._env_int("DISCORD_AI_QUESTION_MAX_GEMINI_CALLS", 8))   # 整題 Gemini 呼叫總數上限
@@ -2768,6 +2769,10 @@ def build_final_prompt(payload: Dict[str, Any]) -> str:
                         "formal 才能依 triangle_structure 的原始事件/日期/目前位置描述；歷史越線不等於目前仍在線外，"
                         "盤中不寫收盤確認。舊整理型態、評分名稱、均線、布林、量區或使用者假設不能替代三角驗證。"
                         "沒有三角仍可解讀均線、量區、布林、趨勢與已提供的K線特徵。多股解讀須標明股票。")
+        if payload.get("pattern_focus") is False:
+            # 10-11：使用者問的不是型態，三角只帶一句，篇幅留給本題
+            sections.append("本題不是問型態：有正式或候選三角時只用一句帶過（例如「目前在三角收斂內」或「先前已跌破三角」），"
+                            "不展開上下緣價位、碰線次數與事件日期；沒有三角就不提。篇幅以使用者所問的內容為主。")
     if "get_recent_news" in names:
         sections.append(FINAL_NEWS_RULES)
     if "get_sheet_stock_chips" in names:
@@ -6347,6 +6352,12 @@ class AceQueryEngine:
         code = session["stock_code"]
         name = session.get("stock_name", "")
         candidate = session.get("candidate") or {}
+        article = weekly_pick.weekly_article_parts(session.get("draft", ""), code, name)
+        if not article["body"].strip():
+            self.log(f"週精選圖片：{code} 正文為空，保留草稿、停止排版與產圖")
+            return AnswerResult(text="目前草稿只有標題，沒有讀到正文。請重新貼上完整文字，再生成圖片。",
+                                route="weekly_article_image", gemini_calls=0, elapsed=time.perf_counter()-started,
+                                cacheable=False)
         # 最終圖片只顯示「管理員最後確認文字中實際提到」的分點。
         # 不因其他分點金額大、勝率高或屬精選五分點而自動補入。
         branches = weekly_pick.mentioned_branches(session.get("draft", ""), candidate)
@@ -6382,7 +6393,6 @@ class AceQueryEngine:
 
         title = f"權證分點觀察｜週精選｜{code} {name}"
         image_text = weekly_pick.weekly_image_text(session["draft"], code, name)
-        article = weekly_pick.weekly_article_parts(session["draft"], code, name)
         data_date = (candidate.get('technical') or {}).get('data_date', '')
         article["subtitle"] = f"資料日 {data_date}｜僅為個人投資筆記，非買賣建議".strip("｜")
         layout, layout_note, layout_calls = None, "", 0
@@ -7286,6 +7296,7 @@ class AceQueryEngine:
         if not plan.need_final_llm or not any(r.ok for r in results):
             return rule_answer, True
         payload = build_final_payload(question, results)
+        payload["pattern_focus"] = bool(plan.route == "rule_pattern" or plan.pattern)
         if plan.needs:
             payload["needs"] = plan.needs
         prompt = build_final_prompt(payload)
@@ -8438,11 +8449,14 @@ def run_discord_bot(config: BotConfig) -> None:
     async def handle_question_with_quote_policy(interaction: "discord.Interaction", question: str, admin_mode: bool,
                                                attachment=None) -> None:
         import request_runtime
-        state = request_runtime.new_state(QUESTION_DEADLINE_SECONDS)
+        # 10-11：管理員本週精選全市場排名約 80 秒，50 秒整題期限會把算完的結果丟掉 → 給較長期限
+        deadline = (WEEKLY_PICK_DEADLINE_SECONDS if admin_mode and is_weekly_pick_question(question)
+                    else QUESTION_DEADLINE_SECONDS)
+        state = request_runtime.new_state(deadline)
         try:
             with request_runtime.scope(state):
                 await asyncio.wait_for(_handle_question_impl(interaction, question, admin_mode, attachment),
-                                       timeout=QUESTION_DEADLINE_SECONDS)
+                                       timeout=deadline)
         except asyncio.TimeoutError:
             state["cancelled"] = True
             try:
