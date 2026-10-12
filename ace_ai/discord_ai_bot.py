@@ -723,6 +723,7 @@ ADMIN_HELP_GROUPS = (
     ("本週精選", ("本週精選排名", "3006 幫我生成週精選文字", "這版確認，生成圖片")),
     ("草稿", ("直接說修改需求", "還原上一版", "目前草稿")),
     ("資料維護", ("系統狀態", "用量（含費用估算）", "錯誤紀錄", "更新市場底庫", "更新族群名冊", "匯出狀態／匯入狀態")),
+    ("Log 開關（平常關閉，白話可）", ("log狀態（看目前哪些有開）", "開啟三角紀錄／關閉三角紀錄（三角核對）", "全部log關掉")),
     ("現股抓取", ("現股測速 2330（70 日）", "現股改成 8 條", "現股恢復自動", "現股抓取狀態")),
     ("族群", ("族群雷達", "族群別名（清單）", "新增族群別名 TGV=玻璃基板", "刪除族群別名 TGV")),
     ("測試員", ("新增測試員 <ID或@人>", "移除測試員 <ID>", "測試員名單")),
@@ -2710,7 +2711,11 @@ FINAL_FOCUS_RULES = ("【先回答重點】payload.question_focus 是使用者�
                      "說外資／投信／自營商最新一日、近5日、近20日買賣超金額與連買／連賣天數，不可換算成張數；支撐壓力＝列出最近的支撐與壓力價位；均線位置＝直接說在該均線上方或下方、距離幾%。"
                      "權證分點＝整張解讀都以權證分點為主：answer 直接說目前分點籌碼偏買、偏賣或已大多出清；why 說明哪些分點、觸發哪個 A～E 事件、"
                      "買進金額、後續是出清還是仍持有、分點的歷史事件勝率，以及分點買在什麼價位或量區附近；技術面最多一句當背景，不可整段改寫成技術面分析。"
-                     "scenarios 用分點條件，例如「若仍持有的分點繼續加碼／開始出清」「股價守住或跌破分點進場的量區」。"
+                     "answer 必須帶數字（金額只能照資料裡各分點各自的金額寫，不可把不同分點的金額自己相加）：仍持有的分點（筆數、買進金額、最近一次事件日）與已出清的分點分開講，不可只寫「整體偏買方」這類空泛結論；"
+                     "已出清的事件要說出清日與 result_return_pct（這次賺或賠多少、大約持有多久）；"
+                     "仍持有的分點要引用它的歷史勝率、平均報酬與平均持有天數（event_performance／holding_style），說明這類分點過去通常持有多久才出場（只描述歷史，不預測）。"
+                     "scenarios 兩個都要用分點條件，例如「仍持有的分點依過去習慣約 N 天後開始減碼／出清」「再出現新的 A～E 事件或其他分點跟進」；"
+                     "不可把均線、大量區、量能當成其中一個走法。"
                      "權證分點是事件資料、不是每日流量，不可用「買盤力道」「買盤轉弱」「賣壓」「籌碼鬆動」這類說法；"
                      "要說「幾筆事件已出清、幾筆仍持有、最近一次事件在哪天」。"
                      "重點需要的資料若失敗或沒有，第一句就說明取不到，不可改寫成一般技術面來帶過。")
@@ -3265,7 +3270,7 @@ def _prune_clauses(sentence: str, current: str, checker: Callable[[str, str], Li
     句子不能拆（只有一個子句）或拆完全部都有問題 → 整句刪。"""
     body = sentence.strip()
     end = body[-1] if body and body[-1] in "。！？!?；;" else ""
-    parts = [p for p in re.split(r"[，,]", body[:-1] if end else body) if p.strip()]
+    parts = [p for p in re.split(r"，|(?<!\d),|,(?!\d)", body[:-1] if end else body) if p.strip()]   # 千分位逗號（2,038）不拆
     if len(parts) < 2:
         return "", ""
     good = [p for p in parts if not checker(p, current)]
@@ -4344,7 +4349,7 @@ def drop_directives(text: str) -> str:
         if _DIRECTIVE_RE.search(p):
             continue
         if _PREDICTION_RE.search(p):
-            clauses = [c for c in re.split(r"[，,]", p.rstrip("。；！？")) if c.strip() and not _PREDICTION_RE.search(c)]
+            clauses = [c for c in re.split(r"，|(?<!\d),|,(?!\d)", p.rstrip("。；！？")) if c.strip() and not _PREDICTION_RE.search(c)]
             p = ("，".join(clauses) + "。") if clauses else ""
         kept.append(p)
     return "".join(kept).strip()
@@ -4652,7 +4657,8 @@ REQUIRED_MODULE_API = {
     "market_data": ("RECENT_DAYS",),
     "warrant_store": ("StoreShrunk",),
     "spot_chip": ("_official_trading_dates", "remember_history", "prefetch_history"),
-    "kline_patterns": ("detect", "names", "ai_pattern_facts"),
+    "kline_patterns": ("detect", "names", "ai_pattern_facts", "user_triangle", "LAST_TRI_INFO"),
+    "log_switch": ("enabled", "parse_command", "set_many", "status_text"),
     "sector_analysis": ("live_group_ranking",),
     "market_scan": ("value_liquid_codes", "EXCLUDED_NAMES"),
 }
@@ -6004,6 +6010,16 @@ class AceQueryEngine:
                 r"你(?:會|能|可以)(?:做|幫我做)?(?:什麼|哪些)|(?:怎麼|如何)用|說明書?|(?:管理員)?功能(?:表|清單|列表)", compact):
             # 新增管理員指令時，同時加進 ADMIN_HELP_GROUPS（test_admin_help_complete 會檢查有沒有漏）
             return help_result(started, admin=self._show_admin_help(True))
+        log_cmd = __import__("log_switch").parse_command(compact)   # Log 開關（白話可；正式版只開放三角核對）
+        if log_cmd:
+            import log_switch
+            action, cats = log_cmd
+            if action != "status":
+                log_switch.set_many(cats, action == "on")
+                names = "、".join(log_switch.CATEGORIES[c][0] for c in cats)
+                self.log(f"Log 開關｜{names}｜{'開啟' if action == 'on' else '關閉'}")
+            return AnswerResult(text=log_switch.status_text(), route="admin_log_switch", gemini_calls=0,
+                                elapsed=time.perf_counter()-started, cacheable=False, as_text=True)
         if compact in ("目前草稿", "現在草稿", "看草稿"):
             session = self._load_draft_session(context_key)
             text = str((session or {}).get("draft") or "")

@@ -44,7 +44,8 @@ def parse_codes(question: str, limit: int = 10) -> list[str]:
     found=list(dict.fromkeys(c.upper() for c in re.findall(r'(?<![0-9A-Za-z])(?:[0-9]{4,6}[A-Za-z]?|TAIEX|TPEX)(?![0-9A-Za-z])',q,re.I)))
     if len(found)<=1:return [parse_code(q)]
     if not is_request(q):raise ValueError('請說：型態驗證 2344 1608（一次最多10檔）')
-    return found[:limit]
+    if len(found) > limit:raise ValueError(f"共 {len(found)} 檔，每次最多 {limit} 檔，請分批驗證")
+    return found
 
 
 def load_panel(code: str) -> dict[str, Any]:
@@ -65,11 +66,23 @@ def load_panel(code: str) -> dict[str, Any]:
     if frame.empty:
         raise ValueError("沒有可使用的正式收盤日 K")
     events = tools.get_corporate_actions(code)
-    return build_panel(frame, events, code, name)   # 正式版沒有三角存檔（不傳 state_key）
+    return build_panel(frame, events, code, name, state_key=f"tri_state_{code}", state_write=False)
 
 
-def _state_summary(state_key: str) -> str:
+def _state_summary(state_key: str, computed=None, read_only=False, loaded_rules=None) -> str:
     """三角存檔摘要（重啟前後比對用）：as_of、revision、正式紀錄數、各筆首次突破（辨識）日。"""
+    if computed is not None:
+        if not computed:
+            return "三角本次計算：資料不足，未建立快照；不是資料庫舊紀錄"
+        recs = computed.get("records") or []
+        firsts = []
+        for r in recs:
+            # Recognized date is the stored trigger, not an invented confirmation date.
+            firsts.append(r.get("recognized", "")[5:] + ("（回溯）" if r.get("reconstructed_at") else ""))
+        saved = "；含待突破形成快照" if computed.get("formation") else ""
+        rules = str(computed.get("sig") or "").split("|")[0]
+        loaded = str(loaded_rules or "無").split("|")[0]
+        return f"三角本次計算：as_of {computed.get('as_of')}｜{rules}｜正式紀錄 {len(recs)} 筆｜辨識日 {'、'.join(firsts) or '無'}｜{'只讀' if read_only else '讀寫'}；載入規則 {loaded}{saved}"
     store = kline_patterns._tri_store()
     if store is None:
         return "三角存檔：未啟用（不是正式資料庫，未讀寫）"
@@ -84,8 +97,9 @@ def _state_summary(state_key: str) -> str:
     return f"三角存檔：as_of {st.get('as_of')}｜revision {st.get('revision', 0)}｜正式紀錄 {len(recs)} 筆｜首次突破 {firsts}"
 
 
-def build_panel(frame: pd.DataFrame, events: dict | None, code: str, name: str = "", state_key: str = "") -> dict:
-    result = kline_patterns.detect(frame, events, include_debug=True, state_key=state_key)
+def build_panel(frame: pd.DataFrame, events: dict | None, code: str, name: str = "", state_key: str = "",
+                state_write: bool = True) -> dict:
+    result = kline_patterns.detect(frame, events, include_debug=True, state_key=state_key, state_write=state_write)
     snapshot = result.get("debug")
     if not snapshot:
         raise ValueError("；".join(result.get("summary") or ["日 K 資料不足或無法判定"]))
@@ -105,7 +119,7 @@ def build_panel(frame: pd.DataFrame, events: dict | None, code: str, name: str =
                             "formation": result.get("formation"), "ended": result.get("ended"),
                             "invalid": snapshot.get("invalid"), "trend": snapshot.get("trend"),
                             "summary": result["summary"],
-                            "flags": (result.get("flags") or []) + ([_state_summary(state_key)] if state_key else []),
+                            "flags": (result.get("flags") or []) + ([_state_summary(state_key, snapshot.get("triangle_state"), snapshot.get("triangle_state_read_only", False), snapshot.get("triangle_loaded_rules"))] if state_key else []),
                             "atr20": result.get("atr20"), "break_multiplier": snapshot["break_multiplier"],
                             "retest_multiplier": snapshot["retest_multiplier"]}}
 
@@ -137,6 +151,12 @@ def line_specs(data: dict) -> list[dict]:
                           "fit_end": formation["end"], "stop": stop,
                           "anchors": (formation.get("anchors") or {}).get(edge, []),
                           "color": "#87909E" if historical else color, "historical": historical})
+    for h in (triangle or {}).get("history_lines") or []:   # 10-12 歷史越線三角：灰線，原係數畫到交會點或圖右端
+        for edge in ("upper", "lower"):
+            anchors = list(h["anchors"][edge])
+            lines.append({"label": "歷史線", "coef": h[edge], "start": anchors[0] if anchors else h["start"],
+                          "fit_end": anchors[-1] if anchors else h["start"], "stop": min(last, h["stop"]),
+                          "anchors": [], "color": "#87909E", "historical": True})
     tr = data.get("trend")
     if tr and tr.get("line_coefficients"):
         points = tr["points"]

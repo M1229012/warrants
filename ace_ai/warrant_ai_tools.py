@@ -4833,7 +4833,8 @@ def get_sheet_stock_chips(stock_code: str, days: int = CHIPS_DAYS, lookback_days
         })
     # 只留「近期有 A～E 事件」或「區間內有事件／有效賣出」的分點；高勝率與近期金額優先。
     rows = [r for r in rows if r["_sort_recent"] > 0 or r["_sort_long"] > 0 or r["reduce_or_exit_lookback"]]
-    rows.sort(key=lambda r: (r["_sort_recent"] > 0, r["is_high_win_rate"], r["_sort_recent"], r["_sort_long"]), reverse=True)
+    # 10-12：仍持有中的分點排在已全部出清之前（避免 AI 標題寫一兩個月前已出清的分點）
+    rows.sort(key=lambda r: (r["_sort_recent"] > 0, r["open_event_count"] > 0, r["is_high_win_rate"], r["_sort_recent"], r["_sort_long"]), reverse=True)
     for row in rows:
         row.pop("_sort_recent", None)
         row.pop("_sort_long", None)
