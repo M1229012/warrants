@@ -850,6 +850,25 @@ def _tri_lines(P, B, Q, C, A, lo: int, F: int, sg: int, majors: List[Tuple[int, 
              else (lambda r: (-r["major"], -len(r["a"]), -r["peaks"], -r["reacted"], r["err"], r["src"])))
     if TRI_SELECTION_MODE == "balanced-v1":
         return _tri_diverse_lines(out, lo, F, A)
+    if TRI_DIVERSE_POOL:                          # 10-12 實驗：短／中／長三段各自去重、分層，長線不被短線擠掉
+        pool = []
+        span = max(1, F - lo)
+        for b in range(3):
+            part = [r for r in out if min(2, max(0, F - r["i0"]) * 3 // (span + 1)) == b]
+            kept: List[Dict[str, Any]] = []
+            for r in part:
+                x_same = lambda u: max(abs((r["s"] - u["s"]) * x + r["k"] - u["k"]) for x in (max(r["i0"], u["i0"]), F)) <= 0.2 * A[max(r["i0"], u["i0"])]
+                if not any(x_same(u) for u in kept):
+                    kept.append(r)
+                if len(kept) >= TRI_DIVERSE_POOL:
+                    break
+            if kept:
+                lay = [x for x in kept if x["major"] >= kept[0]["major"] - 1]
+                tp = max(len(x["a"]) for x in lay)
+                pool += [x for x in lay if len(x["a"]) >= tp - 1]
+        if getattr(_REJ, "on", False):
+            _REJ.stages = getattr(_REJ, "stages", []) + [{"sg": sg, "all": out, "uniq": pool, "final": pool}]
+        return pool
     uniq: List[Dict[str, Any]] = []
     for r in out:
         def same(u):
@@ -1161,6 +1180,7 @@ def _tri_form(H, L, O, C, A, lo: int, F: int, piv, confirm: bool = True, local: 
                 quality = _tri_pair_quality(H, L, O, C, A, u, d, joint, F)
                 key = (-quality["boundary_penalty"], quality["score"], quality["body_cover"], quality["common_coverage"], key)
                 ranked_pairs.append((quality["boundary_penalty"], quality["score"]))
+            _pair_rej(u, d, ("通過", key))       # 診斷：通過的配對與排名鍵（預設關）
             if best is None or key > best[0]:
                 best = (key, u, d, start, joint, w0, wF, hgt, quality)
     if not best:
@@ -1246,6 +1266,8 @@ TRI_SHOW_DAYS = int(_env("TRI_SHOW_DAYS", 69))       # 越線後持續畫到越�
 TRI_PREFER_LONG = int(_env("TRI_PREFER_LONG", 0))   # 實驗開關：1＝同證據偏好較長線
 TRI_PREFER_LONG_STEP = int(_env("TRI_PREFER_LONG_STEP", 10))
 TRI_FAIL_DAYS = int(_env("TRI_FAIL_DAYS", 3))        # 越線後 N 天沒有延續：改列歷史（照畫、保留事件），不再擋新型態；不刪除
+TRI_DIVERSE_POOL = int(_env("TRI_DIVERSE_POOL", 0))   # 實驗：>0＝短中長三段各留前 N 條再分層
+TRI_HISTORY_MAX = int(_env("TRI_HISTORY_MAX", 0))    # 圖上畫幾組歷史越線三角；0＝不畫（10-12 使用者回饋太亂）
 TRI_FAIL_ATR = float(_env("TRI_FAIL_ATR", 1.0))    # 延續門檻：往越線方向再走 1 ATR（1608 實測 0.5 太鬆）
 TRI_TRACK_DAYS = int(_env("TRI_TRACK_DAYS", 20))     # 已突破型態沿固定線追蹤最多 20 日（或交會）就結束
 TRI_CONFIRM2 = int(_env("TRI_CONFIRM2", 0))          # 10-08：1＝文字顯示兩日確認（比較驗證前預設關；欄位一律計算）
@@ -1710,7 +1732,7 @@ def _user_triangle(df, atr_prev, end, state=None, out_state=None, replay_days=No
                                   "start": min(u_["i0"], d_["i0"]), "stop": min(end, cross) if cross is not None else end,
                                   "first_cross": _d(df.index[r["recognized"]]), "candidate": bool(r["snap"].get("candidate")),
                                   "anchors": {"upper": u_["a"], "lower": d_["a"]}})
-        history_lines = history_lines[-2:]        # 最多畫 2 組歷史
+        history_lines = history_lines[-TRI_HISTORY_MAX:] if TRI_HISTORY_MAX > 0 else []   # 10-12 使用者：歷史線讓圖變亂，預設不畫
     others = sorted([x for x in rec_out if not x["is_current"]], key=lambda x: x["_last"])
     if others:                                    # 圖卡只留最近一組歷史型態的最新狀態，其餘見明細
         o = others[-1]
@@ -1969,7 +1991,7 @@ def detect(df: pd.DataFrame, events: Optional[Dict[str, Any]] = None, provisiona
         if tri:
             up = tri["upper"][0] * last_official + tri["upper"][1]
             dn = tri["lower"][0] * last_official + tri["lower"][1]
-            fb = tri.get("first_break") or ({"date": tri["first_cross"][5:].replace("-", "/") + "（候選）"} if tri.get("first_cross") else {})
+            fb = tri.get("first_break") or ({"date": f"{tri['first_cross']}（候選）"} if tri.get("first_cross") else {})
             line += (f"｜{'候選' if tri.get('candidate') else '正式'}｜上緣 {_p(up)}｜下緣 {_p(dn)}"
                      f"｜位置 {tri.get('current_position')}｜首次越線 {fb.get('date', '-')}｜歷史線 {len(tri.get('history_lines') or [])} 組｜{tri.get('state', '')}")
         else:
