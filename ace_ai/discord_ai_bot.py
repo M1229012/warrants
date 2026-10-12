@@ -2767,7 +2767,7 @@ FINAL_FOCUS_RULES = ("【先回答重點】payload.question_focus 是使用者�
                      "說外資／投信／自營商最新一日、近5日、近20日買賣超金額與連買／連賣天數，不可換算成張數；支撐壓力＝列出最近的支撐與壓力價位；均線位置＝直接說在該均線上方或下方、距離幾%。"
                      "權證分點＝整張解讀都以權證分點為主：answer 直接說目前分點籌碼偏買、偏賣或已大多出清；why 說明哪些分點、觸發哪個 A～E 事件、"
                      "買進金額、後續是出清還是仍持有、分點的歷史事件勝率，以及分點買在什麼價位或量區附近；技術面最多一句當背景，不可整段改寫成技術面分析。"
-                     "answer 必須帶數字：仍持有的分點（筆數、合計買進金額、最近一次事件日）與已出清的分點分開講，不可只寫「整體偏買方」這類空泛結論；"
+                     "answer 必須帶數字（金額只能照資料裡各分點各自的金額寫，不可把不同分點的金額自己相加）：仍持有的分點（筆數、買進金額、最近一次事件日）與已出清的分點分開講，不可只寫「整體偏買方」這類空泛結論；"
                      "已出清的事件要說出清日與 result_return_pct（這次賺或賠多少、大約持有多久）；"
                      "仍持有的分點要引用它的歷史勝率、平均報酬與平均持有天數（event_performance／holding_style），說明這類分點過去通常持有多久才出場（只描述歷史，不預測）。"
                      "scenarios 兩個都要用分點條件，例如「仍持有的分點依過去習慣約 N 天後開始減碼／出清」「再出現新的 A～E 事件或其他分點跟進」；"
@@ -3530,7 +3530,7 @@ def _prune_clauses(sentence: str, current: str, checker: Callable[[str, str], Li
     句子不能拆（只有一個子句）或拆完全部都有問題 → 整句刪。"""
     body = sentence.strip()
     end = body[-1] if body and body[-1] in "。！？!?；;" else ""
-    parts = [p for p in re.split(r"[，,]", body[:-1] if end else body) if p.strip()]
+    parts = [p for p in re.split(r"，|(?<!\d),|,(?!\d)", body[:-1] if end else body) if p.strip()]   # 千分位逗號（2,038）不拆
     if len(parts) < 2:
         return "", ""
     good = [p for p in parts if not checker(p, current)]
@@ -4611,7 +4611,7 @@ def drop_directives(text: str) -> str:
         if _DIRECTIVE_RE.search(p):
             continue
         if _PREDICTION_RE.search(p):
-            clauses = [c for c in re.split(r"[，,]", p.rstrip("。；！？")) if c.strip() and not _PREDICTION_RE.search(c)]
+            clauses = [c for c in re.split(r"，|(?<!\d),|,(?!\d)", p.rstrip("。；！？")) if c.strip() and not _PREDICTION_RE.search(c)]
             p = ("，".join(clauses) + "。") if clauses else ""
         kept.append(p)
     return "".join(kept).strip()
