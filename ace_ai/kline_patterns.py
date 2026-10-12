@@ -1265,7 +1265,11 @@ TRI_FULL_REPLAY = int(_env("TRI_FULL_REPLAY", 0))    # 1＝從資料起點逐日
 TRI_SHOW_DAYS = int(_env("TRI_SHOW_DAYS", 69))       # 越線後持續畫到越線日移出 70 根圖為止
 TRI_PREFER_LONG = int(_env("TRI_PREFER_LONG", 0))   # 實驗開關：1＝同證據偏好較長線
 TRI_PREFER_LONG_STEP = int(_env("TRI_PREFER_LONG_STEP", 10))
-TRI_FAIL_DAYS = int(_env("TRI_FAIL_DAYS", 2))        # 10-12 C：越線後收盤回到線內連續 N 天＝失敗（或反向越線），才移到歷史；原線與事件保留
+TRI_FAIL_DAYS = int(_env("TRI_FAIL_DAYS", 3))        # 預設（TRI_EVENT_STATE=0）：越線後 N 天沒再往越線方向走 TRI_FAIL_ATR → 移歷史、不再擋新型態
+TRI_FAIL_ATR = float(_env("TRI_FAIL_ATR", 1.0))
+TRI_EVENT_STATE = int(_env("TRI_EVENT_STATE", 0))    # 10-12 C 實驗：1＝失敗只看反向越線或回內連續 TRI_FAIL_INSIDE 天（橫盤、回測不讓位）。
+                                                     # 實測 3034（10/02 早期陡線紀錄擋住 10/07 正確線）、1608（尖端窄三角越線）會變錯，需 D 的同段讓位規則後才可開
+TRI_FAIL_INSIDE = int(_env("TRI_FAIL_INSIDE", 2))
 TRI_DIVERSE_POOL = int(_env("TRI_DIVERSE_POOL", 0))   # 實驗：>0＝短中長三段各留前 N 條再分層
 TRI_HISTORY_MAX = int(_env("TRI_HISTORY_MAX", 0))    # 圖上畫幾組歷史越線三角；0＝不畫（10-12 使用者回饋太亂）
 TRI_TRACK_DAYS = int(_env("TRI_TRACK_DAYS", 20))     # 已突破型態沿固定線追蹤最多 20 日（或交會）就結束
@@ -1327,13 +1331,17 @@ def _tri_event_state(tr, H, L, C, A, snap, end) -> str:
         n = 0
         while end - n > b["idx"] and d["s"]*(end-n)+d["k"] <= C[end-n] <= u["s"]*(end-n)+u["k"]:
             n += 1
-        return "失敗（回內）" if TRI_FAIL_DAYS > 0 and n >= TRI_FAIL_DAYS else "回內待確認"
+        return "失敗（回內）" if TRI_FAIL_INSIDE > 0 and n >= TRI_FAIL_INSIDE else "回內待確認"
     up = b["type"] == "break_up"
     line = (lambda t: u["s"]*t+u["k"]) if up else (lambda t: d["s"]*t+d["k"])
-    retest = any((L[t] <= line(t) + TRI_TOUCH*A[t]) if up else (H[t] >= line(t) - TRI_TOUCH*A[t])
-                 for t in range(b["idx"] + 1, end + 1))
-    if retest:
-        return "回測守住"
+    # 只看最近一次回測：之後收盤再往越線方向走 TRI_REACT ATR＝守住；還沒走出去＝回測中（不因很久以前碰過一次就一直標守住）
+    touches = [t for t in range(b["idx"] + 1, end + 1)
+               if ((L[t] <= line(t) + TRI_TOUCH*A[t]) if up else (H[t] >= line(t) - TRI_TOUCH*A[t]))]
+    if touches:
+        r = touches[-1]
+        sg = 1 if up else -1
+        held = any((C[t] - C[r]) * sg >= TRI_REACT * A[t] for t in range(r + 1, end + 1))
+        return "回測守住" if held else "回測中"
     return "確認" if b.get("confirm") == "確認" else "越線"
 
 
@@ -1452,8 +1460,8 @@ def _user_triangle(df, atr_prev, end, state=None, out_state=None, replay_days=No
         start_X = first_valid + 31                # 鎖線模式：從資料起點逐日重播，每天只用當天以前的 K 棒（與有無存檔結果相同）
     else:
         replay_span = max(TRI_TRACK_DAYS + 1, TRI_INIT_REPLAY if replay_days is None else max(0, int(replay_days)))
-        if lock_mode and replay_days is None:
-            replay_span = max(replay_span, TRI_SHOW_DAYS + 1)   # 10-12：冷重播要能重建 70 根內的歷史越線
+        # 10-12 止血：無存檔冷重播改回 21 天（70 天讓 2474 型態驗證逾時）；較早的越線只靠存檔保留，
+        # 冷重播看不到的期間以 history_partial 標示，不代表「以前沒有越線」
         start_X = max(first_valid + 31, end - replay_span)   # 冷重播至少涵蓋完整追蹤期及前一日形成資料
     replay_from = start_X
     reconstructed = True                          # 沒有有效快照：從固定起點重建，紀錄標「回溯辨識」
@@ -1532,15 +1540,23 @@ def _user_triangle(df, atr_prev, end, state=None, out_state=None, replay_days=No
             n += 1
         return n
 
-    def fail_reason(r, X):                        # 10-12 C：反向越線，或回內連續 TRI_FAIL_DAYS 天＝失敗；橫盤、回測都不算
-        if TRI_FAIL_DAYS <= 0 or X - r["recognized"] > TRI_TRACK_DAYS:
+    def fail_reason(r, X):                        # 10-12 C：反向越線，或回內連續 TRI_FAIL_INSIDE 天＝失敗；橫盤、回測都不算
+        if not TRI_EVENT_STATE:                   # 預設：舊規則（N 天沒延續 1 ATR）
+            b = r["recognized"]
+            if TRI_FAIL_DAYS <= 0 or X - b < TRI_FAIL_DAYS or X - b > TRI_TRACK_DAYS or np.isnan(A[b]):
+                return None
+            up = C[b] > r["snap"]["u"]["s"] * b + r["snap"]["u"]["k"]
+            after = C[b + 1:b + TRI_FAIL_DAYS + 1]
+            follow = (after.max() >= C[b] + TRI_FAIL_ATR * A[b]) if up else (after.min() <= C[b] - TRI_FAIL_ATR * A[b])
+            return None if follow else "未延續"
+        if TRI_FAIL_INSIDE <= 0 or X - r["recognized"] > TRI_TRACK_DAYS:
             return None
         tr = _tri_track(df, C, A, r["snap"], X)
         if tr["crossed"] or not tr["breaks"]:
             return None
         if tr["reversed"]:
             return "失敗（反向越線）"
-        if tr["pos"] == "inside" and inside_run(r["snap"], X, tr["breaks"][-1]["idx"]) >= TRI_FAIL_DAYS:
+        if tr["pos"] == "inside" and inside_run(r["snap"], X, tr["breaks"][-1]["idx"]) >= TRI_FAIL_INSIDE:
             return "失敗（回內）"
         return None
 
@@ -1550,7 +1566,7 @@ def _user_triangle(df, atr_prev, end, state=None, out_state=None, replay_days=No
                    for e in ("u", "d") for t in (t0, X))
 
     def add_or_revive(snap, X):                   # 10-12 C：失敗後同一組線再次越線＝追加原型態事件，不新建紀錄搶主圖
-        for r in reversed(shown):
+        for r in (reversed(shown) if TRI_EVENT_STATE else ()):
             if (str(r.get("reason") or "").startswith("失敗") and not _tri_is_new_consolidation(snap, r["recognized"])
                     and same_lines(r["snap"], snap, X)):
                 if r["reason"] == "失敗（回內）":
@@ -1694,7 +1710,7 @@ def _user_triangle(df, atr_prev, end, state=None, out_state=None, replay_days=No
     elif (lock_mode and shown and not records and pick is None
           and (shown[-1]["snap"]["u"]["s"]-shown[-1]["snap"]["d"]["s"])*end + shown[-1]["snap"]["u"]["k"]-shown[-1]["snap"]["d"]["k"] > 0):
         own = shown[-1]                           # 10-11：越線已超過追蹤期，仍畫到越線日移出 70 根圖
-        main, source = own["snap"], "歷史越線（" + ("超過追蹤期" if own.get("reason") in (None, "追蹤期滿") else own["reason"]) + "）"
+        main, source = own["snap"], "歷史越線（" + (own["reason"] if str(own.get("reason") or "").startswith("失敗") else "超過追蹤期") + "）"
     elif pick is not None:
         main, source = pick, ("候選" if pick.get("candidate") else "正式（觀察中，未鎖）")
     else:                                         # 今天沒有形成型態：只用保留期限內、仍在追蹤的已突破型態
@@ -1703,7 +1719,7 @@ def _user_triangle(df, atr_prev, end, state=None, out_state=None, replay_days=No
         main = own["snap"] if own else None
         source = "越線紀錄" if own else ""
     _TRI_LOCAL.info = {"source": source or "無", "replay_from": dates[replay_from] if replay_from <= end else "-",
-                       "state_loaded": state_loaded, "records": len(records), "held": len(held_records),
+                       "state_loaded": state_loaded, "history_partial": not state_loaded, "records": len(records), "held": len(held_records),
                        "locked_on": (main or {}).get("locked_on") or (formation or {}).get("locked_on") or "-",
                        "F": dates[main["F"]] if main else "-", "version": TRI_STATE_VERSION}
     if main is None:
@@ -1741,8 +1757,9 @@ def _user_triangle(df, atr_prev, end, state=None, out_state=None, replay_days=No
     if tr["crossed"] and not cand:
         state_txt += "（已過上下緣交會點，位置不適用）"
     layer = "history" if source.startswith("歷史") else "current"   # 10-12 C：歷史圖示不算目前有效三角
-    if layer == "history":
-        why = own.get("reason") if own.get("reason") not in (None, "追蹤期滿") else f"越線已超過 {TRI_TRACK_DAYS} 日"
+    failed = str(own.get("reason") or "").startswith("失敗") if own is not None else False
+    if layer == "history" and (failed or end - own["recognized"] > TRI_TRACK_DAYS):
+        why = own["reason"] if failed else f"越線已超過 {TRI_TRACK_DAYS} 日"
         state_txt += f"（{why}，僅保留圖示，不代表目前型態）"
     rec_out = []
     for r in records:                             # 顯示：保留期限內辨識的紀錄＋目前型態本身的紀錄
@@ -1814,6 +1831,7 @@ def _user_triangle(df, atr_prev, end, state=None, out_state=None, replay_days=No
             "recent_pattern_events": rec_out,
             "first_cross": _d(df.index[own["recognized"]]) if own is not None else None,   # 候選與正式共用的首次越線日（Log 用）
             "layer": layer, "event_state": _tri_event_state(tr, H, L, C, A, main, end),
+            "history_partial": not state_loaded,   # 冷重播只涵蓋近 21 日：更早有無越線未知
             "history_lines": history_lines}
 
 
