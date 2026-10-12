@@ -977,6 +977,42 @@ def _tri_pair_quality(H, L, O, C, A, u, d, joint, F):
             "formation_bars": F - joint + 1}
 
 
+def _tri_d2_score(H, L, O, C, A, u, d, joint, F) -> Dict[str, Any]:
+    """10-12 D2 實驗排名（TRI_RANK_MODE=1）：只用共同形成期間 [joint, F]（F 以前，不看越線後）。
+    三項各 0～1、總分＝平均：碰線品質、穿線代價、共同收斂。門檻與候選池不變，只換排名。"""
+    x = np.arange(joint, F + 1)
+    atr = np.maximum(A[joint:F + 1], 1e-9)
+    third = max(1, (F - joint + 1) / 3.)
+
+    def side(line):
+        days = sorted({t for ev in line["events"] for t in ev["days"] if joint <= t <= F})
+        events = sum(1 for ev in line["events"] if any(joint <= t <= F for t in ev["days"]))
+        spread = len({min(2, int((t - joint) / third)) for t in days}) / 3.
+        return (min(events, 4) / 4. + spread) / 2.
+    contact = min(side(u), side(d))
+    upper, lower = u["s"] * x + u["k"], d["s"] * x + d["k"]
+    c = C[joint:F + 1]
+    outside = float(np.mean((c > upper + TRI_OUT * atr) | (c < lower - TRI_OUT * atr)))
+    top, bot = np.maximum(O[joint:F + 1], c), np.minimum(O[joint:F + 1], c)
+    body = float(np.mean(np.clip((np.maximum(0., top - upper) + np.maximum(0., lower - bot)) / atr, 0., 1.)))
+    pierce = 1. - (outside + body) / 2.
+    w0 = (u["s"] - d["s"]) * joint + u["k"] - d["k"]
+    wF = (u["s"] - d["s"]) * F + u["k"] - d["k"]
+    r = wF / w0 if w0 > 0 else 0.
+    if r < 0.08:
+        conv = 0.
+    elif r < 0.30:
+        conv = 0.3 + 0.7 * (r - 0.08) / 0.22
+    elif r <= 0.50:
+        conv = 1.
+    else:
+        conv = max(0., 1. - 0.5 * (r - 0.50) / 0.15)
+    # TRI_RANK_MODE=2：收斂只當成立門檻、不計排名分（10-12 固定日期診斷：收斂加分推動 3034、1608 換線）
+    score = (contact + pierce) / 2. if TRI_RANK_MODE == 2 else (contact + pierce + conv) / 3.
+    return {"score": round(score, 6), "contact": round(contact, 4), "pierce": round(pierce, 4),
+            "converge": round(conv, 4), "ratio": round(r, 4), "outside": round(outside, 4), "body": round(body, 4)}
+
+
 def _tri_sequence(u, d) -> List[Tuple[int, str]]:
     """上下緣共用的「順序明確接觸序列」：每個事件取第一個不是同日雙側的接觸日；整個事件都不明才略過。
     交替次數與初期高度都用這份序列。"""
@@ -1144,6 +1180,7 @@ def _tri_form(H, L, O, C, A, lo: int, F: int, piv, confirm: bool = True, local: 
     dns = _tri_lines(L, bot, H, C, A, lo, F, -1, ml, confirm) if ups else []
     best = None
     ranked_pairs = []
+    d2_pool = []                                  # 10-12 D2：(分數, v10 鍵, 配對資料)
     for u in ups:
         for d in dns:
             support = (min(u["turn_events"], d["turn_events"]) >= 2 and min(u["mtouch"], d["mtouch"]) >= 1) if local \
@@ -1181,13 +1218,21 @@ def _tri_form(H, L, O, C, A, lo: int, F: int, piv, confirm: bool = True, local: 
                 key = (-quality["boundary_penalty"], quality["score"], quality["body_cover"], quality["common_coverage"], key)
                 ranked_pairs.append((quality["boundary_penalty"], quality["score"]))
             _pair_rej(u, d, ("通過", key))       # 診斷：通過的配對與排名鍵（預設關）
+            if TRI_RANK_MODE and TRI_SELECTION_MODE == "baseline":
+                d2 = _tri_d2_score(H, L, O, C, A, u, d, joint, F)
+                d2_pool.append((d2["score"], key, (u, d, start, joint, w0, wF, hgt, d2)))
+                continue                          # D2：先收集，迴圈後一次選
             if best is None or key > best[0]:
                 best = (key, u, d, start, joint, w0, wF, hgt, quality)
+    if d2_pool:                                   # D2 同分處理：最高分 S*，分數 ≥ S*−0.02 的配對中用 v10 鍵選最大
+        top_score = max(p[0] for p in d2_pool)
+        pick = max((p for p in d2_pool if p[0] >= top_score - 0.02), key=lambda p: p[1])
+        best = (pick[1],) + pick[2]
     if not best:
         return None
     _, u, d, start, joint, w0, wF, hgt, quality = best
     scores = sorted(ranked_pairs, key=lambda x: (-x[0], x[1]), reverse=True)
-    selection = {"mode": TRI_SELECTION_MODE, "quality": quality,
+    selection = {"mode": TRI_SELECTION_MODE, **({"rank": "d2"} if d2_pool else {}), "quality": quality,
                  "qualified_pairs": len(scores),
                  "boundary_gap": round(scores[1][0]-scores[0][0], 6) if len(scores)>1 else None,
                  "margin": round(scores[0][1]-scores[1][1], 6) if len(scores)>1 and scores[0][0]==scores[1][0] else None}
@@ -1257,6 +1302,7 @@ TRI_SELECTION_MODE = os.getenv("DISCORD_AI_KLINE_TRI_SELECTION_MODE", "baseline"
 if TRI_SELECTION_MODE not in ("baseline", "balanced-v1", "envelope"):
     raise ValueError("DISCORD_AI_KLINE_TRI_SELECTION_MODE must be baseline, balanced-v1 or envelope")
 TRI_LOCK = TRI_SELECTION_MODE in ("baseline", "envelope")
+TRI_RANK_MODE = int(_env("TRI_RANK_MODE", 0))   # 10-12 D2 實驗：1＝三項分數排名；2＝不計收斂（碰線＋穿線）；候選池、門檻、事件流程不變；預設 0 關
 TRI_STATE_VERSION = {"baseline": "tri-v16-v10-events", "envelope": "tri-v15-user-envelope"}.get(TRI_SELECTION_MODE, "tri-v13-envelope-tracking-1")
 TRI_INIT_REPLAY = int(_env("TRI_INIT_REPLAY", 20))   # balanced 模式冷重播天數；鎖線模式一律從資料起點逐日重播
 TRI_LOCK_DAYS = int(_env("TRI_LOCK_DAYS", 0))        # 0＝不鎖線（預設）；2＝連續 2 天同一組線才鎖住。3034 實測鎖線會卡住較早的畫法，預設關
@@ -1279,8 +1325,13 @@ TRI_SPLIT_BORROWED = int(_env("TRI_SPLIT_BORROWED", 0))   # 10-08：1＝借用�
 
 def _tri_params_sig() -> str:
     # 10-08：原本只收 TRI_*，改 ZIGZAG_ATR 等參數後仍沿用舊快照；改成所有大寫數值參數
+    # 10-12：實驗開關在預設值時不列入（新增開關不讓舊存檔失效）；開啟時列入＝存檔與快取隔離
     return "|".join(f"{k}={v}" for k, v in sorted(globals().items())
-                    if k.isupper() and isinstance(v, (int, float)) and not isinstance(v, bool))
+                    if k.isupper() and isinstance(v, (int, float)) and not isinstance(v, bool)
+                    and not (k in _SIG_EXPERIMENT_DEFAULTS and v == _SIG_EXPERIMENT_DEFAULTS[k]))
+
+
+_SIG_EXPERIMENT_DEFAULTS = {"TRI_RANK_MODE": 0}
 
 
 def _shift_snap(snap: Dict[str, Any], delta: int) -> Dict[str, Any]:
@@ -1379,7 +1430,7 @@ def user_triangle(df: pd.DataFrame, atr_prev, end: int, state: Optional[Dict[str
         import copy, hashlib, json
         raw = pd.util.hash_pandas_object(df[[c for c in ("Open", "High", "Low", "Close", "Volume") if c in df]], index=True).values.tobytes()
         key = hashlib.sha256(raw + np.asarray(atr_prev, dtype=float).tobytes() + json.dumps(
-            [end, {k: state.get(k) for k in ("sig", "as_of", "fingerprint", "records", "formation", "previous_rules_state")} if isinstance(state, dict) else state, replay_days, _tri_params_sig(), TRI_STATE_VERSION, df.attrs.get("trading_sessions")], sort_keys=True, default=str).encode()).digest()
+            [end, {k: state.get(k) for k in ("sig", "as_of", "fingerprint", "records", "formation", "previous_rules_state", "shown", "history_from")} if isinstance(state, dict) else state, replay_days, _tri_params_sig(), TRI_STATE_VERSION, df.attrs.get("trading_sessions")], sort_keys=True, default=str).encode()).digest()
         cacheable = getattr(_tri_form, "__module__", "") == __name__
         with _TRI_MEMO_LOCK:
             cached = _TRI_MEMO.get(key) if cacheable else None
@@ -1490,7 +1541,11 @@ def _user_triangle(df, atr_prev, end, state=None, out_state=None, replay_days=No
                         shown.append({"snap": snap, "recognized": pos[r["recognized"]], "reason": r.get("reason"),
                                       "reconstructed_at": r.get("reconstructed_at"), "detected_on": r.get("detected_on")})
             start_X, reconstructed = a + 1, False
+            replay_from = start_X                 # 10-12：載入存檔後從存檔隔天續算，Log 重播起點跟著改（原本仍顯示冷重播起點）
             state_loaded = True
+    # 10-12：歷史涵蓋起日。冷重播＝重播起點；載入存檔＝沿用存檔記錄的起日（舊存檔沒有＝未知），不因載入存檔就當成完整
+    history_from = (state or {}).get("history_from") if state_loaded else dates[start_X] if start_X <= end else None
+    history_partial = history_from is None or history_from > dates[max(0, end - TRI_SHOW_DAYS)]
     formation = None
     saved_formation = (state or {}).get("formation")
     if saved_formation and state_loaded:          # 10-11：鎖線模式也載入「已鎖住、尚未越線」的型態
@@ -1681,7 +1736,7 @@ def _user_triangle(df, atr_prev, end, state=None, out_state=None, replay_days=No
         out_state.clear()
     if out_state is not None:
         out_state.update(_jsonable({
-            "sig": sig, "as_of": dates[end],
+            "sig": sig, "as_of": dates[end], "history_from": history_from,
             "formation": {"F_date": dates[formation["F"]], "snap": _shift_snap(formation, -formation["F"])} if formation is not None else None,
             "fingerprint": {dates[i]: bar_hash(i) for i in range(0, end + 1)},
             "records": [{"F_date": dates[r["snap"]["F"]], "recognized": dates[r["recognized"]],
@@ -1693,7 +1748,7 @@ def _user_triangle(df, atr_prev, end, state=None, out_state=None, replay_days=No
         # 規則變更採原子存檔一起保留上一版快照；只讀入口不會寫入。
         previous = (incoming_state or {}).get("previous_rules_state")
         if incoming_state and incoming_state.get("sig") and incoming_state["sig"] != sig:
-            previous = {k: incoming_state[k] for k in ("sig", "as_of", "revision", "fingerprint", "records", "formation", "shown") if k in incoming_state}
+            previous = {k: incoming_state[k] for k in ("sig", "as_of", "revision", "fingerprint", "records", "formation", "shown", "history_from") if k in incoming_state}
         if previous:
             out_state["previous_rules_state"] = _jsonable(previous)
     keep_from = end - TRI_BREAK_RECENT
@@ -1719,7 +1774,7 @@ def _user_triangle(df, atr_prev, end, state=None, out_state=None, replay_days=No
         main = own["snap"] if own else None
         source = "越線紀錄" if own else ""
     _TRI_LOCAL.info = {"source": source or "無", "replay_from": dates[replay_from] if replay_from <= end else "-",
-                       "state_loaded": state_loaded, "history_partial": not state_loaded, "records": len(records), "held": len(held_records),
+                       "state_loaded": state_loaded, "history_from": history_from, "history_partial": history_partial, "records": len(records), "held": len(held_records),
                        "locked_on": (main or {}).get("locked_on") or (formation or {}).get("locked_on") or "-",
                        "F": dates[main["F"]] if main else "-", "version": TRI_STATE_VERSION}
     if main is None:
@@ -1831,7 +1886,7 @@ def _user_triangle(df, atr_prev, end, state=None, out_state=None, replay_days=No
             "recent_pattern_events": rec_out,
             "first_cross": _d(df.index[own["recognized"]]) if own is not None else None,   # 候選與正式共用的首次越線日（Log 用）
             "layer": layer, "event_state": _tri_event_state(tr, H, L, C, A, main, end),
-            "history_partial": not state_loaded,   # 冷重播只涵蓋近 21 日：更早有無越線未知
+            "history_from": history_from, "history_partial": history_partial,   # 涵蓋起日之前有無越線未知
             "history_lines": history_lines}
 
 
@@ -2083,7 +2138,9 @@ def detect(df: pd.DataFrame, events: Optional[Dict[str, Any]] = None, provisiona
         shape_observation = triangle_observation(adj, tri, last_official, provisional_today)
     if not any(x for x in summary if not x.startswith("股價位於")):
         summary.insert(0, "目前沒有明確的整理型態或趨勢")
+    cover = getattr(LAST_TRI_INFO, "info", {}) or {}
     result = {"summary": summary, "names": names, "levels": levels, "flags": flag_text, "triangle": tri,
+              "triangle_coverage": {"history_from": cover.get("history_from"), "history_partial": cover.get("history_partial", True)},
             "atr20": _p(atr_prev[last_official]) if not np.isnan(atr_prev[last_official]) else None,
             "pivots": piv, "formation": ev or cur, "ended": ended}
     result["observations"] = {
