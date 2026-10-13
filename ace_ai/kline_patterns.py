@@ -1313,6 +1313,7 @@ TRI_PREFER_LONG = int(_env("TRI_PREFER_LONG", 0))   # 實驗開關：1＝同證�
 TRI_PREFER_LONG_STEP = int(_env("TRI_PREFER_LONG_STEP", 10))
 TRI_FAIL_DAYS = int(_env("TRI_FAIL_DAYS", 3))        # 預設（TRI_EVENT_STATE=0）：越線後 N 天沒再往越線方向走 TRI_FAIL_ATR → 移歷史、不再擋新型態
 TRI_FAIL_ATR = float(_env("TRI_FAIL_ATR", 1.0))
+TRI_YIELD = int(_env("TRI_YIELD", 0))   # 10-13 實驗：1＝同段較好新線有條件讓位（越線後已被新線驗證、越線日在新線內、今天在新線內）；舊紀錄保留
 TRI_EVENT_STATE = int(_env("TRI_EVENT_STATE", 0))    # 10-12 C 實驗：1＝失敗只看反向越線或回內連續 TRI_FAIL_INSIDE 天（橫盤、回測不讓位）。
                                                      # 實測 3034（10/02 早期陡線紀錄擋住 10/07 正確線）、1608（尖端窄三角越線）會變錯，需 D 的同段讓位規則後才可開
 TRI_FAIL_INSIDE = int(_env("TRI_FAIL_INSIDE", 2))
@@ -1331,7 +1332,7 @@ def _tri_params_sig() -> str:
                     and not (k in _SIG_EXPERIMENT_DEFAULTS and v == _SIG_EXPERIMENT_DEFAULTS[k]))
 
 
-_SIG_EXPERIMENT_DEFAULTS = {"TRI_RANK_MODE": 0}
+_SIG_EXPERIMENT_DEFAULTS = {"TRI_RANK_MODE": 0, "TRI_YIELD": 0}
 
 
 def _shift_snap(snap: Dict[str, Any], delta: int) -> Dict[str, Any]:
@@ -1755,8 +1756,19 @@ def _user_triangle(df, atr_prev, end, state=None, out_state=None, replay_days=No
     own = None
     primary, held = active_record()
     source = ""
+    yielded = None
+
+    def yield_ok(r):                              # 10-13 TRI_YIELD：同段新線讓位的四個條件
+        b, u, d = r["recognized"], pick["u"], pick["d"]
+        at = lambda ln, t: ln["s"] * t + ln["k"]
+        inside = lambda t: at(d, t) - TRI_OUT * A[t] <= C[t] <= at(u, t) + TRI_OUT * A[t]
+        touched_after = any(t > b for e in ("u", "d") for ev in pick[e].get("events", []) for t in ev.get("days", []))
+        return touched_after and inside(b) and inside(end) and at(u, end) > at(d, end)
     if lock_mode and formation is not None:
         main, source = formation, "鎖定"          # 已鎖住的正式型態優先：不因今天重新排名而換線
+    elif (TRI_YIELD and primary is not None and not held and pick is not None and not pick.get("candidate")
+          and not primary["snap"].get("candidate") and yield_ok(primary)):
+        main, source, yielded = pick, "正式（同段改畫，原越線保留）", primary
     elif primary is not None and (pick is None or not new_consolidation(pick, primary, held, end)) and not (
             primary["snap"].get("candidate") and pick is not None and not pick.get("candidate")):   # 正式型態優先於候選越線紀錄
         source = "越線紀錄" if not held else "越線紀錄（窗口外）"
@@ -1811,6 +1823,8 @@ def _user_triangle(df, atr_prev, end, state=None, out_state=None, replay_days=No
         compat = last_b["type"]
     if tr["crossed"] and not cand:
         state_txt += "（已過上下緣交會點，位置不適用）"
+    if yielded is not None:
+        state_txt += f"（原 {_d(df.index[yielded['recognized']])} 越線的是同段較舊的線，已改依新線判斷，原紀錄保留）"
     layer = "history" if source.startswith("歷史") else "current"   # 10-12 C：歷史圖示不算目前有效三角
     failed = str(own.get("reason") or "").startswith("失敗") if own is not None else False
     if layer == "history" and (failed or end - own["recognized"] > TRI_TRACK_DAYS):
