@@ -2150,6 +2150,11 @@ def detect(df: pd.DataFrame, events: Optional[Dict[str, Any]] = None, provisiona
             levels += [f"{label}上緣 {_p(_at(tri['upper'], today))}（上方候選壓力）",
                        f"{label}下緣 {_p(_at(tri['lower'], today))}（下方候選支撐）"]
         shape_observation = triangle_observation(adj, tri, last_official, provisional_today)
+        if provisional_today:     # 10-13：管理員盤中＝狀態用昨收，位置另給即時價（需收盤確認）
+            up, lo_, a_ = _at(tri["upper"], n - 1), _at(tri["lower"], n - 1), atr_prev[last_official]
+            live = ("above_upper" if c[-1] > up + TRI_OUT * a_ else "below_lower" if c[-1] < lo_ - TRI_OUT * a_ else "inside")
+            shape_observation.update(live_position=live, live_close=_p(c[-1]),
+                                     state_basis=f"{adj.index[last_official]:%Y-%m-%d} 收盤")
     if not any(x for x in summary if not x.startswith("股價位於")):
         summary.insert(0, "目前沒有明確的整理型態或趨勢")
     cover = getattr(LAST_TRI_INFO, "info", {}) or {}
@@ -2211,7 +2216,7 @@ def ai_pattern_facts(result: Dict[str, Any], *, data_date: str = "",
         fields = ("kind", "candidate", "candidate_reasons", "validity", "state",
                   "current_position", "pattern_events", "events", "near_tip",
                   "formation_date", "event_date", "event_age", "event_direction",
-                  "is_provisional", "upper_price", "lower_price")
+                  "is_provisional", "upper_price", "lower_price", "live_position", "live_close", "state_basis")
         out["triangle"] = {k: shape[k] for k in fields if k in shape}
         out["triangle"].update(kind=tri.get("kind"), candidate=bool(tri.get("candidate")))
         if day is not None and tri.get("upper") is not None and tri.get("lower") is not None:
