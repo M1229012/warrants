@@ -1956,9 +1956,12 @@ class GeminiResult:
 # 思考程度：3.x 模型用 thinking_level（minimal／low…）、2.5 用 thinking_budget=0；default＝不帶參數
 GEMINI_THINKING = os.getenv("DISCORD_AI_GEMINI_THINKING", "minimal").strip().lower()
 _THINKING_UNSUPPORTED: set = set()
+_GEN_OVERRIDE = threading.local()   # 10-13 型態驗證 AI 畫線：指定模型鏈、開思考、放寬單次逾時（只在該次呼叫的執行緒有效）
 
 
 def _thinking_config(model: str) -> Optional[Dict[str, Any]]:
+    if getattr(_GEN_OVERRIDE, "think", False):
+        return None                               # 模型預設思考（2.5-flash 動態思考）
     if GEMINI_THINKING in ("", "default") or model in _THINKING_UNSUPPORTED:
         return None
     if re.match(r"gemini-2\.5-(flash|flash-lite)\b", model):
@@ -2306,12 +2309,16 @@ class GeminiGateway:
         return result
 
     def generate_with_image(self, prompt: str, image: bytes, mime_type: str, purpose: str,
-                            schema: Optional[Dict[str, Any]] = None) -> GeminiResult:
-        """圖片＋文字（例如讀截圖裡的股票清單）；同一套模型鏈、金鑰輪流與總時限。"""
+                            schema: Optional[Dict[str, Any]] = None, models: Optional[List[str]] = None) -> GeminiResult:
+        """圖片＋文字（例如讀截圖裡的股票清單）；同一套模型鏈、金鑰輪流與總時限。models＝指定模型鏈並開思考。"""
         def work(deadline: float) -> GeminiResult:
             from google.genai import types as genai_types
             contents = [genai_types.Part.from_bytes(data=image, mime_type=mime_type), prompt]
-            return self._generate(prompt, purpose, schema, 0.0, deadline, contents=contents)
+            _GEN_OVERRIDE.models, _GEN_OVERRIDE.think = models, bool(models)
+            try:
+                return self._generate(prompt, purpose, schema, 0.0, deadline, contents=contents)
+            finally:
+                _GEN_OVERRIDE.models, _GEN_OVERRIDE.think = None, False
         return self._run_with_deadline(purpose, work)
 
     @staticmethod
@@ -2357,7 +2364,7 @@ class GeminiGateway:
         if 0 < recovery <= 16 and (not deadline or time.monotonic() + recovery + 1 < deadline):
             self.log(f"Gemini 模型忙碌，等待恢復｜{recovery:.1f}s｜用途={purpose}")
             time.sleep(recovery + .05)
-        for rank, model in enumerate(GEMINI_MODEL_CHAIN):
+        for rank, model in enumerate(getattr(_GEN_OVERRIDE, "models", None) or GEMINI_MODEL_CHAIN):
             if not self.quota.model_ready(model):
                 continue
             overload_retried = False
@@ -2379,7 +2386,8 @@ class GeminiGateway:
                         if left is not None and left < GEMINI_MIN_CALL_SECONDS:
                             raise TimeoutError("Gemini 等名額後剩餘時間不足")
                         __import__("request_runtime").check_budget(IMAGE_RESERVE_SECONDS)
-                        call_ms = GEMINI_CALL_TIMEOUT_MS if left is None else int(max(10000, min(GEMINI_CALL_TIMEOUT_MS, (left - 1.0) * 1000)))   # 10-13：Gemini API 最短只收 10 秒，低於會直接 400
+                        cap_ms = 60000 if getattr(_GEN_OVERRIDE, "think", False) else GEMINI_CALL_TIMEOUT_MS
+                        call_ms = cap_ms if left is None else int(max(10000, min(cap_ms, (left - 1.0) * 1000)))   # 10-13：Gemini API 最短只收 10 秒，低於會直接 400
                         response = self._call_once(kf, keys[key], model, contents, config, call_ms)
                     finally:
                         self._slots.release()
@@ -6336,7 +6344,8 @@ class AceQueryEngine:
                 if re.search(r"AI\s*畫線|gemini", question, re.I):   # 10-13 試驗：Gemini 自己畫三角，疊在驗證圖（桃紅）
                     prompt, png = kline_debug.ai_draw_request(panel)
                     drawn = self.gateway.generate_with_image(prompt, png, "image/png", purpose="kline_ai_draw",
-                                                             schema=kline_debug.AI_DRAW_SCHEMA)
+                                                             schema=kline_debug.AI_DRAW_SCHEMA,
+                                                             models=[m.strip() for m in os.getenv("DISCORD_AI_KLINE_DRAW_MODELS", "gemini-2.5-flash,gemini-3.1-flash-lite").split(",") if m.strip()])
                     ocr_calls += 1
                     note = kline_debug.apply_ai_lines(panel, json.loads(drawn.text)) if drawn.ok else "Gemini 畫線失敗：" + str(drawn.error)
                 results.append(AnswerResult(text="管理員型態驗證：沿用程式計算結果與價格基準；" + note,
