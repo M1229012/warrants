@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -2155,6 +2156,11 @@ def detect(df: pd.DataFrame, events: Optional[Dict[str, Any]] = None, provisiona
             live = ("above_upper" if c[-1] > up + TRI_OUT * a_ else "below_lower" if c[-1] < lo_ - TRI_OUT * a_ else "inside")
             shape_observation.update(live_position=live, live_close=_p(c[-1]),
                                      state_basis=f"{adj.index[last_official]:%Y-%m-%d} 收盤")
+            if live != "inside" and "型態內" in tri["text"]:   # 昨收的「位於型態內」不可當成現在位置
+                note = (f"盤中暫時站上上緣 {_p(up)}（需收盤確認）" if live == "above_upper"
+                        else f"盤中暫時跌破下緣 {_p(lo_)}（需收盤確認）")
+                tri = dict(tri, text=re.sub("(位於|仍在)型態內", lambda m: f"昨收{m.group(0)}，{note}", tri["text"], count=1))
+                summary[0] = tri["text"]
     if not any(x for x in summary if not x.startswith("股價位於")):
         summary.insert(0, "目前沒有明確的整理型態或趨勢")
     cover = getattr(LAST_TRI_INFO, "info", {}) or {}
