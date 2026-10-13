@@ -157,6 +157,13 @@ def line_specs(data: dict) -> list[dict]:
             lines.append({"label": "歷史線", "coef": h[edge], "start": anchors[0] if anchors else h["start"],
                           "fit_end": anchors[-1] if anchors else h["start"], "stop": min(last, h["stop"]),
                           "anchors": [], "color": "#87909E", "historical": True})
+    for edge, label in (("upper", "Gemini上緣"), ("lower", "Gemini下緣")):   # 10-13 試驗：Gemini 畫線（桃紅）
+        pts = (data.get("ai_lines") or {}).get(edge)
+        if pts:
+            (i1, p1), (i2, p2) = pts
+            s = (p2 - p1) / (i2 - i1)
+            lines.append({"label": label, "coef": (s, p1 - s * i1), "start": i1, "fit_end": i2, "stop": last,
+                          "anchors": [i1, i2], "color": "#D6336C", "historical": False})
     tr = data.get("trend")
     if tr and tr.get("line_coefficients"):
         points = tr["points"]
@@ -319,3 +326,44 @@ def render(data: dict) -> Image.Image:
         y += 35
     text(margin, height - 53, "僅管理員驗證｜線條忠實呈現目前演算法，未辨識到型態時不補畫｜驗證描述，不代表預測能力", 20, muted)
     return image
+
+
+AI_DRAW_SCHEMA = {"type": "object", "properties": {
+    "has_triangle": {"type": "boolean"}, "reason": {"type": "string"},
+    **{e: {"type": "object", "properties": {"start_date": {"type": "string"}, "start_price": {"type": "number"},
+                                            "end_date": {"type": "string"}, "end_price": {"type": "number"}},
+           "required": ["start_date", "start_price", "end_date", "end_price"]} for e in ("upper", "lower")}},
+    "required": ["has_triangle", "reason"]}
+
+
+def ai_draw_request(panel: dict) -> tuple[str, bytes]:
+    """10-13 試驗：給 Gemini 乾淨 K 線圖＋OHLC 表，請它自己畫三角上下緣（不看程式的線）。"""
+    import io
+    data = panel["kline_debug"]
+    clean = dict(data, triangle=None, pivots=[], trend=None, formation=None, ended=None, invalid=None, summary=[], flags=[])
+    buf = io.BytesIO()
+    render(clean).save(buf, format="PNG")
+    bars = data["bars"][data["display_start"]:data["last_official"] + 1]
+    table = chr(10).join(f"{b['date']} {b['Open']:.2f} {b['High']:.2f} {b['Low']:.2f} {b['Close']:.2f}" for b in bars)
+    prompt = (f"你是台股技術分析師。圖片與下表是 {data['stock_code']} {data.get('stock_name', '')} 的日 K（還原價，圖上的文字說明請忽略）。"
+              "請依一般交易員的畫法，畫出目前這段整理的三角收斂：upper＝壓力線（連高點），lower＝支撐線（連低點）。"
+              "每條線給兩個錨點，日期必須是表中的日期，價格用當天的高點或低點附近；不能用最後一天之後的資料。"
+              "重點是支撐壓力位置要對、貼近多數轉折，不要被單一長影線拉走，也不要用早已結束的上一段走勢。"
+              "沒有合理三角就 has_triangle=false。reason 用繁體中文 60 字內說明畫法。" + chr(10) + "日期 開 高 低 收" + chr(10) + table)
+    return prompt, buf.getvalue()
+
+
+def apply_ai_lines(panel: dict, payload: dict) -> str:
+    """把 Gemini 回傳的錨點換成 index 疊到驗證圖；回傳一句說明。"""
+    data = panel["kline_debug"]
+    idx = {b["date"]: i for i, b in enumerate(data["bars"])}
+    out = {}
+    for e in ("upper", "lower"):
+        ln = payload.get(e) or {}
+        i1, i2 = idx.get(str(ln.get("start_date"))), idx.get(str(ln.get("end_date")))
+        if payload.get("has_triangle") and i1 is not None and i2 is not None and i1 != i2 and max(i1, i2) <= data["last_official"]:
+            out[e] = sorted([(i1, float(ln["start_price"])), (i2, float(ln["end_price"]))])
+    data["ai_lines"] = out
+    note = "Gemini 畫線（桃紅）：" + (str(payload.get("reason") or "") if out else "判斷沒有合理三角或錨點無效｜" + str(payload.get("reason") or ""))
+    data["summary"] = list(data.get("summary") or []) + [note]
+    return note

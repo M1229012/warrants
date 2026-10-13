@@ -2447,6 +2447,7 @@ FINAL_BASE_PROMPT = """你是「艾斯助手｜喬巴」。你的回答要像熟
 
 FINAL_TECH_RULES = """技術面規則：
 - 盤中（triangle_structure 有 live_position）：三角的 state／事件是 state_basis 那天收盤的結果；現在位置一律看 live_position 與 live_close：above_upper 寫「盤中暫時站上上緣 upper_price，需收盤確認才算突破」，below_lower 寫「盤中暫時跌破下緣 lower_price，需收盤確認」，inside 寫「盤中仍在三角內」；不可把昨收狀態當成現在位置，也不可在 live_position 在線外時還寫「仍在三角內」。
+- 先跌破下緣、之後改向上突破上緣叫「破底翻」；先突破上緣、之後改跌破下緣叫「突破失敗後轉弱」；不可寫「反向突破」，兩次事件的日期與方向分開寫。
 - 盤中 volume_trend 是截至昨收的量能，不含今天；今天量能只能看 intraday_volume_estimate，沒有就不評論今天量能，不可拿盤中累計量說量縮。
 - 訊號狀態分三種，不可混用：「收盤確認」＝signal_status、型態評分、布林與均線訊號（都用最後一根已收盤 K 棒）；「盤中暫時」＝intraday_observation.changes，一定要寫「盤中暫時…，尚待收盤確認」，不可說成已突破、已站穩；「資料不足」＝欄位為 null 或寫資料不足，要說「目前無法確認」，不可當成沒有訊號。
 - 盤中量能看 intraday_volume_estimate：以 vs_mv20_pct（對 20 日均量）為主要判讀，再補 vs_mv5_pct 與 vs_prev_day_pct；昨日本身可能是異常量，不可只跟昨日比。一律講明是估算、收盤前會變動，並照 confidence（初步／估算／可靠）調整語氣：「初步」時不要給肯定結論。沒有這個欄位就不拿盤中累計量和日均量比較；volume_suspect=true 不解讀量能。
@@ -6331,8 +6332,15 @@ class AceQueryEngine:
             try:
                 __import__("request_runtime").check_budget(IMAGE_RESERVE_SECONDS)
                 panel = kline_debug.load_panel(code)
-                results.append(AnswerResult(text="管理員型態驗證：沿用程式計算結果與價格基準；未使用 AI 畫線。",
-                                            route="admin_kline_debug", gemini_calls=0, elapsed=time.perf_counter()-started,
+                note = "未使用 AI 畫線。"
+                if re.search(r"AI\s*畫線|gemini", question, re.I):   # 10-13 試驗：Gemini 自己畫三角，疊在驗證圖（桃紅）
+                    prompt, png = kline_debug.ai_draw_request(panel)
+                    drawn = self.gateway.generate_with_image(prompt, png, "image/png", purpose="kline_ai_draw",
+                                                             schema=kline_debug.AI_DRAW_SCHEMA)
+                    ocr_calls += 1
+                    note = kline_debug.apply_ai_lines(panel, json.loads(drawn.text)) if drawn.ok else "Gemini 畫線失敗：" + str(drawn.error)
+                results.append(AnswerResult(text="管理員型態驗證：沿用程式計算結果與價格基準；" + note,
+                                            route="admin_kline_debug", gemini_calls=ocr_calls, elapsed=time.perf_counter()-started,
                                             panels=[panel], cacheable=False, image_title=f"{code}｜型態驗證"))
             except Exception as exc:
                 self.log(f"型態驗證未完成｜{code}｜{tools.err_text(exc)}")

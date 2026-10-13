@@ -1172,6 +1172,9 @@ def _tri_form(H, L, O, C, A, lo: int, F: int, piv, confirm: bool = True, local: 
     if TRI_SELECTION_MODE == "envelope":           # 10-11：使用者畫法；不另出候選
         return _tri_form_envelope(H, L, O, C, A, lo, F) if confirm and not local else None
     top, bot = np.maximum(O, C), np.minimum(O, C)
+    if TRI_SEGMENT and F - lo > 40:              # 10-13：整理區＝最近趨勢極值之後
+        seg = lo + max(int(np.argmax(H[lo:F - 19])), int(np.argmin(L[lo:F - 19])))
+        lo = max(lo, seg)
     mh = [(p["idx"], p["confirm"]) for p in piv if p["type"] == "H"]
     ml = [(p["idx"], p["confirm"]) for p in piv if p["type"] == "L"]
     required = 1 if local else 2
@@ -1206,6 +1209,12 @@ def _tri_form(H, L, O, C, A, lo: int, F: int, piv, confirm: bool = True, local: 
             if _tri_alternations(u, d) < 3:
                 _pair_rej(u, d, "上下交替不足3次")
                 continue
+            if TRI_SPAN_CHECK:                    # 10-13：起點到 F 收盤不可大幅超出兩線（含往回延伸段）
+                ts = np.arange(start, F + 1)
+                out = np.maximum(C[ts] - (u["s"] * ts + u["k"]), (d["s"] * ts + d["k"]) - C[ts]) / A[ts]
+                if np.nanmax(out) > TRI_SPAN_CHECK:
+                    _pair_rej(u, d, "形成期收盤大幅超出")
+                    continue
             n = len(u["a"]) + len(d["a"])
             span = (F - u["i0"]) + (F - d["i0"])        # 10-11 實驗：TRI_PREFER_LONG＝1 時，碰線證據相同下偏好時間較長的線
             key = (min(u["major"], d["major"]), u["major"] + d["major"],
@@ -1213,6 +1222,8 @@ def _tri_form(H, L, O, C, A, lo: int, F: int, piv, confirm: bool = True, local: 
                    min(len(u["a"]), len(d["a"])), n,
                    u["reacted"] + d["reacted"], -(u["fakes"] + d["fakes"]), -round(u["err"] + d["err"], 3),
                    tuple(-x if isinstance(x, int) else 0 for x in u["src"] + d["src"]))
+            if TRI_RECENT_HL:
+                key = (round(sum(0.5 ** ((F - t) / TRI_RECENT_HL) for t in list(u["a"]) + list(d["a"])), 1),) + key
             quality = None
             if TRI_SELECTION_MODE == "balanced-v1":
                 quality = _tri_pair_quality(H, L, O, C, A, u, d, joint, F)
@@ -1314,6 +1325,9 @@ TRI_PREFER_LONG = int(_env("TRI_PREFER_LONG", 0))   # 實驗開關：1＝同證�
 TRI_PREFER_LONG_STEP = int(_env("TRI_PREFER_LONG_STEP", 10))
 TRI_FAIL_DAYS = int(_env("TRI_FAIL_DAYS", 3))        # 預設（TRI_EVENT_STATE=0）：越線後 N 天沒再往越線方向走 TRI_FAIL_ATR → 移歷史、不再擋新型態
 TRI_FAIL_ATR = float(_env("TRI_FAIL_ATR", 1.0))
+TRI_SPAN_CHECK = _env("TRI_SPAN_CHECK", 0.0)   # 10-13 實驗：>0＝形成期內收盤離上下緣（往回延伸）超過此 ATR 倍數就淘汰配對（起點太早）
+TRI_SEGMENT = int(_env("TRI_SEGMENT", 0))   # 10-13 實驗：1＝只在最近一個趨勢極值（區間最高／最低較晚者）之後畫線
+TRI_RECENT_HL = _env("TRI_RECENT_HL", 0.0)   # 10-13 實驗：>0＝碰線依距 F 天數半衰（此天數）加權，排名最優先
 TRI_YIELD = int(_env("TRI_YIELD", 0))   # 10-13 實驗：1＝同段較好新線有條件讓位（越線後已被新線驗證、越線日在新線內、今天在新線內）；舊紀錄保留
 TRI_EVENT_STATE = int(_env("TRI_EVENT_STATE", 0))    # 10-12 C 實驗：1＝失敗只看反向越線或回內連續 TRI_FAIL_INSIDE 天（橫盤、回測不讓位）。
                                                      # 實測 3034（10/02 早期陡線紀錄擋住 10/07 正確線）、1608（尖端窄三角越線）會變錯，需 D 的同段讓位規則後才可開
@@ -1333,7 +1347,7 @@ def _tri_params_sig() -> str:
                     and not (k in _SIG_EXPERIMENT_DEFAULTS and v == _SIG_EXPERIMENT_DEFAULTS[k]))
 
 
-_SIG_EXPERIMENT_DEFAULTS = {"TRI_RANK_MODE": 0, "TRI_YIELD": 0}
+_SIG_EXPERIMENT_DEFAULTS = {"TRI_RANK_MODE": 0, "TRI_YIELD": 0, "TRI_SPAN_CHECK": 0.0, "TRI_SEGMENT": 0, "TRI_RECENT_HL": 0.0}
 
 
 def _shift_snap(snap: Dict[str, Any], delta: int) -> Dict[str, Any]:
@@ -1816,7 +1830,7 @@ def _user_triangle(df, atr_prev, end, state=None, out_state=None, replay_days=No
         if TRI_CONFIRM2 and last_b.get("confirm"):
             state_txt += f"（{last_b['confirmed_date']} 兩日確認）" if last_b["confirm"] == "確認" else f"（{last_b['confirm']}）"
         if tr["reversed"]:
-            state_txt = f"{breaks[0]['date']} {'突破' if breaks[0]['type'] == 'break_up' else '跌破'}後反向，" + state_txt
+            state_txt = f"{breaks[0]['date']} {'突破上緣失敗後轉弱' if breaks[0]['type'] == 'break_up' else '跌破下緣後破底翻'}，" + state_txt   # 10-13：不用「反向」
         elif len(breaks) > 1:
             state_txt = f"{breaks[0]['date']} 首次{'突破' if breaks[0]['type'] == 'break_up' else '跌破'}，" + state_txt + "（再次同向）"
         if posn == "inside":
