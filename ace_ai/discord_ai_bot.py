@@ -1982,7 +1982,7 @@ _OVERLOAD_CONFIG = tools._env_int("DISCORD_AI_GEMINI_OVERLOAD_COOLDOWN", 15)
 # 將先前 env.example 的 120 秒預設一併遷移，避免舊 Railway 設定繼續鎖住所有模型。
 GEMINI_OVERLOAD_COOLDOWN = max(10, 15 if _OVERLOAD_CONFIG == 120 else _OVERLOAD_CONFIG)
 GEMINI_OVERLOAD_RETRY_WAIT = max(0.0, tools._env_float("DISCORD_AI_GEMINI_OVERLOAD_RETRY_WAIT", 1.5))    # 主模型 503：等一下換金鑰重試一次
-GEMINI_CALL_TIMEOUT_MS = max(5000, tools._env_int("DISCORD_AI_GEMINI_CALL_TIMEOUT_MS", 12000))   # 10-03：一次卡 148 秒；10-07：504 塞車白等 20 秒→12 秒就換金鑰／模型（正常回答約 6～8 秒）
+GEMINI_CALL_TIMEOUT_MS = max(10000, tools._env_int("DISCORD_AI_GEMINI_CALL_TIMEOUT_MS", 12000))   # 10-03：一次卡 148 秒；10-07：504 塞車白等 20 秒→12 秒就換金鑰／模型（正常回答約 6～8 秒）
 GEMINI_MAX_ATTEMPTS = max(1, tools._env_int("DISCORD_AI_GEMINI_MAX_ATTEMPTS", 5))      # 10-08：一次呼叫換金鑰／模型總次數上限
 GEMINI_MIN_CALL_SECONDS = 3.0                                                                  # 剩不到 3 秒就不再啟動新呼叫
 QUESTION_DEADLINE_SECONDS = max(15.0, tools._env_float("DISCORD_AI_QUESTION_DEADLINE_SECONDS", 50.0))
@@ -2379,7 +2379,7 @@ class GeminiGateway:
                         if left is not None and left < GEMINI_MIN_CALL_SECONDS:
                             raise TimeoutError("Gemini 等名額後剩餘時間不足")
                         __import__("request_runtime").check_budget(IMAGE_RESERVE_SECONDS)
-                        call_ms = GEMINI_CALL_TIMEOUT_MS if left is None else int(max(2000, min(GEMINI_CALL_TIMEOUT_MS, (left - 1.0) * 1000)))
+                        call_ms = GEMINI_CALL_TIMEOUT_MS if left is None else int(max(10000, min(GEMINI_CALL_TIMEOUT_MS, (left - 1.0) * 1000)))   # 10-13：Gemini API 最短只收 10 秒，低於會直接 400
                         response = self._call_once(kf, keys[key], model, contents, config, call_ms)
                     finally:
                         self._slots.release()
