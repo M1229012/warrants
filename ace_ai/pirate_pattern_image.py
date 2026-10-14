@@ -82,6 +82,7 @@ def _number(value):
 # never starts a line.
 _TOKEN_RE = re.compile(r'[A-Za-z0-9.,%+\-/>＜<＞]+|.')
 _CLOSING = set('，。、；：！？）」』%')
+_OPENING = set('（「『')
 
 
 def _wrap(text, width, size=25, kind='body'):
@@ -98,8 +99,12 @@ def _wrap(text, width, size=25, kind='body'):
                             line = ''
                         line += char
                     continue
+                carry = ''
+                # Opening brackets never end a line; they move down with their content.
+                while line and line[-1] in _OPENING:
+                    carry, line = line[-1] + carry, line[:-1]
                 lines.append(line.rstrip())
-                line = token.lstrip()
+                line = carry + token.lstrip()
             else:
                 line += token
         if line.strip():
@@ -245,6 +250,16 @@ _SUB_COMPONENT = {'均線排列': '均線趨勢', 'MA20 方向': '均線趨勢',
                   '最近支撐': '下方支撐', '支撐密度': '下方支撐', '開布林': '布林', '通道位置': '布林'}
 
 
+def _tone(text):
+    """台股慣例：偏多／偏強＝紅，偏空／偏弱＝綠，中性＝金。"""
+    text = str(text or '')
+    if any(k in text for k in ('弱', '空', '差')):
+        return DOWN
+    if any(k in text for k in ('強', '多', '佳')):
+        return UP
+    return GOLD
+
+
 def _component_notes(card):
     """One short reason per score row: full marks → strongest item, else biggest loss."""
     items = {}
@@ -282,6 +297,7 @@ class Page:
     def __init__(self):
         self.parts = []
         self.overlays = []
+        self.score_shift = 0
 
     def band(self, a, b, height):
         image = _asset('template.png').crop((0, a, 793, b)).resize((WIDTH, height), Image.Resampling.LANCZOS)
@@ -307,29 +323,67 @@ class Page:
     def hero(self, panel):
         # Template rows 252–272 are only desk clutter under the text; trimmed (−36px).
         im = self.band(0, 252, 458)
-        self.protect(im, (112, 62, 625, 433), 110)
-        self.protect(im, (122, 375, 576, 429), 175)
+        self.protect(im, (112, 62, 625, 445), 110)
+        self.protect(im, (116, 356, 604, 446), 190)
         t, d = self.text, ImageDraw.Draw(im)
         t(im, 130, 75, '艾斯助手｜喬巴｜研究筆記', 20, 'bold', GOLD)
-        t(im, 130, 118, 'ACE RESEARCH', 24, 'classic', GOLD)
+        t(im, 130, 112, 'Ace Research', 32, 'pirate', GOLD)
         title = _clean(panel.get('stock_code')) + ' ' + _clean(panel.get('stock_name'))
         title_lines = _wrap(title, 472, 58, 'serif')
         self.lines(im, 125, 167, title_lines, 58, 'serif', spacing=62)
         d.line((130, 263, 488, 263), fill='#BFA073')
         d.polygon([(126, 278), (561, 278), (550, 308), (561, 338), (126, 338), (137, 308)], fill='#EDDCB9', outline='#BFA073')
-        self.compass(im, 162, 308, 16)
-        t(im, 194, 287, '現在型態怎麼看？', 27, 'serif')
-        d.line((130, 371, 589, 371), fill='#C7AC86')
-        d.line((130, 424, 589, 424), fill='#D4BF9F')
-        # Shared baseline across Western date and CJK metadata, not shared top coordinate.
+        # Compass + question centred inside the ribbon (its notches are symmetric).
+        question = '現在型態怎麼看？'
+        q_w = font(27, 'serif').getlength(question)
+        left = (126 + 561)/2 - (32 + 12 + q_w)/2
+        self.compass(im, round(left + 16), 308, 16)
+        t(im, left + 44, 309, question, 27, 'serif', INK, 'lm')
+        # Ship's-log plaque: double gold frame, rivets, one drawn icon per field.
         last = panel['bars'][-1]
         date = str(last.get('date', ''))[:10].replace('-', '/')
         live = panel.get('intraday') or {}
         status = '盤中 ' + str(live.get('time', '')) if live.get('is_live') else '日K收盤'
-        for x, value, kind in [(130, date, 'classic'), (341, status, 'body'), (485, '型態研究', 'body')]:
-            t(im, x, 407, value, 20, kind, MUTED, 'ls')
-        for x in (322, 465):
-            d.line((x, 384, x, 413), fill='#CCB38E')
+        box = (126, 364, 594, 434)
+        d.rectangle(box, fill='#EAD7B0', outline='#9C7A48', width=2)
+        d.rectangle((box[0]+5, box[1]+5, box[2]-5, box[3]-5), outline='#C7AA78')
+        for rx in (box[0]+11, box[2]-11):
+            for ry in (box[1]+11, box[3]-11):
+                d.ellipse((rx-3, ry-3, rx+3, ry+3), fill='#B79A68', outline='#7E5F35')
+        cells = [(self.compass, date, 26, 'pirate'), (self.anchor, status, 21, 'serif'),
+                 (self.wheel, '型態研究', 21, 'serif')]
+        widths = [30 + font(size, kind).getlength(text) for _, text, size, kind in cells]
+        space = (box[2] - box[0] - 40 - sum(widths)) / (len(cells) - 1)
+        x, cy = box[0] + 20, (box[1] + box[3])//2
+        for i, ((icon, text, size, kind), w) in enumerate(zip(cells, widths)):
+            icon(im, round(x + 11), cy, 11)
+            t(im, x + 30, cy + (2 if kind == 'pirate' else 1), text, size, kind, INK, 'lm')
+            x += w + space
+            if i < len(cells) - 1:
+                sx = round(x - space/2)
+                d.polygon([(sx, cy-6), (sx+4, cy), (sx, cy+6), (sx-4, cy)], fill=GOLD)
+
+    @staticmethod
+    def anchor(im, cx, cy, r):
+        d = ImageDraw.Draw(im)
+        d.ellipse((cx-3, cy-r, cx+3, cy-r+6), outline=GOLD, width=2)
+        d.line((cx, cy-r+6, cx, cy+r), fill=GOLD, width=2)
+        d.line((cx-6, cy-r+10, cx+6, cy-r+10), fill=GOLD, width=2)
+        d.arc((cx-r+1, cy-r+4, cx+r-1, cy+r), 20, 160, fill=GOLD, width=2)
+        for sx in (-1, 1):
+            tip = (cx + sx*(r-2), cy + r//2 - 1)
+            d.polygon([tip, (tip[0] - sx*5, tip[1] - 1), (tip[0] - sx*1, tip[1] - 5)], fill=GOLD)
+
+    @staticmethod
+    def wheel(im, cx, cy, r):
+        d = ImageDraw.Draw(im)
+        d.ellipse((cx-r+3, cy-r+3, cx+r-3, cy+r-3), outline=GOLD, width=2)
+        d.ellipse((cx-3, cy-3, cx+3, cy+3), fill=GOLD)
+        for i in range(8):
+            a = math.radians(i*45)
+            x1, y1 = cx + math.cos(a)*(r+1), cy + math.sin(a)*(r+1)
+            d.line((cx, cy, x1, y1), fill=GOLD, width=2)
+            d.ellipse((x1-2, y1-2, x1+2, y1+2), fill=GOLD)
 
     @staticmethod
     def compass(im, cx, cy, r):
@@ -399,8 +453,11 @@ class Page:
 
     def _card_plans(self, scenarios, width, bsize):
         inner = width - 74
-        plans = [(_fit(s.get('title') or '觀察情境', inner, (24, 22), 1, 'serif'),
-                  _fit(s.get('text') or '', inner, (bsize, bsize-1, bsize-2), 3)) for s in scenarios]
+        # Body is never ellipsized: fewer lines via a smaller size, else the card grows.
+        plans = [(_fit(s.get('title') or '觀察情境', inner, (24, 22, 20), 1, 'serif'),
+                  _fit(s.get('text') or '', inner, (bsize, bsize-1, bsize-2), 4) if
+                  len(_wrap(s.get('text') or '', inner, bsize-2)) <= 4 else
+                  (_wrap(s.get('text') or '', inner, bsize-2), bsize-2)) for s in scenarios]
         content = max((t[1] + 30 + len(b[0])*(b[1]+10) for t, b in plans), default=0)
         return plans, content + 46
 
@@ -431,8 +488,8 @@ class Page:
                 return text_h + (24 + card_h if scenarios else 0)
             if 116 + stack(wrapped) <= limit:
                 break
-        while len(wrapped) > 1 and 116 + stack(wrapped) > limit:
-            wrapped.pop()
+        # Still too long at 20px: keep every sentence and push 03 down instead.
+        self.score_shift = max(0, 116 + stack(wrapped) - limit)
         # Text is top-anchored; cards sit on the paper's lower edge unless pushed down.
         y = 116
         y = self.lines(im, L+26, y, head, size, 'bold', spacing=size+12)
@@ -464,14 +521,15 @@ class Page:
         components = list(card.get('components') or [])
         notes = _component_notes(card)
         row_h = 44
-        rows_top = 108
+        shift = self.score_shift
+        rows_top = 108 + shift
         rows_h = max(5, len(components)) * row_h
         tag = '｜'.join(f'{label}：{_clean(card[key])}' for label, key in
                        (('型態', 'pattern_label'), ('均線', 'ma_alignment')) if _clean(card.get(key)))
         height = rows_top + rows_h + (44 if tag else 0) + 40
         im = self.band(1255,1578,height)
         self.protect(im,(112,25,1328,height-17),128)
-        self.text(im,140,42,'03  完整型態評分依據',32,'serif')
+        self.text(im,140,42+shift,'03  完整型態評分依據',32,'serif')
         d = ImageDraw.Draw(im)
         y = rows_top + (rows_h - len(components)*row_h)//2
         for component in components:
@@ -515,7 +573,7 @@ class Page:
         self.text(im,cx,cy,f'{score:.1f}%' if score is not None else '—',40,'pirate',INK,'mm')
         grade = card.get('grade') if score is not None else '評分待取得'
         for i,line in enumerate(_wrap(grade or '',184,23,'bold')[:2]):
-            self.text(im,cx,cy+112+i*30,line,23,'bold',UP if score is not None else MUTED,'mm')
+            self.text(im,cx,cy+112+i*30,line,23,'bold',_tone(grade) if score is not None else MUTED,'mm')
 
     def prices(self, panel):
         rows, close = _levels(panel), _finite(panel['bars'][-1].get('Close'))
