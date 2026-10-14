@@ -128,6 +128,25 @@ def _asset(name):
         return image.convert('RGB')
 
 
+def _tighten_blank_rows(pixels, longest=28, keep=.5, floor=18):
+    """Halve long empty white bands (date axis→volume, below volume). Only rows
+    with no drawing at all are removed, so no plotted pixel moves relative to
+    its own axis; a minimum gap is always kept."""
+    blank = np.all(pixels.min(axis=2) >= 250, axis=1)
+    rows, start = [], None
+    for y, empty in enumerate(list(blank) + [False]):
+        if empty and start is None:
+            start = y
+        elif not empty and start is not None:
+            length = y - start
+            if length > longest:
+                drop = length - max(floor, round(length * keep))
+                mid = start + (length - drop)//2
+                rows.extend(range(mid, mid + drop))
+            start = None
+    return np.delete(pixels, rows, axis=0) if rows else pixels
+
+
 def chart_image(panel):
     """Native 1:1 chart, including every optional subplot and annotation.
 
@@ -140,7 +159,8 @@ def chart_image(panel):
     image = Image.new('RGB', (native.WIDTH, height), 'white')
     native.draw_chart(ImageDraw.Draw(image), 0, panel)
     image = image.crop((96, 136, 1376, height))
-    pixels = np.array(image)
+    pixels = _tighten_blank_rows(np.array(image))
+    image = Image.fromarray(pixels)
     paper = _asset('chart_mount.png').crop((80, 330, 1360, 1160)).resize(image.size, Image.Resampling.BILINEAR)
     paper = Image.blend(paper.filter(ImageFilter.GaussianBlur(20)), Image.new('RGB', image.size, '#FAF0DE'), .70)
     spread = np.ptp(pixels.astype(np.int16), axis=2)
@@ -194,8 +214,15 @@ def _facts(panel):
 
 
 def _research(panel, answer, ai):
-    """One bold conclusion + data facts; long AI prose stays in the text reply."""
+    """Bold conclusion + AI key points (one bullet per sentence) + A/B cards."""
     headline = _clean(ai.get('answer')) or _clean(answer).split('\n')[0]
+    points = [s.strip() + '。' for s in re.split('[。\n]', _clean(ai.get('why'))) if s.strip()]
+    summary = _clean(ai.get('summary'))
+    if summary and summary not in headline:
+        points.append(summary.rstrip('。') + '。')
+    if not points:
+        # AI pending: chart facts keep the card informative instead of blank.
+        points = [label + '：' + text for label, text in _facts(panel)]
     if not headline:
         card = panel.get('scorecard') or panel.get('key_levels') or {}
         headline = _clean(card.get('pattern_label')) or '依本次 K 線、均線與價量位置觀察。'
@@ -207,7 +234,7 @@ def _research(panel, answer, ai):
             {'title': 'A｜守住月線再攻', 'text': ('月線 ' + _number(month) + ' 守穩，再觀察站回短均 ' + _number(short) + ' 與量能延續。') if month and short else '觀察支撐守穩、壓力突破與量能配合。', 'tone': 'good'},
             {'title': 'B｜跌破月線轉弱', 'text': ('若跌破月線 ' + _number(month) + ' 且量增，留意下一支撐與反彈能否站回。') if month else '觀察支撐失守與量增，留意下一支撐。', 'tone': 'warn'},
         ]
-    return headline, supplied[:2]
+    return headline, points, supplied[:2]
 
 
 # Scorecard reason「說明（小項 得分/滿分）」→ owning component (weekly_pick.score_pattern).
@@ -241,17 +268,20 @@ def _component_notes(card):
 
 
 def _short_note(text, width, size=21):
-    """Keep the first clause when the reason is wider than the column."""
-    f = font(size)
-    if f.getlength(text) > width:
-        text = re.split('[，；]', text)[0]
-    lines, size = _fit(text, width, (size, size - 2), 1)
+    """Key point only: drop（…）asides first, then later clauses, before any ellipsis."""
+    text = re.sub(r'（[^（）]*）', '', text).strip()
+    for candidate in (text, re.split('[，；]', text)[0]):
+        for s in (size, size - 2):
+            if font(s).getlength(candidate) <= width:
+                return candidate, s
+    lines, size = _fit(candidate, width, (size - 2,), 1)
     return lines[0], size
 
 
 class Page:
     def __init__(self):
         self.parts = []
+        self.overlays = []
 
     def band(self, a, b, height):
         image = _asset('template.png').crop((0, a, 793, b)).resize((WIDTH, height), Image.Resampling.LANCZOS)
@@ -275,7 +305,8 @@ class Page:
         return y
 
     def hero(self, panel):
-        im = self.band(0, 272, 494)
+        # Template rows 252–272 are only desk clutter under the text; trimmed (−36px).
+        im = self.band(0, 252, 458)
         self.protect(im, (112, 62, 625, 433), 110)
         self.protect(im, (122, 375, 576, 429), 175)
         t, d = self.text, ImageDraw.Draw(im)
@@ -321,17 +352,25 @@ class Page:
             # Four 280px tiles, 16px gaps: 136…1304 is centred on the 1440 page.
             x = 136 + 296*i
             header.paste(mount.crop(boxes[i]).resize((280,128), Image.Resampling.LANCZOS), (x,104))
-            self.compass(header, x+36, 140, 10)
-            self.text(header, x+64, 115, label, 25, 'serif', MUTED)
-            d.line((x+64,157,x+209,157), fill='#C7AA78')
-            size = 40 if i == 0 else 36
+            # Label (with compass) and value are each centred on the tile's axis.
+            cx = x + 140
+            # The close tile's change % rides on the label row so all four values
+            # share one size and stay clear of the paper's curled corner.
+            change = _finite(panel.get('change_pct')) if i == 0 else None
+            tail = f'{change:+.2f}%' if change is not None else ''
+            label_w = font(25, 'serif').getlength(label)
+            tail_w = font(19, 'bold').getlength(tail) + 10 if tail else 0
+            left = cx - (label_w + 30 + tail_w)/2
+            self.compass(header, round(left+10), 138, 10)
+            self.text(header, left+30, 138, label, 25, 'serif', MUTED, 'lm')
+            if tail:
+                self.text(header, left+30+label_w+10, 139, tail, 19, 'bold', UP if change>=0 else DOWN, 'lm')
+            d.line((x+52,160,x+228,160), fill='#C7AA78')
             text = _number(last.get(key))
-            if font(size, 'num').getlength(text) > 164:
-                size = 30
-            self.text(header, x+25, 212, text, size, 'num', INK, 'ls')
-            change = _finite(panel.get('change_pct'))
-            if i == 0 and change is not None:
-                self.text(header, x+249, 184, f'{change:+.2f}%', 21, 'bold', UP if change>=0 else DOWN, 'rs')
+            size = 36
+            while size > 26 and font(size, 'num').getlength(text) > 200:
+                size -= 2
+            self.text(header, cx, 210, text, size, 'num', INK, 'ms')
         chart = chart_image(panel)
         body_height = chart.height + 110
         board = self.band(465, 895, body_height)
@@ -355,10 +394,20 @@ class Page:
     # scene always ends exactly where 03 begins; text is fitted, never extends paper.
     READ_H = 654
     READ_L, READ_R = 640, 1392
+    # A/B cards may hang into 03's empty top-right strip, stopping above its first row.
+    READ_OVERLAP = 86
 
-    def reading(self, panel, headline, scenarios):
+    def _card_plans(self, scenarios, width, bsize):
+        inner = width - 74
+        plans = [(_fit(s.get('title') or '觀察情境', inner, (24, 22), 1, 'serif'),
+                  _fit(s.get('text') or '', inner, (bsize, bsize-1, bsize-2), 3)) for s in scenarios]
+        content = max((t[1] + 30 + len(b[0])*(b[1]+10) for t, b in plans), default=0)
+        return plans, content + 46
+
+    def reading(self, headline, points, scenarios):
         H, L, R = self.READ_H, self.READ_L, self.READ_R
         im = self.band(895, 1255, H)
+        band_y = sum(part.height for part in self.parts[:-1])
         d = ImageDraw.Draw(im)
         # Covers the template's blank green/pink slips; our A/B cards replace them.
         self.protect(im, (L-14, 18, R+14, H-8), 235)
@@ -367,41 +416,48 @@ class Page:
         tw = R - L - 52
         head, size = _fit(headline, tw, (28, 26), 2, 'bold')
         if head[-1].endswith('…'):
-            # A third line still clears the A/B cards at 24px.
             head, size = _fit(headline, tw, (24,), 3, 'bold')
-        facts = []
-        for label, text in _facts(panel):
-            lines, fsize = _fit(text, tw - 66, (22, 20), 1)
-            facts.append((label, lines[0], fsize))
-        block = len(head)*(size+12) + (14 + len(facts)*38 if facts else 0)
-        card_top, card_bottom = 330, H - 22
-        # Without A/B cards the text block is centred in the paper instead.
-        y = 116 if scenarios else 96 + max(20, (H - 40 - 96 - block)//2)
-        y = self.lines(im, L+26, y, head, size, 'bold', spacing=size+12)
-        y += 14
-        for label, text, fsize in facts:
-            self.text(im, L+26, y+2, label, 22, 'bold', GOLD)
-            self.text(im, L+92, y+2, text, fsize, 'body', INK)
-            y += 38
-        if not scenarios:
-            return
+        head_h = len(head)*(size+12)
         gap = 22
         width = (R - L - gap) // 2 if len(scenarios) > 1 else R - L
-        inner = width - 74
-        plans = [(_fit(s.get('title') or '觀察情境', inner, (26, 24, 22), 1, 'serif'),
-                  _fit(s.get('text') or '', inner, (24, 23, 22), 4)) for s in scenarios]
-        # Both cards share one top so A/B titles and rules sit on the same line.
-        content = max(t[1] + 34 + len(b[0])*(b[1]+12) for t, b in plans)
-        top = card_top + max(26, (card_bottom - card_top - content)//2)
-        for i, (scenario, ((titles, tsize), (body, bsize))) in enumerate(zip(scenarios, plans)):
-            x = L + i*(width + gap)
-            color = UP if scenario.get('tone') == 'good' else DOWN if scenario.get('tone') == 'warn' else GOLD
-            self.paper_card(im, (x, card_top, x+width, card_bottom), color)
-            cy = top
-            self.text(im, x+44, cy, titles[0], tsize, 'serif', color)
-            cy += tsize + 16
-            d.line((x+43, cy, x+width-24, cy), fill='#CBB694')
-            self.lines(im, x+44, cy+18, body, bsize, spacing=bsize+12)
+        limit = H + self.READ_OVERLAP if scenarios else H - 30
+        # Largest bullet size that fits; only if 20px still overflows, drop whole
+        # trailing sentences (never cut one mid-way).
+        for bsize in (23, 22, 21, 20):
+            wrapped = [_wrap(p, tw - 26, bsize) for p in points]
+            plans, card_h = self._card_plans(scenarios, width, min(bsize, 22)) if scenarios else ([], 0)
+            def stack(items):
+                text_h = head_h + (14 + sum(len(w)*(bsize+10) + 6 for w in items) if items else 0)
+                return text_h + (24 + card_h if scenarios else 0)
+            if 116 + stack(wrapped) <= limit:
+                break
+        while len(wrapped) > 1 and 116 + stack(wrapped) > limit:
+            wrapped.pop()
+        # Text is top-anchored; cards sit on the paper's lower edge unless pushed down.
+        y = 116
+        y = self.lines(im, L+26, y, head, size, 'bold', spacing=size+12)
+        if wrapped:
+            y += 14
+            for lines in wrapped:
+                dot = y + bsize*0.62
+                d.ellipse((L+30, dot-4, L+38, dot+4), fill=GOLD)
+                y = self.lines(im, L+52, y, lines, bsize, spacing=bsize+10) + 6
+        if not scenarios:
+            return
+        top = band_y + max(y + 24 - 6, H - 24 - card_h)
+        def draw_cards(page, top=top, plans=plans, card_h=card_h):
+            pd = ImageDraw.Draw(page)
+            for i, (scenario, ((titles, tsize), (body, bsize))) in enumerate(zip(scenarios, plans)):
+                x = L + i*(width + gap)
+                color = UP if scenario.get('tone') == 'good' else DOWN if scenario.get('tone') == 'warn' else GOLD
+                self.paper_card(page, (x, top, x+width, top+card_h), color)
+                cy = top + 26
+                self.text(page, x+44, cy, titles[0], tsize, 'serif', color)
+                cy += tsize + 12
+                pd.line((x+43, cy, x+width-24, cy), fill='#CBB694')
+                self.lines(page, x+44, cy+16, body, bsize, spacing=bsize+10)
+        # Drawn after assembly so a card may overlap the start of 03.
+        self.overlays.append(draw_cards)
 
     def score(self, panel):
         card = panel.get('scorecard') or {}
@@ -529,6 +585,8 @@ class Page:
         for part in self.parts:
             image.paste(part,(0,y))
             y+=part.height
+        for overlay in self.overlays:
+            overlay(image)
         return image
 
 
@@ -545,11 +603,11 @@ def render_answer(question, answer, panels=None):
     if len(ai_cards)>1:
         import answer_image
         return answer_image.render_answer(question,answer,panels)
-    headline,scenarios=_research(panel,answer,ai_cards[0] if ai_cards else {})
+    headline,points,scenarios=_research(panel,answer,ai_cards[0] if ai_cards else {})
     page=Page()
     page.hero(panel)
     page.technical(panel)
-    page.reading(panel,headline,scenarios)
+    page.reading(headline,points,scenarios)
     page.score(panel)
     page.prices(panel)
     return page.finish()
