@@ -9071,6 +9071,12 @@ def run_discord_bot(config: BotConfig) -> None:
             return
         demo = bool(access.simulation)
         statistics_access[0] = access
+        if demo and access.entitlement.general and not access.entitlement.admin:
+            # 10-14：模擬會員（測試 general／warrant／both）也照會員頻道限制；真實身分是管理員也一樣擋
+            blocked = member_channel_block(config, None, getattr(interaction, "channel", None), False)
+            if blocked:
+                await interaction_image(interaction, "使用頻道", blocked, ephemeral=True)
+                return
         stats_command = member_usage_stats.command(question)
         if stats_command:
             if not access.admin_mode or demo:
