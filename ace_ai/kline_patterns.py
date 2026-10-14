@@ -1390,7 +1390,7 @@ def _tri_event_state(tr, H, L, C, A, snap, end) -> str:
         return "型態內"
     if tr["crossed"]:
         return "已過交會點"
-    if tr["reversed"]:
+    if tr["reversed"] and tr["breaks"][-1]["type"] != tr["breaks"][0]["type"]:   # 10-14：最後一次越線仍是反向才算失敗
         return "失敗（反向越線）"
     u, d = snap["u"], snap["d"]
     b = tr["breaks"][-1]
@@ -1829,7 +1829,13 @@ def _user_triangle(df, atr_prev, end, state=None, out_state=None, replay_days=No
         state_txt = act if last_b["idx"] == end else f"{last_b['date']} {act}"
         if TRI_CONFIRM2 and last_b.get("confirm"):
             state_txt += f"（{last_b['confirmed_date']} 兩日確認）" if last_b["confirm"] == "確認" else f"（{last_b['confirm']}）"
-        if tr["reversed"]:
+        flips = [b for i, b in enumerate(breaks) if i == 0 or b["type"] != breaks[i - 1]["type"]]   # 10-14：方向改變的越線，依時間
+        if tr["reversed"] and flips[-1]["type"] == flips[0]["type"]:   # 換向後又回到原方向＝反覆，不說失敗
+            seq = "、".join(f"{b['date']} {'越過上緣' if b['type'] == 'break_up' else '跌破下緣'}" for b in flips[:-1])
+            width = (u["s"] - d["s"]) * end + u["k"] - d["k"]
+            tip = f"目前兩線僅距 {_p(width)}，接近交會點，" if width < TRI_TIP * main["w0"] else ""
+            state_txt = f"{seq}，" + state_txt + f"（{tip}近期方向反覆，仍待確認）"
+        elif tr["reversed"]:
             state_txt = f"{breaks[0]['date']} {'突破上緣失敗後轉弱' if breaks[0]['type'] == 'break_up' else '跌破下緣後破底翻'}，" + state_txt   # 10-13：不用「反向」
         elif len(breaks) > 1:
             state_txt = f"{breaks[0]['date']} 首次{'突破' if breaks[0]['type'] == 'break_up' else '跌破'}，" + state_txt + "（再次同向）"
@@ -1942,7 +1948,7 @@ def _user_triangle(df, atr_prev, end, state=None, out_state=None, replay_days=No
             "upper": (u["s"], u["k"]), "lower": (d["s"], d["k"]),
             "anchors": {"upper": u["a"], "lower": d["a"]}, "state": state_txt, "pos": compat,
             "current_position": "unknown" if tr["crossed"] else posn, "history": [] if cand else tr["history"],
-            "failed": tr["reversed"] and not cand, "pending": bool(breaks) and posn == "inside" and not tr["crossed"],
+            "failed": tr["reversed"] and tr["breaks"][-1]["type"] != tr["breaks"][0]["type"] and not cand,   # 10-14：反覆後回原方向不算失敗 "pending": bool(breaks) and posn == "inside" and not tr["crossed"],
             "first_break": breaks[0] if breaks else None, "first_bday": breaks[0]["idx"] if breaks else None,
             "bday": breaks[-1]["idx"] if breaks else None, "eval": F, "text": text, "gap": None,
             "start": main["start"], "joint_start": main["joint"], "near_tip": main["near_tip"],
