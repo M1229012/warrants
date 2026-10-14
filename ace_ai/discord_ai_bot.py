@@ -7420,6 +7420,10 @@ class AceQueryEngine:
                 view = member_pattern.overlay(panel, (technical.get("kline_patterns") or {}).get("member_view"))
                 if view:
                     panel["member_triangle"] = view
+                    # 10-14：只有管理員入口（/ace，測試版 /testace）畫三角上下緣；/ask 保留型態判斷與價位表，不疊線
+                    access = self._access()
+                    if access is None or access.entry != "ace":
+                        panel["hide_triangle_lines"] = True
                     if not view.get("visible"):
                         self.log(f"{code} 三角疊線未通過｜{view.get('notice')}｜{json.dumps(view.get('diagnostic') or {}, ensure_ascii=False, default=str)}")
                 panel["key_levels"] = member_pattern.levels_card(panel, technical, tools.key_price_levels, tools.NEAR_ZONE_RATIO)

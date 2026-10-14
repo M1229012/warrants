@@ -1280,7 +1280,7 @@ def _date_ticks(bars: list, step: float) -> list[int]:
 def draw_member_triangle(draw, panel, px, py, left, right, top, bottom):
     """Same dated coefficients as detection, clipped to the chart; never refit."""
     view = panel.get('member_triangle') or {}
-    if not view.get('visible'):
+    if not view.get('visible') or panel.get('hide_triangle_lines'):
         return
     rows = view.get('rows') or []
     for edge, color in (('upper', '#C76C00'), ('lower', '#1478B5')):
@@ -1353,7 +1353,8 @@ def draw_chart(draw, y: int, panel: dict) -> None:
         draw.text((chip_x + chip_w / 2, y + 98), chip, font=font(22, True), fill=color, anchor='mm')
     show_bollinger = not panel.get("hide_bollinger", False)
     draw_value_tiles(draw, x0 + 32, y + 136, CONTENT - 64, last, show_bollinger)
-    if panel.get('member_triangle'):
+    # 不畫三角線時（/ask）也不放「橘上緣、藍下緣、虛線」圖說，避免說明找不到線。
+    if panel.get('member_triangle') and not panel.get('hide_triangle_lines'):
         import member_pattern
         label = member_pattern.chart_label(panel['member_triangle'])
         label, label_size = fit(label, 18, CONTENT - 64, False, 14)
