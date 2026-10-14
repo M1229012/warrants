@@ -37,7 +37,8 @@ def _chart_renderer():
             original_text = module.text_at
 
             def paper_text(draw, xy, text, *args, **kwargs):
-                return original_text(draw, xy, str(text).replace('藍：其他價位', '棕：其他價位'), *args, **kwargs)
+                text = str(text).replace('藍：其他價位', '棕：其他價位').replace('橘：第二大量區', '青：第二大量區')
+                return original_text(draw, xy, text, *args, **kwargs)
 
             module.text_at = paper_text
             module.MUTED, module.LINE, module.GRID = MUTED, '#DCD0B9', '#E7DDCB'
@@ -128,6 +129,14 @@ def _asset(name):
         return image.convert('RGB')
 
 
+SECOND_VOLUME = (196, 221, 211)
+
+
+def _vp_fill(rgb, alpha):
+    # Same blend as answer_image.volume_profile_rectangles, so the match is exact.
+    return tuple(round(255 * (1 - alpha) + c * alpha) for c in rgb)
+
+
 def _tighten_blank_rows(pixels, longest=28, keep=.5, floor=18):
     """Halve long empty white bands (date axis→volume, below volume). Only rows
     with no drawing at all are removed, so no plotted pixel moves relative to
@@ -170,8 +179,12 @@ def chart_image(panel):
     ink = np.array([63., 45., 34.])
     tinted = np.round(ink + (np.array(paper) - ink) * mix[:, :, None]).astype(np.uint8)
     pixels[neutral] = tinted[neutral]
-    # Reference VP's two largest areas retain red/orange; only the other bins warm up.
-    other_volume = np.all(pixels == (225, 245, 254), axis=2)
+    # VP: largest bin keeps native red. The native 20% orange second bin is almost
+    # the parchment colour, so it becomes pale sea-glass teal — cool against the warm
+    # paper (visible) but lighter/less saturated than the red bin. Other bins warm up.
+    second_volume = np.all(pixels == _vp_fill((245, 158, 11), .20), axis=2)
+    pixels[second_volume] = SECOND_VOLUME
+    other_volume = np.all(pixels == _vp_fill((56, 189, 248), .15), axis=2)
     pixels[other_volume] = (229, 220, 201)
     return Image.fromarray(pixels)
 
@@ -238,7 +251,7 @@ def _research(panel, answer, ai):
 
 
 # Scorecard reason「說明（小項 得分/滿分）」→ owning component (weekly_pick.score_pattern).
-_REASON_RE = re.compile(r'（([^（）]+?)\s+([\d.]+)/([\d.]+)）\s*$')
+_REASON_RE = re.compile(r'[（(]([^（）()]+?)\s+([\d.]+)/([\d.]+)[）)]\s*$')
 _SUB_COMPONENT = {'均線排列': '均線趨勢', 'MA20 方向': '均線趨勢', 'MA60 方向': '均線趨勢',
                   'MA60': '價格位置', '距 MA20': '價格位置', '追高風險': '價格位置',
                   '上方量區壓力': '量區結構', '最大量區': '量區結構', '相對兩大量區': '量區結構',
@@ -277,19 +290,23 @@ def _component_notes(card):
     return notes
 
 
-def _short_note(text, width, size=21):
-    """Key point only, never cut: drop（…）asides, then 「A＋B＋C」 name chains
-    (「最近支撐 最大量區上緣＋MA10 在下方 8.1%」→「最近支撐在下方 8.1%」),
-    then later clauses; only then shrink the font."""
-    text = re.sub(r'（[^（）]*）', '', text).strip()
-    chainless = re.sub(r'\s*[^\s，；]+(?:＋[^\s，；]+)+\s*', '', text).strip()
-    candidates = [text, chainless, re.split('[，；]', chainless)[0]]
+NOTE_SIZE = 21
+
+
+def _short_note(text, width, size=NOTE_SIZE):
+    """Key point at a fixed size (never shrunk, never cut): drop （…）/(…) asides,
+    then 「A＋B＋C」 name chains, then later clauses. If even that is wider than the
+    column, the row gets a second line instead of a smaller font."""
+    text = re.sub(r'[（(][^（）()]*[）)]', '', text).strip()
+    chainless = re.sub(r'\s*[^\s，；,;]+(?:[＋+][^\s，；,;]+)+\s*', '', text).strip() or text
+    first = re.split('[，；,;]', chainless)[0].strip() or chainless
+    # 「多頭排列 MA5>MA10>MA20>MA60」→「多頭排列」: a trailing formula only restates the label.
+    formula_free = re.sub(r'\s+[A-Za-z0-9<>=.+\-%]*[<>=][A-Za-z0-9<>=.+\-%]*$', '', first).strip() or first
+    candidates = [text, chainless, first, formula_free]
     for candidate in candidates:
-        for s in (size, size - 2):
-            if candidate and font(s).getlength(candidate) <= width:
-                return candidate, s
-    lines, size = _fit(candidates[-1] or text, width, (size - 3,), 1)
-    return lines[0], size
+        if font(size).getlength(candidate) <= width:
+            return [candidate]
+    return _wrap(candidates[-1], width, size)
 
 
 def _deduction_rows(card, close):
@@ -543,7 +560,11 @@ class Page:
         row_h = 44
         shift = self.score_shift
         rows_top = 108 + shift
-        rows_h = max(5, len(components)) * row_h
+        # A note that needs two lines makes its own row taller (font stays 21px).
+        note_lines = {c.get('label'): _short_note(notes[c.get('label')], 1100-790)
+                      for c in components if notes.get(c.get('label'))}
+        heights = [row_h + 24*(len(note_lines.get(c.get('label')) or [''])-1) for c in components]
+        rows_h = max(5*row_h, sum(heights))
         tag = '｜'.join(f'{label}：{_clean(card[key])}' for label, key in
                        (('型態', 'pattern_label'), ('均線', 'ma_alignment')) if _clean(card.get(key)))
         height = rows_top + rows_h + (44 if tag else 0) + 40
@@ -551,10 +572,10 @@ class Page:
         self.protect(im,(112,25,1328,height-17),128)
         self.text(im,140,42+shift,'03  完整型態評分依據',32,'serif')
         d = ImageDraw.Draw(im)
-        y = rows_top + (rows_h - len(components)*row_h)//2
-        for component in components:
+        y = rows_top + (rows_h - sum(heights))//2
+        for component, rh in zip(components, heights):
             # Each row: label | bar | score | note share one text middle line.
-            mid = y + row_h//2
+            mid = y + rh//2
             label, lsize = _fit(component.get('label',''), 170, (25, 22), 1, 'bold')
             self.text(im,140,mid,label[0],lsize,'bold',INK,'lm')
             value, maximum = _finite(component.get('value')), _finite(component.get('max'))
@@ -566,11 +587,10 @@ class Page:
                 d.line((330+70*j,mid-7,330+70*j,mid+7),fill='#AE8F61')
             text = f'{value:g} / {maximum:g}' if value is not None and maximum is not None else '—'
             self.text(im,760,mid,text,25,'num',GOLD,'rm')
-            note = notes.get(component.get('label'))
-            if note:
-                line, nsize = _short_note(note, 1100-790)
-                self.text(im,790,mid,line,nsize,'body',MUTED,'lm')
-            y += row_h
+            lines = note_lines.get(component.get('label')) or []
+            for k, line in enumerate(lines):
+                self.text(im,790,mid+(k-(len(lines)-1)/2)*24,line,NOTE_SIZE,'body',MUTED,'lm')
+            y += rh
         if tag:
             line, tsize = _fit(tag, 1180-140, (21, 19), 1)
             self.text(im,140,rows_top+rows_h+22,line[0],tsize,'bold',MUTED,'lm')
