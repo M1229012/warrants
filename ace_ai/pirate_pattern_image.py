@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import importlib.util
 import math
+import re
 import sys
 import threading
 from functools import lru_cache
@@ -47,6 +48,12 @@ def _chart_renderer():
 
 def font(size, kind='body'):
     # A new font instance per call avoids shared FreeType variation state in workers.
+    if kind == 'pirate':
+        # Pirata One (OFL) is Latin-only and used for the score gauge alone.
+        pirate = ASSETS / 'PirataOne-Regular.ttf'
+        if pirate.exists():
+            return ImageFont.truetype(str(pirate), int(size))
+        kind = 'classic'
     serif = kind in ('serif', 'classic')
     path = ASSETS / ('NotoSerifTC-VF.ttf' if serif else 'NotoSansTC-VF.ttf')
     f = ImageFont.truetype(str(path), int(size))
@@ -71,18 +78,48 @@ def _number(value):
     return f'{number:,.2f}' if number is not None else '—'
 
 
+# Numbers / Latin words stay whole ("2,511.50" never splits); closing punctuation
+# never starts a line.
+_TOKEN_RE = re.compile(r'[A-Za-z0-9.,%+\-/>＜<＞]+|.')
+_CLOSING = set('，。、；：！？）」』%')
+
+
 def _wrap(text, width, size=25, kind='body'):
     f, lines = font(size, kind), []
     for paragraph in _clean(text).splitlines():
         line = ''
-        for char in paragraph:
-            if line and f.getlength(line + char) > width:
+        for token in _TOKEN_RE.findall(paragraph):
+            if line and f.getlength(line + token) > width and token not in _CLOSING:
+                if f.getlength(token) > width:
+                    # Over-long token: fall back to character breaks.
+                    for char in token:
+                        if line and f.getlength(line + char) > width:
+                            lines.append(line.rstrip())
+                            line = ''
+                        line += char
+                    continue
                 lines.append(line.rstrip())
-                line = ''
-            line += char
+                line = token.lstrip()
+            else:
+                line += token
         if line.strip():
             lines.append(line.rstrip())
     return lines
+
+
+def _fit(text, width, sizes, max_lines, kind='body'):
+    """Largest size whose wrap fits max_lines; the last size ellipsizes."""
+    for size in sizes:
+        lines = _wrap(text, width, size, kind)
+        if len(lines) <= max_lines:
+            return lines, size
+    f = font(size, kind)
+    lines = lines[:max_lines]
+    last = lines[-1]
+    while last and f.getlength(last + '…') > width:
+        last = last[:-1]
+    lines[-1] = last.rstrip('，、；： ') + '…'
+    return lines, size
 
 
 @lru_cache(maxsize=2)
@@ -135,24 +172,34 @@ def _levels(panel):
     return rows[:5]
 
 
+def _facts(panel):
+    """趨勢／動能 rows come from chart data, so the card stays short and exact."""
+    card = panel.get('scorecard') or panel.get('key_levels') or {}
+    last = panel['bars'][-1]
+    groups = {}
+    for key in ('MA5', 'MA10', 'MA20', 'MA60'):
+        info = (card.get('ma_deduction') or {}).get(key)
+        if isinstance(info, dict) and info.get('direction_now'):
+            groups.setdefault(info['direction_now'], []).append(key[2:])
+    moves = ['MA' + '／'.join(nums) + ' ' + direction for direction, nums in groups.items()]
+    trend = '；'.join(v for v in [_clean(card.get('ma_alignment')), '，'.join(moves)] if v)
+    close, ma5 = _finite(last.get('Close')), _finite(last.get('MA5'))
+    volume, mv5 = _finite(last.get('Volume')), _finite(last.get('MV5'))
+    momentum = []
+    if close is not None and ma5:
+        momentum.append(('站上' if close >= ma5 else '跌破') + ' MA5 ' + _number(ma5))
+    if volume is not None and mv5:
+        momentum.append('成交量' + ('高於' if volume >= mv5 else '低於') + ' 5 日均量')
+    return [(label, text) for label, text in (('趨勢', trend), ('動能', '；'.join(momentum))) if text]
+
+
 def _research(panel, answer, ai):
-    """Preserve supplied interpretation; use observable facts while AI is pending."""
-    paragraphs = []
-    for key in ('answer', 'summary', 'why', 'context', 'notice', 'cost_basis', 'footer'):
-        value = _clean(ai.get(key))
-        if value and value not in paragraphs:
-            paragraphs.append(value)
-    if not paragraphs:
-        paragraphs = [_clean(answer)] if _clean(answer) else []
-    if not paragraphs:
+    """One bold conclusion + data facts; long AI prose stays in the text reply."""
+    headline = _clean(ai.get('answer')) or _clean(answer).split('\n')[0]
+    if not headline:
         card = panel.get('scorecard') or panel.get('key_levels') or {}
-        paragraphs = [card.get('pattern_label') or '依本次 K 線、均線與價量位置觀察。']
-        if card.get('ma_alignment'):
-            paragraphs.append('均線：' + str(card['ma_alignment']))
-    supplied = list(ai.get('scenarios') or [])
-    # Retain additional scenarios as prose rather than silently drop them.
-    for scenario in supplied[2:]:
-        paragraphs.append(str(scenario.get('title', '')) + '：' + str(scenario.get('text', '')))
+        headline = _clean(card.get('pattern_label')) or '依本次 K 線、均線與價量位置觀察。'
+    supplied = [s for s in ai.get('scenarios') or [] if _clean(s.get('text'))]
     if not supplied:
         last = panel['bars'][-1]
         month, short = _finite(last.get('MA20')), _finite(last.get('MA5'))
@@ -160,7 +207,46 @@ def _research(panel, answer, ai):
             {'title': 'A｜守住月線再攻', 'text': ('月線 ' + _number(month) + ' 守穩，再觀察站回短均 ' + _number(short) + ' 與量能延續。') if month and short else '觀察支撐守穩、壓力突破與量能配合。', 'tone': 'good'},
             {'title': 'B｜跌破月線轉弱', 'text': ('若跌破月線 ' + _number(month) + ' 且量增，留意下一支撐與反彈能否站回。') if month else '觀察支撐失守與量增，留意下一支撐。', 'tone': 'warn'},
         ]
-    return paragraphs, supplied
+    return headline, supplied[:2]
+
+
+# Scorecard reason「說明（小項 得分/滿分）」→ owning component (weekly_pick.score_pattern).
+_REASON_RE = re.compile(r'（([^（）]+?)\s+([\d.]+)/([\d.]+)）\s*$')
+_SUB_COMPONENT = {'均線排列': '均線趨勢', 'MA20 方向': '均線趨勢', 'MA60 方向': '均線趨勢',
+                  'MA60': '價格位置', '距 MA20': '價格位置', '追高風險': '價格位置',
+                  '上方量區壓力': '量區結構', '最大量區': '量區結構', '相對兩大量區': '量區結構',
+                  '最近支撐': '下方支撐', '支撐密度': '下方支撐', '開布林': '布林', '通道位置': '布林'}
+
+
+def _component_notes(card):
+    """One short reason per score row: full marks → strongest item, else biggest loss."""
+    items = {}
+    for text in list(card.get('plus_reasons') or []) + list(card.get('minus_reasons') or []):
+        text = _clean(text)
+        match = _REASON_RE.search(text)
+        if not match or match.group(1) not in _SUB_COMPONENT:
+            continue
+        points, maximum = float(match.group(2)), float(match.group(3))
+        items.setdefault(_SUB_COMPONENT[match.group(1)], []).append((points, maximum, text[:match.start()].strip()))
+    notes = {}
+    for component in card.get('components') or []:
+        rows = items.get(component.get('label'))
+        if not rows:
+            continue
+        value, maximum = _finite(component.get('value')), _finite(component.get('max'))
+        full = value is not None and maximum and value >= maximum * .9
+        notes[component.get('label')] = (max(rows, key=lambda r: r[0]) if full else
+                                         max(rows, key=lambda r: r[1] - r[0]))[2]
+    return notes
+
+
+def _short_note(text, width, size=21):
+    """Keep the first clause when the reason is wider than the column."""
+    f = font(size)
+    if f.getlength(text) > width:
+        text = re.split('[，；]', text)[0]
+    lines, size = _fit(text, width, (size, size - 2), 1)
+    return lines[0], size
 
 
 class Page:
@@ -224,15 +310,16 @@ class Page:
 
     def technical(self, panel):
         header = self.band(280, 465, 236)
-        self.protect(header, (113, 38, 1338, 212), 128)
+        self.protect(header, (112, 38, 1328, 212), 128)
         d = ImageDraw.Draw(header)
         self.text(header, 140, 50, '01  K 線技術研究', 32, 'serif')
-        d.line((455, 82, 1081, 82), fill='#BA9B6B')
-        self.text(header, 1122, 55, '航海行情札記', 22, 'serif', GOLD)
+        d.line((455, 82, 1130, 82), fill='#BA9B6B')
+        self.text(header, 1300, 55, '航海行情札記', 22, 'serif', GOLD, 'rt')
         boxes = [(105,112,398,242),(423,112,717,242),(739,112,1034,242),(1055,112,1342,242)]
         last, mount = panel['bars'][-1], _asset('chart_mount.png')
         for i, (label, key) in enumerate([('收盤價', 'Close'), ('開盤', 'Open'), ('最高', 'High'), ('最低', 'Low')]):
-            x = 128 + 296*i
+            # Four 280px tiles, 16px gaps: 136…1304 is centred on the 1440 page.
+            x = 136 + 296*i
             header.paste(mount.crop(boxes[i]).resize((280,128), Image.Resampling.LANCZOS), (x,104))
             self.compass(header, x+36, 140, 10)
             self.text(header, x+64, 115, label, 25, 'serif', MUTED)
@@ -264,71 +351,97 @@ class Page:
         d.line((x+19,y+25,x+19,y2-22), fill=color, width=4)
         d.ellipse(((x+x2)//2-4,y+9,(x+x2)//2+4,y+17), fill='#BA9663', outline='#88683E')
 
-    def reading(self, paragraphs, scenarios):
-        main_lines = []
-        for paragraph in paragraphs:
-            main_lines.extend(_wrap(paragraph, 640, 25))
-        scenario_lines = [(_wrap(s.get('title') or '觀察情境', 236, 26, 'serif'), _wrap(s.get('text') or '', 236, 25)) for s in scenarios]
-        top_height = max(310, 182 + len(main_lines)*36)
-        card_height = max(235, max((len(a)*34 + len(b)*36 + 73 for a,b in scenario_lines), default=0))
-        height = max(625, top_height + card_height + 35)
-        # Keep the body character at the approved size/pose when text requires more paper.
-        im = self.band(895, 1195, 625)
-        if height > 625:
-            extension = _asset('template.png').crop((25,1350,765,1520)).resize((WIDTH, height), Image.Resampling.LANCZOS)
-            extension.paste(im, (0,0))
-            self.parts[-1] = im = extension
-        self.protect(im, (652,92,1338,height-25), 145)
-        self.text(im, 675, 108, '02  喬巴研究解讀', 32, 'serif')
-        ImageDraw.Draw(im).line((675,166,1308,166), fill='#C7AC7F')
-        self.lines(im, 675, 185, main_lines)
-        for i, (scenario, (titles, body)) in enumerate(zip(scenarios, scenario_lines)):
-            x = 665 + 335*i
+    # 02 keeps the template's own proportions (895–1255 ≈ 1.816×), so the Chopper
+    # scene always ends exactly where 03 begins; text is fitted, never extends paper.
+    READ_H = 654
+    READ_L, READ_R = 640, 1392
+
+    def reading(self, panel, headline, scenarios):
+        H, L, R = self.READ_H, self.READ_L, self.READ_R
+        im = self.band(895, 1255, H)
+        d = ImageDraw.Draw(im)
+        # Covers the template's blank green/pink slips; our A/B cards replace them.
+        self.protect(im, (L-14, 18, R+14, H-8), 235)
+        self.text(im, L+26, 40, '02  喬巴研究解讀', 32, 'serif')
+        d.line((L+26, 96, R-26, 96), fill='#C7AC7F')
+        tw = R - L - 52
+        head, size = _fit(headline, tw, (28, 26), 2, 'bold')
+        if head[-1].endswith('…'):
+            # A third line still clears the A/B cards at 24px.
+            head, size = _fit(headline, tw, (24,), 3, 'bold')
+        facts = []
+        for label, text in _facts(panel):
+            lines, fsize = _fit(text, tw - 66, (22, 20), 1)
+            facts.append((label, lines[0], fsize))
+        block = len(head)*(size+12) + (14 + len(facts)*38 if facts else 0)
+        card_top, card_bottom = 330, H - 22
+        # Without A/B cards the text block is centred in the paper instead.
+        y = 116 if scenarios else 96 + max(20, (H - 40 - 96 - block)//2)
+        y = self.lines(im, L+26, y, head, size, 'bold', spacing=size+12)
+        y += 14
+        for label, text, fsize in facts:
+            self.text(im, L+26, y+2, label, 22, 'bold', GOLD)
+            self.text(im, L+92, y+2, text, fsize, 'body', INK)
+            y += 38
+        if not scenarios:
+            return
+        gap = 22
+        width = (R - L - gap) // 2 if len(scenarios) > 1 else R - L
+        inner = width - 74
+        plans = [(_fit(s.get('title') or '觀察情境', inner, (26, 24, 22), 1, 'serif'),
+                  _fit(s.get('text') or '', inner, (24, 23, 22), 4)) for s in scenarios]
+        # Both cards share one top so A/B titles and rules sit on the same line.
+        content = max(t[1] + 34 + len(b[0])*(b[1]+12) for t, b in plans)
+        top = card_top + max(26, (card_bottom - card_top - content)//2)
+        for i, (scenario, ((titles, tsize), (body, bsize))) in enumerate(zip(scenarios, plans)):
+            x = L + i*(width + gap)
             color = UP if scenario.get('tone') == 'good' else DOWN if scenario.get('tone') == 'warn' else GOLD
-            self.paper_card(im, (x,top_height,x+310,top_height+card_height), color)
-            cursor = self.lines(im, x+42, top_height+27, titles, 26, 'serif', color, 34)
-            ImageDraw.Draw(im).line((x+41,cursor+7,x+288,cursor+7), fill='#CBB694')
-            self.lines(im, x+42, cursor+22, body)
+            self.paper_card(im, (x, card_top, x+width, card_bottom), color)
+            cy = top
+            self.text(im, x+44, cy, titles[0], tsize, 'serif', color)
+            cy += tsize + 16
+            d.line((x+43, cy, x+width-24, cy), fill='#CBB694')
+            self.lines(im, x+44, cy+18, body, bsize, spacing=bsize+12)
 
     def score(self, panel):
         card = panel.get('scorecard') or {}
         components = list(card.get('components') or [])
-        details = []
-        for label, key in [('加分', 'plus_reasons'), ('扣分', 'minus_reasons')]:
-            reasons = [_clean(v) for v in card.get(key) or [] if _clean(v)]
-            if reasons:
-                details.extend(_wrap(label+'：'+'；'.join(reasons), 1180, 22))
-        for label, key in [('型態', 'pattern_label'), ('均線', 'ma_alignment'), ('評分基準', 'score_basis')]:
-            if card.get(key):
-                details.extend(_wrap(label+'：'+str(card[key]), 1180, 22))
-        deductions = card.get('ma_deduction') or {}
-        for key, info in deductions.items():
-            if isinstance(info, dict):
-                details.extend(_wrap(str(key)+'：'+_chart_renderer().public_ma_condition(info), 1180, 22))
-        if card.get('show_tracked_branches') and card.get('tracked_branches'):
-            tracked = card['tracked_branches']
-            details.extend(_wrap('追蹤分點：'+str(tracked), 1180, 22))
-        component_height = max(188, sum(max(37, len(_wrap(c.get('label',''),190,25,'bold'))*32) for c in components))
-        height = max(370, 110+component_height+len(details)*32+35)
-        im = self.band(1260,1580,height)
-        self.protect(im,(114,25,1338,height-17),128)
-        self.text(im,140,45,'03  完整型態評分依據',32,'serif')
-        d, y = ImageDraw.Draw(im), 112
+        notes = _component_notes(card)
+        row_h = 44
+        rows_top = 108
+        rows_h = max(5, len(components)) * row_h
+        tag = '｜'.join(f'{label}：{_clean(card[key])}' for label, key in
+                       (('型態', 'pattern_label'), ('均線', 'ma_alignment')) if _clean(card.get(key)))
+        height = rows_top + rows_h + (44 if tag else 0) + 40
+        im = self.band(1255,1578,height)
+        self.protect(im,(112,25,1328,height-17),128)
+        self.text(im,140,42,'03  完整型態評分依據',32,'serif')
+        d = ImageDraw.Draw(im)
+        y = rows_top + (rows_h - len(components)*row_h)//2
         for component in components:
-            labels = _wrap(component.get('label',''),190,25,'bold')
-            self.lines(im,140,y,labels,25,'bold',spacing=32)
+            # Each row: label | bar | score | note share one text middle line.
+            mid = y + row_h//2
+            label, lsize = _fit(component.get('label',''), 170, (25, 22), 1, 'bold')
+            self.text(im,140,mid,label[0],lsize,'bold',INK,'lm')
             value, maximum = _finite(component.get('value')), _finite(component.get('max'))
             ratio = max(0.,min(1.,value/maximum)) if value is not None and maximum and maximum>0 else 0
-            d.rectangle((350,y+10,650,y+18),fill='#DFCCAD')
+            d.rectangle((330,mid-4,610,mid+4),fill='#DFCCAD')
             if ratio:
-                d.rectangle((350,y+10,350+round(300*ratio),y+18),fill=GOLD)
+                d.rectangle((330,mid-4,330+round(280*ratio),mid+4),fill=GOLD)
             for j in range(5):
-                d.line((350+75*j,y+7,350+75*j,y+21),fill='#AE8F61')
+                d.line((330+70*j,mid-7,330+70*j,mid+7),fill='#AE8F61')
             text = f'{value:g} / {maximum:g}' if value is not None and maximum is not None else '—'
-            self.text(im,805,y+26,text,25,'num',GOLD,'rs')
-            y += max(37,len(labels)*32)
+            self.text(im,760,mid,text,25,'num',GOLD,'rm')
+            note = notes.get(component.get('label'))
+            if note:
+                line, nsize = _short_note(note, 1100-790)
+                self.text(im,790,mid,line,nsize,'body',MUTED,'lm')
+            y += row_h
+        if tag:
+            line, tsize = _fit(tag, 1180-140, (21, 19), 1)
+            self.text(im,140,rows_top+rows_h+22,line[0],tsize,'bold',MUTED,'lm')
         score = None if card.get('hide_score') else _finite(card.get('pattern_score'))
-        cx,cy = 1247,150
+        cx,cy = 1222,rows_top+rows_h//2-14
         d.ellipse((cx-75,cy-75,cx+75,cy+75),fill='#F6E9CC',outline='#AF8E59',width=2)
         d.ellipse((cx-69,cy-69,cx+69,cy+69),outline='#D3BA91')
         d.arc((cx-59,cy-59,cx+59,cy+59),0,360,fill='#DCC9A6',width=8)
@@ -343,40 +456,69 @@ class Page:
         for i in range(20):
             a=math.radians(i*18-90)
             d.line((cx+math.cos(a)*68,cy+math.sin(a)*68,cx+math.cos(a)*72,cy+math.sin(a)*72),fill='#B79A68')
-        self.text(im,cx,cy,f'{score:.1f}%' if score is not None else '—',27,'classic',INK,'mm')
+        self.text(im,cx,cy,f'{score:.1f}%' if score is not None else '—',40,'pirate',INK,'mm')
         grade = card.get('grade') if score is not None else '評分待取得'
-        for i,line in enumerate(_wrap(grade or '',184,23,'bold')):
-            self.text(im,cx,265+i*32,line,23,'bold',UP if score is not None else MUTED,'mm')
-        self.lines(im,140,110+component_height,details,22,color=MUTED,spacing=32)
+        for i,line in enumerate(_wrap(grade or '',184,23,'bold')[:2]):
+            self.text(im,cx,cy+112+i*30,line,23,'bold',UP if score is not None else MUTED,'mm')
 
     def prices(self, panel):
         rows, close = _levels(panel), _finite(panel['bars'][-1].get('Close'))
         plans = [(_wrap(row['name'],190,25),row) for row in rows]
-        height = max(380,100+sum(max(45,len(lines)*32+12) for lines,row in plans)+30)
-        im = self.band(1580,1840,height)
-        self.protect(im,(116,20,593,260),120)
-        self.protect(im,(635,25,1340,height-20),130)
+        card = panel.get('scorecard') or panel.get('key_levels') or {}
+        deduction = []
+        for key in ('MA5', 'MA10', 'MA20', 'MA60'):
+            info = (card.get('ma_deduction') or {}).get(key)
+            if isinstance(info, dict):
+                text = _chart_renderer().public_ma_condition(info)
+                deduction.append((key, text[2:].strip() if text.startswith('明天') else text, info))
+        above = [r for r in rows if r['kind'] == '壓力']
+        below = [r for r in rows if r['kind'] == '支撐']
+        span = (f'最近壓力與支撐相距 {(above[0]["price"]/below[0]["price"]-1)*100:.2f}%'
+                if above and below else '')
+        left_h = 96 + len(deduction)*40 + (46 if span else 0) + 26
+        table_h = 116 + sum(max(45,len(lines)*32+12) for lines,row in plans) + 26
+        height = max(380, left_h, table_h)
+        im = self.band(1578,1840,height)
+        # Stronger veil: the template's compass/book sits under the left column.
+        self.protect(im,(112,20,604,height-20),215)
+        self.protect(im,(628,20,1328,height-20),130)
         self.text(im,140,31,'04  關鍵價位與技術明細',32,'serif')
-        sources = {'ma':'均線','volume_zone':'量區','bollinger':'布林','triangle':'三角邊界'}
-        kinds = list(dict.fromkeys(sources.get(row['source'],'技術位置') for row in rows))
-        guide = (f'本表取自「{"、".join(kinds)}」。\n' if rows else '本次未取得可列示的關鍵價位。\n')
-        guide += f'列出距現價最近的 {len(rows)} 筆；\n正／負值代表現價上／下方，\n先看近價，再確認站回或跌破。'
-        self.lines(im,140,98,_wrap(guide,430,23),23,color=MUTED,spacing=35)
         d=ImageDraw.Draw(im)
-        for x,label,anchor in [(660,'類型','lt'),(802,'名稱','lt'),(1120,'價位','rt'),(1310,'距現價','rt')]:
+        # Left: tomorrow's MA deduction conditions (price conditions only).
+        y = 96
+        if deduction:
+            self.text(im,140,y-6,'明日扣抵條件',24,'serif',GOLD)
+            d.line((140,y+30,576,y+30),fill='#C7AC86')
+            y += 44
+            for key, text, info in deduction:
+                color = UP if info.get('direction_now') == '上揚' else MUTED
+                self.text(im,140,y+16,key,23,'num',INK,'lm')
+                line, size = _fit(text, 576-232, (23, 21), 1)
+                self.text(im,232,y+16,line[0],size,'body',color,'lm')
+                y += 40
+        if span:
+            d.line((140,y+8,576,y+8),fill='#D4BF9F')
+            self.text(im,140,y+30,span,22,'body',MUTED,'lm')
+        elif not deduction:
+            self.text(im,140,y,'本次未取得扣抵條件。',23,'body',MUTED)
+        # Right: nearest levels, columns anchored inside the 628–1328 paper.
+        for x,label,anchor in [(664,'類型','lt'),(790,'名稱','lt'),(1120,'價位','rt'),(1296,'距現價','rt')]:
             self.text(im,x,74,label,25,'bold',MUTED,anchor)
-        d.line((650,110,1320,110),fill='#BFA376')
+        d.line((652,110,1304,110),fill='#BFA376')
         y=122
         for i,(lines,row) in enumerate(plans):
             rh=max(45,len(lines)*32+12)
             if i%2==0:
-                d.rectangle((650,y-3,1320,y+rh-7),fill='#EFE2CB')
+                d.rectangle((652,y-3,1304,y+rh-7),fill='#EFE2CB')
             color = UP if row['kind']=='壓力' else DOWN
-            self.text(im,660,y,row['kind'],25,color=color)
-            self.lines(im,802,y,lines,25,spacing=32)
-            self.text(im,1120,y,_number(row['price']),27,'num',INK,'rt')
+            # Every column shares the row's vertical centre (mixed fonts, same line).
+            mid = y + (rh-10)//2
+            self.text(im,664,mid,row['kind'],25,'body',color,'lm')
+            for k, line in enumerate(lines):
+                self.text(im,790,mid+(k-(len(lines)-1)/2)*32,line,25,'body',INK,'lm')
+            self.text(im,1120,mid,_number(row['price']),27,'num',INK,'rm')
             distance = f'{(row["price"]/close-1)*100:+.2f}%' if close else '—'
-            self.text(im,1310,y,distance,25,'num',color,'rt')
+            self.text(im,1296,mid,distance,25,'num',color,'rm')
             y+=rh
 
     def finish(self):
@@ -403,11 +545,11 @@ def render_answer(question, answer, panels=None):
     if len(ai_cards)>1:
         import answer_image
         return answer_image.render_answer(question,answer,panels)
-    paragraphs,scenarios=_research(panel,answer,ai_cards[0] if ai_cards else {})
+    headline,scenarios=_research(panel,answer,ai_cards[0] if ai_cards else {})
     page=Page()
     page.hero(panel)
     page.technical(panel)
-    page.reading(paragraphs,scenarios[:2])
+    page.reading(panel,headline,scenarios)
     page.score(panel)
     page.prices(panel)
     return page.finish()
