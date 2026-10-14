@@ -1311,7 +1311,7 @@ def branch_store_warrant_sections(d: Dict[str, Any]) -> List[Dict[str, Any]]:
         {"label": "權證檔數", "value": f"{h.get('warrant_count', d.get('warrant_count', 0)):,} 檔", "tone": "ink"},
         {"label": "買進時天期", "value": f"{tenor:.0f} 天" if tenor is not None else "-", "tone": "ink"},
         {"label": "買進時價內外", "value": (f"{'價內' if money >= 0 else '價外'} {abs(money):.0f}%") if money is not None else "-", "tone": "ink"},
-        {"label": "估算槓桿", "value": f"{lev:.1f} 倍" if lev is not None else "-", "tone": "accent"}]})
+        {"label": "買進時估算槓桿", "value": f"{lev:.1f} 倍" if lev is not None else "-", "tone": "accent"}]})
     for group in (d.get("groups") or [])[:3]:
         remaining = group.get("remaining_text") or ""
         head = [group["label"], group.get("event_codes") or "", remaining if remaining in ("已全部賣出", "持有中") else f"剩 {remaining}"]
