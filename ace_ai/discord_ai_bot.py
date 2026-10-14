@@ -1485,17 +1485,22 @@ def is_top_warrant_question(parsed: "ParsedQuestion") -> bool:
 
 NEEDS_PARSE_ENABLE = os.getenv("DISCORD_AI_NEEDS_PARSE", "1").strip().lower() in ("1", "true", "yes", "on")
 _NEEDS_TAILS = ("怎麼樣", "怎樣", "如何", "怎麼看", "好不好", "好嗎", "走勢", "分析", "型態", "技術面", "一下", "看看")
-NEEDS_TYPES = ["pattern", "chips", "news", "price", "institutional", "futures", "cost", "compare", "members", "rank", "score", "spot", "other"]
+NEEDS_TYPES = ["pattern", "chips", "news", "price", "institutional", "futures", "cost", "compare", "members", "rank", "score", "spot",
+               "branch_warrants", "branch_events", "branch_position", "branch_perf", "other"]
+# 10-14：指定分點（券商）的動作。AI 讀懂「這個分點要查什麼」，程式依動作走分點流程，不再降成只查股票。
+BRANCH_NEEDS = {"branch_warrants", "branch_events", "branch_position", "branch_perf"}
 _NEED_INTENTS: Dict[str, Set[str]] = {
     "score": {"score", "analysis", "technical"}, "spot": {"spot", "analysis", "technical"},
     "pattern": {"analysis", "technical"}, "news": {"news"}, "price": {"price"}, "institutional": {"institutional"},
     "futures": {"futures"}, "cost": {"cost", "analysis"}, "compare": {"analysis"}, "chips": {"warrant"}, "members": {"sector"}, "rank": {"sector"},
+    **{t: {"warrant"} for t in BRANCH_NEEDS},
 }
 _EXCLUDE_INTENTS: Dict[str, Set[str]] = {
     "score": {"score"}, "spot": {"spot"},
     "pattern": {"analysis", "technical", "volume_profile"}, "news": {"news"}, "price": {"price"},
     "institutional": {"institutional"}, "futures": {"futures"}, "chips": {"warrant", "win_rate", "recent_trades", "position"},
     "members": {"sector"}, "rank": {"sector"}, "compare": {"analysis"}, "cost": {"cost"}, "other": set(),
+    **{t: {"warrant", "win_rate", "recent_trades", "position"} for t in BRANCH_NEEDS},
 }
 
 
@@ -1512,8 +1517,21 @@ def needs_semantic(parsed: "ParsedQuestion") -> bool:
         return False
     if parsed.sector_context:
         return True
-    if not parsed.stocks or parsed.sector:
+    if parsed.sector:
         return False
+    if not parsed.stocks:
+        if not parsed.branches:
+            return False
+        # 10-14：只有分點（「國票台南槓桿多少」）：拿掉分點名稱與已知字後還有沒讀懂的字，才交給 AI 讀整句
+        text = parsed.original or ""
+        for name in parsed.branches:
+            text = text.replace(str(name), "")
+        for words in INTENT_KEYWORDS.values():
+            for w in sorted(words, key=len, reverse=True):
+                text = text.replace(w, "")
+        for w in sorted(FILLER_WORDS + _NEEDS_TAILS, key=len, reverse=True):
+            text = text.replace(w, "")
+        return len(re.sub(r"[^一-鿿]", "", text)) >= 1
     text = parsed.original or ""
     for code, name in parsed.stocks:
         text = text.replace(str(code), "").replace(str(name or ""), "")
@@ -6906,6 +6924,10 @@ class AceQueryEngine:
         prompt = ("你是台股問句的需求解析器，只輸出 JSON，不要回答問題。讀完整句，列出使用者真正要回答的每一項需求。\n"
                   "type：pattern＝走勢型態技術面、chips＝分點籌碼主力權證、news＝新聞消息、price＝只問股價、institutional＝三大法人、"
                   "futures＝台指期、cost＝自己的成本持股、compare＝比較、members＝族群成分股、rank＝排行、score＝明確問分數、spot＝現股分點。\n"
+                  "問句有指定權證分點（券商分點名稱）時，依使用者要的內容改用分點類型，targets 放分點名稱（有股票也放股票）："
+                  "branch_warrants＝這個分點買了哪些權證、權證明細／權證買賣明細／清單／代號、剩餘天數、槓桿、價內外、估算報酬；"
+                  "branch_events＝這個分點的 A～E 事件、什麼時候進場或出場（不是要列權證）；branch_position＝這個分點部位還在嗎、持有或出清；"
+                  "branch_perf＝這個分點的勝率、績效、報酬。沒有指定分點才用 chips。\n"
                   "怎麼看、支撐壓力、快突破了嗎、如何防守，都可屬pattern，不需要使用者說三角。三角由程式資料判定，不由你猜。"
                   "不同股票各問新聞與型態不是比較，不要新增compare或chips；未明確要求include_score填false。"
                   "targets：這項需求的股票名稱／代號或族群名稱；date_range：提到的期間（沒有填空字串）。\n"
@@ -7041,6 +7063,55 @@ class AceQueryEngine:
             # 10-11：需求表排完沒有任何可查項目（例如只剩接不上的族群需求）→ 請使用者補充，不出空白圖卡
             return QueryPlan(route="clarify", clarification="這題的需求暫時無法對應到可查的項目，請補充要看的內容（例如型態、籌碼或所屬族群）。")
         return merged
+
+    def _branch_plan_from_needs(self, parsed: ParsedQuestion, per_stock: Dict[str, Set[str]]) -> Optional[QueryPlan]:
+        """10-14：需求表判斷這題是在問「指定分點」時，走分點流程（權證明細／事件／部位／績效），
+        不再被逐檔股票計畫降成只查股票權證摘要。分點名稱一律以名冊核對過的為準，AI 不能自創分點。"""
+        items = getattr(parsed, "needs_items", [])
+        drop = getattr(parsed, "needs_excluded", set())
+        types = {str(n.get("type")) for n in items}
+        branch_types = types & BRANCH_NEEDS
+        if "warrant" in drop or not (branch_types or "chips" in types) or not self._warrant_entitled():
+            return None
+        stock_names = {x for c, nm in parsed.stocks for x in (c, nm)}
+        for n in items:
+            if str(n.get("type")) not in BRANCH_NEEDS:
+                continue
+            for target in n.get("targets") or []:
+                target = str(target).strip()
+                if not target or target in stock_names or target in parsed.branches:
+                    continue
+                try:
+                    canonical, _ = tools.resolve_branch(target)
+                except Exception:
+                    canonical = ""
+                if canonical and canonical not in parsed.branches:
+                    parsed.branches.append(canonical)
+        if not parsed.branches:
+            return None
+        intents = {"warrant"}
+        if "branch_position" in branch_types:
+            intents.add("position")
+        if "branch_perf" in branch_types:
+            intents |= {"win_rate", "history"}
+        if "branch_events" in branch_types:
+            intents.add("recent_trades")
+        stocks = [(c, nm) for c, nm in parsed.stocks if per_stock.get(c)] or parsed.stocks
+        one = replace(parsed, stocks=stocks[:1], intents=intents, sector=None,
+                      warrant_list=parsed.warrant_list or "branch_warrants" in branch_types)
+        plan = self.router._branch_plan(one, intents & set(CATEGORY_INTENTS), False)
+        plan.need_final_llm = True
+        for code, _ in one.stocks:
+            per_stock.setdefault(code, set()).add("warrant")   # 指定股票的分點題保留 K 線＋分點標註
+        if "pattern" in types and one.stocks and not plan.pattern:
+            self.router._add_pattern(plan, one)      # 「分點權證明細＋型態」：兩件都答
+        for code, want in per_stock.items():
+            if "news" in want:
+                plan.add("get_recent_news", stock_code=code)
+            if "institutional" in want:
+                plan.add("get_institutional_flow", stock_code=code, days=70)
+        self.log(f"🧭 分點需求｜{','.join(parsed.branches)}｜{','.join(sorted(branch_types)) or 'chips'}｜路由={plan.route}")
+        return plan
 
     @staticmethod
     def _sector_context_data(sector: Dict[str, str], codes: List[str]) -> Dict[str, Any]:
@@ -7210,8 +7281,11 @@ class AceQueryEngine:
             # 10-08：自然問句交給 AI 整句解析需求表（取代下方分類呼叫），逐檔依需求重建工具清單
             needs_table = self._parse_needs(question, parsed, stats)
             if needs_table is not None:
+                rule_plan = plan
                 per_stock = self._apply_needs(needs_table, parsed)
-                plan = self._plan_from_needs(parsed, per_stock, stats)
+                # 分點題先看分點需求；只有分點、AI 又沒讀出分點動作時，保留原本的分點規則計畫
+                plan = (self._branch_plan_from_needs(parsed, per_stock)
+                        or (self._plan_from_needs(parsed, per_stock, stats) if parsed.stocks else rule_plan))
                 needs_table["per_stock"] = {c: sorted(v) for c, v in per_stock.items()}
             else:
                 # 解析失敗：不能照原本可能忽略「不要…」的工具清單執行；改用原分類器（一次）決定主題，最後提示要求只答所問
