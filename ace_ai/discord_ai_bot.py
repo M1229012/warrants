@@ -4452,6 +4452,45 @@ def strip_command_prefix(question: str) -> str:
             return text
         text = cleaned
 
+# 測試版圖片樣式只在入口選擇，不把「海盜」送進資料／AI 的意圖判斷。
+PIRATE_PATTERN_STYLE = "pirate_pattern"
+_pirate_pattern_request = contextvars.ContextVar("ace_pirate_pattern_request", default=False)
+_PIRATE_PATTERN_RE = re.compile(r"海盜\s*型態(?:\s*評分)?")
+
+
+def normalize_image_request(question: str) -> Tuple[str, str]:
+    """海盜型態沿用完整型態評分流程；其他問句保持原樣與原版圖片。"""
+    question = strip_command_prefix(question)
+    if not _PIRATE_PATTERN_RE.search(question):
+        return question, ""
+    return _PIRATE_PATTERN_RE.sub("型態評分", question), PIRATE_PATTERN_STYLE
+
+
+def answer_image_request(engine, question: str, *args, image_style: str = "", **kwargs):
+    """單次海盜型態補完整評分；不改一般型態的三角／評分預設。"""
+    token = _pirate_pattern_request.set(image_style == PIRATE_PATTERN_STYLE)
+    try:
+        return engine.answer(question, *args, **kwargs)
+    finally:
+        _pirate_pattern_request.reset(token)
+
+
+def make_answer_attachment(question: str, text: str, panels=None, *, max_bytes=7_500_000,
+                           image_style: str = ""):
+    """保留普通圖的入口；海盜模組按需載入，避免影響未使用樣式的指令。"""
+    if image_style == PIRATE_PATTERN_STYLE:
+        import pirate_pattern_image
+        return pirate_pattern_image.make_attachment(question, text, panels, max_bytes=max_bytes)
+    return answer_image.make_attachment(question, text, panels, max_bytes=max_bytes)
+
+
+def render_answer_image(question: str, text: str, panels=None, *, image_style: str = ""):
+    """本機 --ask --image-output 與 Discord 使用同一個樣式選擇。"""
+    if image_style == PIRATE_PATTERN_STYLE:
+        import pirate_pattern_image
+        return pirate_pattern_image.render_answer(question, text, panels)
+    return answer_image.render_answer(question, text, panels)
+
 # /ask 的權證 K 線標註版型：event＝編號＋分點明細表（預設），flow＝分點配色圖例（週精選用）。
 # 「是不是只有權值股在動」這類盤面結構問題。
 # 句子同時出現「大盤層級的對象」與「廣度／貢獻的問法」時，一律走盤面結構，不進族群解析。
@@ -5565,6 +5604,8 @@ class AceQueryEngine:
         key = "|".join([member_pattern.VERSION,'現股分點精簡排版v10價格歸屬v1_正式共用修正1011',compact, ",".join(c for c, _ in parsed.stocks), str(parsed.cost_price or ""), ",".join(parsed.branches),
                         "chip=" + parsed.chip,
                         "sector=" + str(sector.get("name") or sector.get("industry") or "") + ":" + str(sector.get("mode") or "")])
+        if _pirate_pattern_request.get():
+            key += "|pirate_pattern_score_v1"
         key = self._access_cache_key(key)
         hit, cached = self._cached_answer(key, partitioned=True)
         if hit:
@@ -7385,7 +7426,7 @@ class AceQueryEngine:
                 if parsed.cost_price is not None:
                     panel["key_levels"]["cost_price"] = parsed.cost_price
                 panel["disable_compare"] = not member_pattern.comparing(plan)
-                if TEST_SHOW_SCORECARD and (not view or member_pattern.wants_score(parsed, plan, code)):
+                if (TEST_SHOW_SCORECARD and (not view or member_pattern.wants_score(parsed, plan, code))) or _pirate_pattern_request.get():
                     # 10-08：正式版還有評分卡，測試版先照正式版顯示，方便比對評分修正；整飾板拿掉時設 0
                     card = self._pattern_scorecard(code, results, parsed.cost_price)
                     with_chips = any(r.name == "get_sheet_stock_chips" and r.ok for r in results)
@@ -8865,7 +8906,7 @@ def run_discord_bot(config: BotConfig) -> None:
     no_mentions = discord.AllowedMentions.none()
     prefix = config.command_prefix.lower()
 
-    async def image_files(question: str, text: str, panels=None, guild=None, weekly=None, *, strict=False):
+    async def image_files(question: str, text: str, panels=None, guild=None, weekly=None, *, strict=False, image_style=""):
         """回傳 discord.File 清單；本週精選會拆成多張（每張最多 3 檔股票）。"""
         limit = min(7_500_000, getattr(guild, "filesize_limit", 7_500_000))
         render_started = asyncio.get_running_loop().time()
@@ -8873,7 +8914,7 @@ def run_discord_bot(config: BotConfig) -> None:
             if weekly:
                 images = await asyncio.to_thread(weekly_image.make_weekly_attachments, question, weekly, panels, max_bytes=limit)
             else:
-                images = [await asyncio.to_thread(answer_image.make_attachment, question, text, panels, max_bytes=limit)]
+                images = [await asyncio.to_thread(make_answer_attachment, question, text, panels, max_bytes=limit, image_style=image_style)]
         except Exception as exc:
             if strict:raise
             print(f"⚠️ 圖片產生失敗：{type(exc).__name__}: {exc}", flush=True)
@@ -8886,13 +8927,13 @@ def run_discord_bot(config: BotConfig) -> None:
             for i, (data, extension) in enumerate(images, 1)
         ]
 
-    def schedule_refresh(original, target, title, guild):
+    def schedule_refresh(original, target, title, guild, *, image_style=""):
         async def make_files(completed):
-            return await image_files(title,with_context_note(completed),panels_with_context(completed),guild,strict=True)
+            return await image_files(title,with_context_note(completed),panels_with_context(completed),guild,strict=True, image_style=image_style)
         return schedule_late_ai_image(engine,original,target,make_files,no_mentions)
 
-    async def reply_image(message, question: str, text: str, panels=None, *, pending=None, weekly=None):
-        files = await image_files(question, text, panels, message.guild, weekly)
+    async def reply_image(message, question: str, text: str, panels=None, *, pending=None, weekly=None, image_style=""):
+        files = await image_files(question, text, panels, message.guild, weekly, image_style=image_style)
         try:
             if pending is not None:
                 try:
@@ -8926,10 +8967,10 @@ def run_discord_bot(config: BotConfig) -> None:
             await interaction.followup.send(content=chunk, ephemeral=ephemeral, allowed_mentions=no_mentions)
 
     async def interaction_image(interaction, question: str, text: str, panels=None, *, ephemeral=False, weekly=None,
-                                followup=False):
+                                followup=False, image_style=""):
         if not interaction.response.is_done():
             await interaction.response.defer(thinking=True, ephemeral=ephemeral)
-        files = await image_files(question, text, panels, interaction.guild, weekly)
+        files = await image_files(question, text, panels, interaction.guild, weekly, image_style=image_style)
         try:
             if followup:
                 return await interaction.followup.send(files=files, ephemeral=ephemeral, allowed_mentions=no_mentions, wait=True)
@@ -9069,6 +9110,7 @@ def run_discord_bot(config: BotConfig) -> None:
         except access_policy.AccessDenied as exc:
             await send_access_denial(interaction, str(exc), exc.required)
             return
+        question, image_style = normalize_image_request(question)
         demo = bool(access.simulation)
         statistics_access[0] = access
         if demo and access.entitlement.general and not access.entitlement.admin:
@@ -9180,8 +9222,8 @@ def run_discord_bot(config: BotConfig) -> None:
                     await send_private("圖片太大", "圖片超過 8MB，請裁切後再上傳。")
                     return
                 image = (await attachment.read(), str(getattr(attachment, "content_type", "") or "image/png"))
-            result = await asyncio.to_thread(engine.answer, question, context_key, on_queue, is_admin, admin_mode, access,
-                                             image=image)
+            result = await asyncio.to_thread(answer_image_request, engine, question, context_key, on_queue, is_admin, admin_mode, access,
+                                             image=image, image_style=image_style)
             if result.denied_feature:
                 await record_member_usage('denied', result.route)
                 hint = chip_channel_hint(config, result.denied_feature, original_entitlement,
@@ -9204,8 +9246,8 @@ def run_discord_bot(config: BotConfig) -> None:
                                        copy=result.route in COPY_TEXT_ROUTES)
             else:
                 sent = await interaction_image(interaction, image_question, with_context_note(result), panels_with_context(result), ephemeral=ephemeral,
-                                        weekly=result.weekly if result.layout == "weekly_pick" else None)
-            schedule_refresh(result,sent,image_question,interaction.guild)
+                                        weekly=result.weekly if result.layout == "weekly_pick" else None, image_style=image_style)
+            schedule_refresh(result,sent,image_question,interaction.guild, image_style=image_style)
             for extra in result.followups:
                 # 「兩種一起看」：第 1 張現股分點籌碼、第 2 張權證分點籌碼，不硬塞成一張超長圖。
                 extra_sent = await interaction_image(interaction, extra.image_title or question, with_context_note(extra),
@@ -9311,7 +9353,7 @@ def run_discord_bot(config: BotConfig) -> None:
         await interaction_image(interaction, "額度管理", text, panels, ephemeral=True)
 
     @client.tree.command(name=config.slash_command_name, description="艾斯 AI：問股票型態、技術面、權證分點與新聞")
-    @app_commands.describe(question="例如：2330現在型態好嗎／記憶體族群誰型態最好／2330最近有什麼新聞")
+    @app_commands.describe(question="例如：2344海盜型態／2330現在型態好嗎／2330最近有什麼新聞")
     async def ask_command(interaction: "discord.Interaction", question: str) -> None:
         await handle_question(interaction, question, admin_mode=False)
 
@@ -9402,6 +9444,7 @@ def run_discord_bot(config: BotConfig) -> None:
             return
         access, question = access_policy.resolve_access(message.author, config.superuser_ids, question,
                                                        beta_ids=config.beta_tester_ids)
+        question, image_style = normalize_image_request(question)
         try:
             access_policy.require_question(access, question, tools.get_cached_known_branches())
         except access_policy.AccessDenied as exc:
@@ -9417,7 +9460,7 @@ def run_discord_bot(config: BotConfig) -> None:
                 pending = await reply_image(message, question, WEEKLY_PICK_ACK)
             async with message.channel.typing():
                 context_key = f"{message.guild.id if message.guild else 0}:{channel_id}:{user_id}"
-                result = await asyncio.to_thread(engine.answer, question, context_key, None, False, False, access)
+                result = await asyncio.to_thread(answer_image_request, engine, question, context_key, None, False, False, access, image_style=image_style)
             if result.denied_feature:
                 await message.author.send(result.text + ("\n" + access_policy.UNLOCK_URL if result.denied_feature == "WARRANT" else ""))
                 return
@@ -9426,8 +9469,8 @@ def run_discord_bot(config: BotConfig) -> None:
             upload_started = asyncio.get_running_loop().time()
             render_seconds.set(0.0)
             sent = await reply_image(message, image_question, with_context_note(result), result.panels, pending=pending,
-                              weekly=result.weekly if result.layout == "weekly_pick" else None)
-            schedule_refresh(result,sent,image_question,message.guild)
+                              weekly=result.weekly if result.layout == "weekly_pick" else None, image_style=image_style)
+            schedule_refresh(result,sent,image_question,message.guild, image_style=image_style)
             upload_elapsed = asyncio.get_running_loop().time() - upload_started
             total_elapsed = asyncio.get_running_loop().time() - request_started
             render_elapsed = render_seconds.get()
@@ -9474,7 +9517,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
     if args.plan:
         engine = AceQueryEngine(config)
-        parsed, plan, stats = engine.plan_only(args.plan)
+        plan_question, _ = normalize_image_request(args.plan)
+        parsed, plan, stats = engine.plan_only(plan_question)
         print(json.dumps({
             "parsed": parsed.summary(),
             "route": plan.route,
@@ -9487,16 +9531,17 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         return
     if args.ask:
         engine = AceQueryEngine(config)
-        result = engine.answer(args.ask)
+        question, image_style = normalize_image_request(args.ask)
+        result = answer_image_request(engine, question, image_style=image_style)
         if args.image_output:
             if result.layout == "weekly_pick":
                 base, ext = os.path.splitext(args.image_output)
-                for i, image in enumerate(weekly_image.render_weekly_pages(args.ask, result.weekly, result.panels), 1):
+                for i, image in enumerate(weekly_image.render_weekly_pages(question, result.weekly, result.panels), 1):
                     path = f"{base}-{i}{ext or '.png'}"
                     image.save(path)
                     print(f"圖片已儲存：{path}")
             else:
-                answer_image.render_answer(args.ask, result.text, result.panels).save(args.image_output)
+                render_answer_image(question, result.text, result.panels, image_style=image_style).save(args.image_output)
                 print(f"圖片已儲存：{args.image_output}")
         print("=" * 60)
         for index, chunk in enumerate(split_discord_message(result.text, config.max_message_chars), 1):

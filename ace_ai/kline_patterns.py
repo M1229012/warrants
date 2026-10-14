@@ -1587,12 +1587,16 @@ def _user_triangle(df, atr_prev, end, state=None, out_state=None, replay_days=No
         records.append({"snap": snap, "recognized": X, "reconstructed_at": run_day if reconstructed else None,
                         "detected_on": None if reconstructed else run_day})
 
+    def at_tip(snap, X):                          # 10-14：X 日兩線寬度 ≤8% 開口（同形成時的尖端門檻）
+        u, d = snap["u"], snap["d"]
+        return (u["s"] - d["s"]) * X + u["k"] - d["k"] <= TRI_TIP_BREAK * (snap.get("w0") or 0)
+
     def expired(r, X):                            # 1) 追蹤結束：辨識後超過 TRI_TRACK_DAYS、兩線已交會，或已收斂到尖端
         u, d = r["snap"]["u"], r["snap"]["d"]
         width = (u["s"] - d["s"]) * X + u["k"] - d["k"]
         if X - r["recognized"] > TRI_TRACK_DAYS:
             return "追蹤期滿"
-        if width <= TRI_TIP_BREAK * (r["snap"].get("w0") or 0):   # 10-14：寬度 <8% 開口（同形成時的尖端門檻）＝三角已結束
+        if at_tip(r["snap"], X):                  # 10-14：已收斂到尖端＝三角已結束
             return "已到尖端"
         return None
 
@@ -1695,6 +1699,8 @@ def _user_triangle(df, atr_prev, end, state=None, out_state=None, replay_days=No
                 continue
             F = X - 1
             pick = form(F)
+            if pick is not None and at_tip(pick, X):
+                pick = None                       # 10-14：昨天合格、今天已到尖端
             if pick is None or pick.get("candidate"):
                 cpick = pick or form(F, False) or form(F, True, True)   # 10-11：候選三角越線也記錄，越線後照樣畫
                 if cpick is not None and active_record()[0] is None and beyond(cpick, X):
@@ -1722,7 +1728,10 @@ def _user_triangle(df, atr_prev, end, state=None, out_state=None, replay_days=No
                 add_record(formation, X)
             formation = None
         F = X - 1
-        pick = form(F)                            # 10-08 提速：候選／補充候選必為 candidate、不建紀錄，歷史日不必搜尋（結果相同）
+        pick = form(F)
+        if pick is not None and at_tip(pick, X):
+            pick = None                           # 10-14：昨天合格、今天已到尖端
+        # 10-08 提速：候選／補充候選必為 candidate、不建紀錄，歷史日不必搜尋（結果相同）
         if pick is None or pick.get("candidate"):
             continue
         primary, held = active_record()
@@ -1736,14 +1745,15 @@ def _user_triangle(df, atr_prev, end, state=None, out_state=None, replay_days=No
         elif TRI_SELECTION_MODE == "balanced-v1":
             formation = pick   # Save evidence for a later break, without freezing unbroken daily selection.
     if lock_mode:
-        shown += [dict(r, reason="追蹤期滿") for r in records if expired(r, end)]
+        shown += [dict(r, reason=expired(r, end)) for r in records if expired(r, end)]
         shown = [r for r in shown if end - r["recognized"] <= TRI_SHOW_DAYS]
     records = [r for r in records if not expired(r, end)]
     held_records = [r for r in held_records if not expired(held_snap(r), end)]
     # 追蹤結束：超過 TRI_TRACK_DAYS 或已過交會點
     tracks = {id(r): _tri_track(df, C, A, r["snap"], end) for r in records}
     live = list(records)
-    pick = form(last) or form(last, False) or (None if live or held_records else form(last, True, True))
+    pick = next((p for p in (form(last), form(last, False), None if live or held_records else form(last, True, True))
+                 if p is not None and not at_tip(p, end)), None)   # 10-14：今天已到尖端的線不當主圖
     primary, held = active_record()
     if (TRI_SELECTION_MODE == "balanced-v1" and pick is not None and not pick.get("candidate") and not outside(pick, end)
             and (primary is None or new_consolidation(pick, primary, held, end))):
@@ -1794,10 +1804,10 @@ def _user_triangle(df, atr_prev, end, state=None, out_state=None, replay_days=No
         source = "越線紀錄" if not held else "越線紀錄（窗口外）"
         own = None if held else primary
         main = None if held else primary["snap"]   # 先用仍在追蹤的正式紀錄；窗口不足只保留、不誤畫替代線
-    elif (lock_mode and shown and not records and pick is None
+    elif (lock_mode and shown and not records and pick is None and shown[-1].get("reason") != "已到尖端"   # 10-14：尖端結束的不再回退成主圖
           and (shown[-1]["snap"]["u"]["s"]-shown[-1]["snap"]["d"]["s"])*end + shown[-1]["snap"]["u"]["k"]-shown[-1]["snap"]["d"]["k"] > 0):
         own = shown[-1]                           # 10-11：越線已超過追蹤期，仍畫到越線日移出 70 根圖
-        main, source = own["snap"], "歷史越線（" + (own["reason"] if str(own.get("reason") or "").startswith("失敗") else "超過追蹤期") + "）"
+        main, source = own["snap"], "歷史越線（" + (own["reason"] if str(own.get("reason") or "").startswith("失敗") or own.get("reason") == "已到尖端" else "超過追蹤期") + "）"
     elif pick is not None:
         main, source = pick, ("候選" if pick.get("candidate") else "正式（觀察中，未鎖）")
     else:                                         # 今天沒有形成型態：只用保留期限內、仍在追蹤的已突破型態
@@ -1953,7 +1963,8 @@ def _user_triangle(df, atr_prev, end, state=None, out_state=None, replay_days=No
             "upper": (u["s"], u["k"]), "lower": (d["s"], d["k"]),
             "anchors": {"upper": u["a"], "lower": d["a"]}, "state": state_txt, "pos": compat,
             "current_position": "unknown" if tr["crossed"] else posn, "history": [] if cand else tr["history"],
-            "failed": tr["reversed"] and tr["breaks"][-1]["type"] != tr["breaks"][0]["type"] and not cand,   # 10-14：反覆後回原方向不算失敗 "pending": bool(breaks) and posn == "inside" and not tr["crossed"],
+            "failed": tr["reversed"] and tr["breaks"][-1]["type"] != tr["breaks"][0]["type"] and not cand,
+            "pending": bool(breaks) and posn == "inside" and not tr["crossed"],   # 10-14：failed＝反覆後回原方向不算失敗
             "first_break": breaks[0] if breaks else None, "first_bday": breaks[0]["idx"] if breaks else None,
             "bday": breaks[-1]["idx"] if breaks else None, "eval": F, "text": text, "gap": None,
             "start": main["start"], "joint_start": main["joint"], "near_tip": main["near_tip"],
