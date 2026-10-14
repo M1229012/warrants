@@ -1587,9 +1587,14 @@ def _user_triangle(df, atr_prev, end, state=None, out_state=None, replay_days=No
         records.append({"snap": snap, "recognized": X, "reconstructed_at": run_day if reconstructed else None,
                         "detected_on": None if reconstructed else run_day})
 
-    def expired(r, X):                            # 1) 追蹤結束：辨識後超過 TRI_TRACK_DAYS，或兩線在 X 日前已交會
+    def expired(r, X):                            # 1) 追蹤結束：辨識後超過 TRI_TRACK_DAYS、兩線已交會，或已收斂到尖端
         u, d = r["snap"]["u"], r["snap"]["d"]
-        return X - r["recognized"] > TRI_TRACK_DAYS or (u["s"] - d["s"]) * X + u["k"] - d["k"] <= 0
+        width = (u["s"] - d["s"]) * X + u["k"] - d["k"]
+        if X - r["recognized"] > TRI_TRACK_DAYS:
+            return "追蹤期滿"
+        if width <= TRI_TIP_BREAK * (r["snap"].get("w0") or 0):   # 10-14：寬度 <8% 開口（同形成時的尖端門檻）＝三角已結束
+            return "已到尖端"
+        return None
 
     def beyond(snap, X):                          # 收盤越過固定線（不受追蹤天數限制）
         u, d = snap["u"], snap["d"]
@@ -1668,7 +1673,7 @@ def _user_triangle(df, atr_prev, end, state=None, out_state=None, replay_days=No
         check_budget()
         held_records = [r for r in held_records if not expired(held_snap(r), X)]
         if lock_mode:                              # 10-11：追蹤期滿的越線紀錄移到「只顯示」清單，不再決定主型態
-            shown += [dict(r, reason="追蹤期滿") for r in records if expired(r, X)]
+            shown += [dict(r, reason=expired(r, X)) for r in records if expired(r, X)]
         records = [r for r in records if not expired(r, X)]   # 每天先清過期紀錄，再判斷新突破（逐日＝一次補算）
         if lock_mode:                             # 10-12 C：失敗（反向越線／回內持續）才移到歷史；原線、日期保留
             for r in list(records):
