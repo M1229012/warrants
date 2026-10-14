@@ -113,17 +113,12 @@ def _wrap(text, width, size=25, kind='body'):
 
 
 def _fit(text, width, sizes, max_lines, kind='body'):
-    """Largest size whose wrap fits max_lines; the last size ellipsizes."""
-    for size in sizes:
+    """Largest size whose wrap fits max_lines. Text is never cut or ellipsized:
+    past the listed sizes it keeps shrinking, and at the floor returns every line."""
+    for size in list(sizes) + list(range(int(sizes[-1]) - 1, 11, -1)):
         lines = _wrap(text, width, size, kind)
         if len(lines) <= max_lines:
             return lines, size
-    f = font(size, kind)
-    lines = lines[:max_lines]
-    last = lines[-1]
-    while last and f.getlength(last + '…') > width:
-        last = last[:-1]
-    lines[-1] = last.rstrip('，、；： ') + '…'
     return lines, size
 
 
@@ -283,14 +278,39 @@ def _component_notes(card):
 
 
 def _short_note(text, width, size=21):
-    """Key point only: drop（…）asides first, then later clauses, before any ellipsis."""
+    """Key point only, never cut: drop（…）asides, then 「A＋B＋C」 name chains
+    (「最近支撐 最大量區上緣＋MA10 在下方 8.1%」→「最近支撐在下方 8.1%」),
+    then later clauses; only then shrink the font."""
     text = re.sub(r'（[^（）]*）', '', text).strip()
-    for candidate in (text, re.split('[，；]', text)[0]):
+    chainless = re.sub(r'\s*[^\s，；]+(?:＋[^\s，；]+)+\s*', '', text).strip()
+    candidates = [text, chainless, re.split('[，；]', chainless)[0]]
+    for candidate in candidates:
         for s in (size, size - 2):
-            if font(s).getlength(candidate) <= width:
+            if candidate and font(s).getlength(candidate) <= width:
                 return candidate, s
-    lines, size = _fit(candidate, width, (size - 2,), 1)
+    lines, size = _fit(candidates[-1] or text, width, (size - 3,), 1)
     return lines[0], size
+
+
+def _deduction_rows(card, close):
+    """明日扣抵（以今日收盤推估）：預估＝MA＋(收盤−明日扣抵價)÷N；失敗值＝明日扣抵價
+    （明天收盤越過它，均線方向就翻轉）；漲跌停都翻不過去時失敗值記 X。"""
+    rows = []
+    for key in ('MA5', 'MA10', 'MA20', 'MA60'):
+        info = (card.get('ma_deduction') or {}).get(key)
+        if not isinstance(info, dict) or close is None:
+            continue
+        ma, fail = _finite(info.get('value')), _finite(info.get('next_deduction_price'))
+        if ma is None or fail is None or fail <= 0:
+            continue
+        estimate = ma + (close - fail) / int(key[2:])
+        direction = '上' if estimate > ma else '下' if estimate < ma else '平'
+        proof = info.get('limit_proof')
+        if proof is None:   # older cache: ±10% approximation of the price limit
+            proof = '跌停也續揚' if fail < close*.9 else '漲停也續彎' if fail > close*1.1 else ''
+        rows.append(dict(key=key, estimate=estimate, direction=direction, fail=fail,
+                         locked=proof in ('跌停也續揚', '漲停也續彎')))
+    return rows
 
 
 class Page:
@@ -472,8 +492,8 @@ class Page:
         d.line((L+26, 96, R-26, 96), fill='#C7AC7F')
         tw = R - L - 52
         head, size = _fit(headline, tw, (28, 26), 2, 'bold')
-        if head[-1].endswith('…'):
-            head, size = _fit(headline, tw, (24,), 3, 'bold')
+        if size < 26:
+            head, size = _fit(headline, tw, (24, 23, 22), 3, 'bold')
         head_h = len(head)*(size+12)
         gap = 22
         width = (R - L - gap) // 2 if len(scenarios) > 1 else R - L
@@ -575,21 +595,79 @@ class Page:
         for i,line in enumerate(_wrap(grade or '',184,23,'bold')[:2]):
             self.text(im,cx,cy+112+i*30,line,23,'bold',_tone(grade) if score is not None else MUTED,'mm')
 
+    def deduction_log(self, im, y, close, rows):
+        """Ship's-log style: wax seal per MA, tomorrow's estimate with a bow arrow,
+        and a tied cargo tag for the fail value (treasure-map X when locked)."""
+        d = ImageDraw.Draw(im)
+        t = self.text
+        lead = '依今日收盤 '
+        t(im, 140, y+14, lead, 22, 'serif', GOLD, 'lm')
+        x = 140 + font(22, 'serif').getlength(lead)
+        t(im, x, y+15, _number(close), 23, 'num', INK, 'lm')
+        x += font(23, 'num').getlength(_number(close))
+        t(im, x, y+14, ' 推估明日', 22, 'serif', GOLD, 'lm')
+        t(im, 172, y+50, '均線', 18, 'serif', MUTED, 'mm')
+        t(im, 216, y+50, '明日預估', 18, 'serif', MUTED, 'lm')
+        t(im, 490, y+50, '失敗值', 18, 'serif', MUTED, 'mm')
+        self.rope(d, 140, 576, y+66)
+        m = y + 70 + 27
+        for i, row in enumerate(rows):
+            color = UP if row['direction'] == '上' else DOWN if row['direction'] == '下' else GOLD
+            wax = {'上': '#A23B2F', '下': '#2F6B55'}.get(row['direction'], '#9C7A48')
+            for k in range(10):   # uneven wax rim
+                a = math.radians(k*36 + 9)
+                bx, by = 172 + math.cos(a)*20, m + math.sin(a)*20
+                d.ellipse((bx-5, by-5, bx+5, by+5), fill=wax)
+            d.ellipse((150, m-22, 194, m+22), fill=wax)
+            d.ellipse((155, m-17, 189, m+17), outline='#E9C9A0')
+            # Seal carries the period only (5/10/20/60); 「均線」 heads the column.
+            t(im, 172, m+1, row['key'][2:], 25, 'pirate', '#FFF3DD', 'mm')
+            value = f"{row['estimate']:,.2f}"
+            t(im, 216, m, value, 25, 'num', INK, 'lm')
+            ax = 216 + font(25, 'num').getlength(value) + 18
+            if row['direction'] == '上':
+                d.polygon([(ax-8, m+7), (ax+8, m+7), (ax, m-9)], fill=color)
+            elif row['direction'] == '下':
+                d.polygon([(ax-8, m-7), (ax+8, m-7), (ax, m+9)], fill=color)
+            else:
+                d.line((ax-8, m, ax+8, m), fill=color, width=3)
+            # Cargo tag: notched left end, eyelet and a short twine.
+            d.line((392, m-14, 412, m), fill='#9C7A48', width=2)
+            d.polygon([(404, m), (418, m-18), (576, m-18), (576, m+18), (418, m+18)],
+                      fill='#F3E3C0', outline='#9C7A48')
+            d.ellipse((413, m-3, 419, m+3), fill='#FFF7E9', outline='#9C7A48')
+            if row['locked']:
+                # Treasure-map X: two brush strokes with round ends.
+                for (x0, y0, x1, y1) in ((485, m-11, 509, m+11), (509, m-11, 485, m+11)):
+                    d.line((x0, y0, x1, y1), fill=color, width=6)
+                    for ex, ey in ((x0, y0), (x1, y1)):
+                        d.ellipse((ex-3, ey-3, ex+3, ey+3), fill=color)
+            else:
+                text = _number(row['fail'])
+                size = 23
+                while size > 16 and font(size, 'num').getlength(text) > 140:
+                    size -= 1
+                t(im, 497, m, text, size, 'num', INK, 'mm')
+            if i < len(rows) - 1:
+                self.rope(d, 140, 576, m+27)
+            m += 54
+        note, nsize = _fit('明天收盤越過失敗值，均線就轉向；X＝漲跌停也不轉向', 436, (18, 17, 16), 1)
+        t(im, 140, m - 27 + 22, note[0], nsize, 'body', MUTED, 'lm')
+
+    @staticmethod
+    def rope(d, x0, x1, y):
+        """Dotted twine with knots every 72px."""
+        for x in range(x0, x1, 8):
+            d.line((x, y, x+4, y), fill='#C7AC86', width=2)
+        for x in range(x0 + 36, x1, 72):
+            d.ellipse((x-3, y-3, x+3, y+3), fill='#B79A68')
+
     def prices(self, panel):
         rows, close = _levels(panel), _finite(panel['bars'][-1].get('Close'))
         plans = [(_wrap(row['name'],190,25),row) for row in rows]
         card = panel.get('scorecard') or panel.get('key_levels') or {}
-        deduction = []
-        for key in ('MA5', 'MA10', 'MA20', 'MA60'):
-            info = (card.get('ma_deduction') or {}).get(key)
-            if isinstance(info, dict):
-                text = _chart_renderer().public_ma_condition(info)
-                deduction.append((key, text[2:].strip() if text.startswith('明天') else text, info))
-        above = [r for r in rows if r['kind'] == '壓力']
-        below = [r for r in rows if r['kind'] == '支撐']
-        span = (f'最近壓力與支撐相距 {(above[0]["price"]/below[0]["price"]-1)*100:.2f}%'
-                if above and below else '')
-        left_h = 96 + len(deduction)*40 + (46 if span else 0) + 26
+        deduction = _deduction_rows(card, close)
+        left_h = 92 + 70 + len(deduction)*54 + 64
         table_h = 116 + sum(max(45,len(lines)*32+12) for lines,row in plans) + 26
         height = max(380, left_h, table_h)
         im = self.band(1578,1840,height)
@@ -598,23 +676,10 @@ class Page:
         self.protect(im,(628,20,1328,height-20),130)
         self.text(im,140,31,'04  關鍵價位與技術明細',32,'serif')
         d=ImageDraw.Draw(im)
-        # Left: tomorrow's MA deduction conditions (price conditions only).
-        y = 96
         if deduction:
-            self.text(im,140,y-6,'明日扣抵條件',24,'serif',GOLD)
-            d.line((140,y+30,576,y+30),fill='#C7AC86')
-            y += 44
-            for key, text, info in deduction:
-                color = UP if info.get('direction_now') == '上揚' else MUTED
-                self.text(im,140,y+16,key,23,'num',INK,'lm')
-                line, size = _fit(text, 576-232, (23, 21), 1)
-                self.text(im,232,y+16,line[0],size,'body',color,'lm')
-                y += 40
-        if span:
-            d.line((140,y+8,576,y+8),fill='#D4BF9F')
-            self.text(im,140,y+30,span,22,'body',MUTED,'lm')
-        elif not deduction:
-            self.text(im,140,y,'本次未取得扣抵條件。',23,'body',MUTED)
+            self.deduction_log(im, 92, close, deduction)
+        else:
+            self.text(im,140,100,'本次未取得扣抵資料。',23,'body',MUTED)
         # Right: nearest levels, columns anchored inside the 628–1328 paper.
         for x,label,anchor in [(664,'類型','lt'),(790,'名稱','lt'),(1120,'價位','rt'),(1296,'距現價','rt')]:
             self.text(im,x,74,label,25,'bold',MUTED,anchor)
