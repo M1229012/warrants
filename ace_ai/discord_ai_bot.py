@@ -1318,7 +1318,7 @@ def branch_store_warrant_sections(d: Dict[str, Any]) -> List[Dict[str, Any]]:
         {"label": "權證檔數", "value": f"{h.get('warrant_count', d.get('warrant_count', 0)):,} 檔", "tone": "ink"},
         {"label": "買進時天期", "value": f"{tenor:.0f} 天" if tenor is not None else "-", "tone": "ink"},
         {"label": "買進時價內外", "value": (f"{'價內' if money >= 0 else '價外'} {abs(money):.0f}%") if money is not None else "-", "tone": "ink"},
-        {"label": "估算槓桿", "value": f"{lev:.1f} 倍" if lev is not None else "-", "tone": "accent"}]})
+        {"label": "買進時估算槓桿", "value": f"{lev:.1f} 倍" if lev is not None else "-", "tone": "accent"}]})
     for group in (d.get("groups") or [])[:3]:
         remaining = group.get("remaining_text") or ""
         head = [group["label"], group.get("event_codes") or "", remaining if remaining in ("已全部賣出", "持有中") else f"剩 {remaining}"]
@@ -2827,11 +2827,16 @@ FINAL_SPOT_BRANCH_RULES = ("【單一現股分點】get_spot_branch_flow 是某�
 
 FINAL_WARRANT_HABIT_RULES = ("【分點挑權證的習慣】get_branch_warrant_detail 是某個分點近 N 日買進的權證清單，habits 是買進當下的統計"
                              "（權證檔數、天期、價內外、估算槓桿的中位數；資料只含認購，不要談認售），每檔權證另有現在的剩餘張數、剩餘天期、價內外、估算槓桿。"
-                             "解讀這個分點的操作風格：偏好長天期還是短天期、價內還是價外、高槓桿還是低槓桿，代表押波段、押短線或是保守；"
-                             "目前主力部位在哪一檔標的、剩多少；哪些持有中的權證快到期（near_expiry_holdings）要注意時間價值流失。"
-                             "估算槓桿是用歷史波動率推算的估計值，提到時要說「估算」；est_return_pct 是依標的漲跌與時間推算的估算報酬（非實際成交價），提到時要說「估算」。只引用 1～3 個關鍵數字，不要逐檔念清單；"
-                             "不給買賣指令、不預測漲跌。輸出解讀卡時：answer＝先回答本題主要需求；問報酬先說估算報酬及限制，問挑選習慣才說挑權證風格；why 2～3 句；scenarios 給空陣列；"
-                             "summary 一句說接下來要留意什麼。")
+                             "圖上已列出權證代號、張數、天期、價內外、槓桿與估算報酬，不要重抄這些數字或逐檔念清單；文字要解讀這些選擇背後的想法："
+                             "1. 天期×價內外×槓桿合起來代表什麼佈局：例如長天期＋小幅價外＝願意給時間、押中期波段；短天期＋深價外＝押短線急漲、賭性高；價內低槓桿＝保守、接近持股；"
+                             "價外幅度代表到期前標的至少要漲多少才進入價內，可用來說明大戶預期的空間。"
+                             "2. 買進時與現在比較：價外變深代表標的下跌、部位承壓，變淺或轉價內代表方向對了；剩餘天期夠不夠撐到想像的空間。"
+                             "3. 進場方式：是否同一標的分批、多檔、不同發行商，代表分批佈局或集中押注；仍持有未減碼代表還在等。"
+                             "4. 風險：快到期的持有部位（near_expiry_holdings）時間價值流失；槓桿越高，標的小跌時部位損失放大越多。"
+                             "估算槓桿是用歷史波動率推算的估計值，提到時要說「估算」；est_return_pct 是依標的漲跌與時間推算的估算報酬（非實際成交價），提到時要說「估算」。"
+                             "只引用支持推論的 1～3 個關鍵數字；推論寫成「顯示／偏向」，不要斷定大戶真實意圖。"
+                             "不給買賣指令、不預測漲跌。輸出解讀卡時：answer＝先回答本題主要需求（問報酬先說估算報酬及限制，問權證或挑選習慣先用一句話點出佈局風格）；"
+                             "why 3～4 句，依上面 1～4 挑有意義的寫；scenarios 給空陣列；summary 一句說接下來要留意什麼（例如標的離價內還差多少、剩餘天期）。")
 
 
 FINAL_FUTURES_RULES = ("【台指期未平倉】只陳述口數與前一日變化，並說明未平倉含現貨避險部位、不能單獨當多空訊號；不可用它推論明天漲跌，也不可給買賣建議。"
