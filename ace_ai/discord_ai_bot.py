@@ -2767,14 +2767,14 @@ FINAL_SPOT_BRANCH_RULES = ("【單一現股分點】get_spot_branch_flow 是某�
 
 FINAL_WARRANT_HABIT_RULES = ("【分點挑權證的習慣】get_branch_warrant_detail 是某個分點近 N 日買進的權證清單，habits 是買進當下的統計"
                              "（權證檔數、天期、價內外、估算槓桿的中位數；資料只含認購，不要談認售），每檔權證另有現在的剩餘張數、剩餘天期、價內外、估算槓桿。"
-                             "圖上已列出權證代號、張數、天期、價內外、槓桿與估算報酬，不要重抄這些數字或逐檔念清單；文字要解讀這些選擇背後的想法："
+                             "圖上表格已逐檔列出權證代號、名稱、張數、天期、價內外、槓桿與估算報酬，使用者問「買了哪些權證」時表格就是答案；解讀卡任何欄位都不可出現權證代號或權證名稱，也不可用 1. 2. 3. 逐檔列出或重抄表格數字，要比較時用「其中價內那檔／最深價外那檔」這類描述。文字只寫觀察重點，解讀這些選擇背後的想法："
                              "1. 天期×價內外×槓桿合起來代表什麼佈局：例如長天期＋小幅價外＝願意給時間、押中期波段；短天期＋深價外＝押短線急漲、賭性高；價內低槓桿＝保守、接近持股；"
                              "價外幅度代表到期前標的至少要漲多少才進入價內，可用來說明大戶預期的空間。"
                              "2. 買進時與現在比較：價外變深代表標的下跌、部位承壓，變淺或轉價內代表方向對了；剩餘天期夠不夠撐到想像的空間。"
                              "3. 進場方式：是否同一標的分批、多檔、不同發行商，代表分批佈局或集中押注；仍持有未減碼代表還在等。"
                              "4. 風險：快到期的持有部位（near_expiry_holdings）時間價值流失；槓桿越高，標的小跌時部位損失放大越多。"
                              "估算槓桿是用歷史波動率推算的估計值，提到時要說「估算」；est_return_pct 是依標的漲跌與時間推算的估算報酬（非實際成交價），提到時要說「估算」。"
-                             "只引用支持推論的 1～3 個關鍵數字；推論寫成「顯示／偏向」，不要斷定大戶真實意圖。"
+                             "只引用支持推論的 1～3 個關鍵數字；推論寫成「顯示／偏向」，不要斷定大戶真實意圖，也不要寫「看好後市／偏多看好」。"
                              "不給買賣指令、不預測漲跌。輸出解讀卡時：answer＝先回答本題主要需求（問報酬先說估算報酬及限制，問權證或挑選習慣先用一句話點出佈局風格）；"
                              "why 3～4 句，依上面 1～4 挑有意義的寫；scenarios 給空陣列；summary 一句說接下來要留意什麼（例如標的離價內還差多少、剩餘天期）。")
 
@@ -4363,6 +4363,30 @@ _PREDICTION_RE = re.compile(r"(?:有望|可望|將會?|即將)?(?:開啟|展開|
                             r"|可望(?:大漲|噴出|續漲|創高)|多方續攻|空方續殺")
 # 情境短標：結構還沒轉多／轉空前，不用「續攻／續殺」這種字
 _SCENARIO_TITLE_FIX = (("多方續攻", "轉強條件"), ("空方續殺", "轉弱條件"))
+
+
+def drop_warrant_listing(text: str, results) -> str:
+    """10-15：分點權證明細表已逐檔列出權證；解讀文字中提到權證代號／名稱或逐檔條列的句子直接拿掉（不重呼叫 Gemini）。"""
+    keys = set()
+    for r in results or []:
+        if getattr(r, "name", "") == "get_branch_warrant_detail" and r.ok:
+            for group in (r.data or {}).get("groups") or []:
+                for w in group.get("warrants") or []:
+                    keys |= {str(w.get(k) or "").strip() for k in ("warrant_code", "warrant_name")}
+    keys = {k for k in keys if len(k) >= 4}
+    if not keys or not text:
+        return text
+    kept = []
+    for line in str(text).splitlines():
+        if re.match(r"\s*\d+[.、．)]", line) and any(k in line for k in keys):
+            continue                                   # 「1. 雙鴻群益65購01（712421）：…」整行逐檔條列
+        parts = re.split(r"(?<=[。；！？])", line)
+        parts = [p for p in parts if not any(k in p for k in keys)]
+        line = "".join(parts)
+        if re.search(r"(分別是|分別為|如下|包括|包含)[:：]\s*$", line):
+            continue                                   # 只剩引言「目前持有的三檔權證分別是：」
+        kept.append(line)
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(kept)).strip()
 
 
 def drop_directives(text: str) -> str:
@@ -7433,6 +7457,7 @@ class AceQueryEngine:
                 return f"（AI 文字中有內容無法對應到原始資料，這次不附 AI 解讀）\n\n{rule_answer}", False
             for key in ("answer", "why", "summary"):
                 card[key] = drop_directives(card.get(key, ""))
+                card[key] = drop_warrant_listing(card[key], results)
             card["scenarios"] = [dict(x, text=drop_directives(x["text"]), title=drop_directives(fix_scenario_title(x.get("title", ""))))
                                  for x in card.get("scenarios") or []]
             card["scenarios"] = [x for x in card["scenarios"] if x["text"]]
