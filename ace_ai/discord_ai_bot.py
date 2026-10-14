@@ -1956,12 +1956,9 @@ class GeminiResult:
 # 思考程度：3.x 模型用 thinking_level（minimal／low…）、2.5 用 thinking_budget=0；default＝不帶參數
 GEMINI_THINKING = os.getenv("DISCORD_AI_GEMINI_THINKING", "minimal").strip().lower()
 _THINKING_UNSUPPORTED: set = set()
-_GEN_OVERRIDE = threading.local()   # 10-13 型態驗證 AI 畫線：指定模型鏈、開思考、放寬單次逾時（只在該次呼叫的執行緒有效）
 
 
 def _thinking_config(model: str) -> Optional[Dict[str, Any]]:
-    if getattr(_GEN_OVERRIDE, "think", False):
-        return None                               # 模型預設思考（2.5-flash 動態思考）
     if GEMINI_THINKING in ("", "default") or model in _THINKING_UNSUPPORTED:
         return None
     if re.match(r"gemini-2\.5-(flash|flash-lite)\b", model):
@@ -2309,16 +2306,12 @@ class GeminiGateway:
         return result
 
     def generate_with_image(self, prompt: str, image: bytes, mime_type: str, purpose: str,
-                            schema: Optional[Dict[str, Any]] = None, models: Optional[List[str]] = None) -> GeminiResult:
-        """圖片＋文字（例如讀截圖裡的股票清單）；同一套模型鏈、金鑰輪流與總時限。models＝指定模型鏈並開思考。"""
+                            schema: Optional[Dict[str, Any]] = None) -> GeminiResult:
+        """圖片＋文字（例如讀截圖裡的股票清單）；同一套模型鏈、金鑰輪流與總時限。"""
         def work(deadline: float) -> GeminiResult:
             from google.genai import types as genai_types
             contents = [genai_types.Part.from_bytes(data=image, mime_type=mime_type), prompt]
-            _GEN_OVERRIDE.models, _GEN_OVERRIDE.think = models, bool(models)
-            try:
-                return self._generate(prompt, purpose, schema, 0.0, deadline, contents=contents)
-            finally:
-                _GEN_OVERRIDE.models, _GEN_OVERRIDE.think = None, False
+            return self._generate(prompt, purpose, schema, 0.0, deadline, contents=contents)
         return self._run_with_deadline(purpose, work)
 
     @staticmethod
@@ -2364,7 +2357,7 @@ class GeminiGateway:
         if 0 < recovery <= 16 and (not deadline or time.monotonic() + recovery + 1 < deadline):
             self.log(f"Gemini 模型忙碌，等待恢復｜{recovery:.1f}s｜用途={purpose}")
             time.sleep(recovery + .05)
-        for rank, model in enumerate(getattr(_GEN_OVERRIDE, "models", None) or GEMINI_MODEL_CHAIN):
+        for rank, model in enumerate(GEMINI_MODEL_CHAIN):
             if not self.quota.model_ready(model):
                 continue
             overload_retried = False
@@ -2386,8 +2379,7 @@ class GeminiGateway:
                         if left is not None and left < GEMINI_MIN_CALL_SECONDS:
                             raise TimeoutError("Gemini 等名額後剩餘時間不足")
                         __import__("request_runtime").check_budget(IMAGE_RESERVE_SECONDS)
-                        cap_ms = 60000 if getattr(_GEN_OVERRIDE, "think", False) else GEMINI_CALL_TIMEOUT_MS
-                        call_ms = cap_ms if left is None else int(max(10000, min(cap_ms, (left - 1.0) * 1000)))   # 10-13：Gemini API 最短只收 10 秒，低於會直接 400
+                        call_ms = GEMINI_CALL_TIMEOUT_MS if left is None else int(max(10000, min(GEMINI_CALL_TIMEOUT_MS, (left - 1.0) * 1000)))   # 10-13：Gemini API 最短只收 10 秒，低於會直接 400
                         response = self._call_once(kf, keys[key], model, contents, config, call_ms)
                     finally:
                         self._slots.release()
@@ -2455,6 +2447,7 @@ FINAL_BASE_PROMPT = """你是「艾斯助手｜喬巴」。你的回答要像熟
 
 FINAL_TECH_RULES = """技術面規則：
 - 盤中（triangle_structure 有 live_position）：三角的 state／事件是 state_basis 那天收盤的結果；現在位置一律看 live_position 與 live_close：above_upper 寫「盤中暫時站上上緣 upper_price，需收盤確認才算突破」，below_lower 寫「盤中暫時跌破下緣 lower_price，需收盤確認」，inside 寫「盤中仍在三角內」；不可把昨收狀態當成現在位置，也不可在 live_position 在線外時還寫「仍在三角內」。
+- triangle_structure.line_recoveries 是已移入歷史的原線事件（不是今天的越線）：side=lower 且 recovered_date 有值＝該日收盤收復 break_date 跌破的原下緣（破底翻）；side=upper＝跌回原上緣（假突破）；today=站回待確認 只能說待確認。同一波多條原線合成一句、照日期寫，不可說成突破目前上緣，也不可把原線價位當成目前支撐壓力（目前支撐壓力看 upper_price／lower_price）。
 - 先跌破下緣、之後改向上突破上緣叫「破底翻」；先突破上緣、之後改跌破下緣叫「突破失敗後轉弱」；不可寫「反向突破」，兩次事件的日期與方向分開寫。
 - 盤中 volume_trend 是截至昨收的量能，不含今天；今天量能只能看 intraday_volume_estimate，沒有就不評論今天量能，不可拿盤中累計量說量縮。
 - 訊號狀態分三種，不可混用：「收盤確認」＝signal_status、型態評分、布林與均線訊號（都用最後一根已收盤 K 棒）；「盤中暫時」＝intraday_observation.changes，一定要寫「盤中暫時…，尚待收盤確認」，不可說成已突破、已站穩；「資料不足」＝欄位為 null 或寫資料不足，要說「目前無法確認」，不可當成沒有訊號。
@@ -6340,15 +6333,7 @@ class AceQueryEngine:
             try:
                 __import__("request_runtime").check_budget(IMAGE_RESERVE_SECONDS)
                 panel = kline_debug.load_panel(code)
-                note = "未使用 AI 畫線。"
-                if re.search(r"AI\s*畫線|gemini", question, re.I):   # 10-13 試驗：Gemini 自己畫三角，疊在驗證圖（桃紅）
-                    prompt, png = kline_debug.ai_draw_request(panel)
-                    drawn = self.gateway.generate_with_image(prompt, png, "image/png", purpose="kline_ai_draw",
-                                                             schema=kline_debug.AI_DRAW_SCHEMA,
-                                                             models=[m.strip() for m in os.getenv("DISCORD_AI_KLINE_DRAW_MODELS", "gemini-2.5-flash,gemini-3.1-flash-lite").split(",") if m.strip()])
-                    ocr_calls += 1
-                    note = kline_debug.apply_ai_lines(panel, json.loads(drawn.text)) if drawn.ok else "Gemini 畫線失敗：" + str(drawn.error)
-                results.append(AnswerResult(text="管理員型態驗證：沿用程式計算結果與價格基準；" + note,
+                results.append(AnswerResult(text="管理員型態驗證：沿用程式計算結果與價格基準；未使用 AI 畫線。",
                                             route="admin_kline_debug", gemini_calls=ocr_calls, elapsed=time.perf_counter()-started,
                                             panels=[panel], cacheable=False, image_title=f"{code}｜型態驗證"))
             except Exception as exc:

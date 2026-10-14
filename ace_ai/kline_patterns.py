@@ -1880,6 +1880,46 @@ def _user_triangle(df, atr_prev, end, state=None, out_state=None, replay_days=No
                                   "first_cross": _d(df.index[r["recognized"]]), "candidate": bool(r["snap"].get("candidate")),
                                   "anchors": {"upper": u_["a"], "lower": d_["a"]}})
         history_lines = history_lines[-TRI_HISTORY_MAX:] if TRI_HISTORY_MAX > 0 else []   # 10-12 使用者：歷史線讓圖變亂，預設不畫
+    # 10-14：「未延續」移入歷史的原線，沿原固定線補收復事件（只輸出事件與文字，不影響主圖、紀錄進出）。
+    # 自原越線辨識日起 TRI_TRACK_DAYS 個交易日，或原兩線交會即停；回到原線內 ≥TRI_OUT ATR＝收復（只記第一次）。
+    line_recoveries = []
+    at = lambda ln, t: ln["s"] * t + ln["k"]
+    for r in shown if lock_mode else []:
+        if r.get("reason") != "未延續":
+            continue
+        u_, d_, b = r["snap"]["u"], r["snap"]["d"], r["recognized"]
+        side = "lower" if C[b] < at(d_, b) else "upper"
+        ln = d_ if side == "lower" else u_
+        hit, tag, stop, last_t = None, None, None, None
+        for t in range(b + 1, min(end, b + TRI_TRACK_DAYS) + 1):
+            if at(u_, t) <= at(d_, t):
+                stop = t
+                break
+            g = ((C[t] - at(ln, t)) if side == "lower" else (at(ln, t) - C[t])) / A[t]
+            tag = "收復" if g >= TRI_OUT else "站回待確認" if g >= 0 else "接近原線" if g >= -TRI_OUT else "線外"
+            last_t = t
+            if tag == "收復" and hit is None:
+                hit = t
+        if last_t is None:
+            continue
+        today = ("原兩線已交會（停止追蹤）" if stop is not None else "追蹤期滿" if end > b + TRI_TRACK_DAYS
+                 else ("已收復" if hit is not None and tag == "收復" else tag))
+        line_recoveries.append({"side": side, "break_date": _d(df.index[b]),
+                                "recovered_date": _d(df.index[hit]) if hit is not None else None,
+                                "line_price": _p(at(ln, hit if hit is not None else last_t)), "today": today,
+                                "_hit": hit})
+    for side, word, name in (("lower", "收復", "跌破的原下緣（破底翻）"), ("upper", "跌回", "突破的原上緣（假突破）")):
+        # 摘要只寫「仍站在原線內、且收復在最近 TRI_BREAK_RECENT 個交易日內」的；交會、期滿、收復後又回到線外的只留結構化欄位
+        got = sorted([x for x in line_recoveries if x["side"] == side and x["_hit"] is not None and x["today"] == "已收復"
+                      and end - x["_hit"] <= TRI_BREAK_RECENT], key=lambda x: x["_hit"])
+        if got:
+            state_txt += (f"；這波{'回升' if side == 'lower' else '回落'}於 {'、'.join(dict.fromkeys(x['recovered_date'] for x in got))}，"
+                          f"先後{word} {'、'.join(x['break_date'] for x in got)} {name}")
+        wait = [x for x in line_recoveries if x["side"] == side and not x["recovered_date"] and x["today"] == "站回待確認"]
+        if wait:
+            state_txt += f"；站回 {'、'.join(x['break_date'] for x in wait)} {name.split('（')[0]}，待確認"
+    for x in line_recoveries:
+        x.pop("_hit")
     others = sorted([x for x in rec_out if not x["is_current"]], key=lambda x: x["_last"])
     if others:                                    # 圖卡只留最近一組歷史型態的最新狀態，其餘見明細
         o = others[-1]
@@ -1916,7 +1956,7 @@ def _user_triangle(df, atr_prev, end, state=None, out_state=None, replay_days=No
             "first_cross": _d(df.index[own["recognized"]]) if own is not None else None,   # 候選與正式共用的首次越線日（Log 用）
             "layer": layer, "event_state": _tri_event_state(tr, H, L, C, A, main, end),
             "history_from": history_from, "history_partial": history_partial,   # 涵蓋起日之前有無越線未知
-            "history_lines": history_lines}
+            "history_lines": history_lines, "line_recoveries": line_recoveries}
 
 
 def triangle_observation(df: pd.DataFrame, tri: Dict[str, Any], day: int, provisional: bool) -> Dict[str, Any]:
@@ -2239,6 +2279,8 @@ def ai_pattern_facts(result: Dict[str, Any], *, data_date: str = "",
                   "is_provisional", "upper_price", "lower_price", "live_position", "live_close", "state_basis")
         out["triangle"] = {k: shape[k] for k in fields if k in shape}
         out["triangle"].update(kind=tri.get("kind"), candidate=bool(tri.get("candidate")))
+        if tri.get("line_recoveries"):            # 10-14：已移入歷史的原線收復／跌回事件（不是今日越線）
+            out["triangle"]["line_recoveries"] = tri["line_recoveries"]
         if day is not None and tri.get("upper") is not None and tri.get("lower") is not None:
             out["triangle"].update(upper_price=_p(_at(tri["upper"], day)),
                                    lower_price=_p(_at(tri["lower"], day)))
