@@ -99,6 +99,7 @@ import market_scan
 import sector_roster
 import local_market_cache
 import spot_chip
+import overnight_habit
 from weekly_pick import is_weekly_pick_question
 
 
@@ -2749,6 +2750,18 @@ FINAL_INDEX_COMPARE_RULES = ("【加權 vs 櫃買】圖上已經有兩邊的 K �
                              "輸出解讀卡時：answer＝結論；why 最多 2 句；scenarios 給空陣列；summary 一句。")
 
 
+FINAL_OVERNIGHT_RULES = ("【隔日沖：給一般投資人看的白話回答】使用者只想知道：今天的買盤是不是隔日沖、是誰、明天要注意什麼。"
+                         "answer 第一句直接下結論並點名分點，例如「今天買最多的凱基-城中、美商高盛都是常做隔日沖的分點，合計買了當天成交量約 15%，明天開盤要留意賣壓」；"
+                         "主要買盤不是這類分點就直接說「今天主要買盤不像隔日沖」。"
+                         "判斷依據（只用於你的推論，不要把名稱寫出來）：overnight.top_buyers 的 habit 有值＝常做隔日沖的分點，volume_pct＝買超占當天成交量%，"
+                         "tier 大量／重押＝買很多；get_spot_event_backtest 的 overnight 有 pairs＝這個分點在這檔曾買完隔天就賣；verify_previous_day reversed＝昨天買的今天已經賣了。"
+                         "why 用 2～3 句白話說：誰買多少（占成交量幾%）、他們通常隔天會賣多少、今天漲停或爆量等狀況，以及明天要看的價位。"
+                         "禁止出現這些詞：隔日反向、反向紀錄、慣性、樣本、rate、pairs、統計涵蓋、資料庫、門檻、checked；不要解釋計算方法。"
+                         "limit_lock＝今天收漲停且這個分點大量買超（疑似鎖漲停買盤，買進成本約在漲停價），這是隔日沖最典型的買法，要優先點出，"
+                         "例如「凱基-城中在漲停價大量鎖單買進約當天成交量 10%」；常做隔日沖又鎖漲停＝明天開盤賣壓風險最高。"
+                         "不要把 est_cost、分點買超日收盤加權參考價或觀察估均價說成分點成本或買進均價（那是多日收盤的估算）。"
+                         "可以說「常做隔日沖」「通常隔天會賣掉大半」。不可說同一分點就是同一個人，不可保證明天一定賣；"
+                         "資料不足時只說「目前看不出明顯的隔日沖買盤」，不要講原因細節。")
 FINAL_SPOT_RULES = ("【現股分點籌碼】get_spot_chip_summary 是券商分點的買賣超（單位：張），不是三大法人，也不是權證分點。"
                     "先回答原句需求：問哪些分點持續買進，依continuity的買超天數與cumulative_buy_top3指認；當日Top5不等於持續買進。使用者用了比喻就自然接住整句，再說具體證據。只有工具提供技術資料時才整合技術面，不為了固定格式杜撰技術結構；只提供現股資料時用最新 Top5 買賣超、近 5／20 日淨集中度與判讀、"
                     "主要累積買超分點、量價加權均價（vwap 欄位；是日收盤×成交量的估算，不是成交金額算的正式 VWAP，要稱「量價加權均價（估）」）與現價差距說明籌碼是否支持目前結構；兩者矛盾要講清楚。"
@@ -2813,6 +2826,8 @@ def build_final_prompt(payload: Dict[str, Any]) -> str:
         sections.append(FINAL_RANK_RULES)
     if "get_spot_chip_summary" in names:
         sections.append(FINAL_SPOT_RULES)
+        if _OVERNIGHT_ASK_RE.search(str(payload.get("question") or "")):
+            sections.append(FINAL_OVERNIGHT_RULES)      # 10-15：問隔日沖用白話規則
     if "get_spot_branch_flow" in names:
         sections.append(FINAL_SPOT_BRANCH_RULES)
     if "get_branch_warrant_detail" in names:
@@ -4229,6 +4244,7 @@ _SECTOR_ROWS_TTL = 1800
 _BRANCH_FOLLOWUP_INTENTS = frozenset({"position", "recent_trades", "warrant", "behavior", "win_rate"})
 # 指代詞（排除「其他」「其它」）：沒有上一題可接時不猜，請使用者給股票。
 # 同時問型態／技術／操作＋籌碼 → 型態分析頁加「籌碼重點」
+_OVERNIGHT_ASK_RE = re.compile(r"隔日[沖衝充]|隔天.{0,4}(?:賣|倒貨|出貨|出場)")
 _PATTERN_WITH_CHIP_RE = re.compile(r"型態|技術|操作|走勢|K線|策略|均線|支撐|壓力")
 # 三大法人：問「怎麼看／分析／搭配技術面」才交給 AI；只問數字（買超多少、近 5 日）直接排版，0 次 Gemini
 # 分點×個股：問「完整／全部／所有／半年／180」時，K 線拉長到涵蓋該分點在這檔的所有事件（最多回推 180 個日曆日）
@@ -5269,6 +5285,9 @@ class AceQueryEngine:
                                               warrant_branch=bool(parsed.branches or parsed.branch_candidates),
                                               # 只有真的追問（沿用上一題的股票／分點）才沿用上一題的籌碼類型
                                               remembered=getattr(remembered, "chip_context", "") if remembered and note else "")
+        if (_OVERNIGHT_ASK_RE.search(question) and parsed.chip not in ("spot", "combined") and parsed.stocks
+                and (access is None or access.entitlement.spot)):
+            parsed.chip = "spot"   # 10-15：問隔日沖＝看現股籌碼頁（顯示不變），AI 解讀再回答有沒有隔日沖可能
         access_policy.require_question(access, question, tools.get_cached_known_branches(), parsed)
         if (_PRONOUN_RE.search(question) and not (parsed.stocks or parsed.branches or parsed.sector)
                 and not parsed.stock_candidates and not parsed.branch_candidates):
@@ -5551,6 +5570,11 @@ class AceQueryEngine:
         # 使用同一份報表解讀，沒有額外抓價或再次抓 70 日；缺資料卡仍走上方備援。
         payload = dict(spot_chip.summary_payload(report), stock_code=code, stock_name=name,
                        continuity=report.get("continuity") or [], history=report.get("history") or [])
+        if _OVERNIGHT_ASK_RE.search(question):
+            try:
+                payload["overnight"] = overnight_habit.check(code, report)
+            except Exception as exc:   # 判斷不出來：照常解讀現股籌碼，AI 依規則說看不出明顯隔日沖
+                self.log(f"隔日沖判斷略過：{type(exc).__name__}: {exc}")
         stats = AnswerStats()
         ai_text, llm_ok = self._compose(question, QueryPlan(route="rule_spot_chip", need_final_llm=True),
                                         [tools.ToolResult("get_spot_chip_summary", True, payload)], stats)
