@@ -5086,8 +5086,8 @@ def module_version_problems() -> List[str]:
             continue
         if name in ("chip_event_backtest", "answer_image"):
             version = getattr(module, "VERSION" if name == "chip_event_backtest" else "CHIP_LAYOUT_VERSION", "未知")
-            if version != "chip-events-year-v10":
-                problems.append(f"{name}.py 版本 {version}，需要 chip-events-year-v10")
+            if version != "chip-events-year-v11":
+                problems.append(f"{name}.py 版本 {version}，需要 chip-events-year-v11")
         missing = [a for a in attrs if not hasattr(module, a)]
         if missing:
             problems.append(f"{name}.py 缺少 {'、'.join(missing)}")
@@ -9183,7 +9183,7 @@ def run_discord_bot(config: BotConfig) -> None:
             # 只上傳部分檔案：新舊版混用，某些功能會在執行時才壞掉（09-27 AI 回答失敗就是這樣）
             notify_admin("❌ 檔案版本不一致，請把 ace_ai 資料夾整批重新上傳：" + "；".join(stale))
         else:
-            print("✅ 必要函式與回測排版版本檢查通過｜chip-events-year-v10", flush=True)
+            print("✅ 必要函式與回測排版版本檢查通過｜chip-events-year-v11", flush=True)
         print("✅ AI晚到補圖｜late-image-v1｜最多再等300秒｜只覆蓋原訊息", flush=True)
         print("✅ 現股AI價格解讀｜price-scope-v1｜全股與分點參考價分開", flush=True)
         print(f"📦 測試排版｜回測={getattr(chip_event_backtest, 'VERSION', '未知')}｜圖片={getattr(answer_image, 'CHIP_LAYOUT_VERSION', '未知')}｜Bot={Path(__file__).resolve()}", flush=True)
