@@ -101,6 +101,7 @@ import market_scan
 import sector_roster
 import local_market_cache
 import spot_chip
+import overnight_habit
 import spot_history
 from weekly_pick import is_weekly_pick_question
 
@@ -390,6 +391,7 @@ class ParsedQuestion:
     chip: str = ""        # 籌碼類型：spot（現股分點）／warrant（權證分點）／combined／""（非籌碼題）
     spot_branch: str = "" # 用現股資料庫分點名單辨識出的分點（和權證分點名單分開）
     spot_combo: bool = False  # 同時問型態＋現股籌碼：型態分析頁加一段精簡「籌碼重點」
+    overnight_ask: bool = False   # 10-15：問隔日沖 → 型態頁帶現股分點＋隔日沖慣性判斷
     unknown_terms: List[str] = field(default_factory=list)   # 沒有對到股票／分點的剩餘字（反問「找不到 X」用）
     branch_leftover: List[str] = field(default_factory=list) # 權證／籌碼題沒對到分點的剩餘字（交給 AI 讀整句判斷）
     warrant_list: bool = False                               # AI 判斷：要列出分點買了哪些權證
@@ -2809,6 +2811,15 @@ FINAL_INDEX_COMPARE_RULES = ("【加權 vs 櫃買】圖上已經有兩邊的 K �
                              "輸出解讀卡時：answer＝結論；why 最多 2 句；scenarios 給空陣列；summary 一句。")
 
 
+FINAL_OVERNIGHT_RULES = ("【隔日沖判斷】使用者問隔日沖：answer 第一句直接回答今日買盤像不像隔日沖。overnight.top_buyers 是最新完整日主要買超分點："
+                         "volume_pct＝淨買超占該股當日成交量的比例（一般上榜分點約 1%，5% 以上 tier＝大量，10% 以上＝重押）；"
+                         "habit 有值＝這個分點在全市場歷史上「大量買超後隔天賣出一半以上」比例高（rate＝反向比例、median_reverse_pct＝通常隔天倒出幾成、"
+                         "heavy_reverse／heavy_checked＝重押時的反向次數、stocks＝跨幾檔股票），即使第一次買這檔也算。"
+                         "habit_share_of_top_buy_pct／habit_share_of_volume_pct＝慣性分點占主要買超／占當日成交量的比例。"
+                         "慣性分點又是大量或重押＝短線隔日賣壓風險高；主要買盤都不是慣性分點＝目前不像隔日沖。可搭配當天漲幅、量能、是否收在高檔說明。"
+                         "verify_previous_day 是前一日慣性分點大量買超後今天有沒有賣（reversed），用來說明已驗證或未驗證。"
+                         "universe_stocks 是統計涵蓋的股票數，要說「依資料庫內 N 檔統計」；day_volume_lots 沒有值時不能說占成交量幾%。"
+                         "不可說同一分點就是同一客戶，不可斷定明天一定賣；unavailable 時說明隔日沖資料暫時無法判斷，再回答型態。")
 FINAL_SPOT_RULES = ("【現股分點籌碼】get_spot_chip_summary 是券商分點的買賣超（單位：張），不是三大法人，也不是權證分點。"
                     "先回答原句需求：問哪些分點持續買進，依continuity的買超天數與cumulative_buy_top3指認；當日Top5不等於持續買進。使用者用了比喻就自然接住整句，再說具體證據。只有工具提供技術資料時才整合技術面，不為了固定格式杜撰技術結構；只提供現股資料時用最新 Top5 買賣超、近 5／20 日淨集中度與判讀、"
                     "主要累積買超分點、量價加權均價（vwap 欄位；是日收盤×成交量的估算，不是成交金額算的正式 VWAP，要稱「量價加權均價（估）」）與現價差距說明籌碼是否支持目前結構；兩者矛盾要講清楚。"
@@ -2887,6 +2898,8 @@ def build_final_prompt(payload: Dict[str, Any]) -> str:
         sections.append(FINAL_SPOT_PRICE_RULES)
     if "get_spot_chip_summary" in names:
         sections.append(FINAL_SPOT_RULES)
+        if any(isinstance(r.get("overnight"), dict) for r in [v for k, v in (payload.get("tool_results") or {}).items() if k.startswith("get_spot_chip_summary")] if isinstance(r, dict)):
+            sections.append(FINAL_OVERNIGHT_RULES)
     if "get_spot_event_backtest" in names:
         sections.append("現股波段統計：使用觀察到的上榜資料，波段累積達規模門檻才成立，次日開盤模擬買進，5/10/20交易日收盤計算。不是實際持股或獲利。主畫面20日，達3%/5%是期末比例，不能把盤中曾達標或漲0.01%算達標。成熟波段少於5笔時使用逐筆紀錄，不拿百分比推論未來。median_return_pct為報酬中位數，median_entry_depth_pct為相對進場價最深跌幅中位數；與worst_drawdown_pct不同，最高漲幅和最深跌幅無先後順序。background為同期間、同進場及排除規則的股價參考，40有效日以下不顯示比例。overnight為本股票本分點的大額買超後隔日反向紀錄：未上榜不是零，不代表同一客戶、真實出場或其他股票也隔日沖；少量配對只陳述事實。estimated_return_pct只是現價相對觀察估均價，非實際損益。沒有margin就省略融資；存在才依實際事件回應，不推論大戶身分。沿用原問句客製回覆與接梗，先回答問題，避免逐行念表；計算方法與例行註解留Log，不在圖片生成免責小字，但資料不足時需用正常文字明確回答。")
     if "get_spot_branch_flow" in names:
@@ -4534,6 +4547,7 @@ _SECTOR_ROWS_TTL = 1800
 _BRANCH_FOLLOWUP_INTENTS = frozenset({"position", "recent_trades", "warrant", "behavior", "win_rate"})
 # 指代詞（排除「其他」「其它」）：沒有上一題可接時不猜，請使用者給股票。
 # 同時問型態／技術／操作＋籌碼 → 型態分析頁加「籌碼重點」
+_OVERNIGHT_ASK_RE = re.compile(r"隔日[沖衝充]|隔天.{0,4}(?:賣|倒貨|出貨|出場)")
 _PATTERN_WITH_CHIP_RE = re.compile(r"型態|技術|操作|走勢|K線|策略|均線|支撐|壓力")
 # 三大法人：問「怎麼看／分析／搭配技術面」才交給 AI；只問數字（買超多少、近 5 日）直接排版，0 次 Gemini
 # 分點×個股：問「完整／全部／所有／半年／180」時，K 線拉長到涵蓋該分點在這檔的所有事件（最多回推 180 個日曆日）
@@ -5631,7 +5645,9 @@ class AceQueryEngine:
                                 elapsed=time.perf_counter() - started)
         if note:
             self.log(f"追問記憶：{note}")
-        if (parsed.chip == "spot" and _PATTERN_WITH_CHIP_RE.search(question)
+        # 10-15：問「隔日沖」且有現股權限：一定帶現股分點，判斷今日買盤是不是隔日沖慣性分點
+        parsed.overnight_ask = bool(_OVERNIGHT_ASK_RE.search(question)) and (access is None or access.entitlement.spot)
+        if (((parsed.chip == "spot" and _PATTERN_WITH_CHIP_RE.search(question)) or parsed.overnight_ask)
                 and any(c not in tools.INDEX_CODES for c, _ in parsed.stocks)):
             # 同時問型態＋現股籌碼：維持型態分析長圖（K 線＋分點回測卡），中間加精簡籌碼重點，AI 同時解讀技術面＋籌碼面。
             access_policy.require_chip(access, "spot")
@@ -5815,7 +5831,17 @@ class AceQueryEngine:
             card = dict(card, sections=[{"type": "badge", "text": f"歷史資料補齊中（已確認 {report.get('available_days')}／{report.get('requested_days')} 日），約 1 分鐘內自動更新本圖"}]
                         + list(card.get("sections") or []))
         return ({"branch_card": card, "hide_text": False,
-                 "footer_suffix": "現股分點為每日前段分點近似統計"}, spot_chip.summary_payload(report))
+                 "footer_suffix": "現股分點為每日前段分點近似統計"}, self._with_overnight(parsed, code, report))
+
+    def _with_overnight(self, parsed, code, report):
+        payload = spot_chip.summary_payload(report)
+        if getattr(parsed, "overnight_ask", False):
+            try:
+                payload["overnight"] = overnight_habit.check(code, report)
+            except Exception as exc:   # 慣性表算不出來：照常回答型態＋籌碼，AI 依規則說明無法判斷
+                self.log(f"隔日沖判斷略過：{type(exc).__name__}: {exc}")
+                payload["overnight"] = {"unavailable": True}
+        return payload
 
     def _answer_warrant_chip(self, parsed: ParsedQuestion, question: str, started: float) -> AnswerResult:
         access_policy.require_chip(self._access(), "warrant")
