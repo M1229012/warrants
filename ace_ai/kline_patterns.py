@@ -1928,15 +1928,18 @@ def _user_triangle(df, atr_prev, end, state=None, out_state=None, replay_days=No
         line_recoveries.append({"side": side, "break_date": _d(df.index[b]),
                                 "recovered_date": _d(df.index[hit]) if hit is not None else None,
                                 "line_price": _p(at(ln, hit if hit is not None else last_t)), "today": today,
-                                "_hit": hit})
-    for side, word, name in (("lower", "收復", "跌破的原下緣（破底翻）"), ("upper", "跌回", "突破的原上緣（假突破）")):
+                                "candidate": bool(r["snap"].get("candidate")), "_hit": hit})   # 10-15：保留候選身分
+    # 10-15：候選線收回只寫「候選下緣／上緣」，不升格成正式三角事件（不寫破底翻／假突破）
+    for side, cand_line, word, name in (("lower", False, "收復", "跌破的原下緣（破底翻）"), ("upper", False, "跌回", "突破的原上緣（假突破）"),
+                                        ("lower", True, "收回", "跌破的候選下緣（候選參考線，非正式三角）"),
+                                        ("upper", True, "跌回", "突破的候選上緣（候選參考線，非正式三角）")):
         # 摘要只寫「仍站在原線內、且收復在最近 TRI_BREAK_RECENT 個交易日內」的；交會、期滿、收復後又回到線外的只留結構化欄位
-        got = sorted([x for x in line_recoveries if x["side"] == side and x["_hit"] is not None and x["today"] == "已收復"
-                      and end - x["_hit"] <= TRI_BREAK_RECENT], key=lambda x: x["_hit"])
+        got = sorted([x for x in line_recoveries if x["side"] == side and x["candidate"] == cand_line and x["_hit"] is not None
+                      and x["today"] == "已收復" and end - x["_hit"] <= TRI_BREAK_RECENT], key=lambda x: x["_hit"])
         if got:
             state_txt += (f"；這波{'回升' if side == 'lower' else '回落'}於 {'、'.join(dict.fromkeys(x['recovered_date'] for x in got))}，"
                           f"先後{word} {'、'.join(x['break_date'] for x in got)} {name}")
-        wait = [x for x in line_recoveries if x["side"] == side and not x["recovered_date"] and x["today"] == "站回待確認"]
+        wait = [x for x in line_recoveries if x["side"] == side and x["candidate"] == cand_line and not x["recovered_date"] and x["today"] == "站回待確認"]
         if wait:
             state_txt += f"；站回 {'、'.join(x['break_date'] for x in wait)} {name.split('（')[0]}，待確認"
     for x in line_recoveries:
@@ -1993,7 +1996,8 @@ def triangle_observation(df: pd.DataFrame, tri: Dict[str, Any], day: int, provis
         state, validity = "past_apex", "not_applicable"     # 已過交會點：不說目前在型態內
     else:
         state = tri["pos"] if cur in ("above", "below") else ("returned_inside" if bday is not None else "inside")
-        validity = "failed" if tri.get("failed") else "pending" if tri.get("pending") else "active"
+        validity = ("historical" if tri.get("layer") == "history"   # 10-15：歷史越線三角回退顯示，不是目前有效三角
+                    else "failed" if tri.get("failed") else "pending" if tri.get("pending") else "active")
     return {"kind": tri["kind"], "candidate": bool(tri.get("candidate")), "candidate_reasons": tri.get("candidate_reasons", []),
             "pattern_events": tri.get("recent_pattern_events", []), "validity": validity,
             "state": state,

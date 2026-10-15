@@ -2467,7 +2467,7 @@ FINAL_BASE_PROMPT = """你是「艾斯助手｜喬巴」。你的回答要像熟
 
 FINAL_TECH_RULES = """技術面規則：
 - 盤中（triangle_structure 有 live_position）：三角的 state／事件是 state_basis 那天收盤的結果；現在位置一律看 live_position 與 live_close：above_upper 寫「盤中暫時站上上緣 upper_price，需收盤確認才算突破」，below_lower 寫「盤中暫時跌破下緣 lower_price，需收盤確認」，inside 寫「盤中仍在三角內」；不可把昨收狀態當成現在位置，也不可在 live_position 在線外時還寫「仍在三角內」。
-- triangle_structure.line_recoveries 是已移入歷史的原線事件（不是今天的越線）：side=lower 且 recovered_date 有值＝該日收盤收復 break_date 跌破的原下緣（破底翻）；side=upper＝跌回原上緣（假突破）；today=站回待確認 只能說待確認。同一波多條原線合成一句、照日期寫，不可說成突破目前上緣，也不可把原線價位當成目前支撐壓力（目前支撐壓力看 upper_price／lower_price）。
+- triangle_structure.line_recoveries 是已移入歷史的原線事件（不是今天的越線）：side=lower 且 recovered_date 有值＝該日收盤收復 break_date 跌破的原下緣（破底翻）；side=upper＝跌回原上緣（假突破）；today=站回待確認 只能說待確認；candidate=true 是候選參考線，只能寫「收回候選下緣／跌回候選上緣」，不可稱破底翻、假突破或正式三角事件。triangle_structure.validity=historical 是歷史越線三角的回退顯示，不是目前有效三角，只能當過去的支撐壓力參考。同一波多條原線合成一句、照日期寫，不可說成突破目前上緣，也不可把原線價位當成目前支撐壓力（目前支撐壓力看 upper_price／lower_price）。
 - 先跌破下緣、之後改向上突破上緣叫「破底翻」；先突破上緣、之後改跌破下緣叫「突破失敗後轉弱」；不可寫「反向突破」，兩次事件的日期與方向分開寫。
 - 盤中 volume_trend 是截至昨收的量能，不含今天；今天量能只能看 intraday_volume_estimate，沒有就不評論今天量能，不可拿盤中累計量說量縮。
 - 訊號狀態分三種，不可混用：「收盤確認」＝signal_status、型態評分、布林與均線訊號（都用最後一根已收盤 K 棒）；「盤中暫時」＝intraday_observation.changes，一定要寫「盤中暫時…，尚待收盤確認」，不可說成已突破、已站穩；「資料不足」＝欄位為 null 或寫資料不足，要說「目前無法確認」，不可當成沒有訊號。
@@ -7831,8 +7831,7 @@ class AceQueryEngine:
                 allow_margin=allow_margin, branch_name=branch_name)
             all_branches=result['spot'].pop('all_branches',result['spot']['branches'])
             if re.search(r'隔日[沖衝充]|隔天.{0,4}(?:賣|倒貨|出貨)',question) and not branch_name:
-                candidates=[b for b in all_branches if b.get('overnight',{}).get('pairs')]
-                result['spot']['branches']=sorted(candidates,key=lambda b:(b['overnight']['pairs'][-1]['sell_date'],abs(b['observed_net_5'])),reverse=True)[:6]
+                # 10-15：不再改成「曾有隔日賣出紀錄」的舊分點；沿用最新一天大買／大賣優先的挑選，隔日沖由徽章與 AI 說明
                 result['spot']['overnight_question']=True
                 try:   # 10-15：全市場常做隔日沖的分點＋今日買超占成交量%，讓 AI 直接點名
                     result['spot']['overnight']=overnight_habit.check(code, report or {})

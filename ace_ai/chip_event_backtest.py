@@ -324,9 +324,7 @@ def _margin_sections(payload, detailed=False):
 
 def _latest_action(b):
     n=b.get('latest_net')
-    if not n:return '未上榜'
-    if n>0:return f'加碼 {n:+,.0f}'
-    return f'出場 {n:,.0f}' if (b.get('retention_pct') or 0)<20 else f'調節 {n:,.0f}'
+    return f'{n:+,.0f}' if n else '—'
 
 
 def _branch_kind(b,habits):
@@ -352,17 +350,17 @@ def _brief_spot_card(payload):
     except Exception:
         habits={}
     for b in data.get('branches',[]):
-        rows.append([b['branch'],f"{b['observed_net_5']:+,.0f}",
+        rows.append([b['branch'],f"{b['observed_net_5']:+,.0f}",f"{b['observed_net_20']:+,.0f}",
             f"{b['volume_pct_5']:.1f}%" if b.get('volume_pct_5') is not None else '—',
-            _latest_action(b),f"{b['retention_pct']}%" if b.get('retention_pct') is not None else '—',
+            _latest_action(b),
             pct(b['estimated_return_pct'],True) if b.get('estimated_return_pct') is not None else '—'])
         badges.append(_branch_kind(b,habits))
     if rows:
         sections+=[{'type':'heading','text':'近期分點動向｜張數'},
-            {'type':'table','columns':['券商分點','近5日淨超','占成交量','最新一天','籌碼留存','現價對估成本'],
-             'widths':[.32,.14,.12,.16,.12,.14],'signed':['近5日淨超','現價對估成本'],'accent':[],
+            {'type':'table','columns':['券商分點','近5日淨超','近20日淨超','占成交量','最新一天','現價對估成本'],
+             'widths':[.30,.13,.14,.12,.15,.16],'signed':['近5日淨超','近20日淨超','最新一天','現價對估成本'],'accent':[],
              'rows':rows,'row_badges':badges},
-            {'type':'paragraph','text':'占成交量＝近5日淨買賣超÷近5日成交量；籌碼留存＝近20日買進量還留著的比例；估成本為買超日收盤加權，非實際成本'}]
+            {'type':'paragraph','text':'占成交量＝近5日淨買賣超÷近5日成交量；估成本為買超日收盤加權，非實際成本'}]
     if not data.get('branches'):sections.append({'type':'paragraph','text':'目前沒有可顯示的分點動向'})
     sections.extend(_margin_sections(payload))
     return {'branch':f"{payload['stock_code']} {payload['stock_name']}｜分點動向",'label':data.get('period_end',''),
