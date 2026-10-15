@@ -215,11 +215,15 @@ def branch_study(dates,complete_dates,rows,prices,branch_name='',action_dates=()
             best=max((b.get('estimated_return_pct') or 0 for b in pool),default=0) or 1
             score=lambda b:.65*b['observed_net_20']/top+.35*max(0.,b.get('estimated_return_pct') or 0)/max(best,1e-9)
             selected=sorted(pool,key=lambda b:(-score(b),b['branch']))[:3]
+            for i,b in enumerate(selected,1):b['rank_label']=f'主力{i}'
         else:
             ranked=[b for b in studied if b.get(key_net)]
             # 買超由多到少，接著賣超由多到少
-            selected=(sorted((b for b in ranked if b[key_net]>0),key=lambda b:-b[key_net])[:3]
-                      +sorted((b for b in ranked if b[key_net]<0),key=lambda b:b[key_net])[:3])
+            buys=sorted((b for b in ranked if b[key_net]>0),key=lambda b:-b[key_net])[:3]
+            sells=sorted((b for b in ranked if b[key_net]<0),key=lambda b:b[key_net])[:3]
+            for tag,group in (('買超',buys),('賣超',sells)):
+                for i,b in enumerate(group,1):b['rank_label']=f'{tag}{i}'
+            selected=buys+sells
         if not selected:selected=sorted((b for b in studied if any(r['date'] in window for r in b['records'])),key=lambda b:(-abs(b['observed_net_5']),b['branch']))[:3]
         for b in selected:b['selection_reasons']=['近期動向']
     return {'available':bool(dates),'period_start':observation[0] if observation else '',
@@ -347,11 +351,11 @@ def _latest_action(b):
 
 
 def _branch_kind(b,habits):
-    """分點屬性徽章：隔日沖型（全市場慣性）＞外資＞波段型（近20日買 8 天以上）＞短線大買。"""
-    if b['branch'] in habits or b.get('overnight',{}).get('recent_match'):return '隔日沖型'
+    """分點屬性徽章：隔日衝（全市場慣性）＞外資＞波段（近20日買 8 天以上）＞短線大買。"""
+    if b['branch'] in habits or b.get('overnight',{}).get('recent_match'):return '隔日衝'
     tag=spot_chip.broker_tag(b['branch'])
     if tag:return tag
-    if b.get('buy_days_20',0)>=8:return '波段型'
+    if b.get('buy_days_20',0)>=8:return '波段'
     if b.get('buy_days_20',0)<=2 and abs(b.get('volume_pct_5') or 0)>=5:return '短線大買'
     return ''
 
@@ -363,23 +367,30 @@ def _brief_spot_card(payload):
     progress=f'近70日 {done}/{wanted}日已確認'+('（補齊中）' if done<wanted else '')
     history='歷史 '+data.get('history_start','')+'～'+data.get('history_end','')
     metadata=progress+'  ｜  '+history
-    rows=[];badges=[]
     try:
         habits=overnight_habit.habits()[0]
     except Exception:
         habits={}
+    view=data.get('view')
+    basis={'latest':'依最新交易日淨買賣超','rank20':'依近20日淨買賣超'}.get(view,'')
+    # 依 rank_label 分組：買超前3／賣超前3（主力分點、指定分點為一組），讓讀者知道為何列出這些分點
+    groups=[]
     for b in data.get('branches',[]):
-        rows.append([b['branch'],_latest_action(b),f"{b['observed_net_5']:+,.0f}",f"{b['observed_net_20']:+,.0f}",
+        label=str(b.get('rank_label',''))
+        name=('買超前3' if label.startswith('買超') else '賣超前3' if label.startswith('賣超')
+              else '主力分點' if label.startswith('主力') else '指定分點' if view=='branch' else '分點動向')
+        if not groups or groups[-1][0]!=name:groups.append((name,[],[]))
+        groups[-1][1].append([b['branch'],_latest_action(b),f"{b['observed_net_5']:+,.0f}",f"{b['observed_net_20']:+,.0f}",
             f"{b['volume_pct_5']:.1f}%" if b.get('volume_pct_5') is not None else '—',
             pct(b['estimated_return_pct'],True) if b.get('estimated_return_pct') is not None else '—'])
-        badges.append(_branch_kind(b,habits))
-    if rows:
-        title={'latest':'當日主要進出分點','rank20':'近20日主要進出分點','key':'主力分點'}.get(data.get('view'),'分點動向')
-        sections+=[{'type':'heading','text':title+'｜張數'},
+        groups[-1][2].append(_branch_kind(b,habits))
+    for name,rows,badges in groups:
+        sections+=[{'type':'heading','text':name+(f'｜{basis}' if basis else '')+'｜張數'},
             {'type':'table','columns':['券商分點','當日（占量）','近5日淨超','近20日淨超','5日占成交量','現價對估成本'],
              'widths':[.28,.14,.13,.14,.15,.16],'signed':['近5日淨超','近20日淨超','當日（占量）','現價對估成本'],'accent':[],
-             'rows':rows,'row_badges':badges},
-            {'type':'paragraph','text':'當日（占量）為最新交易日淨買賣超張數，括號內為占當日成交量比重；5日占成交量＝近5日淨買賣超÷近5日成交量；估成本為買超日收盤加權，非實際成本'}]
+             'rows':rows,'row_badges':badges}]
+    if groups:
+        sections.append({'type':'paragraph','text':'當日（占量）為最新交易日淨買賣超張數，括號內為占當日成交量比重；5日占成交量＝近5日淨買賣超÷近5日成交量；估成本為買超日收盤加權，非實際成本'})
     if not data.get('branches'):sections.append({'type':'paragraph','text':'目前沒有可顯示的分點動向'})
     sections.extend(_margin_sections(payload))
     return {'branch':f"{payload['stock_code']} {payload['stock_name']}｜分點動向",'label':data.get('period_end',''),
