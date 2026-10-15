@@ -96,6 +96,13 @@ def check(stock_code, report):
     latest = report.get("latest_complete_date")
     with store._connect() as conn:
         volume = _volumes(conn, stock_code)
+        if not latest:   # 分點動向流程沒有帶報表：直接讀本機最新完整日
+            row = conn.execute("SELECT MAX(date) FROM spot_branch_days WHERE stock_code=? AND status='complete'", (stock_code,)).fetchone()
+            latest = row[0] if row else None
+            report = {"latest_complete_date": latest, "latest_top_buy": [
+                {"branch": b, "net": n} for b, n in conn.execute(
+                    "SELECT branch_name, net FROM spot_branch_daily WHERE stock_code=? AND date=? AND net>0 ORDER BY net DESC LIMIT 5",
+                    (stock_code, latest)).fetchall()]} if latest else {}
     vol = volume.get((stock_code, latest))
     top = [x for x in report.get("latest_top_buy") or [] if float(x.get("net") or 0) > 0]
     total = sum(float(x["net"]) for x in top)

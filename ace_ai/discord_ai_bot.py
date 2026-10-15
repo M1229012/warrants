@@ -2811,15 +2811,15 @@ FINAL_INDEX_COMPARE_RULES = ("【加權 vs 櫃買】圖上已經有兩邊的 K �
                              "輸出解讀卡時：answer＝結論；why 最多 2 句；scenarios 給空陣列；summary 一句。")
 
 
-FINAL_OVERNIGHT_RULES = ("【隔日沖判斷】使用者問隔日沖：answer 第一句直接回答今日買盤像不像隔日沖。overnight.top_buyers 是最新完整日主要買超分點："
-                         "volume_pct＝淨買超占該股當日成交量的比例（一般上榜分點約 1%，5% 以上 tier＝大量，10% 以上＝重押）；"
-                         "habit 有值＝這個分點在全市場歷史上「大量買超後隔天賣出一半以上」比例高（rate＝反向比例、median_reverse_pct＝通常隔天倒出幾成、"
-                         "heavy_reverse／heavy_checked＝重押時的反向次數、stocks＝跨幾檔股票），即使第一次買這檔也算。"
-                         "habit_share_of_top_buy_pct／habit_share_of_volume_pct＝慣性分點占主要買超／占當日成交量的比例。"
-                         "慣性分點又是大量或重押＝短線隔日賣壓風險高；主要買盤都不是慣性分點＝目前不像隔日沖。可搭配當天漲幅、量能、是否收在高檔說明。"
-                         "verify_previous_day 是前一日慣性分點大量買超後今天有沒有賣（reversed），用來說明已驗證或未驗證。"
-                         "universe_stocks 是統計涵蓋的股票數，要說「依資料庫內 N 檔統計」；day_volume_lots 沒有值時不能說占成交量幾%。"
-                         "不可說同一分點就是同一客戶，不可斷定明天一定賣；unavailable 時說明隔日沖資料暫時無法判斷，再回答型態。")
+FINAL_OVERNIGHT_RULES = ("【隔日沖：給一般投資人看的白話回答】使用者只想知道：今天的買盤是不是隔日沖、是誰、明天要注意什麼。"
+                         "answer 第一句直接下結論並點名分點，例如「今天買最多的凱基-城中、美商高盛都是常做隔日沖的分點，合計買了當天成交量約 15%，明天開盤要留意賣壓」；"
+                         "主要買盤不是這類分點就直接說「今天主要買盤不像隔日沖」。"
+                         "判斷依據（只用於你的推論，不要把名稱寫出來）：overnight.top_buyers 的 habit 有值＝常做隔日沖的分點，volume_pct＝買超占當天成交量%，"
+                         "tier 大量／重押＝買很多；get_spot_event_backtest 的 overnight 有 pairs＝這個分點在這檔曾買完隔天就賣；verify_previous_day reversed＝昨天買的今天已經賣了。"
+                         "why 用 2～3 句白話說：誰買多少（占成交量幾%）、他們通常隔天會賣多少、今天漲停或爆量等狀況，以及明天要看的價位。"
+                         "禁止出現這些詞：隔日反向、反向紀錄、慣性、樣本、rate、pairs、統計涵蓋、資料庫、門檻、checked；不要解釋計算方法。"
+                         "可以說「常做隔日沖」「通常隔天會賣掉大半」。不可說同一分點就是同一個人，不可保證明天一定賣；"
+                         "資料不足時只說「目前看不出明顯的隔日沖買盤」，不要講原因細節。")
 FINAL_SPOT_RULES = ("【現股分點籌碼】get_spot_chip_summary 是券商分點的買賣超（單位：張），不是三大法人，也不是權證分點。"
                     "先回答原句需求：問哪些分點持續買進，依continuity的買超天數與cumulative_buy_top3指認；當日Top5不等於持續買進。使用者用了比喻就自然接住整句，再說具體證據。只有工具提供技術資料時才整合技術面，不為了固定格式杜撰技術結構；只提供現股資料時用最新 Top5 買賣超、近 5／20 日淨集中度與判讀、"
                     "主要累積買超分點、量價加權均價（vwap 欄位；是日收盤×成交量的估算，不是成交金額算的正式 VWAP，要稱「量價加權均價（估）」）與現價差距說明籌碼是否支持目前結構；兩者矛盾要講清楚。"
@@ -2898,8 +2898,8 @@ def build_final_prompt(payload: Dict[str, Any]) -> str:
         sections.append(FINAL_SPOT_PRICE_RULES)
     if "get_spot_chip_summary" in names:
         sections.append(FINAL_SPOT_RULES)
-        if any(isinstance(r.get("overnight"), dict) for r in [v for k, v in (payload.get("tool_results") or {}).items() if k.startswith("get_spot_chip_summary")] if isinstance(r, dict)):
-            sections.append(FINAL_OVERNIGHT_RULES)
+    if names & {"get_spot_chip_summary", "get_spot_event_backtest"} and _OVERNIGHT_ASK_RE.search(str(payload.get("question") or "")):
+        sections.append(FINAL_OVERNIGHT_RULES)      # 10-15：問隔日沖，不論走型態＋籌碼或分點動向，都用白話規則
     if "get_spot_event_backtest" in names:
         sections.append("現股波段統計：使用觀察到的上榜資料，波段累積達規模門檻才成立，次日開盤模擬買進，5/10/20交易日收盤計算。不是實際持股或獲利。主畫面20日，達3%/5%是期末比例，不能把盤中曾達標或漲0.01%算達標。成熟波段少於5笔時使用逐筆紀錄，不拿百分比推論未來。median_return_pct為報酬中位數，median_entry_depth_pct為相對進場價最深跌幅中位數；與worst_drawdown_pct不同，最高漲幅和最深跌幅無先後順序。background為同期間、同進場及排除規則的股價參考，40有效日以下不顯示比例。overnight為本股票本分點的大額買超後隔日反向紀錄：未上榜不是零，不代表同一客戶、真實出場或其他股票也隔日沖；少量配對只陳述事實。estimated_return_pct只是現價相對觀察估均價，非實際損益。沒有margin就省略融資；存在才依實際事件回應，不推論大戶身分。沿用原問句客製回覆與接梗，先回答問題，避免逐行念表；計算方法與例行註解留Log，不在圖片生成免責小字，但資料不足時需用正常文字明確回答。")
     if "get_spot_branch_flow" in names:
@@ -7826,6 +7826,10 @@ class AceQueryEngine:
                 candidates=[b for b in all_branches if b.get('overnight',{}).get('pairs')]
                 result['spot']['branches']=sorted(candidates,key=lambda b:(b['overnight']['pairs'][-1]['sell_date'],abs(b['observed_net_5'])),reverse=True)[:6]
                 result['spot']['overnight_question']=True
+                try:   # 10-15：全市場常做隔日沖的分點＋今日買超占成交量%，讓 AI 直接點名
+                    result['spot']['overnight']=overnight_habit.check(code, report or {})
+                except Exception as exc:
+                    self.log(f"隔日沖判斷略過：{type(exc).__name__}: {exc}")
             self.log(f"測試現股回測｜{code}｜分點 {len(result['spot']['branches'])} 家｜融資事件 {len((result.get('margin') or {}).get('events', []))}")
             return result
         except Exception as exc:
