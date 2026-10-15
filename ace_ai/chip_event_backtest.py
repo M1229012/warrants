@@ -9,10 +9,13 @@ import time
 from statistics import median
 from collections import defaultdict
 
+import overnight_habit
+import spot_chip
+
 HORIZONS = (5, 10, 20)
 # 一買一賣成本（手續費 0.1425%×2＋證交稅 0.3%，未打折）；扣掉成本後報酬 > 0 才算贏
 ROUND_TRIP_COST_PCT = max(0., float(os.getenv('TEST_ROUND_TRIP_COST_PCT', '0.585')))
-VERSION = 'chip-events-year-v10'
+VERSION = 'chip-events-year-v11'
 
 
 def finite(value):
@@ -176,7 +179,14 @@ def branch_study(dates,complete_dates,rows,prices,branch_name='',action_dates=()
         status='累積・近期調節' if is_active and latest is not None and latest<0 else '持續買進' if is_active else '近期調節' if net5<0 else '近期買超' if net5>0 else '近期未上榜'
         overnight=overnight_study(b,daily,dates,complete,prices,actions)
         overnight['recent_match'] = overnight['label']=='疑似隔日沖' and any(q['sell_date'] in window for q in overnight['pairs'])
+        # 10-15：分點動向改看份量與動作（成熟波段樣本太少，不再拿來排序或顯示）
+        last20=dates[-20:];vol5=sum(finite(prices[d].get('volume_lots')) or 0. for d in window)
+        buy20=sum(max(0.,daily[d].get(b,0)) for d in last20);net20=sum(daily[d].get(b,0) for d in last20)
+        buys20=[d for d in last20 if daily[d].get(b,0)>0]
         studied.append({'branch':b,'active_now':is_active,'status':status,'latest_net':latest,
+            'volume_pct_5':round(net5/vol5*100,2) if vol5 else None,
+            'retention_pct':round(max(0.,net20)/buy20*100) if buy20>0 else None,
+            'buy_days_20':len(buys20),'first_buy_20':buys20[0] if buys20 else '',
             'buy_days_5':sum(daily[d].get(b,0)>0 for d in window),'buy_days_70':sum(daily[d].get(b,0)>0 for d in observation),
             'observed_net_5':round(net5,1),'observed_net_20':round(sum(daily[d].get(b,0) for d in dates[-20:]),1),
             'observed_net_70':round(net70,1),'estimated_buy_cost':round(cost,2) if cost else None,
@@ -187,12 +197,12 @@ def branch_study(dates,complete_dates,rows,prices,branch_name='',action_dates=()
         selected=studied
         for b in selected:b['selection_reasons']=['指定分點']
     else:
-        current=sorted((b for b in studied if b['active_now']),key=lambda b:(-b['observed_net_5'],b['branch']))[:3]
-        rest=sorted((b for b in studied if b not in current and
-            (b['observed_net_70']>0 and b['observed_net_5']<0 or
-             b['metrics']['20']['samples']>=5 and any(r['date'] in window for r in b['records']))),
-            key=lambda b:(-abs(b['observed_net_5']),b['branch']))[:3]
-        selected=current+rest
+        # 10-15：最新一天買超前 2、賣超第 1 一定列入，其餘依近 5 日淨買賣超占成交量排序補到 6 家
+        latest_rank=sorted((b for b in studied if b['latest_net']),key=lambda b:-b['latest_net'])
+        selected=latest_rank[:2]+[b for b in latest_rank[-1:] if b['latest_net']<0]
+        for b in sorted(studied,key=lambda b:(-abs(b['volume_pct_5'] if b['volume_pct_5'] is not None else b['observed_net_5']/1e6),b['branch'])):
+            if len(selected)>=6:break
+            if all(b is not x for x in selected) and b['observed_net_5']:selected.append(b)
         if not selected:selected=sorted((b for b in studied if any(r['date'] in window for r in b['records'])),key=lambda b:(-abs(b['observed_net_5']),b['branch']))[:3]
         for b in selected:b['selection_reasons']=['近期動向']
     return {'available':bool(dates),'period_start':observation[0] if observation else '',
@@ -312,6 +322,23 @@ def _margin_sections(payload, detailed=False):
         {'type':'paragraph','text':'報酬已扣一買一賣成本；次日開盤進場、第20個交易日收盤出場'}]
 
 
+def _latest_action(b):
+    n=b.get('latest_net')
+    if not n:return '未上榜'
+    if n>0:return f'加碼 {n:+,.0f}'
+    return f'出場 {n:,.0f}' if (b.get('retention_pct') or 0)<20 else f'調節 {n:,.0f}'
+
+
+def _branch_kind(b,habits):
+    """分點屬性徽章：隔日沖型（全市場慣性）＞外資＞波段型（近20日買 8 天以上）＞短線大買。"""
+    if b['branch'] in habits or b.get('overnight',{}).get('recent_match'):return '隔日沖型'
+    tag=spot_chip.broker_tag(b['branch'])
+    if tag:return tag
+    if b.get('buy_days_20',0)>=8:return '波段型'
+    if b.get('buy_days_20',0)<=2 and abs(b.get('volume_pct_5') or 0)>=5:return '短線大買'
+    return ''
+
+
 def _brief_spot_card(payload):
     data=payload['spot'];sections=[]
     ready=data.get('readiness') or {'resolved_days':data.get('complete_days',0),'requested_days':data.get('requested_days',70)}
@@ -319,21 +346,24 @@ def _brief_spot_card(payload):
     progress=f'近70日 {done}/{wanted}日已確認'+('（補齊中）' if done<wanted else '')
     history='歷史 '+data.get('history_start','')+'～'+data.get('history_end','')
     metadata=progress+'  ｜  '+history
+    rows=[];badges=[]
+    try:
+        habits=overnight_habit.habits()[0]
+    except Exception:
+        habits={}
     for b in data.get('branches',[]):
-        m=b['metrics']['20'];n=int(m['samples'])
-        history=(f'20日成熟波段 {n}筆  ・  20日收盤達3% {pct(m["reach_3_pct"])}  ・  報酬中位數 {pct(m["median_return_pct"],True)}  ・  最深跌幅 {pct(m["median_entry_depth_pct"],True)}'
-                 if n>=5 else f'20日成熟波段 {n}筆，樣本不足；逐筆結果請查分點明細' if n else '尚無完成20日觀察的波段')
-        sections.append({'type':'spot_brief','branch':b['branch'],'status':b['status'],
-            'badge':'疑似隔日沖' if b.get('overnight',{}).get('recent_match') else '',
-            'net_5':b['observed_net_5'],'history':history,'samples':n,
-            'metrics':[{'label':'成熟波段','value':f'{n}筆'},
-                       {'label':'20日收盤達3%','value':pct(m['reach_3_pct']),'tone':'accent'},
-                       {'label':'報酬中位數','value':pct(m['median_return_pct'],True),'tone':'signed'},
-                       {'label':'最深跌幅中位數','value':pct(m['median_entry_depth_pct'],True),'tone':'signed'}] if n>=5 else []})
+        rows.append([b['branch'],f"{b['observed_net_5']:+,.0f}",
+            f"{b['volume_pct_5']:.1f}%" if b.get('volume_pct_5') is not None else '—',
+            _latest_action(b),f"{b['retention_pct']}%" if b.get('retention_pct') is not None else '—',
+            pct(b['estimated_return_pct'],True) if b.get('estimated_return_pct') is not None else '—'])
+        badges.append(_branch_kind(b,habits))
+    if rows:
+        sections+=[{'type':'heading','text':'近期分點動向｜張數'},
+            {'type':'table','columns':['券商分點','近5日淨超','占成交量','最新一天','籌碼留存','現價對估成本'],
+             'widths':[.32,.14,.12,.16,.12,.14],'signed':['近5日淨超','現價對估成本'],'accent':[],
+             'rows':rows,'row_badges':badges},
+            {'type':'paragraph','text':'占成交量＝近5日淨買賣超÷近5日成交量；籌碼留存＝近20日買進量還留著的比例；估成本為買超日收盤加權，非實際成本'}]
     if not data.get('branches'):sections.append({'type':'paragraph','text':'目前沒有可顯示的分點動向'})
-    base=data.get('background',{})
-    metadata+='  ｜  '+('同期20日收盤達3% '+pct(base.get('background_reach_3_pct'))
-        if base.get('background_samples',0)>=40 else '同期參考不足')
     sections.extend(_margin_sections(payload))
     return {'branch':f"{payload['stock_code']} {payload['stock_name']}｜分點動向",'label':data.get('period_end',''),
             'tags':[],'clean_display':True,'compact_meta':metadata,'layout_version':VERSION,'sections':sections}
