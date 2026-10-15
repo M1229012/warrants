@@ -7818,6 +7818,31 @@ class AceQueryEngine:
         print(f"🧩 分點排版 v10｜{'詳細明細' if detailed else '精簡主畫面'}｜{data.get('stock_code', '')}｜分點 {len(data.get('spot', {}).get('branches', []))} 家", flush=True)
         return card
 
+    def _chip_view(self, question: str) -> str:
+        """10-15：AI 讀整句判斷現股籌碼要看哪一組分點（不寫死關鍵字）；判斷失敗一律用最新一天。"""
+        cache = self.__dict__.setdefault("_chip_view_cache", {})
+        if question in cache:
+            return cache[question]
+        view = "latest"
+        gateway = getattr(self, "gateway", None)
+        if gateway is not None:
+            schema = {"type": "object", "properties": {"view": {"type": "string", "enum": ["latest", "rank20", "key"]}},
+                      "required": ["view"]}
+            prompt = ("判斷這個台股現股籌碼問題想看哪一組券商分點，只輸出 JSON。"
+                      "latest＝一般問籌碼好不好、今天誰買誰賣、會不會隔日沖；"
+                      "rank20＝問近20日或最近一段時間的買超／賣超排名、最近誰買最多；"
+                      "key＝問關鍵分點、主力是誰、誰在主導、誰最賺。問題：" + question)
+            try:
+                result = gateway.generate(prompt, purpose="intent", schema=schema, temperature=0.0)
+                if result.ok:
+                    view = str(json.loads(result.text).get("view") or "latest")
+            except Exception as exc:
+                self.log(f"籌碼分點視角判斷略過：{type(exc).__name__}: {exc}")
+        cache[question] = view if view in ("latest", "rank20", "key") else "latest"
+        if len(cache) > 500:
+            cache.pop(next(iter(cache)))
+        return cache[question]
+
     def _prepare_event_backtest(self, code: str, name: str = "", report=None, branch_name: str = "", question: str = ""):
         if code in tools.INDEX_CODES:
             return None
@@ -7827,8 +7852,9 @@ class AceQueryEngine:
             return None
         allow_margin = bool(access and access.admin_mode and not access.simulation)
         try:
+            view = "latest" if branch_name or not question else self._chip_view(question)
             result = chip_event_backtest.prepare(code, name, report=report,
-                allow_margin=allow_margin, branch_name=branch_name)
+                allow_margin=allow_margin, branch_name=branch_name, view=view)
             all_branches=result['spot'].pop('all_branches',result['spot']['branches'])
             if re.search(r'隔日[沖衝充]|隔天.{0,4}(?:賣|倒貨|出貨)',question) and not branch_name:
                 # 10-15：不再改成「曾有隔日賣出紀錄」的舊分點；沿用最新一天大買／大賣優先的挑選，隔日沖由徽章與 AI 說明

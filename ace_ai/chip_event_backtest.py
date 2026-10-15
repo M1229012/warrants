@@ -129,7 +129,7 @@ def overnight_study(branch,daily,dates,complete,prices,action_dates=()):
         'label':label,'pairs':pairs,'minimum_lots':minimum,'volume_ratio':ratio,'reverse_ratio':reverse}
 
 
-def branch_study(dates,complete_dates,rows,prices,branch_name='',action_dates=()):
+def branch_study(dates,complete_dates,rows,prices,branch_name='',action_dates=(),view='latest'):
     dates=sorted(set(dates).intersection(prices));complete=set(complete_dates);daily=defaultdict(dict)
     for row in rows:
         value=finite(row.get('net'))
@@ -183,7 +183,9 @@ def branch_study(dates,complete_dates,rows,prices,branch_name='',action_dates=()
         last20=dates[-20:];vol5=sum(finite(prices[d].get('volume_lots')) or 0. for d in window)
         buy20=sum(max(0.,daily[d].get(b,0)) for d in last20);net20=sum(daily[d].get(b,0) for d in last20)
         buys20=[d for d in last20 if daily[d].get(b,0)>0]
+        day_vol=finite(prices[dates[-1]].get('volume_lots')) if dates else None
         studied.append({'branch':b,'active_now':is_active,'status':status,'latest_net':latest,
+            'latest_volume_pct':round(latest/day_vol*100,2) if latest and day_vol else None,
             'volume_pct_5':round(net5/vol5*100,2) if vol5 else None,
             'retention_pct':round(max(0.,net20)/buy20*100) if buy20>0 else None,
             'buy_days_20':len(buys20),'first_buy_20':buys20[0] if buys20 else '',
@@ -197,19 +199,25 @@ def branch_study(dates,complete_dates,rows,prices,branch_name='',action_dates=()
         selected=studied
         for b in selected:b['selection_reasons']=['指定分點']
     else:
-        # 10-15：最新一天買超前 2、賣超第 1 一定列入，其餘依近 5 日淨買賣超占成交量排序補到 6 家
-        latest_rank=sorted((b for b in studied if b['latest_net']),key=lambda b:-b['latest_net'])
-        selected=latest_rank[:2]+[b for b in latest_rank[-1:] if b['latest_net']<0]
-        for b in sorted(studied,key=lambda b:(-abs(b['volume_pct_5'] if b['volume_pct_5'] is not None else b['observed_net_5']/1e6),b['branch'])):
-            if len(selected)>=6:break
-            if all(b is not x for x in selected) and b['observed_net_5']:selected.append(b)
+        # 10-15：依問法選分點。latest＝最新一天買超／賣超各前 3；rank20＝近 20 日買超／賣超各前 3；
+        # key＝近 20 日淨買超前 10 名中，現價對估成本最高的前 3（先看份量再看報酬，避免張數很少的分點）
+        key_net={'latest':'latest_net','rank20':'observed_net_20'}.get(view,'observed_net_20')
+        if view=='key':
+            top10=sorted((b for b in studied if (b['observed_net_20'] or 0)>0),key=lambda b:-b['observed_net_20'])[:10]
+            selected=sorted((b for b in top10 if b.get('estimated_return_pct') is not None),
+                            key=lambda b:-b['estimated_return_pct'])[:3]
+        else:
+            ranked=[b for b in studied if b.get(key_net)]
+            selected=(sorted((b for b in ranked if b[key_net]>0),key=lambda b:-b[key_net])[:3]
+                      +sorted((b for b in ranked if b[key_net]<0),key=lambda b:b[key_net])[:3])
+            selected.sort(key=lambda b:-b[key_net])        # 由買到賣
         if not selected:selected=sorted((b for b in studied if any(r['date'] in window for r in b['records'])),key=lambda b:(-abs(b['observed_net_5']),b['branch']))[:3]
         for b in selected:b['selection_reasons']=['近期動向']
     return {'available':bool(dates),'period_start':observation[0] if observation else '',
         'period_end':observation[-1] if observation else '', 'history_start':dates[0] if dates else '',
         'history_end':dates[-1] if dates else '', 'complete_days':len(complete.intersection(observation)),
         'requested_days':len(observation),'history_complete_days':len(complete.intersection(dates)),
-        'branches':selected,'all_branches':studied,'compared_branches':len(studied),
+        'branches':selected,'all_branches':studied,'compared_branches':len(studied),'view':'branch' if branch_name else view,
         'background':summarize(prices,[],background)['20'],'share_adjusted_window':bool(recent_action),
         'definition':f'觀察到的買超波段：相隔不超過5交易日歸同一波，累積淨買超達20日均量{threshold_ratio*100:g}%且至少{minimum:g}張才成立；次日開盤起算。一波只成立一次。未上榜不是零，資料缺日中止波段；訊號觀察期仍可能重疊。門檻為測試預設，非已驗證策略。'}
 
@@ -324,7 +332,9 @@ def _margin_sections(payload, detailed=False):
 
 def _latest_action(b):
     n=b.get('latest_net')
-    return f'{n:+,.0f}' if n else '—'
+    if not n:return '—'
+    share=b.get('latest_volume_pct')
+    return f'{n:+,.0f}（{share:.1f}%）' if share is not None else f'{n:+,.0f}'
 
 
 def _branch_kind(b,habits):
@@ -350,17 +360,17 @@ def _brief_spot_card(payload):
     except Exception:
         habits={}
     for b in data.get('branches',[]):
-        rows.append([b['branch'],f"{b['observed_net_5']:+,.0f}",f"{b['observed_net_20']:+,.0f}",
+        rows.append([b['branch'],_latest_action(b),f"{b['observed_net_5']:+,.0f}",f"{b['observed_net_20']:+,.0f}",
             f"{b['volume_pct_5']:.1f}%" if b.get('volume_pct_5') is not None else '—',
-            _latest_action(b),
             pct(b['estimated_return_pct'],True) if b.get('estimated_return_pct') is not None else '—'])
         badges.append(_branch_kind(b,habits))
     if rows:
-        sections+=[{'type':'heading','text':'近期分點動向｜張數'},
-            {'type':'table','columns':['券商分點','近5日淨超','近20日淨超','占成交量','最新一天','現價對估成本'],
-             'widths':[.30,.13,.14,.12,.15,.16],'signed':['近5日淨超','近20日淨超','最新一天','現價對估成本'],'accent':[],
+        title={'latest':'最新一日買賣超前3','rank20':'近20日買賣超前3','key':'關鍵分點｜近20日買超前10中報酬最高'}.get(data.get('view'),'分點動向')
+        sections+=[{'type':'heading','text':title+'｜張數'},
+            {'type':'table','columns':['券商分點','最新一天','近5日淨超','近20日淨超','5日占成交量','現價對估成本'],
+             'widths':[.28,.14,.13,.14,.15,.16],'signed':['近5日淨超','近20日淨超','最新一天','現價對估成本'],'accent':[],
              'rows':rows,'row_badges':badges},
-            {'type':'paragraph','text':'占成交量＝近5日淨買賣超÷近5日成交量；估成本為買超日收盤加權，非實際成本'}]
+            {'type':'paragraph','text':'最新一天括號＝占當日成交量；5日占成交量＝近5日淨買賣超÷近5日成交量；估成本為買超日收盤加權，非實際成本'}]
     if not data.get('branches'):sections.append({'type':'paragraph','text':'目前沒有可顯示的分點動向'})
     sections.extend(_margin_sections(payload))
     return {'branch':f"{payload['stock_code']} {payload['stock_name']}｜分點動向",'label':data.get('period_end',''),
@@ -459,13 +469,13 @@ def event_marks(payload, bars, branch_name='', include_margin=False):
     return marks
 
 
-def prepare(code, name='', as_of='', report=None, allow_margin=False, branch_name=''):
+def prepare(code, name='', as_of='', report=None, allow_margin=False, branch_name='', view='latest'):
     import spot_history
     with spot_history.active(code,query=True):
-        return _prepare_inner(code,name,as_of,report,allow_margin,branch_name)
+        return _prepare_inner(code,name,as_of,report,allow_margin,branch_name,view)
 
 
-def _prepare_inner(code, name='', as_of='', report=None, allow_margin=False, branch_name=''):
+def _prepare_inner(code, name='', as_of='', report=None, allow_margin=False, branch_name='', view='latest'):
     import spot_chip
     import local_market_cache as store
     import warrant_ai_tools as tools
@@ -500,7 +510,7 @@ def _prepare_inner(code, name='', as_of='', report=None, allow_margin=False, bra
     action_dates = {str(e.get('date', ''))[:10] for e in (bundle.get('corporate_actions') or {}).get('items', [])
                     if e.get('kind') in SHARE_KINDS or e.get('kind') in ('合併', '減資')}
     result = {'stock_code': code, 'stock_name': name, 'data_date': max(prices),
-              'version': VERSION, 'spot': branch_study(dates, complete, rows, prices, branch_name, action_dates),
+              'version': VERSION, 'spot': branch_study(dates, complete, rows, prices, branch_name, action_dates, view),
               'price_period_start': min(prices), 'price_period_end': max(prices),
               'price_basis': '已核實股數還原收盤OHLC；不含盤中棒；現金股利不計入報酬'}
     result['spot']['readiness']={'resolved_days':report.get('resolved_days',len(report.get('complete_dates',[]))),
