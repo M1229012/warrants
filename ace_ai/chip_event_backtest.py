@@ -181,12 +181,14 @@ def branch_study(dates,complete_dates,rows,prices,branch_name='',action_dates=()
         overnight['recent_match'] = overnight['label']=='疑似隔日沖' and any(q['sell_date'] in window for q in overnight['pairs'])
         # 10-15：分點動向改看份量與動作（成熟波段樣本太少，不再拿來排序或顯示）
         last20=dates[-20:];vol5=sum(finite(prices[d].get('volume_lots')) or 0. for d in window)
+        vol20=sum(finite(prices[d].get('volume_lots')) or 0. for d in last20)
         buy20=sum(max(0.,daily[d].get(b,0)) for d in last20);net20=sum(daily[d].get(b,0) for d in last20)
         buys20=[d for d in last20 if daily[d].get(b,0)>0]
         day_vol=finite(prices[dates[-1]].get('volume_lots')) if dates else None
         studied.append({'branch':b,'active_now':is_active,'status':status,'latest_net':latest,
             'latest_volume_pct':round(latest/day_vol*100,2) if latest and day_vol else None,
             'volume_pct_5':round(net5/vol5*100,2) if vol5 else None,
+            'volume_pct_20':round(net20/vol20*100,2) if vol20 else None,
             'retention_pct':round(max(0.,net20)/buy20*100) if buy20>0 else None,
             'buy_days_20':len(buys20),'first_buy_20':buys20[0] if buys20 else '',
             'buy_days_5':sum(daily[d].get(b,0)>0 for d in window),'buy_days_70':sum(daily[d].get(b,0)>0 for d in observation),
@@ -343,6 +345,11 @@ def _margin_sections(payload, detailed=False):
         {'type':'paragraph','text':'報酬已扣一買一賣成本；次日開盤進場、第20個交易日收盤出場'}]
 
 
+def _net_share(net,share):
+    if not net:return '—'
+    return f'{net:+,.0f}（{share:.1f}%）' if share is not None else f'{net:+,.0f}'
+
+
 def _latest_action(b):
     n=b.get('latest_net')
     if not n:return '—'
@@ -380,17 +387,17 @@ def _brief_spot_card(payload):
         name=('買超前3' if label.startswith('買超') else '賣超前3' if label.startswith('賣超')
               else '主力分點' if label.startswith('主力') else '指定分點' if view=='branch' else '分點動向')
         if not groups or groups[-1][0]!=name:groups.append((name,[],[]))
-        groups[-1][1].append([b['branch'],_latest_action(b),f"{b['observed_net_5']:+,.0f}",f"{b['observed_net_20']:+,.0f}",
-            f"{b['volume_pct_5']:.1f}%" if b.get('volume_pct_5') is not None else '—',
+        groups[-1][1].append([b['branch'],_latest_action(b),_net_share(b['observed_net_5'],b.get('volume_pct_5')),
+            _net_share(b['observed_net_20'],b.get('volume_pct_20')),
             pct(b['estimated_return_pct'],True) if b.get('estimated_return_pct') is not None else '—'])
         groups[-1][2].append(_branch_kind(b,habits))
     for name,rows,badges in groups:
         sections+=[{'type':'heading','text':name+(f'｜{basis}' if basis else '')+'｜張數'},
-            {'type':'table','columns':['券商分點','當日（占量）','近5日淨超','近20日淨超','5日占成交量','現價對估成本'],
-             'widths':[.28,.14,.13,.14,.15,.16],'signed':['近5日淨超','近20日淨超','當日（占量）','現價對估成本'],'accent':[],
+            {'type':'table','columns':['券商分點','當日（占量）','近5日（占量）','近20日（占量）','現價對估成本'],
+             'widths':[.28,.18,.18,.19,.17],'signed':['當日（占量）','近5日（占量）','近20日（占量）','現價對估成本'],'accent':[],
              'rows':rows,'row_badges':badges}]
     if groups:
-        sections.append({'type':'paragraph','text':'當日（占量）為最新交易日淨買賣超張數，括號內為占當日成交量比重；5日占成交量＝近5日淨買賣超÷近5日成交量；估成本為買超日收盤加權，非實際成本'})
+        sections.append({'type':'paragraph','text':'各期間為淨買賣超張數，括號內為占同期間成交量比重；估成本為買超日收盤加權，非實際成本'})
     if not data.get('branches'):sections.append({'type':'paragraph','text':'目前沒有可顯示的分點動向'})
     sections.extend(_margin_sections(payload))
     return {'branch':f"{payload['stock_code']} {payload['stock_name']}｜分點動向",'label':data.get('period_end',''),
