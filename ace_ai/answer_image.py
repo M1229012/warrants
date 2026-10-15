@@ -1607,8 +1607,11 @@ def _deduction_outlook(info: dict) -> tuple[str, str]:
 
 
 def level_ma_note(info: dict) -> str:
-    """關鍵價位說明欄：只寫失敗值（10-11 使用者要求）；沒有失敗值才寫目前方向。"""
-    fail = _finite(info.get('fail_price'))
+    """關鍵價位說明欄：只寫失敗值（10-11 使用者要求）；沒有失敗值才寫目前方向。
+    10-15：失敗值改成與海盜圖同算法＝明日扣抵價（明天收盤越過它，均線就轉向）；漲跌停都翻不過去寫 X。"""
+    if info.get('limit_proof') in ('跌停也續揚', '漲停也續彎'):
+        return '失敗值 X'
+    fail = _finite(info.get('next_deduction_price'))
     if fail is not None and fail > 0:
         return f'失敗值 {fail:,.2f}'
     return {'上揚': '目前上揚', '下彎': '目前下彎', '走平': '目前走平'}.get(info.get('direction_now'), '扣抵條件待更新')
