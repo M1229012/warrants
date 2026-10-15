@@ -2909,7 +2909,7 @@ def build_final_prompt(payload: Dict[str, Any]) -> str:
     if names & {"get_spot_chip_summary", "get_spot_event_backtest"} and _OVERNIGHT_ASK_RE.search(str(payload.get("question") or "")):
         sections.append(FINAL_OVERNIGHT_RULES)      # 10-15：問隔日沖，不論走型態＋籌碼或分點動向，都用白話規則
     if "get_spot_event_backtest" in names:
-        sections.append("現股分點動向（10-15）：主要看 volume_pct_5＝近5日淨買賣超占成交量、latest_net＝最新一天加碼或調節、retention_pct＝近20日買進量還留著的比例、estimated_return_pct＝現價對估成本（買超日收盤加權，不是實際成本）；成熟波段樣本很少，samples 未達 20 筆時不要引用波段勝率、達標比例或報酬中位數。現股波段統計：使用觀察到的上榜資料，波段累積達規模門檻才成立，次日開盤模擬買進，5/10/20交易日收盤計算。不是實際持股或獲利。主畫面20日，達3%/5%是期末比例，不能把盤中曾達標或漲0.01%算達標。成熟波段少於5笔時使用逐筆紀錄，不拿百分比推論未來。median_return_pct為報酬中位數，median_entry_depth_pct為相對進場價最深跌幅中位數；與worst_drawdown_pct不同，最高漲幅和最深跌幅無先後順序。background為同期間、同進場及排除規則的股價參考，40有效日以下不顯示比例。overnight為本股票本分點的大額買超後隔日反向紀錄：未上榜不是零，不代表同一客戶、真實出場或其他股票也隔日沖；少量配對只陳述事實。estimated_return_pct只是現價相對觀察估均價，非實際損益。沒有margin就省略融資；存在才依實際事件回應，不推論大戶身分。沿用原問句客製回覆與接梗，先回答問題，避免逐行念表；計算方法與例行註解留Log，不在圖片生成免責小字，但資料不足時需用正常文字明確回答。")
+        sections.append("現股分點動向（10-15）：不要引用任何波段／事件的勝率、平均報酬、筆數或「歷史勝率較高」這類說法；主要看 volume_pct_5＝近5日淨買賣超占成交量、latest_net＝最新一天加碼或調節、retention_pct＝近20日買進量還留著的比例、estimated_return_pct＝現價對估成本（買超日收盤加權，不是實際成本）；成熟波段樣本很少，samples 未達 20 筆時不要引用波段勝率、達標比例或報酬中位數。現股波段統計：使用觀察到的上榜資料，波段累積達規模門檻才成立，次日開盤模擬買進，5/10/20交易日收盤計算。不是實際持股或獲利。主畫面20日，達3%/5%是期末比例，不能把盤中曾達標或漲0.01%算達標。成熟波段少於5笔時使用逐筆紀錄，不拿百分比推論未來。median_return_pct為報酬中位數，median_entry_depth_pct為相對進場價最深跌幅中位數；與worst_drawdown_pct不同，最高漲幅和最深跌幅無先後順序。background為同期間、同進場及排除規則的股價參考，40有效日以下不顯示比例。overnight為本股票本分點的大額買超後隔日反向紀錄：未上榜不是零，不代表同一客戶、真實出場或其他股票也隔日沖；少量配對只陳述事實。estimated_return_pct只是現價相對觀察估均價，非實際損益。沒有margin就省略融資；存在才依實際事件回應，不推論大戶身分。沿用原問句客製回覆與接梗，先回答問題，避免逐行念表；計算方法與例行註解留Log，不在圖片生成免責小字，但資料不足時需用正常文字明確回答。")
     if "get_spot_branch_flow" in names:
         sections.append(FINAL_SPOT_BRANCH_RULES)
     if "get_branch_warrant_detail" in names:
@@ -9291,10 +9291,9 @@ def run_discord_bot(config: BotConfig) -> None:
                 await interaction_image(interaction, "使用頻道", blocked, ephemeral=True)
                 return
         stats_command = member_usage_stats.command(question)
+        if stats_command and (not access.admin_mode or demo):
+            stats_command = None   # 10-15：非管理員入口一律當一般問題，不提示這項功能的存在
         if stats_command:
-            if not access.admin_mode or demo:
-                await interaction_text(interaction, '會員使用統計僅限管理員透過 /ace 查詢。', ephemeral=True)
-                return
             await interaction.response.defer(thinking=True, ephemeral=False)
             excluded = set(config.superuser_ids)
             excluded.update(m.id for m in getattr(interaction.guild, 'members', ())
