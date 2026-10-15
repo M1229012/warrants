@@ -86,6 +86,21 @@ def habits(force=False):
         return table, _CACHE["stocks"]
 
 
+def _limit_up(stock_code, date):
+    """當天是否收漲停（漲幅 ≥ 9.5%，台股漲停 10% 含跳動單位捨入）。沒有日 K 回傳 None。"""
+    if not date:
+        return None
+    try:
+        with store._connect() as conn:
+            rows = conn.execute("SELECT date, close FROM spot_history_bars WHERE stock_code=? AND confirmed=1 AND date<=? "
+                                "ORDER BY date DESC LIMIT 2", (stock_code, date)).fetchall()
+    except Exception:
+        return None
+    if len(rows) < 2 or rows[0][0] != date or not rows[1][1]:   # 當天日 K 還沒存：不拿前一天代替
+        return None
+    return rows[0][1] / rows[1][1] - 1 >= .095
+
+
 def _tier(share):
     return "重押" if share is not None and share >= HEAVY_SHARE * 100 else "大量" if share is not None and share >= BIG_SHARE * 100 else ""
 
@@ -104,15 +119,18 @@ def check(stock_code, report):
                     "SELECT branch_name, net FROM spot_branch_daily WHERE stock_code=? AND date=? AND net>0 ORDER BY net DESC LIMIT 5",
                     (stock_code, latest)).fetchall()]} if latest else {}
     vol = volume.get((stock_code, latest))
+    limit_up = _limit_up(stock_code, latest)
     top = [x for x in report.get("latest_top_buy") or [] if float(x.get("net") or 0) > 0]
     total = sum(float(x["net"]) for x in top)
     buyers = []
     for x in top:
         share = round(float(x["net"]) / vol * 100, 2) if vol else None
+        # 收漲停＋大量買超＝疑似鎖漲停買盤：成本約在漲停價，隔日沖最典型的買法
         buyers.append(dict(branch=x["branch"], net_lots=x["net"], volume_pct=share, tier=_tier(share),
-                           habit=table.get(x["branch"])))
+                           limit_lock=bool(limit_up and _tier(share)), habit=table.get(x["branch"])))
     flagged = [b for b in buyers if b["habit"]]
-    out = {"data_date": latest, "day_volume_lots": vol, "universe_stocks": universe, "habit_branches_known": len(table),
+    out = {"data_date": latest, "day_volume_lots": vol, "limit_up": limit_up,
+           "universe_stocks": universe, "habit_branches_known": len(table),
            "top_buyers": buyers,
            "habit_share_of_top_buy_pct": round(sum(float(b["net_lots"]) for b in flagged) / total * 100, 1) if total else None,
            "habit_share_of_volume_pct": round(sum(float(b["net_lots"]) for b in flagged) / vol * 100, 1) if vol and flagged else None}
