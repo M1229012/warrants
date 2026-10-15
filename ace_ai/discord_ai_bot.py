@@ -102,6 +102,7 @@ import sector_roster
 import local_market_cache
 import spot_chip
 import overnight_habit
+import moneydj_spot_cost
 import spot_history
 from weekly_pick import is_weekly_pick_question
 
@@ -2910,7 +2911,7 @@ def build_final_prompt(payload: Dict[str, Any]) -> str:
     if names & {"get_spot_chip_summary", "get_spot_event_backtest"} and _OVERNIGHT_ASK_RE.search(str(payload.get("question") or "")):
         sections.append(FINAL_OVERNIGHT_RULES)      # 10-15：問隔日沖，不論走型態＋籌碼或分點動向，都用白話規則
     if "get_spot_event_backtest" in names:
-        sections.append("現股分點動向（10-15）：表格已列出各分點張數與估成本，解讀要分析買賣結構，例如：買盤是長期布局（近20日≫近5日）還是短線突然進場（近5日≈近20日）、是否有隔日沖型買盤、外資與本土券商是否對作、主要買方估成本與現價的距離代表的支撐或獲利了結壓力、買盤集中或分散；不要逐一念各分點的張數與參考價。不要引用任何波段／事件的勝率、平均報酬、筆數或「歷史勝率較高」這類說法；主要看 volume_pct_5＝近5日淨買賣超占成交量、latest_net＝最新一天加碼或調節、retention_pct＝近20日買進量還留著的比例、estimated_return_pct＝現價對估成本（買超日收盤加權，不是實際成本）；成熟波段樣本很少，samples 未達 20 筆時不要引用波段勝率、達標比例或報酬中位數。現股波段統計：使用觀察到的上榜資料，波段累積達規模門檻才成立，次日開盤模擬買進，5/10/20交易日收盤計算。不是實際持股或獲利。主畫面20日，達3%/5%是期末比例，不能把盤中曾達標或漲0.01%算達標。成熟波段少於5笔時使用逐筆紀錄，不拿百分比推論未來。median_return_pct為報酬中位數，median_entry_depth_pct為相對進場價最深跌幅中位數；與worst_drawdown_pct不同，最高漲幅和最深跌幅無先後順序。background為同期間、同進場及排除規則的股價參考，40有效日以下不顯示比例。overnight為本股票本分點的大額買超後隔日反向紀錄：未上榜不是零，不代表同一客戶、真實出場或其他股票也隔日沖；少量配對只陳述事實。estimated_return_pct只是現價相對觀察估均價，非實際損益。沒有margin就省略融資；存在才依實際事件回應，不推論大戶身分。沿用原問句客製回覆與接梗，先回答問題，避免逐行念表；計算方法與例行註解留Log，不在圖片生成免責小字，但資料不足時需用正常文字明確回答。")
+        sections.append("現股分點動向（10-15）：分點有 moneydj 時是 MoneyDJ 實際成交金額算出的均價（buy_avg_day／sell_avg_day＝當日買／賣均價、buy_avg_period＝近20日買進均價），比估成本可靠，可用來說明主力成本與現價的距離、是否在漲停價附近鎖單買進、隔日以什麼價位賣出；沒有 moneydj 的分點不要寫價格。表格已列出各分點張數與估成本，解讀要分析買賣結構，例如：買盤是長期布局（近20日≫近5日）還是短線突然進場（近5日≈近20日）、是否有隔日沖型買盤、外資與本土券商是否對作、主要買方估成本與現價的距離代表的支撐或獲利了結壓力、買盤集中或分散；不要逐一念各分點的張數與參考價。不要引用任何波段／事件的勝率、平均報酬、筆數或「歷史勝率較高」這類說法；主要看 volume_pct_5＝近5日淨買賣超占成交量、latest_net＝最新一天加碼或調節、retention_pct＝近20日買進量還留著的比例、estimated_return_pct＝現價對估成本（買超日收盤加權，不是實際成本）；成熟波段樣本很少，samples 未達 20 筆時不要引用波段勝率、達標比例或報酬中位數。現股波段統計：使用觀察到的上榜資料，波段累積達規模門檻才成立，次日開盤模擬買進，5/10/20交易日收盤計算。不是實際持股或獲利。主畫面20日，達3%/5%是期末比例，不能把盤中曾達標或漲0.01%算達標。成熟波段少於5笔時使用逐筆紀錄，不拿百分比推論未來。median_return_pct為報酬中位數，median_entry_depth_pct為相對進場價最深跌幅中位數；與worst_drawdown_pct不同，最高漲幅和最深跌幅無先後順序。background為同期間、同進場及排除規則的股價參考，40有效日以下不顯示比例。overnight為本股票本分點的大額買超後隔日反向紀錄：未上榜不是零，不代表同一客戶、真實出場或其他股票也隔日沖；少量配對只陳述事實。estimated_return_pct只是現價相對觀察估均價，非實際損益。沒有margin就省略融資；存在才依實際事件回應，不推論大戶身分。沿用原問句客製回覆與接梗，先回答問題，避免逐行念表；計算方法與例行註解留Log，不在圖片生成免責小字，但資料不足時需用正常文字明確回答。")
     if "get_spot_branch_flow" in names:
         sections.append(FINAL_SPOT_BRANCH_RULES)
     if "get_branch_warrant_detail" in names:
@@ -5735,6 +5736,7 @@ class AceQueryEngine:
         # 10-06：這一題用到的現股資料只要還在背景補（籌碼、型態＋籌碼、指定分點…所有問法），補完就整題重算換圖
         # 10-08：出圖時已交給背景（圖上有「補齊中」）的股票，回答完不管背景補完沒都要排換圖；已補完的立即重算
         waits = [f for f in (spot_chip.background_future(c, include_done=True) for c in spot_chip.pending_codes()) if f is not None]
+        waits += self._request_local.__dict__.pop("moneydj_futures", None) or []   # 10-15：MoneyDJ 分點均價補完也換圖
         fut = None
         if waits and result.spot_refresh is None:
             fut = Future()
@@ -5972,9 +5974,14 @@ class AceQueryEngine:
         full = ((mode == "latest" or report.get("available_days", 0) >= report.get("requested_days", spot_chip.REQUESTED_DAYS))
                 and not (report.get("progress") or {}).get("background"))
         fut = None if full or simulation else spot_chip.background_future(code)
+        cost_jobs = [] if simulation else (self._request_local.__dict__.pop("moneydj_futures", None) or [])
+        cost_only = fut is None and bool(cost_jobs)
+        if cost_only:
+            fut = cost_jobs[0]                     # 10-15：只剩 MoneyDJ 分點均價在補：補完一樣整題重算換圖
         if fut is not None:
             # 10-06：資料還在背景補：圖上註明，補完後重算並換掉原訊息的圖（會員不用重問）
-            note = (f"歷史資料補齊中（已確認 {report.get('available_days')}／{report.get('requested_days')} 日），"
+            note = ("分點買賣均價補抓中，完成後自動更新本圖" if cost_only else
+                    f"歷史資料補齊中（已確認 {report.get('available_days')}／{report.get('requested_days')} 日），"
                     "約 1 分鐘內自動更新本圖")
             panels = [dict(p) for p in result.panels]
             for p in panels:
@@ -5987,7 +5994,7 @@ class AceQueryEngine:
                 rerun=lambda: self._rerun_spot(parsed, question, access)))
         if full and not simulation:
             self._bind_late_cache(result, key)
-        if full and not simulation and result.cacheable:
+        if full and not simulation and result.cacheable and not cost_only:
             # build_report 已讀過整個窗口的狀態，直接用（原本這裡逐日各查一次 DB）
             complete_now = (list(report["complete_all"]) if "complete_all" in report else
                             [d for d, info in local_market_cache.spot_day_status(code, dates).items()
@@ -7819,6 +7826,28 @@ class AceQueryEngine:
         print(f"🧩 分點排版 v10｜{'詳細明細' if detailed else '精簡主畫面'}｜{data.get('stock_code', '')}｜分點 {len(data.get('spot', {}).get('branches', []))} 家", flush=True)
         return card
 
+    def _attach_moneydj_cost(self, code: str, spot: Dict[str, Any]) -> None:
+        """10-15：MoneyDJ 分點買賣均價。有快取就掛上；沒有就排背景（單執行緒＋限流），本題先出圖，
+        補完後由 spot_refresh 整題重算覆蓋原圖；抓不到就不顯示價格。"""
+        branches = spot.get("branches") or []
+        date = str(spot.get("period_end") or "")
+        if not branches or not date:
+            return
+        try:
+            have, job = moneydj_spot_cost.costs(code, date, [b["branch"] for b in branches])
+        except Exception as exc:
+            self.log(f"MoneyDJ 分點均價略過｜{code}｜{type(exc).__name__}: {exc}")
+            return
+        for b in branches:
+            if have.get(b["branch"]):
+                b["moneydj"] = have[b["branch"]]
+        if job is not None and not job.done():
+            local = getattr(self, "_request_local", None)
+            if local is not None:
+                local.moneydj_futures = list(getattr(local, "moneydj_futures", None) or []) + [job]
+                local.spot_partial = True          # 價格還在補：這題不寫入回答快取
+            self.log(f"MoneyDJ 分點均價背景補抓｜{code}｜{date}｜{sum(1 for b in branches if 'moneydj' not in b)} 家")
+
     def _chip_view(self, question: str) -> str:
         """10-15：AI 讀整句判斷現股籌碼要看哪一組分點（不寫死關鍵字）；判斷失敗一律用最新一天。"""
         cache = self.__dict__.setdefault("_chip_view_cache", {})
@@ -7864,6 +7893,7 @@ class AceQueryEngine:
                     result['spot']['overnight']=overnight_habit.check(code, report or {})
                 except Exception as exc:
                     self.log(f"隔日沖判斷略過：{type(exc).__name__}: {exc}")
+            self._attach_moneydj_cost(code, result['spot'])
             self.log(f"測試現股回測｜{code}｜分點 {len(result['spot']['branches'])} 家｜融資事件 {len((result.get('margin') or {}).get('events', []))}")
             return result
         except Exception as exc:

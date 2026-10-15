@@ -350,6 +350,23 @@ def _net_share(net,share):
     return f'{net:+,.0f}（{share:.1f}%）' if share is not None else f'{net:+,.0f}'
 
 
+def _day_prices(b):
+    m=b.get('moneydj') or {}
+    buy,sell=m.get('buy_avg_day'),m.get('sell_avg_day')
+    if buy is None and sell is None:return '—'
+    return f"{buy:,.2f}" if sell is None else f"／{sell:,.2f}" if buy is None else f"{buy:,.2f}／{sell:,.2f}"
+
+
+def _cost_gap(b):
+    """現價對成本：有 MoneyDJ 近20日買進均價就用真實均價，否則用買超日收盤加權並標（估）。"""
+    cost,ret=b.get('estimated_buy_cost'),b.get('estimated_return_pct')
+    real=(b.get('moneydj') or {}).get('buy_avg_period')
+    if real and cost and ret is not None:
+        close=cost*(1+ret/100)
+        return pct((close/real-1)*100,True)
+    return pct(ret,True)+'（估）' if ret is not None else '—'
+
+
 def _latest_action(b):
     n=b.get('latest_net')
     if not n:return '—'
@@ -379,6 +396,7 @@ def _brief_spot_card(payload):
     except Exception:
         habits={}
     view=data.get('view')
+    priced=any(b.get('moneydj') for b in data.get('branches',[]))   # 10-15：有 MoneyDJ 均價才多一欄
     basis={'latest':'依最新交易日淨買賣超','rank20':'依近20日淨買賣超'}.get(view,'')
     # 依 rank_label 分組：買超前3／賣超前3（主力分點、指定分點為一組），讓讀者知道為何列出這些分點
     groups=[]
@@ -387,17 +405,22 @@ def _brief_spot_card(payload):
         name=('買超前3' if label.startswith('買超') else '賣超前3' if label.startswith('賣超')
               else '主力分點' if label.startswith('主力') else '指定分點' if view=='branch' else '分點動向')
         if not groups or groups[-1][0]!=name:groups.append((name,[],[]))
-        groups[-1][1].append([b['branch'],_latest_action(b),_net_share(b['observed_net_5'],b.get('volume_pct_5')),
-            _net_share(b['observed_net_20'],b.get('volume_pct_20')),
-            pct(b['estimated_return_pct'],True) if b.get('estimated_return_pct') is not None else '—'])
+        row=[b['branch'],_latest_action(b),_net_share(b['observed_net_5'],b.get('volume_pct_5')),
+            _net_share(b['observed_net_20'],b.get('volume_pct_20'))]
+        if priced:row.append(_day_prices(b))
+        row.append(_cost_gap(b))
+        groups[-1][1].append(row)
         groups[-1][2].append(_branch_kind(b,habits))
     for name,rows,badges in groups:
         sections+=[{'type':'heading','text':name+(f'｜{basis}' if basis else '')+'｜張數'},
-            {'type':'table','columns':['券商分點','當日（占量）','近5日（占量）','近20日（占量）','現價對估成本'],
-             'widths':[.28,.18,.18,.19,.17],'signed':['當日（占量）','近5日（占量）','近20日（占量）','現價對估成本'],'accent':[],
+            {'type':'table','columns':['券商分點','當日（占量）','近5日（占量）','近20日（占量）']+(['當日買／賣均價'] if priced else [])+['現價對成本'],
+             'widths':[.22,.16,.16,.16,.16,.14] if priced else [.28,.18,.18,.19,.17],
+             'signed':['當日（占量）','近5日（占量）','近20日（占量）','現價對成本'],'accent':[],
              'rows':rows,'row_badges':badges}]
     if groups:
-        sections.append({'type':'paragraph','text':'各期間為淨買賣超張數，括號內為占同期間成交量比重；估成本為買超日收盤加權，非實際成本'})
+        sections.append({'type':'paragraph','text':'各期間為淨買賣超張數，括號內為占同期間成交量比重；'
+            +('均價取自 MoneyDJ 分點買賣金額÷股數，現價對成本以近20日買進均價計算；' if priced else '')
+            +'標（估）者為買超日收盤加權估算，非實際成本'})
     if not data.get('branches'):sections.append({'type':'paragraph','text':'目前沒有可顯示的分點動向'})
     sections.extend(_margin_sections(payload))
     return {'branch':f"{payload['stock_code']} {payload['stock_name']}｜分點動向",'label':data.get('period_end',''),
