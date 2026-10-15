@@ -145,10 +145,11 @@ def check(stock_code, report):
                 today = dict(conn.execute("SELECT branch_name, net FROM spot_branch_daily WHERE stock_code=? AND date=?",
                                           (stock_code, dates[0])).fetchall())
                 pv = volume.get((stock_code, dates[1]))
+                prev_lock = bool(_limit_up(stock_code, dates[1]))   # 前一天鎖漲停的大量買盤，不是慣性分點也一起驗證
                 out["verify_previous_day"] = [
                     {"branch": b, "buy_date": dates[1], "buy_lots": n, "volume_pct": round(float(n) / pv * 100, 2),
                      "next_day_net_lots": today.get(b, 0), "reversed": -float(today.get(b, 0)) >= float(n) * REVERSE}
-                    for b, n in prev.items() if b in table and pv and float(n) >= MIN_LOTS and float(n) / pv >= BIG_SHARE]
+                    for b, n in prev.items() if (b in table or prev_lock) and pv and float(n) >= MIN_LOTS and float(n) / pv >= BIG_SHARE]
     except Exception:
         pass
     return out
