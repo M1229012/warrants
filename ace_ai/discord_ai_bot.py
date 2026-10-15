@@ -5287,7 +5287,7 @@ class AceQueryEngine:
                                               remembered=getattr(remembered, "chip_context", "") if remembered and note else "")
         if (_OVERNIGHT_ASK_RE.search(question) and parsed.chip not in ("spot", "combined") and parsed.stocks
                 and (access is None or access.entitlement.spot)):
-            parsed.chip = "spot"   # 10-15：問隔日沖＝看現股籌碼頁（顯示不變），AI 解讀再回答有沒有隔日沖可能
+            parsed.chip = "spot"   # 10-15：問隔日沖＝型態頁＋今日現股籌碼重點（顯示不變），AI 解讀再回答有沒有隔日沖可能
         access_policy.require_question(access, question, tools.get_cached_known_branches(), parsed)
         if (_PRONOUN_RE.search(question) and not (parsed.stocks or parsed.branches or parsed.sector)
                 and not parsed.stock_candidates and not parsed.branch_candidates):
@@ -5299,7 +5299,7 @@ class AceQueryEngine:
                                 elapsed=time.perf_counter() - started)
         if note:
             self.log(f"追問記憶：{note}")
-        if (parsed.chip == "spot" and _PATTERN_WITH_CHIP_RE.search(question)
+        if (parsed.chip == "spot" and (_PATTERN_WITH_CHIP_RE.search(question) or _OVERNIGHT_ASK_RE.search(question))
                 and any(c not in tools.INDEX_CODES for c, _ in parsed.stocks)):
             # 同時問型態＋現股籌碼：維持型態分析長圖（K 線＋評分卡），中間加精簡籌碼重點，AI 同時解讀技術面＋籌碼面。
             access_policy.require_chip(access, "spot")
@@ -5481,7 +5481,16 @@ class AceQueryEngine:
             card = dict(card, sections=[{"type": "badge", "text": f"歷史資料補齊中（已確認 {report.get('available_days')}／{report.get('requested_days')} 日），約 1 分鐘內自動更新本圖"}]
                         + list(card.get("sections") or []))
         return ({"branch_card": card, "hide_text": False,
-                 "footer_suffix": "現股分點為每日前段分點近似統計"}, spot_chip.summary_payload(report))
+                 "footer_suffix": "現股分點為每日前段分點近似統計"}, self._with_overnight(parsed, code, report))
+
+    def _with_overnight(self, parsed, code, report):
+        payload = spot_chip.summary_payload(report)
+        if _OVERNIGHT_ASK_RE.search(parsed.original or ""):
+            try:
+                payload["overnight"] = overnight_habit.check(code, report)
+            except Exception as exc:   # 判斷不出來：照常解讀，AI 依規則說看不出明顯隔日沖
+                self.log(f"隔日沖判斷略過：{type(exc).__name__}: {exc}")
+        return payload
 
     def _answer_warrant_chip(self, parsed: ParsedQuestion, question: str, started: float) -> AnswerResult:
         access_policy.require_chip(self._access(), "warrant")
@@ -5570,11 +5579,6 @@ class AceQueryEngine:
         # 使用同一份報表解讀，沒有額外抓價或再次抓 70 日；缺資料卡仍走上方備援。
         payload = dict(spot_chip.summary_payload(report), stock_code=code, stock_name=name,
                        continuity=report.get("continuity") or [], history=report.get("history") or [])
-        if _OVERNIGHT_ASK_RE.search(question):
-            try:
-                payload["overnight"] = overnight_habit.check(code, report)
-            except Exception as exc:   # 判斷不出來：照常解讀現股籌碼，AI 依規則說看不出明顯隔日沖
-                self.log(f"隔日沖判斷略過：{type(exc).__name__}: {exc}")
         stats = AnswerStats()
         ai_text, llm_ok = self._compose(question, QueryPlan(route="rule_spot_chip", need_final_llm=True),
                                         [tools.ToolResult("get_spot_chip_summary", True, payload)], stats)
