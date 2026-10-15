@@ -7575,7 +7575,9 @@ class AceQueryEngine:
                 if parsed.cost_price is not None:
                     panel["key_levels"]["cost_price"] = parsed.cost_price
                 panel["disable_compare"] = not member_pattern.comparing(plan)
-                if (TEST_SHOW_SCORECARD and (not view or member_pattern.wants_score(parsed, plan, code))) or _pirate_pattern_request.get():
+                # 10-15：籌碼題（現股／權證／兩種一起、型態＋籌碼）不顯示型態評分；海盜型態照舊
+                chip_question = bool(getattr(parsed, "spot_combo", False) or getattr(parsed, "chip", "") in ("spot", "warrant", "combined"))
+                if (TEST_SHOW_SCORECARD and not chip_question and (not view or member_pattern.wants_score(parsed, plan, code))) or _pirate_pattern_request.get():
                     # 10-08：正式版還有評分卡，測試版先照正式版顯示，方便比對評分修正；整飾板拿掉時設 0
                     card = self._pattern_scorecard(code, results, parsed.cost_price)
                     with_chips = any(r.name == "get_sheet_stock_chips" and r.ok for r in results)
