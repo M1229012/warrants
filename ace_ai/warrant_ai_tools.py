@@ -2509,7 +2509,9 @@ def _load_price_bundle(stock_code: str, spot_history_mode: bool = False) -> Dict
         if set(gaps) - known:
             # 已證實合法的缺口（颱風假等全市場休市、確定沒成交）不必補；只有沒證據的缺口才用本地底庫＋FinMind 補。
             # 以前每檔股票的 7/10 颱風假都會各打一次 FinMind，背景型態分數一跑就把每小時額度吃光。
-            legal = set(legal_gap_days(code, gaps))
+            # 10-16：興櫃常常整天沒成交，又不在上市櫃收盤快照裡（無法用快照證明）→ 缺口一律視為無成交
+            emerging_gaps = set(gaps) if str(code) in get_emerging_codes() else set()
+            legal = set(legal_gap_days(code, gaps)) | emerging_gaps
             unproven = [d for d in gaps if d not in legal]
             if unproven:
                 daily_df, daily_source = _repair_daily(code, daily_df, unproven, daily_source,
@@ -2518,7 +2520,7 @@ def _load_price_bundle(stock_code: str, spot_history_mode: bool = False) -> Dict
                 CACHE.set(f"price_daily_{code}", (daily_df, market, daily_source), TTL_PRICE_SECONDS)
                 merged, intraday = _append_intraday_bar(code, daily_df, market)
             gaps = _missing_trading_days(merged)
-            unproven = [d for d in gaps if d not in set(legal_gap_days(code, gaps))]
+            unproven = [d for d in gaps if d not in set(legal_gap_days(code, gaps)) and str(code) not in get_emerging_codes()]
             if unproven:
                 # 補不回來、又沒有休市或停牌證據的缺口：均線／布林會算錯，寧可不答（不假設是停牌或休市）。
                 # 有證據的缺口不限天數：冷門股常常好幾天沒成交、重大訊息暫停交易也可能連續好幾天沒有價格。

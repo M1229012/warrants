@@ -1631,10 +1631,7 @@ class QueryRouter:
             return plan
         if parsed.stocks and ("cost" in intents or not other_categories):
             if categories == {"price"} and not analysis and "cost" not in intents and not _WHY_RE.search(parsed.original or ""):
-                plan = self._stock_plan(parsed, categories, analysis)
-                plan.need_final_llm = True            # 10-16：只問數字也給 1～2 句簡短看法
-                for code, _ in parsed.stocks:
-                    plan.add("get_technical_analysis", stock_code=code)
+                plan = self._pattern_plan(parsed)     # 10-16：只問數字也出型態圖，AI 解讀以回答所問為主
                 plan.brief_quote = True
                 return plan
             plan = self._pattern_plan(parsed)
@@ -2933,8 +2930,9 @@ def build_final_prompt(payload: Dict[str, Any]) -> str:
         sections.append(FINAL_PATTERN_RULES)
     sections.append(FINAL_CARD_FORMAT)
     if payload.get("brief_quote"):
-        sections.append("本題只問數字（股價、成交量、漲跌）：answer 先直接回答數字，再用一句說明代表的意義（例如量價關係、相對均線或近期高低位置）；"
-                        "why 最多 2 句簡短看法，scenarios 給空陣列，summary 留空。")
+        sections.append("本題只問數字（股價、成交量、漲跌）：圖上雖有完整型態資料，解讀要以回答所問為主。answer 先直接回答數字，"
+                        "再說明這個數字代表的意義（例如成交量和 5／20 日均量比較、量價關係、價格在均線或近期高低的位置）；"
+                        "why 2～3 句只談和所問數字有關的看法，不展開完整型態分析；scenarios 最多 1 個，summary 留空。")
     if names & {'get_technical_analysis', 'get_pattern_scorecard', 'get_volume_profile'}:
         sections.append("白話／持倉回答：先回答這次原問句真正關心的事，再挑有必要的依據與觀察條件；不以成本高低決定股票好壞。問持有、賣出、回本時回答結構與風險，不替人做交易決定，不說續抱、值得持有、賣掉、加碼或保證回本。成本未提供就不計個人損益；日期未提供就不推測進場當天或持有時間；理由是用戶陳述，未核實不可當已知事實。欄位依資訊需要選擇，說清楚即可，資料不足不硬湊。用戶要賣不等於已賣出。")
         if review_language.intent(payload['question']) == 'review':
