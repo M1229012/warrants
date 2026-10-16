@@ -2536,15 +2536,16 @@ def _load_price_bundle(stock_code: str, spot_history_mode: bool = False) -> Dict
         raw_closed = daily_df.copy()
         raw_merged = merged.copy()
         actions = get_corporate_actions(code)
+        jumps = str(code) in get_emerging_codes()   # 10-16：興櫃價格跳動不當成未核實斷層
         try:
-            daily_df = price_adjustment.adjust_shares(daily_df, actions, as_of=merged.index[-1])
-            merged = price_adjustment.adjust_shares(merged, actions)
+            daily_df = price_adjustment.adjust_shares(daily_df, actions, as_of=merged.index[-1], allow_jumps=jumps)
+            merged = price_adjustment.adjust_shares(merged, actions, allow_jumps=jumps)
         except ValueError:
             # FinMind 回應成功但事件漏列，也必須查官方參考價；成功空表不等於沒有事件。
             actions = _recover_corporate_reference(code, actions)
             try:
-                daily_df = price_adjustment.adjust_shares(raw_closed, actions, as_of=raw_merged.index[-1])
-                merged = price_adjustment.adjust_shares(raw_merged, actions)
+                daily_df = price_adjustment.adjust_shares(raw_closed, actions, as_of=raw_merged.index[-1], allow_jumps=jumps)
+                merged = price_adjustment.adjust_shares(raw_merged, actions, allow_jumps=jumps)
             except ValueError as exc:
                 raise ToolDataError(str(exc)) from exc
         closed = kf.calculate_indicators(daily_df)

@@ -21,12 +21,12 @@ def event_from_row(row, kind):
             'volume_factor':volume_factor, 'before_price':before, 'reference_price':after}
 
 
-def adjust_shares(frame, events, as_of=None):
+def adjust_shares(frame, events, as_of=None, allow_jumps=False):
     out = frame.copy()
     if out.empty:
         return out
     if out.attrs.get('share_adjustments') is not None:
-        validate_adjusted(out)
+        validate_adjusted(out, allow_jumps)
         return out
     applied=[]
     if events and events.get('status') == 'ok':
@@ -56,20 +56,21 @@ def adjust_shares(frame, events, as_of=None):
             # 權息混合事件沒有純股數比率：成交量維持原始張數（與券商 App 一致），不清空
             applied.append(dict(ev))
     # 大幅斷層僅作資料警示，絕不從這個比例反推還原因子。
-    validate_adjusted(out)
+    validate_adjusted(out, allow_jumps)
     out.attrs['share_adjustments']=applied
     out.attrs['share_adjustment_as_of']=str(pd.Timestamp(as_of if as_of is not None else out.index[-1]).date())
     return out
 
 
-def validate_adjusted(frame):
+def validate_adjusted(frame, allow_jumps=False):
     if frame.empty:
         return
     close = pd.to_numeric(frame['Close'], errors='coerce')
     if not close.map(lambda v: math.isfinite(v) and v > 0).all():
         raise ValueError('日K含無效價格，暫停覆盤與技術分析')
     ratios = close.div(close.shift())
-    if ((ratios < .65) | (ratios > 1.8)).any():
+    # 10-16：興櫃沒有漲跌幅限制、常隔多日才成交，價格跳動不代表公司行動（allow_jumps）
+    if not allow_jumps and ((ratios < .65) | (ratios > 1.8)).any():
         raise ValueError('日K仍有未核實的大幅價格斷層，請更新公司行動參考價後再分析')
 
 
