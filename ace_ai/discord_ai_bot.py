@@ -3331,6 +3331,8 @@ class FactSheet:
                 if re.search(other_boundary, clause) or re.search(r"歷史|先前|前一組", clause):
                     continue
                 position = view.get("current_position")
+                if position not in ("inside", "above", "below"):
+                    position = None          # 10-16：not_applicable（超過追蹤期）等無法核對位置，不判不符
                 claims = ((r"(?:位於|處於|仍在|仍位於|回到)(?:目前)?(?:三角(?:收斂)?(?:候選)?(?:型態)?|型態|候選線|線)內", "inside"),
                           (r"(?:收盤|股價)?(?:已|目前)?(?:高於|站上|越過)(?:三角(?:收斂)?(?:候選)?|候選)?上緣", "above"),
                           (r"(?:收盤|股價)?(?:已|目前)?(?:低於|跌破)(?:三角(?:收斂)?(?:候選)?|候選)?下緣", "below"))
@@ -8032,6 +8034,11 @@ class AceQueryEngine:
         card["scenarios"] = [s for s in card["scenarios"] if s["text"]]
         if not card["answer"] and card["summary"]:
             card["answer"], card["summary"] = card["summary"], ""     # 標題句被刪：改用一句話總結當標題，不整張丟掉
+        if not card["answer"] and card["why"]:
+            # 10-16：標題句被刪、又沒有總結：拿「為什麼」第一句當標題，不讓整張解讀消失
+            head = re.split(r"(?<=[。！？])", card["why"], maxsplit=1)[0]
+            card["answer"] = head.strip()
+            card["why"] = card["why"][len(head):].strip()
         if removed_all:
             self.log(f"事實核對（解讀卡）：刪除 {len(removed_all)} 句｜{'；'.join(r for r in removed_all[:6])}")
         if not card["answer"] or len(ai_card_text(card)) < before * 0.6:

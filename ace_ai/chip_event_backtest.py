@@ -417,10 +417,7 @@ def _brief_spot_card(payload):
              'widths':[.22,.16,.16,.16,.16,.14] if priced else [.28,.18,.18,.19,.17],
              'signed':['當日（占量）','近5日（占量）','近20日（占量）','現價對成本'],'accent':[],
              'rows':rows,'row_badges':badges}]
-    if groups:
-        sections.append({'type':'paragraph','text':'各期間為淨買賣超張數，括號內為占同期間成交量比重；'
-            +('均價取自 MoneyDJ 分點買賣金額÷股數，現價對成本以近20日買進均價計算；' if priced else '')
-            +'標（估）者為買超日收盤加權估算，非實際成本'})
+    # 10-16：分點表格不放註解，保持乾淨
     if not data.get('branches'):sections.append({'type':'paragraph','text':'目前沒有可顯示的分點動向'})
     sections.extend(_margin_sections(payload))
     return {'branch':f"{payload['stock_code']} {payload['stock_name']}｜分點動向",'label':data.get('period_end',''),
