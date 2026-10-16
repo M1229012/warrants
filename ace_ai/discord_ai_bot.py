@@ -228,8 +228,8 @@ def narrow_by_channel(config: BotConfig, access, channel):
     ids = _channel_ids(channel)
     if ids & config.warrant_channel_ids:
         e = replace(e, spot=False)
-    elif ids & config.spot_channel_ids:
-        e = replace(e, warrant=False)
+    elif config.warrant_channel_ids:
+        e = replace(e, warrant=False)    # 10-16：權證籌碼只在權證頻道（現股頻道與其他頻道都不行）；管理員不限
     return replace(access, entitlement=e) if e is not access.entitlement else access
 
 
@@ -239,7 +239,7 @@ def chip_channel_hint(config: BotConfig, required: str, original, channel) -> st
     ids = _channel_ids(channel) if channel is not None else set()
     if required == "SPOT" and original.spot and ids & config.warrant_channel_ids:
         target, label = config.spot_channel_ids, "現股籌碼"
-    elif required == "WARRANT" and original.warrant and ids & config.spot_channel_ids:
+    elif required == "WARRANT" and original.warrant and not ids & config.warrant_channel_ids:
         target, label = config.warrant_channel_ids, "權證籌碼"
     else:
         return ""                                   # 不是頻道收窄造成的 → 照舊顯示購買／解鎖訊息
@@ -656,6 +656,7 @@ class QueryPlan:
     beta_fallback: Optional["QueryPlan"] = None  # beta_only route 的正式舊 route；非 tester 靜默改走這個
     uncertain: bool = False     # 規則只認出股票、看不出要問什麼：交給 AI 讀整句分類（10-06）
     needs: Optional[Dict[str, Any]] = None   # 10-08：需求表（要回答什麼、排除什麼、對象），送進最後提示
+    brief_quote: bool = False                # 10-16：只問數字＋簡短 AI 看法
 
     def add(self, name: str, **kwargs: Any) -> None:
         call = ToolCall(name, {k: v for k, v in kwargs.items() if v not in (None, "")})
@@ -1630,7 +1631,12 @@ class QueryRouter:
             return plan
         if parsed.stocks and ("cost" in intents or not other_categories):
             if categories == {"price"} and not analysis and "cost" not in intents and not _WHY_RE.search(parsed.original or ""):
-                return self._stock_plan(parsed, categories, analysis)
+                plan = self._stock_plan(parsed, categories, analysis)
+                plan.need_final_llm = True            # 10-16：只問數字也給 1～2 句簡短看法
+                for code, _ in parsed.stocks:
+                    plan.add("get_technical_analysis", stock_code=code)
+                plan.brief_quote = True
+                return plan
             plan = self._pattern_plan(parsed)
             # 規則沒認出任何「要問什麼」，句子卻還有別的字（「聯電最近是發生甚麼事」）：先走型態，但交給 AI 判斷題意
             plan.uncertain = (len(parsed.stocks) == 1 and not categories and not analysis and "cost" not in intents
@@ -2926,6 +2932,9 @@ def build_final_prompt(payload: Dict[str, Any]) -> str:
     elif "get_pattern_scorecard" in names:
         sections.append(FINAL_PATTERN_RULES)
     sections.append(FINAL_CARD_FORMAT)
+    if payload.get("brief_quote"):
+        sections.append("本題只問數字（股價、成交量、漲跌）：answer 先直接回答數字，再用一句說明代表的意義（例如量價關係、相對均線或近期高低位置）；"
+                        "why 最多 2 句簡短看法，scenarios 給空陣列，summary 留空。")
     if names & {'get_technical_analysis', 'get_pattern_scorecard', 'get_volume_profile'}:
         sections.append("白話／持倉回答：先回答這次原問句真正關心的事，再挑有必要的依據與觀察條件；不以成本高低決定股票好壞。問持有、賣出、回本時回答結構與風險，不替人做交易決定，不說續抱、值得持有、賣掉、加碼或保證回本。成本未提供就不計個人損益；日期未提供就不推測進場當天或持有時間；理由是用戶陳述，未核實不可當已知事實。欄位依資訊需要選擇，說清楚即可，資料不足不硬湊。用戶要賣不等於已賣出。")
         if review_language.intent(payload['question']) == 'review':
@@ -5668,6 +5677,13 @@ class AceQueryEngine:
             self.log(f"追問記憶：{note}")
         # 10-15：問「隔日沖」且有現股權限：一定帶現股分點，判斷今日買盤是不是隔日沖慣性分點
         parsed.overnight_ask = bool(_OVERNIGHT_ASK_RE.search(question)) and (access is None or access.entitlement.spot)
+        emerging = [c for c, _ in parsed.stocks if c in tools.get_emerging_codes()]
+        if emerging and parsed.chip in ("spot", "combined", "warrant"):
+            # 10-16：興櫃股票沒有公開的券商分點進出：不抓籌碼，改出型態卡，AI 先說明是興櫃、沒有籌碼資料
+            self.log(f"興櫃股票不查籌碼｜{','.join(emerging)}｜改型態分析")
+            parsed.chip, parsed.overnight_ask = "", False
+            parsed.intents = (set(parsed.intents) - {"warrant", "recent_trades", "win_rate"}) | {"analysis"}
+            question = f"{question}（{'、'.join(emerging)} 為興櫃股票，沒有公開的券商分點籌碼；請先簡短說明這點，再分析K線、技術面與型態）"
         if (((parsed.chip == "spot" and _PATTERN_WITH_CHIP_RE.search(question)) or parsed.overnight_ask)
                 and any(c not in tools.INDEX_CODES for c, _ in parsed.stocks)):
             # 同時問型態＋現股籌碼：維持型態分析長圖（K 線＋分點回測卡），中間加精簡籌碼重點，AI 同時解讀技術面＋籌碼面。
@@ -8068,6 +8084,8 @@ class AceQueryEngine:
             return rule_answer, True
         payload = build_final_payload(question, results)
         payload["pattern_focus"] = bool(plan.route == "rule_pattern" or plan.pattern)
+        if getattr(plan, "brief_quote", False):
+            payload["brief_quote"] = True
         context = getattr(getattr(self, "_request_local", None), "member_chart_context", None)
         if context and (context.get("compound") or any(v.get("triangle") or not v.get("show_bollinger", True) for v in context.get("stocks", {}).values())):
             payload = member_pattern.scoped_payload(payload, context)

@@ -951,6 +951,19 @@ def run_tool(name: str, kwargs: Dict[str, Any], cancel_event: Optional[threading
 # 股票代號／名稱與分點名稱辨識資料
 # ============================================================
 
+def get_emerging_codes() -> set:
+    """10-16：興櫃股票代號（FinMind 股票清單 type=emerging）。興櫃沒有公開的券商分點進出，籌碼題不去抓。"""
+    def build():
+        info = core()._finmind_load_stock_info()
+        if info is None or info.empty or "type" not in info.columns:
+            return set()
+        return set(info.loc[info["type"].astype(str) == "emerging", "stock_id"].astype(str))
+    try:
+        return _cached("emerging_codes", TTL_REFERENCE_SECONDS, build)
+    except Exception:
+        return set()
+
+
 def get_stock_name_map() -> Dict[str, str]:
     """股票代號 → 名稱：TWSE／TPEx 官方基本資料為主，FinMind 股票清單補上 ETF 等其餘代號。"""
     return _cached("stock_name_map", TTL_REFERENCE_SECONDS, _build_stock_name_map)
