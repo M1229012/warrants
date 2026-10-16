@@ -2403,6 +2403,11 @@ def _drop_invalid_bars(code: str, frame: pd.DataFrame, source: str) -> pd.DataFr
     拿掉的日子變成缺口，交給 legal_gap_days 用「所屬市場收盤完整、卻沒有這檔」證明確定沒成交。"""
     if frame is None or frame.empty:
         return frame
+    if str(code) in get_emerging_codes():
+        # 10-16：興櫃的 FinMind「開盤」是參考價／均價，常落在當日高低之外（例 3585 10/15 開 68.75、高 66.7），
+        # 不是壞資料：開盤夾回高低區間，其餘照常檢查（價格為 0 的無成交日仍會拿掉）
+        frame = frame.copy()
+        frame["Open"] = frame["Open"].clip(lower=frame["Low"], upper=frame["High"])
     ok = [local_market_cache.valid_bar(r.Open, r.High, r.Low, r.Close, 0.0 if pd.isna(r.Volume) else r.Volume)
           for r in frame[["Open", "High", "Low", "Close", "Volume"]].itertuples(index=False)]
     bad = len(ok) - sum(ok)
