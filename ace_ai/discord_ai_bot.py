@@ -2638,6 +2638,26 @@ def _compact_tool_data(name: str, data: Dict[str, Any], has_scorecard: bool) -> 
         return None  # 成本位置、支撐壓力、量區型態都已整理在評分卡
     # 權證分點只在會員明確問權證時才和評分卡一起出現（「權證籌碼和型態」），要送給 AI，否則 AI 無法回答權證那一半
     data = dict(data)
+    if name == "get_spot_event_backtest":
+        # 10-16：只送表格上那幾家分點的摘要；逐日紀錄、波段事件與統計不送（原本一題 7～13 萬字）
+        spot = data.get("spot") or {}
+        keep = ("branch", "rank_label", "status", "latest_net", "latest_volume_pct", "observed_net_5", "volume_pct_5",
+                "observed_net_20", "volume_pct_20", "buy_days_20", "estimated_buy_cost", "estimated_return_pct", "moneydj")
+        rows = []
+        for b in spot.get("branches") or []:
+            row = {k: b[k] for k in keep if b.get(k) not in (None, "", [], {})}
+            if (b.get("overnight") or {}).get("recent_match"):
+                row["overnight_recent"] = True
+            rows.append(row)
+        slim = {"period_end": spot.get("period_end"), "view": spot.get("view"), "branches": rows}
+        for k in ("overnight", "overnight_question"):
+            if spot.get(k):
+                slim[k] = spot[k]
+        out = {k: data[k] for k in ("stock_code", "stock_name") if data.get(k)}
+        out["spot"] = slim
+        if (data.get("margin") or {}).get("events"):
+            out["margin"] = {"events": data["margin"]["events"][-3:]}
+        return out
     if name == "get_technical_analysis":
         data["bollinger"] = {k: v for k, v in (data.get("bollinger") or {}).items() if k in _BOLLINGER_KEEP}
         import kline_patterns
@@ -3294,10 +3314,12 @@ class FactSheet:
             if re.search(other_boundary, clause):
                 continue
             # Numeric grounding alone cannot detect swapped upper/lower labels.
-            for side, number in re.findall(r"(上緣|下緣)\s*[：:為約在]*\s*(\d+(?:\.\d+)?)", clause):
+            for side, number in re.findall(r"(上緣|下緣)\s*[：:為約在]*\s*(\d[\d,]*(?:\.\d+)?)", clause):
+                number = number.replace(",", "")         # 10-16：「2,444.45」不能只讀到 2
                 if number not in lines.get(side, set()):
                     issues.append(f"三角{side}價位不符")
-            for number, side in re.findall(r"(\d+(?:\.\d+)?)\s*(?:元\s*的?|的)(?:三角(?:收斂)?(?:候選)?|候選)?(上緣|下緣)", clause):
+            for number, side in re.findall(r"(\d[\d,]*(?:\.\d+)?)\s*(?:元\s*的?|的)(?:三角(?:收斂)?(?:候選)?|候選)?(上緣|下緣)", clause):
+                number = number.replace(",", "")
                 if number not in lines.get(side, set()):
                     issues.append(f"三角{side}價位不符")
         # Current position and confirmation must come from this drawn pair.
@@ -3318,11 +3340,9 @@ class FactSheet:
                             if position and position != claimed:
                                 issues.append("目前三角位置與圖上收盤不符")
                 if "first_break" in view and re.search(r"(?:已確認|確認(?:向[上下])?(?:突破|跌破)|突破(?:已)?確認|突破成功)", clause):
-                    if not re.search(r"未|尚未|不代表|不能|沒有|並非", clause):
-                        breaks = [h for h in view.get("history") or [] if h.get("type") in ("break_up", "break_down")]
-                        event = breaks[-1] if breaks else view.get("first_break") or {}
-                        if view.get("candidate") or event.get("confirm") != "確認":
-                            issues.append("三角越線尚未通過兩日確認")
+                    # 10-16：收盤越線就是突破，不再要求兩日確認；只有候選線不能寫成確認突破
+                    if not re.search(r"未|尚未|不代表|不能|沒有|並非", clause) and view.get("candidate"):
+                        issues.append("候選三角不能寫成確認突破")
                 if "first_break" in view and re.search(r"(?:正式|已經|已)(?:向[上下])?(?:突破|跌破)", clause):
                     if not re.search(r"未|尚未|不代表|不能|沒有|並非", clause):
                         breaks = [h for h in view.get("history") or [] if h.get("type") in ("break_up", "break_down")]
