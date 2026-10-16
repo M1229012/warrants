@@ -362,7 +362,7 @@ def chart_context(panels, compound=False):
                 stock["ma_positions"][key] = "站上" if close > ma else "跌破" if close < ma else "持平"
         view = p.get("member_triangle")
         if view:
-            stock["triangle"] = ({k: deepcopy(v) for k, v in view.items() if k not in ("rows", "detector_position", "diagnostic")}
+            stock["triangle"] = ({k: deepcopy(v) for k, v in view.items() if k not in ("rows", "diagnostic")}   # 10-16：detector_position（越線判定）也要給核對與 AI
                                  if view.get("visible") else {"visible": False, "notice": view.get("notice")})
             stock["show_score"] = bool(p.get("scorecard"))
         out["stocks"][p["stock_code"]] = stock

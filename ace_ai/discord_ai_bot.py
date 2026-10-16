@@ -2009,6 +2009,7 @@ _OVERLOAD_CONFIG = tools._env_int("DISCORD_AI_GEMINI_OVERLOAD_COOLDOWN", 15)
 GEMINI_OVERLOAD_COOLDOWN = max(10, 15 if _OVERLOAD_CONFIG == 120 else _OVERLOAD_CONFIG)
 GEMINI_OVERLOAD_RETRY_WAIT = max(0.0, tools._env_float("DISCORD_AI_GEMINI_OVERLOAD_RETRY_WAIT", 1.5))    # 主模型 503：等一下換金鑰重試一次
 GEMINI_CALL_TIMEOUT_MS = max(10000, tools._env_int("DISCORD_AI_GEMINI_CALL_TIMEOUT_MS", 12000))   # 10-03：一次卡 148 秒；10-07：504 塞車白等 20 秒→12 秒就換金鑰／模型（正常回答約 6～8 秒）
+_GEMINI_SENT = threading.local()   # 10-16：每次 _generate 實際送出的請求數
 GEMINI_MAX_ATTEMPTS = max(1, tools._env_int("DISCORD_AI_GEMINI_MAX_ATTEMPTS", 5))      # 10-08：一次呼叫換金鑰／模型總次數上限
 GEMINI_MIN_CALL_SECONDS = 3.0                                                                  # 剩不到 3 秒就不再啟動新呼叫
 QUESTION_DEADLINE_SECONDS = max(15.0, tools._env_float("DISCORD_AI_QUESTION_DEADLINE_SECONDS", 50.0))
@@ -2352,6 +2353,7 @@ class GeminiGateway:
             client = kf.genai.Client(api_key=key)
         try:
             __import__("request_runtime").reserve_call(QUESTION_MAX_GEMINI_CALLS)
+            _GEMINI_SENT.n = getattr(_GEMINI_SENT, "n", 0) + 1
             return client.models.generate_content(model=model, contents=contents, config=use)
         except Exception as exc:
             if not thinking or "thinking" not in str(exc).lower():
@@ -2359,6 +2361,7 @@ class GeminiGateway:
             _THINKING_UNSUPPORTED.add(model)
             print(f"⚠️ {model} 不支援思考參數，改用模型預設：{str(exc)[:160]}", flush=True)
             __import__("request_runtime").reserve_call(QUESTION_MAX_GEMINI_CALLS)
+            _GEMINI_SENT.n = getattr(_GEMINI_SENT, "n", 0) + 1     # 不支援 thinking 改送一次也要算
             return client.models.generate_content(model=model, contents=contents, config=config)
 
     def _generate(self, prompt: str, purpose: str, schema: Optional[Dict[str, Any]] = None, temperature: float = 0.3,
@@ -2379,6 +2382,7 @@ class GeminiGateway:
             config.update(response_mime_type="application/json", response_schema=schema)
         contents = prompt if contents is None else contents
         started, attempts, last_error, kinds = time.perf_counter(), 0, "", []
+        _GEMINI_SENT.n = 0              # 10-16：實際呼叫 generate_content 的次數（在 _call_once 內計算；attempts 是重試額度）
         recovery = self.quota.recovery_wait(GEMINI_MODEL_CHAIN)
         if 0 < recovery <= 16 and (not deadline or time.monotonic() + recovery + 1 < deadline):
             self.log(f"Gemini 模型忙碌，等待恢復｜{recovery:.1f}s｜用途={purpose}")
@@ -2424,6 +2428,8 @@ class GeminiGateway:
                         continue
                     if kind in ("overloaded", "missing_model", "timeout") or _TIMEOUT_RE.search(last_error):
                         break          # 整個模型的問題（含單次逾時）：換金鑰沒用，直接換下一個模型
+                    if kind in ("daily", "minute"):
+                        attempts -= 1  # 10-16：額度用完是立即失敗，不占總嘗試次數，否則輪不到下一個備援模型（次數仍受金鑰×模型數限制）
                     continue
                 if overload_retried:
                     self.quota.note_ok(model)
@@ -2439,7 +2445,7 @@ class GeminiGateway:
                     in_tokens, out_tokens = max(1, round(len(prompt) / 4)), max(1, round(len(text) / 4))
                 _record_gemini_usage(model, ok=True, in_tokens=in_tokens, out_tokens=out_tokens)
                 self.log(f"Gemini 呼叫｜用途={purpose}｜model={model}{'（備援）' if rank else ''}｜key {key + 1}｜"
-                         f"latency={latency:.2f}s｜嘗試 {attempts} 次｜tokens {in_tokens}+{out_tokens}（{source}）｜結果=成功")
+                         f"latency={latency:.2f}s｜請求 {_GEMINI_SENT.n} 次（重試額度用 {attempts}）｜tokens {in_tokens}+{out_tokens}（{source}）｜結果=成功")
                 return GeminiResult(ok=True, text=text, latency=latency, purpose=purpose, input_tokens=in_tokens,
                                     output_tokens=out_tokens, total_tokens=in_tokens + out_tokens, token_source=source)
             if (deadline and time.monotonic() >= deadline) or attempts >= GEMINI_MAX_ATTEMPTS:
@@ -2448,7 +2454,7 @@ class GeminiGateway:
         if not attempts:
             last_error = last_error or ("Gemini 模型暫時忙碌（503 冷卻中）" if self.quota.recovery_wait(GEMINI_MODEL_CHAIN)
                                         else "所有模型與金鑰的額度都暫時用完或暫停中")
-        self.log(f"Gemini 呼叫｜用途={purpose}｜嘗試 {attempts} 次｜latency={latency:.2f}s｜結果=失敗｜{last_error[:160]}")
+        self.log(f"Gemini 呼叫｜用途={purpose}｜請求 {getattr(_GEMINI_SENT, 'n', 0)} 次（重試額度用 {attempts}）｜latency={latency:.2f}s｜結果=失敗｜{last_error[:160]}")
         rate_limited = (not attempts and '503' not in last_error) or any(k in ("daily", "minute") for k in kinds) or \
             bool(_RATE_RE.search(last_error) and not _DEADLINE_RE.search(last_error))
         return GeminiResult(ok=False, error=last_error or "Gemini 沒有回傳內容", rate_limited=rate_limited,
@@ -3331,14 +3337,21 @@ class FactSheet:
             for clause in re.split(r"[，。；;\n]|(?<!\d),|,(?!\d)", present):
                 if re.search(other_boundary, clause) or re.search(r"歷史|先前|前一組", clause):
                     continue
-                position = view.get("current_position")
-                if position not in ("inside", "above", "below"):
-                    position = None          # 10-16：not_applicable（超過追蹤期）等無法核對位置，不判不符
                 claims = ((r"(?:位於|處於|仍在|仍位於|回到)(?:目前)?(?:(?:上升|下降|對稱|收斂)?三角(?:收斂)?(?:候選)?(?:型態)?|型態|候選線|線)內", "inside"),
                           (r"(?:收盤|股價)?(?:已|目前)?(?:高於|站上|越過)(?:(?:上升|下降|對稱|收斂)?三角(?:收斂)?(?:候選)?|候選)?上緣", "above"),
                           (r"(?:收盤|股價)?(?:已|目前)?(?:低於|跌破)(?:(?:上升|下降|對稱|收斂)?三角(?:收斂)?(?:候選)?|候選)?下緣", "below"))
+                # 10-16：依敘述核對不同事實：一般位置敘述（低於下緣／兩線間）核對圖上收盤的實際位置；
+                # 帶「未達越線門檻／尚未正式越線」等限定的敘述核對型態驗證的越線判定。兩個欄位不互相代替。
+                # 「低於下緣／站上上緣」是價格位置，一律核對實際位置；「仍在型態內」整句有越線門檻限定時核對越線判定。
+                threshold_talk = re.search(r"未達(?:越線)?門檻|尚未(?:正式)?(?:越線|突破|跌破)|未正式(?:越線|突破|跌破)|未構成(?:越線|突破|跌破)", present)
                 for pattern, claimed in claims:
                     for match in re.finditer(pattern, clause):
+                        # 明確講收盤／股價位置的子句一律核對實際位置；門檻限定只放行沒有價格主詞的「仍在型態內」
+                        price_subject = re.search(r"收盤|股價|價格|K\s*棒|現價", clause[:match.end()])
+                        use_detector = claimed == "inside" and threshold_talk and not price_subject
+                        position = view.get("detector_position") if use_detector else view.get("current_position")
+                        if position not in ("inside", "above", "below"):
+                            position = None
                         if not re.search(r"未|尚未|不代表|不能|沒有|並非|不宜", clause[:match.start()]):
                             if position and position != claimed:
                                 issues.append("目前三角位置與圖上收盤不符")
