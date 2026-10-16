@@ -802,12 +802,19 @@ def _background_pool() -> ThreadPoolExecutor:
         return _BACKGROUND_POOL
 
 
+_STALL: Dict[str, Tuple[int, int, float]] = {}   # 代號 → (仍缺日數, 連續補不動輪數, 暫停到)
+STALL_ROUNDS, STALL_PAUSE = 3, 6 * 3600
+
+
 def continue_in_background(stock_code: str, dates: Sequence[str], latest_date: str,
                            bar_dates: Sequence[str] = (), fetch_source=open_source) -> bool:
     """這一題的時間用完但還有日期沒補：交給背景 worker 繼續補（同一檔同時只排一次），不擋住 Discord 回覆。"""
     code = str(stock_code)
     if source_cooling():
         return False   # 來源冷卻中：不排背景，下次有人查再試
+    stall = _STALL.get(code)
+    if stall and stall[1] >= STALL_ROUNDS and time.monotonic() < stall[2]:
+        return False   # 10-16：連續多輪補不動（例 3585 每輪仍缺 74 日）：暫停背景重試，避免白耗資料源
     with _BACKGROUND_GUARD:
         if code in _BACKGROUND or len(_BACKGROUND) >= MAX_PENDING_BACKFILLS:
             return False
@@ -819,6 +826,12 @@ def continue_in_background(stock_code: str, dates: Sequence[str], latest_date: s
             result = ensure_days(code, dates, budget=BACKGROUND_BUDGET, fetch_source=fetch_source,
                                  latest_date=latest_date, lock_wait=BACKGROUND_BUDGET, background=True)
             print(f"📚 現股分點背景補資料｜{code}｜嘗試 {result.get('fetched', 0)} 日｜仍未確認 {result.get('remaining', 0)}", flush=True)
+            left = int(result.get('remaining', 0) or 0)
+            prev = _STALL.get(code)
+            rounds = (prev[1] + 1) if prev and left and left >= prev[0] else 0
+            _STALL[code] = (left, rounds, time.monotonic() + STALL_PAUSE)
+            if rounds == STALL_ROUNDS:
+                print(f"⏸️ 現股分點背景補資料暫停｜{code}｜連續 {rounds} 輪仍缺 {left} 日｜{STALL_PAUSE // 3600:.0f} 小時後再試", flush=True)
         except Exception as exc:
             print(f"⚠️ 現股分點背景補資料失敗｜{code}｜{type(exc).__name__}: {exc}", flush=True)
         finally:

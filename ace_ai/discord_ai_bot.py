@@ -1543,6 +1543,8 @@ def needs_semantic(parsed: "ParsedQuestion") -> bool:
             text = text.replace(w, "")
     for w in sorted(FILLER_WORDS + _NEEDS_TAILS, key=len, reverse=True):
         text = text.replace(w, "")
+    for w in ("加權指數", "大盤", "台股", "加權", "櫃買", "指數", "今天", "今日"):   # 10-16：大盤用語不算沒讀懂的字
+        text = text.replace(w, "")
     if len(parsed.stocks) >= 2 and len(set(parsed.intents) & {"news", "technical", "analysis", "price", "institutional", "warrant", "futures"}) >= 2:
         return True                    # 「2330新聞、2454型態」：要逐檔綁定需求
     return len(re.sub(r"[^\u4e00-\u9fff]", "", text)) >= 1     # 「2330新聞，不技術」剩「不」也要交給 AI
@@ -2467,6 +2469,7 @@ FINAL_BASE_PROMPT = """你是「艾斯助手｜喬巴」。你的回答要像熟
 8. 全部使用繁體中文，語氣自然、精簡、有分析感；同一件事不要重複。"""
 
 FINAL_TECH_RULES = """技術面規則：
+- 當日大跌（大盤跌 2% 以上、個股跌 5% 以上，或跌破月線收長黑）時，解讀重點改成：下方支撐由近到遠、哪個價位或支撐密集帶最有機會止跌與原因、止跌要看的訊號（下影線、量縮、站回某價位）、跌破後的下一個支撐；壓力只用一句帶過。
 - 盤中（triangle_structure 有 live_position）：三角的 state／事件是 state_basis 那天收盤的結果；現在位置一律看 live_position 與 live_close：above_upper 寫「盤中暫時站上上緣 upper_price，需收盤確認才算突破」，below_lower 寫「盤中暫時跌破下緣 lower_price，需收盤確認」，inside 寫「盤中仍在三角內」；不可把昨收狀態當成現在位置，也不可在 live_position 在線外時還寫「仍在三角內」。
 - triangle_structure.line_recoveries 是已移入歷史的原線事件（不是今天的越線）：side=lower 且 recovered_date 有值＝該日收盤收復 break_date 跌破的原下緣（破底翻）；side=upper＝跌回原上緣（假突破）；today=站回待確認 只能說待確認；candidate=true 是候選參考線，只能寫「收回候選下緣／跌回候選上緣」，不可稱破底翻、假突破或正式三角事件。triangle_structure.validity=historical 是歷史越線三角的回退顯示，不是目前有效三角，只能當過去的支撐壓力參考。同一波多條原線合成一句、照日期寫，不可說成突破目前上緣，也不可把原線價位當成目前支撐壓力（目前支撐壓力看 upper_price／lower_price）。
 - 先跌破下緣、之後改向上突破上緣叫「破底翻」；先突破上緣、之後改跌破下緣叫「突破失敗後轉弱」；不可寫「反向突破」，兩次事件的日期與方向分開寫。
@@ -3491,6 +3494,14 @@ class FactSheet:
             if value.is_integer() and abs(value) <= 10 and not _PERCENT_AFTER_RE.match(text, match.end()):
                 continue
             forms = {cleaned, cleaned.lstrip("-")}
+            unit = text[match.end():match.end() + 1]
+            if unit in ("萬", "億"):            # 10-16：「1870 萬張」＝18,709,109 張；換算後在 0.5% 內就算對得上
+                scaled = abs(value) * (1e4 if unit == "萬" else 1e8)
+                nums = getattr(self, "_market_floats", None)
+                if nums is None:
+                    nums = self._market_floats = [abs(float(m)) for m in self.market if re.fullmatch(r"-?\d+(?:\.\d+)?", str(m))]
+                if scaled and any(abs(n - scaled) <= scaled * .005 for n in nums):
+                    continue
             if forms & self.market:
                 # 句子只講一檔股票時，數字不可以只屬於另一檔股票。
                 if len(codes) == 1 and len(self.stock_numbers) >= 2:
@@ -6999,7 +7010,7 @@ class AceQueryEngine:
                   "branch_warrants＝這個分點買了哪些權證、權證明細／權證買賣明細／清單／代號、剩餘天數、槓桿、價內外、估算報酬；"
                   "branch_events＝這個分點的 A～E 事件、什麼時候進場或出場（不是要列權證）；branch_position＝這個分點部位還在嗎、持有或出清；"
                   "branch_perf＝這個分點的勝率、績效、報酬。沒有指定分點才用 chips。\n"
-                  "怎麼看、支撐壓力、快突破了嗎、如何防守，都可屬pattern，不需要使用者說三角。三角由程式資料判定，不由你猜。"
+                  "個股或大盤問怎麼看、如何、看法、分析、支撐壓力、快突破了嗎、如何防守，都屬pattern；price 只限問數字（股價多少、漲跌幾%）。不需要使用者說三角。三角由程式資料判定，不由你猜。"
                   "不同股票各問新聞與型態不是比較，不要新增compare或chips；未明確要求include_score填false。"
                   "targets：這項需求的股票名稱／代號或族群名稱；date_range：提到的期間（沒有填空字串）。\n"
                   "exclude_types／exclude_targets：使用者明確說不要的分析類別或股票（例「不要技術分析」「不要看台積電」）。"
@@ -7039,7 +7050,8 @@ class AceQueryEngine:
                 return None
             for stock in (hit.stocks if hit is not None else [])[:1]:
                 if stock[0] not in out_targets and stock[1] not in out_targets:
-                    parsed.stocks.append(stock)
+                    if stock not in parsed.stocks:   # 10-16：「大盤」解析回 TAIEX 不重複加
+                        parsed.stocks.append(stock)
                     return stock
             return None
 
