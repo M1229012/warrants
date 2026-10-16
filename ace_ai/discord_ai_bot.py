@@ -1084,7 +1084,9 @@ def futures_card(data: Dict[str, Any], question: str = "", retail: Optional[Dict
     items = []
     for x in data.get("investors") or []:
         change = x.get("change_vs_prev")
-        delta = "" if change is None else f"較前日 {int(change):+,}"
+        delta = "" if change is None else f"淨未平倉較前日 {int(change):+,}"
+        if x.get("short_oi") is not None:   # 10-16：問「空單多少」要看得到空方未平倉口數，不只淨額
+            delta = f"多單 {int(x.get('long_oi') or 0):,}｜空單 {int(x['short_oi']):,}" + (f"｜{delta}" if delta else "")
         items.append({"label": x["investor"], "value": f"{x['net_text']} 口", "tone": "signed" if x["net_oi"] else "ink",
                       "sub": delta})
     sections = [{"type": "badge", "text": f"資料日期 {data.get('data_date', '-')}｜台指期（{data.get('futures_id', 'TX')}）三大法人未平倉"},
@@ -1489,6 +1491,15 @@ def is_top_warrant_question(parsed: "ParsedQuestion") -> bool:
 
 NEEDS_PARSE_ENABLE = os.getenv("DISCORD_AI_NEEDS_PARSE", "1").strip().lower() in ("1", "true", "yes", "on")
 _NEEDS_TAILS = ("怎麼樣", "怎樣", "如何", "怎麼看", "好不好", "好嗎", "走勢", "分析", "型態", "技術面", "一下", "看看")
+def keep_futures_plan(rule_plan, needs_table, parsed, per_stock) -> bool:
+    """10-16：排除條件套完後，題目標的仍有期貨需求才保留台指期流程（排除期貨、目標對不到都不保留）。"""
+    need_types = {str(n.get("type")) for n in (needs_table or {}).get("needs") or []}
+    return (getattr(rule_plan, "route", "") == "rule_futures" and bool(need_types) and need_types <= {"futures", "institutional"}
+            and "futures" not in getattr(parsed, "needs_excluded", set())
+            and any("futures" in want for want in per_stock.values()))
+
+
+_MARKET_TARGET_RE = re.compile(r"外資|投信|自營商|三大法人|法人|台指|期貨|大盤|台股|加權|櫃買|散戶")
 NEEDS_TYPES = ["pattern", "chips", "news", "price", "institutional", "futures", "cost", "compare", "members", "rank", "score", "spot",
                "branch_warrants", "branch_events", "branch_position", "branch_perf", "other"]
 # 10-14：指定分點（券商）的動作。AI 讀懂「這個分點要查什麼」，程式依動作走分點流程，不再降成只查股票。
@@ -2557,6 +2568,7 @@ FINAL_CARD_FORMAT = """輸出格式（艾斯 AI 解讀）：只輸出符合 sche
 - why：重點不要少，說法要精簡：圖上值得講的訊號（均線、型態、量區支撐壓力、扣抵、KD／MACD、布林、法人與分點）挑與本題相關的都可以講，通常 3～4 句、約 120～180 字；用歸納代替列舉（寫「站上所有均線」不寫「站上5日、10日、20日及60日均線」；寫「統一、台新等分點持續買進」不逐家報張數與成本），同方向的證據合併成一句（例「站上所有均線且投信連買 6 日」），不逐項報指標數值。圖上已有的數字（均線值、KD／MACD 數值、分點成本與張數）不要重抄，只在當作關鍵價位時引用 1～2 個。不寫「從技術面來看」「籌碼方面」這類開場詞。若answer已說清楚可留空。型態與趨勢只能引用kline_patterns，不重報評分或所有指標。
 - scenarios：依原問句選擇0～2個有必要的觀察條件，可留空，不強制多空各一個。title用短標直接點出本題要觀察的變化，不套固定情境名稱；text 用「若收盤…／若跌破…，代表…」的條件式，25～45 字，要有具體觀察價位，不重複 why 已講過的理由。只陳述條件與意義，不預測漲跌、不給買賣指令；使用者問操作策略／進出場／停損時也一樣，不寫「建議買進／賣出／停損設在…」，改成要觀察的價位與條件。從K線型態、支撐壓力、量價、均線與布林中選擇能回答本題的證據，不固定順序；why只談真正影響本題答案的面向，不為了湊數羅列指標。K 線型態名稱（箱型、三角收斂、上升／下降趨勢、缺口、紅三兵、吞噬、晨星、十字線、長上／下影線等）只能引用 kline_patterns 有列出的，不可自己判斷；突破狀態照原文的客觀事實描述（價格在上下緣的哪裡、突破後第幾天）；「○○ 起形成」是型態起點、「○○ 收盤向上突破」是突破日，兩個日期不可混用或互換，kline_patterns 有「創近 N 日新高／新低」「越過前高／跌破前低」「脫離近 N 日盤整區」時，與本題相關才在answer或why解釋，用詞照原文（越過、脫離、創高），價位與日期照抄；不可自行下「突破成功／失敗」「假突破／假跌破」「型態失效」這類結論，也不可解讀成偏多或偏空；recent_bars_10（近 10 日 日期 開 高 低 收）與 ma_recent_3d 只用來描述近期走勢與均線方向。answer 第一句要直接回答使用者問的事。均線排列一定照資料寫：MA5<MA10<MA20<MA60 是空頭排列，不可說成多方架構強勢、多方掌控；反之亦然；單日紅K或帶量不等於結構轉多。情境要和目前結構一致：均線空頭排列時，偏多情境寫成「轉強條件」（例「若收盤站穩季線並突破布林上軌，才有機會扭轉空頭排列」），不可寫「多方續攻」「開啟新一波漲勢」這種已經轉多或預測漲勢的說法；均線多頭排列時，偏空情境同理寫成「轉弱條件」。新聞、三大法人或沒有可觀察價位的問題給空陣列。
 - 解讀是在分析，不是把圖表重說一遍：圖卡與表格已列出的分點、張數、價位、比例不要逐項重述（最多引用 1～2 個當作論據），要說明這些資料代表什麼、彼此的關係與對後續的影響。
+- 不要介紹資料來源（不寫「資料來自／取自某網站或資料商」），券商分點名稱照常使用。
 - 只寫和本題答案有關的內容：沒有發生的事、資料顯示「沒有」的項目（例如沒有隔日沖賣出、沒有法人買賣、沒有新聞）不用特別說明；不列和結論無關的數字。分析賣壓或買盤時，從成交量變化、主要賣出／買進券商是誰來說明。
 - summary：通常留空；只有補充 answer 沒講到的新重點時才寫一句 25 字內；若只是重複answer就留空，不強制每題一句話總結，不提供買賣指令或保證。"""
 
@@ -2648,10 +2660,12 @@ def _compact_tool_data(name: str, data: Dict[str, Any], has_scorecard: bool) -> 
         # 10-16：只送表格上那幾家分點的摘要；逐日紀錄、波段事件與統計不送（原本一題 7～13 萬字）
         spot = data.get("spot") or {}
         keep = ("branch", "rank_label", "status", "latest_net", "latest_volume_pct", "observed_net_5", "volume_pct_5",
-                "observed_net_20", "volume_pct_20", "buy_days_20", "estimated_buy_cost", "estimated_return_pct", "moneydj")
+                "observed_net_20", "volume_pct_20", "buy_days_20", "estimated_buy_cost", "estimated_return_pct")
         rows = []
         for b in spot.get("branches") or []:
             row = {k: b[k] for k in keep if b.get(k) not in (None, "", [], {})}
+            if b.get("moneydj"):
+                row["avg_prices"] = b["moneydj"]      # 不帶資料來源名稱，避免 AI 寫進解讀
             if (b.get("overnight") or {}).get("recent_match"):
                 row["overnight_recent"] = True
             rows.append(row)
@@ -2943,7 +2957,7 @@ def build_final_prompt(payload: Dict[str, Any]) -> str:
     if names & {"get_spot_chip_summary", "get_spot_event_backtest"} and _OVERNIGHT_ASK_RE.search(str(payload.get("question") or "")):
         sections.append(FINAL_OVERNIGHT_RULES)      # 10-15：問隔日沖，不論走型態＋籌碼或分點動向，都用白話規則
     if "get_spot_event_backtest" in names:
-        sections.append("現股分點動向（10-15）：分點有 moneydj 時是 MoneyDJ 實際成交金額算出的均價（buy_avg_day／sell_avg_day＝當日買／賣均價、buy_avg_period＝近20日買進均價），比估成本可靠，可用來說明主力成本與現價的距離、是否在漲停價附近鎖單買進、隔日以什麼價位賣出；沒有 moneydj 的分點不要寫價格。表格已列出各分點張數與估成本，解讀要分析買賣結構，例如：買盤是長期布局（近20日≫近5日）還是短線突然進場（近5日≈近20日）、是否有隔日沖型買盤、外資與本土券商是否對作、主要買方估成本與現價的距離代表的支撐或獲利了結壓力、買盤集中或分散；不要逐一念各分點的張數與參考價。不要引用任何波段／事件的勝率、平均報酬、筆數或「歷史勝率較高」這類說法；主要看 volume_pct_5＝近5日淨買賣超占成交量、latest_net＝最新一天加碼或調節、retention_pct＝近20日買進量還留著的比例、estimated_return_pct＝現價對估成本（買超日收盤加權，不是實際成本）；成熟波段樣本很少，samples 未達 20 筆時不要引用波段勝率、達標比例或報酬中位數。現股波段統計：使用觀察到的上榜資料，波段累積達規模門檻才成立，次日開盤模擬買進，5/10/20交易日收盤計算。不是實際持股或獲利。主畫面20日，達3%/5%是期末比例，不能把盤中曾達標或漲0.01%算達標。成熟波段少於5笔時使用逐筆紀錄，不拿百分比推論未來。median_return_pct為報酬中位數，median_entry_depth_pct為相對進場價最深跌幅中位數；與worst_drawdown_pct不同，最高漲幅和最深跌幅無先後順序。background為同期間、同進場及排除規則的股價參考，40有效日以下不顯示比例。overnight為本股票本分點的大額買超後隔日反向紀錄：未上榜不是零，不代表同一客戶、真實出場或其他股票也隔日沖；少量配對只陳述事實。estimated_return_pct只是現價相對觀察估均價，非實際損益。沒有margin就省略融資；存在才依實際事件回應，不推論大戶身分。沿用原問句客製回覆與接梗，先回答問題，避免逐行念表；計算方法與例行註解留Log，不在圖片生成免責小字，但資料不足時需用正常文字明確回答。")
+        sections.append("現股分點動向（10-15）：解讀中不可寫出任何資料來源名稱（MoneyDJ、富邦、FinMind、證交所等）。分點有 avg_prices 時是實際成交金額算出的均價（buy_avg_day／sell_avg_day＝當日買／賣均價、buy_avg_period＝近20日買進均價），比估成本可靠，可用來說明成交發生在什麼價位（例如是否在漲停價附近買進、隔日以什麼價位賣出），不代表持股成本，也不能推論支撐或賣壓；沒有 avg_prices 的分點不要寫價格。answer 先給一個明確看法（籌碼偏多／偏空／多空拉鋸），再用一句話說主因；why 依序寫：支持這個看法的證據、與看法矛盾的證據、接下來確認或推翻看法的條件（例如賣壓是否集中在少數分點、承接買盤是否延續、轉賣且跌破哪個技術價位代表承接轉弱）；不可推定交易者的持有期限、心理、套牢、停損或防守意願，均價只是期間成交均價，不等於目前剩餘持股成本；最多引用 2～3 個關鍵數字，不逐家列分點張數、比率與均價。表格已列出各分點張數與估成本，解讀要分析買賣結構，例如：近5日與近20日淨買賣超的差異（買賣超是否集中在最近幾天）、是否有隔日沖型買盤、外資與本土券商買賣方向是否相反、買盤集中或分散；不要逐一念各分點的張數與參考價。不要引用任何波段／事件的勝率、平均報酬、筆數或「歷史勝率較高」這類說法；主要看 volume_pct_5＝近5日淨買賣超占成交量、latest_net＝最新一天加碼或調節、retention_pct＝近20日買進量還留著的比例、estimated_return_pct＝現價對估成本（買超日收盤加權，不是實際成本）；成熟波段樣本很少，samples 未達 20 筆時不要引用波段勝率、達標比例或報酬中位數。現股波段統計：使用觀察到的上榜資料，波段累積達規模門檻才成立，次日開盤模擬買進，5/10/20交易日收盤計算。不是實際持股或獲利。主畫面20日，達3%/5%是期末比例，不能把盤中曾達標或漲0.01%算達標。成熟波段少於5笔時使用逐筆紀錄，不拿百分比推論未來。median_return_pct為報酬中位數，median_entry_depth_pct為相對進場價最深跌幅中位數；與worst_drawdown_pct不同，最高漲幅和最深跌幅無先後順序。background為同期間、同進場及排除規則的股價參考，40有效日以下不顯示比例。overnight為本股票本分點的大額買超後隔日反向紀錄：未上榜不是零，不代表同一客戶、真實出場或其他股票也隔日沖；少量配對只陳述事實。estimated_return_pct只是現價相對觀察估均價，非實際損益。沒有margin就省略融資；存在才依實際事件回應，不推論大戶身分。沿用原問句客製回覆與接梗，先回答問題，避免逐行念表；計算方法與例行註解留Log，不在圖片生成免責小字，但資料不足時需用正常文字明確回答。")
     if "get_spot_branch_flow" in names:
         sections.append(FINAL_SPOT_BRANCH_RULES)
     if "get_branch_warrant_detail" in names:
@@ -4746,6 +4760,18 @@ _PREDICTION_RE = re.compile(r"(?:有望|可望|將會?|即將)?(?:開啟|展開|
                             r"|可望(?:大漲|噴出|續漲|創高)|多方續攻|空方續殺")
 # 情境短標：結構還沒轉多／轉空前，不用「續攻／續殺」這種字
 _SCENARIO_TITLE_FIX = (("多方續攻", "轉強條件"), ("空方續殺", "轉弱條件"))
+
+
+_SOURCE_NAME_RE = re.compile(r"MoneyDJ|FinMind|eBroker|Goodinfo|CMoney|Fugle|富果", re.IGNORECASE)
+_SOURCE_INTRO_RE = re.compile(r"(?:資料|數據|均價|價格|統計|成本)[^。；]{0,6}(?:來自|取自|來源為|來源是|根據)[^。；]{0,8}(?:富邦|證交所|櫃買中心|交易所|券商網站)")
+
+
+def drop_source_mentions(text: str) -> str:
+    """10-16：解讀不介紹資料來源。含資料源名稱或「資料來自富邦」的句子拿掉；「富邦-台北買超」這類分點名稱照常保留。"""
+    if not text or not (_SOURCE_NAME_RE.search(text) or _SOURCE_INTRO_RE.search(text)):
+        return text
+    parts = re.split(r"(?<=[。！？；])", str(text))
+    return "".join(p for p in parts if not (_SOURCE_NAME_RE.search(p) or _SOURCE_INTRO_RE.search(p))).strip()
 
 
 def drop_warrant_listing(text: str, results) -> str:
@@ -7126,8 +7152,8 @@ class AceQueryEngine:
         for n in items:
             want = _NEED_INTENTS.get(str(n.get("type")), set()) - drop
             codes = [st[0] for st in (resolve(str(t).strip()) for t in n.get("targets") or [] if str(t).strip()) if st]
-            if not (n.get("targets") or []):
-                untargeted |= want
+            if not (n.get("targets") or []) or (not codes and any(_MARKET_TARGET_RE.search(str(t)) for t in n.get("targets") or [])):
+                untargeted |= want   # 10-16：只有「外資／台指期／大盤」這類市場層級目標才套到題目標的；其他對不到的目標不亂套
             for code in codes:
                 per_stock.setdefault(code, set()).update(want)
             days = DAYS_RE.search(str(n.get("date_range") or ""))
@@ -7416,9 +7442,12 @@ class AceQueryEngine:
             if needs_table is not None:
                 rule_plan = plan
                 per_stock = self._apply_needs(needs_table, parsed)
+                keep_futures = keep_futures_plan(rule_plan, needs_table, parsed, per_stock)
                 # 分點題先看分點需求；只有分點、AI 又沒讀出分點動作時，保留原本的分點規則計畫
-                plan = (self._branch_plan_from_needs(parsed, per_stock)
+                plan = rule_plan if keep_futures else (self._branch_plan_from_needs(parsed, per_stock)
                         or (self._plan_from_needs(parsed, per_stock, stats) if parsed.stocks else rule_plan))
+                if keep_futures and any("散戶" in str(t) for t in needs_table.get("exclude_targets") or []):
+                    plan.tool_calls = [c for c in plan.tool_calls if c.name != "get_retail_futures"]   # 「不要散戶多空比」
                 needs_table["per_stock"] = {c: sorted(v) for c, v in per_stock.items()}
             else:
                 # 解析失敗：不能照原本可能忽略「不要…」的工具清單執行；改用原分類器（一次）決定主題，最後提示要求只答所問
@@ -8178,9 +8207,15 @@ class AceQueryEngine:
             for key in ("answer", "why", "summary"):
                 card[key] = drop_directives(card.get(key, ""))
                 card[key] = drop_warrant_listing(card[key], results)
-            card["scenarios"] = [dict(x, text=drop_directives(x["text"]), title=drop_directives(fix_scenario_title(x.get("title", ""))))
+                card[key] = drop_source_mentions(card[key])
+            card["scenarios"] = [dict(x, text=drop_source_mentions(drop_directives(x["text"])),
+                                      title=drop_source_mentions(drop_directives(fix_scenario_title(x.get("title", "")))))
                                  for x in card.get("scenarios") or []]
             card["scenarios"] = [x for x in card["scenarios"] if x["text"]]
+            if not card['answer'] and card.get('why'):
+                # 10-16：標題句因來源字樣等被清掉：拿「為什麼」第一句當標題，不讓整張解讀消失
+                head = re.split(r"(?<=[。！？])", card["why"], maxsplit=1)[0]
+                card['answer'], card['why'] = head.strip(), card['why'][len(head):].strip()
             if not card['answer']:
                 return 'AI文字未通過檢查，本次僅提供可核實的圖表與資料。\n\n'+rule_answer, False
             if stock_banter.holding_question(question):
