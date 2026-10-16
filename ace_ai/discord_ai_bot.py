@@ -3086,7 +3086,7 @@ _PRICE_SUBJECT_RE = re.compile(r"股價|價格|收盤|現價|盤中|K\s?棒|報�
 _NON_PRICE_SUBJECT_RE = re.compile(r"成本|均價|買點|目標|扣抵")
 _INTRADAY_WORD_RE = re.compile(r"盤中|暫時|即時|目前|現在|今日|今天|此刻|最新成交")
 _ASSUME_RE = re.compile(r"成本|假設|假如|如果|若|倘若|買在|買進|買入|進場|均價|持有|持股|部位|停損|套在|套牢|攤平|帳面|損益|虧損|獲利|報酬|你|您|題目|設定")
-_CLAUSE_SPLIT_RE = re.compile(r"[，,：:]")
+_CLAUSE_SPLIT_RE = re.compile(r"[，：:]|(?<!\d),|,(?!\d)")   # 10-16：千分位逗號不切
 _PAREN_RE = re.compile(r"（[^（）]*）|\([^()]*\)")
 _HEADING_RE = re.compile(r"^(?:\*\*|【|#)")
 
@@ -3241,6 +3241,7 @@ class FactSheet:
                 side_numbers = {str(price), f"{price:g}"}
                 for digits in (1, 2):
                     side_numbers.update((f"{price:.{digits}f}", f"{round(price, digits):g}"))
+                side_numbers.update((f"{price:.0f}", str(int(price))))   # 10-16：「2444 元」取整也算同一條線
                 by_side[side] = side_numbers
                 numbers.update(side_numbers)
             self.chart_line_numbers[code] = by_side
@@ -3258,7 +3259,7 @@ class FactSheet:
         if not record or "三角" not in sentence:
             return []
         status = record.get("status")
-        clauses = re.split(r"[，,；;。\n]", sentence)
+        clauses = re.split(r"[，；;。\n]|(?<!\d),|,(?!\d)", sentence)
         negative = r"(?:沒有|未有|尚無|無明確|未(?:偵測|辨識|判斷|確認|形成|出現)到?|不是|並非|不代表|不能視為|無法(?:判定|核實))"
         for clause in clauses:
             if "三角" not in clause:
@@ -3308,7 +3309,7 @@ class FactSheet:
         issues = []
         triangle_talk = bool(re.search(r"三角|候選(?:線|上緣|下緣)", sentence))
         other_boundary = r"大量區|量區|布林|均線|MA\d|通道|楔形|旗形|箱形"
-        for clause in re.split(r"[，,。；;\n]", sentence):
+        for clause in re.split(r"[，。；;\n]|(?<!\d),|,(?!\d)", sentence):
             if not lines or not triangle_talk or re.search(r"歷史|先前|前一組", clause):
                 continue
             if re.search(other_boundary, clause):
@@ -3318,7 +3319,7 @@ class FactSheet:
                 number = number.replace(",", "")         # 10-16：「2,444.45」不能只讀到 2
                 if number not in lines.get(side, set()):
                     issues.append(f"三角{side}價位不符")
-            for number, side in re.findall(r"(\d[\d,]*(?:\.\d+)?)\s*(?:元\s*的?|的)(?:三角(?:收斂)?(?:候選)?|候選)?(上緣|下緣)", clause):
+            for number, side in re.findall(r"(\d[\d,]*(?:\.\d+)?)\s*(?:元\s*的?|的)(?:(?:上升|下降|對稱|收斂)?三角(?:收斂)?(?:候選)?|候選)?(上緣|下緣)", clause):
                 number = number.replace(",", "")
                 if number not in lines.get(side, set()):
                     issues.append(f"三角{side}價位不符")
@@ -3327,15 +3328,15 @@ class FactSheet:
         # remain allowed; they cannot prove the current triangle is confirmed.
         if lines and triangle_talk:
             present = _CONDITIONAL_RE.split(sentence)[0]
-            for clause in re.split(r"[，,。；;\n]", present):
+            for clause in re.split(r"[，。；;\n]|(?<!\d),|,(?!\d)", present):
                 if re.search(other_boundary, clause) or re.search(r"歷史|先前|前一組", clause):
                     continue
                 position = view.get("current_position")
                 if position not in ("inside", "above", "below"):
                     position = None          # 10-16：not_applicable（超過追蹤期）等無法核對位置，不判不符
-                claims = ((r"(?:位於|處於|仍在|仍位於|回到)(?:目前)?(?:三角(?:收斂)?(?:候選)?(?:型態)?|型態|候選線|線)內", "inside"),
-                          (r"(?:收盤|股價)?(?:已|目前)?(?:高於|站上|越過)(?:三角(?:收斂)?(?:候選)?|候選)?上緣", "above"),
-                          (r"(?:收盤|股價)?(?:已|目前)?(?:低於|跌破)(?:三角(?:收斂)?(?:候選)?|候選)?下緣", "below"))
+                claims = ((r"(?:位於|處於|仍在|仍位於|回到)(?:目前)?(?:(?:上升|下降|對稱|收斂)?三角(?:收斂)?(?:候選)?(?:型態)?|型態|候選線|線)內", "inside"),
+                          (r"(?:收盤|股價)?(?:已|目前)?(?:高於|站上|越過)(?:(?:上升|下降|對稱|收斂)?三角(?:收斂)?(?:候選)?|候選)?上緣", "above"),
+                          (r"(?:收盤|股價)?(?:已|目前)?(?:低於|跌破)(?:(?:上升|下降|對稱|收斂)?三角(?:收斂)?(?:候選)?|候選)?下緣", "below"))
                 for pattern, claimed in claims:
                     for match in re.finditer(pattern, clause):
                         if not re.search(r"未|尚未|不代表|不能|沒有|並非|不宜", clause[:match.start()]):
@@ -3354,7 +3355,7 @@ class FactSheet:
             return issues
         claim = re.compile(r"(?:正式|確認|成功|有效|已經|已)(?:向[上下])?(?:突破|跌破)|"
                            r"三角(?:收斂)?(?:向[上下])?(?:突破|跌破)|突破(?:成功|確認|成立)")
-        for clause in re.split(r"[，,。；;\n]", sentence):
+        for clause in re.split(r"[，。；;\n]|(?<!\d),|,(?!\d)", sentence):
             if not triangle_talk or re.search(other_boundary, clause):
                 continue
             if re.search(r"歷史|先前(?:另一組|一組)|前一組", clause):
@@ -3442,7 +3443,7 @@ class FactSheet:
             # because it names two stocks. Keep explicit cross-stock value
             # comparisons separate from collective "both above/below" claims.
             carry = current
-            for clause in re.split(r"[，,；;]", sentence):
+            for clause in re.split(r"[，；;]|(?<!\d),|,(?!\d)", sentence):
                 owners = self.mentioned(clause)
                 if len(owners) == 1:
                     carry = owners[0]
@@ -3523,7 +3524,7 @@ class FactSheet:
             if value.is_integer() and abs(value) <= 10 and not _PERCENT_AFTER_RE.match(text, match.end()):
                 continue
             forms = {cleaned, cleaned.lstrip("-")}
-            unit = text[match.end():match.end() + 1]
+            unit = text[match.end():match.end() + 3].lstrip()[:1]   # 10-16：「3.4 萬張」中間有空白也要換算
             if unit in ("萬", "億"):            # 10-16：「1870 萬張」＝18,709,109 張；換算後在 0.5% 內就算對得上
                 scaled = abs(value) * (1e4 if unit == "萬" else 1e8)
                 nums = getattr(self, "_market_floats", None)
@@ -8041,7 +8042,8 @@ class AceQueryEngine:
             card["why"] = card["why"][len(head):].strip()
         if removed_all:
             self.log(f"事實核對（解讀卡）：刪除 {len(removed_all)} 句｜{'；'.join(r for r in removed_all[:6])}")
-        if not card["answer"] or len(ai_card_text(card)) < before * 0.6:
+        # 10-16：標題句還在就保留解讀（只刪錯的句子）；只有連標題都補不回來才改用規則式回答
+        if not card["answer"]:
             self.log("事實核對未通過（解讀卡），改用規則式回答")
             return None
         return card
