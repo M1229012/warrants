@@ -29,7 +29,7 @@ WIDTH = 1440
 MARGIN = 64
 CONTENT = WIDTH - MARGIN * 2
 # K 線卡片垂直配置：標題＋收盤＋均線／布林數值卡｜價格區｜日期軸＋成交量｜價量分布圖例＋布林狀態。
-CHART_HEAD = 218        # 10-18：均線改成單行（原本 4 格數值卡 98px），標題區縮短
+CHART_HEAD = 226        # 10-18：均線改成單行（原本 4 格數值卡 98px），標題區縮短；字放大後單行 52px
 CHART_PRICE_BASE = 306
 CHART_VOLUME_BLOCK = 156
 CHART_FOOT = 114
@@ -589,7 +589,7 @@ def _draw_mark_table(draw, x: float, y: float, width: float, events: list[dict])
         cells = {
             '分點': (e.get('branch', ''), 19, INK, True),
             '買進日': (e.get('buy_date', '')[5:], 19, INK, False),
-            '權證買進金額': (e.get('buy_amount_text', ''), 19, UP, True),
+            '權證買進金額': (e.get('buy_amount_text', ''), 23, UP, True),   # 10-18：金額放大
             '後續動作': (action, 18, action_color, action_color != INK),
         }
         cx = x
@@ -1292,7 +1292,7 @@ def draw_value_tiles(draw, x: float, y: float, width: float, last: dict, show_bo
         tx += w + gap
 
 
-MA_LINE_H = 44
+MA_LINE_H = 52
 
 
 def draw_ma_line(draw, x: float, y: float, width: float, last: dict) -> None:
@@ -1302,18 +1302,18 @@ def draw_ma_line(draw, x: float, y: float, width: float, last: dict) -> None:
     mid = y + MA_LINE_H / 2
     for i, (key, color) in enumerate(MA_COLORS.items()):
         tx = x + 22 + i * cell
-        draw.line((tx, mid, tx + 22, mid), fill=color, width=3)
-        draw.text((tx + 30, mid), key, font=font(19), fill=MUTED, anchor='lm')
+        draw.line((tx, mid, tx + 24, mid), fill=color, width=4)
+        draw.text((tx + 32, mid), key, font=font(22), fill=MUTED, anchor='lm')
         value = _finite(last.get(key))
-        text, size = fit(number(value) if value is not None else '—', 21, cell - 52 - font(19).getlength(key) - 22, True)
-        draw.text((tx + 30 + font(19).getlength(key) + 10, mid), text, font=font(size, True), fill=INK, anchor='lm')
+        text, size = fit(number(value) if value is not None else '—', 27, cell - 56 - font(22).getlength(key) - 22, True)
+        draw.text((tx + 32 + font(22).getlength(key) + 10, mid), text, font=font(size, True), fill=INK, anchor='lm')
 
 
 # ---------- 10-18：關鍵價位改標在 K 線上（右側價格框＋日期軸下方圖例），不再另畫關鍵價位表 ----------
 LEVELS_ON_CHART = True
 LEVEL_TAG_MAX = 2
-LEVEL_TAG_H = 28
-LEVEL_TAG_FONT = 17
+LEVEL_TAG_H = 32
+LEVEL_TAG_FONT = 20
 _TAG_COLORS = (('三角上緣', '#C76C00'), ('三角下緣', '#1478B5'), ('量區', '#1A9E8A'), ('布林', '#667085'))
 _TAG_SPARE = '#7A5AF8'
 
@@ -1380,7 +1380,7 @@ def _level_legend_rows(panel: dict, width: float) -> list[list[tuple[float, dict
     row, used = [], 0.0
     for item, main in [(x, True) for x in tagged] + [(x, False) for x in rest]:
         text = f"{number(item['price'])} {item['name']}"
-        w = (18 + font(19, True).getlength(text)) if main else font(19).getlength(text)
+        w = (20 + font(21, True).getlength(text)) if main else font(21).getlength(text)
         if row and used + w > width:
             rows.append(row)
             row, used = [], 0.0
@@ -1393,20 +1393,20 @@ def _level_legend_rows(panel: dict, width: float) -> list[list[tuple[float, dict
 
 def _level_legend_height(panel: dict) -> int:
     rows = _level_legend_rows(panel, CONTENT - 200)
-    return len(rows) * 30 + (8 if rows else 0)
+    return len(rows) * 34 + (8 if rows else 0)
 
 
 def draw_level_legend(draw, x: float, y: float, panel: dict) -> None:
     for row in _level_legend_rows(panel, CONTENT - 200):
-        mid = y + 15
+        mid = y + 17
         for dx, item, main in row:
             text = f"{number(item['price'])} {item['name']}"
             if main:
-                draw.ellipse((x + dx, mid - 6, x + dx + 12, mid + 6), fill=item['color'])
-                draw.text((x + dx + 18, mid), text, font=font(19, True), fill=INK, anchor='lm')
+                draw.ellipse((x + dx, mid - 7, x + dx + 14, mid + 7), fill=item['color'])
+                draw.text((x + dx + 20, mid), text, font=font(21, True), fill=INK, anchor='lm')
             else:
-                draw.text((x + dx, mid), text, font=font(19), fill=INK, anchor='lm')
-        y += 30
+                draw.text((x + dx, mid), text, font=font(21), fill=INK, anchor='lm')
+        y += 34
 
 
 def _tag_positions(tagged: list[dict], py, price_top: float, price_bottom: float) -> list[float]:
@@ -1435,8 +1435,8 @@ def draw_level_tags(draw, tagged: list[dict], py, right: float, price_top: float
         draw.line((right + 2, true_y, right + 9, true_y), fill=color, width=2)
         draw.line((right + 9, true_y, right + 14, label_y), fill=color, width=1)
         text = number(item['price'])
-        # 欄寬 118px：指數（47,058.30）這種長數字用 16 級字，數字不截斷
-        text_font = font(LEVEL_TAG_FONT if len(text) <= 8 else LEVEL_TAG_FONT - 1, True)
+        # 欄寬 118px：指數（47,058.30）這種 9 碼以上的長數字用 17 級字，數字不截斷、框不超出卡片
+        text_font = font(LEVEL_TAG_FONT if len(text) <= 8 else LEVEL_TAG_FONT - 3, True)
         w = text_font.getlength(text) + 12
         draw.rounded_rectangle((right + 14, label_y - half, right + 14 + w, label_y + half), radius=6,
                                fill='white', outline=color, width=1)
@@ -1530,7 +1530,7 @@ def draw_chart(draw, y: int, panel: dict) -> None:
         import member_pattern
         label = member_pattern.chart_label(panel['member_triangle'])
         label, label_size = fit(label, 18, CONTENT - 64, False, 14)
-        text_at(draw, (x0 + 32, y + 186), label, label_size, MUTED)
+        text_at(draw, (x0 + 32, y + 194), label, label_size, MUTED)
 
     lane_top, lane_bottom = mark_lanes(panel)
     extra = lane_top + lane_bottom + _price_extra(panel)
@@ -1559,7 +1559,9 @@ def draw_chart(draw, y: int, panel: dict) -> None:
         draw.line((left, gy, right, gy), fill=LINE, width=1)
         # 價格刻度維持在右側；和關鍵價位框太近的那格刻度數字不畫，避免文字重疊
         if all(abs(gy - ty) > LEVEL_TAG_H for ty in tag_label_ys):
-            text_at(draw, (right + 14, gy - 10), number(value), 20, MUTED)
+            tick = number(value)
+            tick_size = 23 if len(tick) <= 8 else 20       # 指數的長數字維持 20 級，不超出卡片
+            text_at(draw, (right + 14, gy - tick_size // 2), tick, tick_size, MUTED)
     if not panel.get('compact'):
         draw_marks(draw, panel, px, py, step, price_top, price_bottom)
     for i, bar in enumerate(bars):

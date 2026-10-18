@@ -1316,27 +1316,33 @@ WEEKLY_WARRANT_DETAIL = True      # 週精選 K 線那張圖的權證明細（�
 
 
 def weekly_warrant_average_text(warrants: Sequence[Dict[str, Any]]) -> str:
-    """週精選權證明細一行：仍持有、未到期的權證，依剩餘張數加權平均剩餘天數／價內外／槓桿。"""
+    """權證明細的一行文字版（全部賣完時用，也給 Log／測試看）；數字和數字卡同一套加權平均。"""
+    tiles = weekly_warrant_tiles(warrants)
+    if not tiles:
+        return f"權證 {len(warrants)} 檔，已全部賣出或到期"
+    return "｜".join(f"{t['label']} {t['value']}" for t in tiles)
+
+
+def weekly_warrant_tiles(warrants: Sequence[Dict[str, Any]]) -> List[Dict[str, str]]:
+    """週精選權證明細數字卡：持有檔數、平均剩餘天數、平均價內外、平均槓桿、剩餘張數（依剩餘張數加權）。"""
     held = [w for w in warrants if (w.get("remaining_lots") or 0) > 0
             and (w.get("days_left") is None or w["days_left"] > 0)]
     if not held:
-        return f"權證 {len(warrants)} 檔，已全部賣出或到期"
+        return []
+    total = sum(float(w["remaining_lots"]) for w in held)
 
     def weighted(key: str) -> Optional[float]:
         pairs = [(float(w[key]), float(w["remaining_lots"])) for w in held if w.get(key) is not None]
-        total = sum(lots for _, lots in pairs)
-        return sum(v * lots for v, lots in pairs) / total if total else None
+        lots = sum(x for _, x in pairs)
+        return sum(v * x for v, x in pairs) / lots if lots else None
 
     days, money, lev = weighted("days_left"), weighted("moneyness_now"), weighted("leverage_now")
-    parts = [f"持有權證 {len(held)} 檔"]
-    if days is not None:
-        parts.append(f"平均剩餘 {days:.0f} 天")
-    if money is not None:
-        parts.append(f"平均{'價內' if money >= 0 else '價外'} {abs(money):.0f}%")
-    if lev is not None:
-        parts.append(f"平均槓桿 {lev:.1f} 倍")
-    parts.append(f"剩餘 {sum(float(w['remaining_lots']) for w in held):,.0f} 張")
-    return "｜".join(parts)
+    return [{"label": "持有權證", "value": f"{len(held)} 檔", "tone": "ink"},
+            {"label": "平均剩餘", "value": f"{days:.0f} 天" if days is not None else "-", "tone": "ink"},
+            {"label": "平均價內外", "value": (f"{'價內' if money >= 0 else '價外'} {abs(money):.0f}%") if money is not None else "-",
+             "tone": "ink"},
+            {"label": "平均槓桿", "value": f"{lev:.1f} 倍" if lev is not None else "-", "tone": "accent"},
+            {"label": "剩餘張數", "value": f"{total:,.0f} 張", "tone": "ink"}]
 
 
 def branch_store_warrant_sections(d: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -6993,17 +6999,22 @@ class AceQueryEngine:
             group = d["groups"][0]
             if not group.get("warrants"):
                 continue
-            head = "｜".join(x for x in (d.get("branch", ""), group.get("event_codes") or "") if x)
-            sections.append({"type": "paragraph", "weekly_note": True,
-                             "text": f"{head}：{weekly_warrant_average_text(group['warrants'])}"})
+            events = group.get("event_codes") or ""
+            sections.append({"type": "heading", "text": d.get("branch", "") + (f"｜{events} 事件" if events else ""),
+                             "weekly_note": True})
+            tiles = weekly_warrant_tiles(group["warrants"])
+            # 10-18：大字數字卡（長輩用手機看得清楚）；全部賣完／到期就寫一句話
+            sections.append({"type": "tiles", "items": tiles} if tiles else
+                            {"type": "paragraph", "weekly_note": True, "text": weekly_warrant_average_text(group["warrants"])})
         if sections:
-            sections.insert(0, {"type": "heading", "text": "權證明細（依剩餘張數加權平均）", "weekly_note": True})
+            sections.insert(0, {"type": "heading", "text": "權證明細｜依剩餘張數加權平均", "weekly_note": True})
         return sections
 
     def _answer_weekly_article_image(self, context_key: str, started: float) -> AnswerResult:
         """管理員確認草稿後，沿用一般個股（3034）版型產生週精選圖片。
 
-        結構固定為：K 線＋精簡權證買賣超標註 → 型態評分（含關鍵價位＋文章提及分點動向） → 已確認週精選文字。
+        10-18 起拆成兩張：第 1 張 K 線（關鍵價位標在圖上）＋權證買賣標註＋權證明細數字卡；第 2 張已確認週精選文字。
+        週精選不畫型態評分卡。
         權證逐日流水只畫在 K 線，不再展開長明細表；分點範圍完全以最終文字實際提到者為準。
         """
         session = self._load_draft_session(context_key, with_candidate=True)
@@ -7027,29 +7038,19 @@ class AceQueryEngine:
         chart_branches = branches or ["__NO_WEEKLY_BRANCH__"]
         panels = self._get_chart_panels([code], {code: chart_branches}, mark_mode="flow", flow_source="sheet")
 
-        # 週精選候選在排名階段已取得同一套技術資料，直接沿用來建 3034 版型的型態評分卡。
-        # 「關鍵價位」照一般 3034 卡保留；「追蹤分點動向」只顯示文章提到的分點。
+        # 10-18：週精選不畫型態評分卡；同一套技術資料只拿來產生關鍵價位（levels_only），
+        # 由 K 線右側價格框＋日期軸下方圖例呈現，不再另畫表格。
         if panels:
             tech = candidate.get("technical") or {}
             vp = candidate.get("volume_profile") or {}
             extras = candidate.get("technical_extras") or {}
-            chips = None
-            try:
-                chip_results = self._run_tools([ToolCall("get_sheet_stock_chips", {"stock_code": code, "days": 20})])
-                if chip_results and chip_results[0].ok:
-                    chips = chip_results[0].data
-            except Exception as exc:
-                self.log(f"週精選圖片分點評分列略過：{code}｜{type(exc).__name__}: {exc}")
             if tech and vp:
                 try:
-                    panels[0]["scorecard"] = weekly_pick.build_pattern_scorecard(
-                        tech, vp, extras, chips, tracked_branch_names=branches
-                    )
-                    # 精選圖精簡：主要得分／失分交給文章解讀、追蹤分點動向和 K 線標註表與文章重複，都不畫
-                    if panels[0]["scorecard"]:
-                        panels[0]["scorecard"].update(hide_reasons=True, show_tracked_branches=False)
+                    card = weekly_pick.build_pattern_scorecard(tech, vp, extras, None, tracked_branch_names=branches)
+                    if card:
+                        panels[0]["key_levels"] = dict(card, levels_only=True)
                 except Exception as exc:
-                    self.log(f"週精選圖片型態評分卡略過：{code}｜{type(exc).__name__}: {exc}")
+                    self.log(f"週精選圖片關鍵價位略過：{code}｜{type(exc).__name__}: {exc}")
 
         title = f"權證分點觀察｜週精選｜{code} {name}"
         image_text = weekly_pick.weekly_image_text(session["draft"], code, name)
