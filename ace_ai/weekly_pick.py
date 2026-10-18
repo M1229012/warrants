@@ -2059,7 +2059,7 @@ def weekly_article_parts(draft: str, stock_code: str, stock_name: str = "") -> D
 # 人工文章自動排版：Gemini 只重新分段、加固定小標、把數字整理成資料列；程式逐字核對，不通過就用原文排版
 # ============================================================
 
-WEEKLY_LAYOUT_VERSION = "weekly-note-v4-row-owner"
+WEEKLY_LAYOUT_VERSION = "weekly-note-v5-no-rows"
 LAYOUT_HEADINGS = ("技術面", "籌碼面", "操作觀察")
 LAYOUT_SCHEMA = {
     "type": "object",
@@ -2079,13 +2079,17 @@ _LAYOUT_NUMBER_RE = re.compile(r"\d[\d,]*(?:\.\d+)?")
 _LAYOUT_STRIP_RE = re.compile(r"[\s*`，。、；：:,.!?！？（）()「」『』【】《》〈〉…\-—～~｜|/／%％]+")
 LAYOUT_LEFTOVER_RATIO = 0.12     # 扣掉段落與資料列後原文剩下的字（刪掉的開頭語、資料列改寫的名稱）最多占全文比例
 LAYOUT_MAX_ROWS = 4
+# 10-18：數字不再抽成資料列（抽走後原句變成「華南永昌台中 10/05 買超，目前…」少了金額，資料列又和內文重複）；
+# 改 True 可恢復舊行為
+LAYOUT_ROWS = False
+LAYOUT_PARAGRAPH_CHARS = 80      # 圖片段落：約 2 句、80 字左右分段，手機上比較好讀
 LAYOUT_MAX_LABEL = 14
 
 
 def layout_prompt(body: str, retry_reason: str = "", others: Sequence[str] = ()) -> str:
     retry = f"\n※ 上一次排版沒通過核對：{retry_reason}。請修正後重新輸出，仍然只能照抄原文。\n" if retry_reason else ""
     other = (f"6. 文中也提到其他股票（{'、'.join(others)}）：這些股票的金額、勝率留在段落，不可抽成 rows；"
-             "rows 只放本檔的數字，避免讀者誤認成本檔。\n") if others else ""
+             "rows 只放本檔的數字，避免讀者誤認成本檔。\n") if others and LAYOUT_ROWS else ""
     return (retry +
         "你是排版編輯。下面是一篇已經寫好的個股觀察文章，請只做排版，輸出 JSON。\n"
         f"1. 分成最多三段，小標只能用：{'、'.join(LAYOUT_HEADINGS)}（沒有內容的段落不要輸出），依原文順序。"
@@ -2093,10 +2097,11 @@ def layout_prompt(body: str, retry_reason: str = "", others: Sequence[str] = ())
         "一句同時講盤勢和法人時，依整句主旨決定。\n"
         "2. 段落內的句子必須逐字照抄原文，不可改寫、增減字詞、換同義詞或改數字；只能重新分段（太長拆開、零碎的合併）。\n"
         "3. 句首和小標意思重複的開頭語要刪掉，例如「技術面來看，」「權證籌碼方面，」「操作上，」。\n"
-        f"4. 籌碼面裡的金額、勝率、持有天數這類數字，最多 {LAYOUT_MAX_ROWS} 個可以整理成 rows：label 是簡短名稱，"
-        "value 只放數字和單位，例如 {\"label\":\"近70日4筆事件買進\",\"value\":\"約2,120萬元\"}、"
-        "{\"label\":\"調整後勝率\",\"value\":\"約67%\"}；整理進 rows 的那一句要從段落刪掉，不要重複。"
-        "後面還接著補充說明的數字句（例如「近70日買進約2,120萬元，目前仍持有」）不要抽成 rows，留在段落，避免意思跑掉。\n"
+        + (f"4. 籌碼面裡的金額、勝率、持有天數這類數字，最多 {LAYOUT_MAX_ROWS} 個可以整理成 rows：label 是簡短名稱，"
+           "value 只放數字和單位，例如 {\"label\":\"近70日4筆事件買進\",\"value\":\"約2,120萬元\"}、"
+           "{\"label\":\"調整後勝率\",\"value\":\"約67%\"}；整理進 rows 的那一句要從段落刪掉，不要重複。"
+           "後面還接著補充說明的數字句（例如「近70日買進約2,120萬元，目前仍持有」）不要抽成 rows，留在段落，避免意思跑掉。\n"
+           if LAYOUT_ROWS else "4. rows 一律輸出空陣列；金額、勝率等數字都留在原句裡，不要抽出來。\n") +
         "5. 去掉 **、emoji 等格式符號；不要加任何原文沒有的內容。\n" + other + "\n"
         f"原文：\n{body}"
     )
@@ -2147,6 +2152,8 @@ def verify_layout(body: str, layout: Dict[str, Any], others: Sequence[str] = ())
     - 扣掉段落子句與資料列內容後，原文剩下沒被呈現的字不超過一定比例（不能整句丟掉）"""
     paragraphs = [p for s in layout["sections"] for p in s["paragraphs"]]
     rows = [r for s in layout["sections"] for r in s["rows"]]
+    if rows and not LAYOUT_ROWS:
+        return False, "資料列已停用，數字要留在原句"
     if len(rows) > LAYOUT_MAX_ROWS:
         return False, f"資料列 {len(rows)} 列，最多 {LAYOUT_MAX_ROWS} 列"
     long_label = next((r["label"] for r in rows if len(r["label"]) > LAYOUT_MAX_LABEL), "")
@@ -2331,7 +2338,7 @@ def rule_layout(body: str, others: Sequence[str] = ()) -> Optional[Dict[str, Any
     if not sections:
         return None
     for sec in sections:
-        if sec["heading"] == "籌碼面":
+        if LAYOUT_ROWS and sec["heading"] == "籌碼面":
             paragraphs = []
             for paragraph in sec["paragraphs"]:
                 text, rows = _extract_rows(paragraph, LAYOUT_MAX_ROWS - len(sec["rows"]), others)
@@ -2342,15 +2349,29 @@ def rule_layout(body: str, others: Sequence[str] = ()) -> Optional[Dict[str, Any
     return {"sections": [s for s in sections if s["paragraphs"] or s["rows"]]}
 
 
+def _reading_chunks(text: str) -> List[str]:
+    """把一段長文依句號切成約 LAYOUT_PARAGRAPH_CHARS 字的小段；句子不拆開，太短的最後一段併回前一段。"""
+    sentences = [x for x in re.findall(r"[^。！？]+[。！？]?", str(text or "")) if x.strip()]
+    chunks: List[str] = []
+    for sentence in sentences:
+        if chunks and len(chunks[-1]) + len(sentence) <= LAYOUT_PARAGRAPH_CHARS:
+            chunks[-1] += sentence
+        else:
+            chunks.append(sentence)
+    if len(chunks) > 1 and len(chunks[-1]) < 20:
+        chunks[-2] += chunks.pop()
+    return [c.strip() for c in chunks if c.strip()]
+
+
 def layout_card(layout: Dict[str, Any], title: str, label: str, disclaimers: List[str], keep_words=()) -> Dict[str, Any]:
     """排版結果 → 和其他研究筆記同一套卡片（金色小標、段落、淺底資料列、註解）。"""
     sections: List[Dict[str, Any]] = []
     for index, sec in enumerate(layout["sections"]):
         sections.append({"type": "heading", "text": sec["heading"], "weekly_note": True, "divider": index > 0})
-        # 每個小標底下一段完整文字：句子接在一起自然換行，不在句號處拆成好幾段（看起來零碎）
+        # 10-18：一整塊長文在手機上難讀 → 約 2 句、80 字一段（不在句子中間切），段落之間留白
         merged = "".join(p.strip() for p in sec["paragraphs"] if p.strip())
-        if merged:
-            sections.append({"type": "paragraph", "text": merged, "weekly_note": True, "keep_words": list(keep_words)})
+        for chunk in _reading_chunks(merged):
+            sections.append({"type": "paragraph", "text": chunk, "weekly_note": True, "keep_words": list(keep_words)})
         if sec["rows"]:
             # 原文數字以緊湊行內資訊呈現，不為單筆數字建立滿版小格
             sections.append({"type": "stats", "presentation": "inline", "items": [{"label": r["label"], "value": r["value"]} for r in sec["rows"]]})

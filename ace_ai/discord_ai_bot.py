@@ -1323,6 +1323,15 @@ def weekly_warrant_average_text(warrants: Sequence[Dict[str, Any]]) -> str:
     return "｜".join(f"{t['label']} {t['value']}" for t in tiles)
 
 
+def weekly_warrant_row(w: Dict[str, Any]) -> List[str]:
+    """權證名單一列：權證代號名稱、剩餘張數、剩餘天數、價內外、槓桿（天期／價內外／槓桿為現在數值）。"""
+    days_left, money_now, lev_now = w.get("days_left"), w.get("moneyness_now"), w.get("leverage_now")
+    return [f"{w.get('warrant_code', '')} {w.get('warrant_name', '')}".strip(), w.get("remaining_text") or "-",
+            ("已到期" if days_left <= 0 else f"{days_left} 天") if days_left is not None else "-",
+            f"{'價內' if money_now >= 0 else '價外'} {abs(money_now):.0f}%" if money_now is not None else "-",
+            f"{lev_now:.1f} 倍" if lev_now is not None else "-"]
+
+
 def weekly_warrant_tiles(warrants: Sequence[Dict[str, Any]]) -> List[Dict[str, str]]:
     """週精選權證明細數字卡：持有檔數、平均剩餘天數、平均價內外、平均槓桿、剩餘張數（依剩餘張數加權）。"""
     held = [w for w in warrants if (w.get("remaining_lots") or 0) > 0
@@ -7006,6 +7015,10 @@ class AceQueryEngine:
             # 10-18：大字數字卡（長輩用手機看得清楚）；全部賣完／到期就寫一句話
             sections.append({"type": "tiles", "items": tiles} if tiles else
                             {"type": "paragraph", "weekly_note": True, "text": weekly_warrant_average_text(group["warrants"])})
+            # 10-18：數字卡下面列出完整權證名單（每檔權證一列）
+            sections.append({"type": "table", "columns": ["權證", "剩餘張數", "剩餘天數", "價內外", "槓桿"],
+                             "widths": (0.40, 0.15, 0.15, 0.15, 0.15), "signed": (), "accent": ("剩餘張數", "槓桿"),
+                             "rows": [weekly_warrant_row(w) for w in group["warrants"]]})
         if sections:
             sections.insert(0, {"type": "heading", "text": "權證明細｜依剩餘張數加權平均", "weekly_note": True})
         return sections
