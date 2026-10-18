@@ -60,6 +60,7 @@ import review_language
 import stock_banter
 import chip_event_backtest
 import member_usage_stats
+import on_demand
 
 # 主程式每算一檔股票都會印「📅 週報統計區間」，Bot 一題會印上百行，把真正的訊息洗掉。
 # 這裡只在 Bot 行程過濾，不動主程式，週報與回測的輸出完全不受影響。
@@ -730,7 +731,7 @@ ADMIN_HELP_GROUPS = (
     ("型態驗證", ("型態驗證 2330（趨勢線、錨點、轉折確認日）", "型態驗證 2344 1608 2421（一次最多 10 檔，公開）", "圖片型態驗證（attachment 附股票清單截圖，最多 10 檔）")),
     ("本週精選", ("本週精選排名", "3006 幫我生成週精選文字", "這版確認，生成圖片")),
     ("草稿", ("直接說修改需求", "還原上一版", "目前草稿")),
-    ("資料維護", ("系統狀態", "用量（含費用估算）", "錯誤紀錄", "更新市場底庫", "更新族群名冊", "匯出狀態／匯入狀態")),
+    ("資料維護", ("系統狀態", "記憶體明細（常駐記憶體花在哪）", "用量（含費用估算）", "錯誤紀錄", "更新市場底庫", "更新族群名冊", "匯出狀態／匯入狀態")),
     ("Log 開關（平常關閉，白話可）", ("log狀態（看目前哪些有開）", "開啟三角紀錄／關閉三角紀錄（三角核對）",
                                   "開啟用量紀錄（每5分鐘用量報表）", "開啟底庫紀錄（底庫更新進度）",
                                   "開啟休市紀錄（個股缺日提示）", "全部log關掉")),
@@ -6353,10 +6354,30 @@ class AceQueryEngine:
         """管理員（含 /ace）不排隊、不佔排隊名額；模擬會員身分（/ace 測試 …）照會員規則排隊。"""
         return access is not None and not access.simulation and (access.entry == "ace" or access.entitlement.admin)
 
+    def _prepare_on_demand(self, calls: Sequence[ToolCall]) -> None:
+        """按需模式（背景工作關閉）：這一題要用到的資料先補到最新再跑工具。"""
+        names = {c.name for c in calls}
+        if names & ON_DEMAND_WARRANT_STORE_TOOLS:
+            on_demand.warrant_store_ready(log=self.log)
+        if names & ON_DEMAND_INSTITUTIONAL_TOOLS:
+            on_demand.tpex_institutional_ready(log=self.log)
+        on_demand.daily_maintenance(log=self.log)
+
     def _answer_weekly_pick(self, question: str, started: float) -> AnswerResult:
         """本週精選排名：Python 公平計算 Top10，排名階段不呼叫 Gemini。"""
         stats = AnswerStats()
         self.log(f"本週精選問題：{question}")
+        if on_demand.enabled():
+            # 10-19 按需模式（測試版關背景省錢）：排名前先把全市場日K與型態分數補到最新；
+            # 整題期限內做不完就先回覆，背景繼續算，算完再問一次直接出圖。
+            budget = WEEKLY_PICK_DEADLINE_SECONDS - (time.perf_counter() - started) - 60
+            prep = on_demand.market_ready(budget_seconds=max(10.0, budget), log=self.log)
+            if not prep.get("ready"):
+                self.log(f"本週精選按需準備未完成｜已算 {prep.get('scored', 0)} 檔｜尚待 {prep.get('pending', 0)} 檔")
+                return AnswerResult(
+                    text=(f"全市場資料準備中（型態分數已算 {prep.get('scored', 0):,} 檔，尚待約 {prep.get('pending', 0):,} 檔），"
+                          "背景會繼續算完。約 5～10 分鐘後再問一次「本週精選排名」就會直接出圖。"),
+                    route="weekly_pick", gemini_calls=0, elapsed=time.perf_counter() - started, cacheable=False)
         panels = []
         weekly: Dict[str, Any] = {}
 
@@ -6517,6 +6538,7 @@ class AceQueryEngine:
     def _answer_radar(self, direction: str, started: float, route: str, scope: str = "all",
                       view: str = "all") -> AnswerResult:
         """族群雷達（大族群 ≥20 檔）；/ace 與 /ask 共用。view＝all／strong／weak（單獨問目前強勢或弱勢）。"""
+        on_demand.wake_radar()       # 按需模式：盤中取樣從現在開始拍 2 小時
         result = sector_radar.answer(direction, scope=scope, view=view)
         panels = result.get("panels") or []
         return AnswerResult(text=result["text"], route=route, gemini_calls=0,
@@ -6604,6 +6626,11 @@ class AceQueryEngine:
             text = str((session or {}).get("draft") or "")
             return AnswerResult(text=text or "目前沒有編輯中的草稿。", route="weekly_draft_show",
                                 gemini_calls=0, elapsed=time.perf_counter()-started, cacheable=False)
+        if compact in ("記憶體明細", "記憶體", "記憶體用量"):
+            # 10-19：Railway 記憶體費用來源；掃一次物件約數秒，只回給管理員本人
+            import mem_report
+            return AnswerResult(text=mem_report.report(), route="admin_memory", gemini_calls=0,
+                                elapsed=time.perf_counter()-started, cacheable=False, as_text=True)
         if compact in ("系統狀態", "狀態", "底庫狀態", "資料狀態"):
             info = market_scan.status()
             lines = [
@@ -7908,6 +7935,9 @@ class AceQueryEngine:
 
         if request.get("mode") == "technical":
             request = dict(request, mode="overview")
+        if on_demand.enabled():
+            on_demand.market_ready(budget_seconds=40.0, log=self.log)   # 按需模式：族群排行用的底庫補到最新
+            on_demand.wake_radar()
         result = sector_analysis.answer(request, self.gateway, validate)
         if request.get("matched_by"):
             # 會員講別名（TGV、CCL…）或模糊比對：卡片說明列與文字都註明對應到哪個族群
@@ -8065,6 +8095,8 @@ class AceQueryEngine:
             return {}
 
     def _run_tools(self, calls: Sequence[ToolCall]) -> List[tools.ToolResult]:
+        if on_demand.enabled():
+            self._prepare_on_demand(calls)
         if any(c.name in WARRANT_TOOLS or (c.name == "get_chart_panel" and c.kwargs.get("with_marks", True)) for c in calls):
             access_policy.require_feature(self._access(), access_policy.FeaturePolicy("WARRANT"))
         cancel_event = threading.Event()
@@ -8479,7 +8511,7 @@ def schedule_late_ai_image(engine, original, target, make_files, no_mentions):
 PUBLIC_ANSWER_ROUTES = frozenset(("planner", "answer_cache"))
 PUBLIC_ADMIN_ROUTES = frozenset(("admin_kline_debug",))
 # /ace 管理指令字眼：含內部狀態、路徑、快取、筆數、log 的回覆一開始就 ephemeral defer。
-_ADMIN_PRIVATE_RE = re.compile(r"錯誤|ERROR|狀態|用量|使用量|USAGE|底庫|名冊|維護|DEBUG|LOG|日誌|快取|CACHE|草稿|說明|HELP|指令", re.IGNORECASE)
+_ADMIN_PRIVATE_RE = re.compile(r"錯誤|ERROR|狀態|用量|使用量|USAGE|底庫|名冊|維護|DEBUG|LOG|日誌|快取|CACHE|草稿|說明|HELP|指令|記憶體", re.IGNORECASE)
 
 
 # 週精選（只有管理員能用）：排名、草稿、改稿、套用文字、精選圖片都公開，不會因為 ephemeral 重新整理後消失
@@ -8951,6 +8983,10 @@ BACKGROUND_TICK_SECONDS = max(30, tools._env_int("DISCORD_AI_BACKGROUND_TICK_SEC
 CMONEY_MEMBER_WARMUP_PER_TICK = max(0, tools._env_int("DISCORD_AI_CMONEY_MEMBER_WARMUP_PER_TICK", 1))
 # 全市場日K底庫：證交所／櫃買官方資料，每個交易日 2 個請求，不吃 FinMind 額度。
 MARKET_SYNC_ENABLE = _env_flag("DISCORD_AI_MARKET_SYNC_ENABLE", "1")
+on_demand.enable(not MARKET_SYNC_ENABLE)    # 10-19：背景關閉（測試版省錢）時，被問到才準備資料
+# 按需模式下，這些工具執行前先補對應資料：權證分點歷史庫（剩餘天數、槓桿）／上櫃三大法人
+ON_DEMAND_WARRANT_STORE_TOOLS = frozenset(("get_branch_warrant_detail", "get_branch_event_window"))
+ON_DEMAND_INSTITUTIONAL_TOOLS = frozenset(("get_institutional_flow", "get_market_institutional"))
 MARKET_SYNC_BUDGET = max(60.0, tools._env_float("DISCORD_AI_MARKET_SYNC_BUDGET", 600.0))
 MARKET_SCORE_BUDGET = max(30.0, tools._env_float("DISCORD_AI_MARKET_SCORE_BUDGET", 240.0))
 
@@ -9000,7 +9036,7 @@ def _intraday_sampling_loop_admin(stop: threading.Event) -> None:
     last_basket = 0.0
     while not stop.is_set():
         try:
-            if sector_radar.session_open(tools.taipei_now()):
+            if sector_radar.session_open(tools.taipei_now()) and on_demand.radar_awake():
                 # 族群漲幅快照（2 個請求、0 次 Gemini）；間隔由 tick 自己控制
                 try:
                     sector_radar.tick()
@@ -9390,8 +9426,9 @@ def run_discord_bot(config: BotConfig) -> None:
             threading.Thread(target=_usage_monitor_loop, args=(engine, usage_stop), name="ace-usage-monitor", daemon=True).start()
             if MARKET_SYNC_ENABLE:
                 threading.Thread(target=_market_maintenance_loop, args=(usage_stop,), name="ace-market-base", daemon=True).start()
-                threading.Thread(target=_intraday_sampling_loop, args=(usage_stop,), name="ace-intraday-sample", daemon=True).start()
                 threading.Thread(target=_tpex_institutional_loop, args=(usage_stop,), name="ace-tpex-inst", daemon=True).start()
+            # 盤中取樣：背景開著一律跑；按需模式只在族群雷達被問到後的 2 小時內取樣（on_demand.radar_awake）
+            threading.Thread(target=_intraday_sampling_loop, args=(usage_stop,), name="ace-intraday-sample", daemon=True).start()
         print(
             f"✅ 艾斯 AI 已上線：{client.user}｜指令 /{config.slash_command_name}（一般）＋/{config.admin_command_name}（管理員）" + (f" 與 {config.command_prefix}" if config.prefix_command_enabled else "") + "｜"
             f"允許使用者 {'不限' if config.allow_all_users else str(len(config.allowed_user_ids)) + ' 人'}｜限制頻道 {len(config.allowed_channel_ids) or '不限'}｜"
