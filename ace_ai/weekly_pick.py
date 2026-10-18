@@ -2011,6 +2011,8 @@ def find_weekly_candidate(stock_code: str, log: Callable[[str], None] = print, c
     return stock, metadata
 
 
+# 管理員在文章裡寫「摘要：逆勢突破後，觀察回測與籌碼延續」→ 圖片上方的摘要句（不寫就不顯示，AI 不自己編）
+_SUMMARY_RE = re.compile(r"(?:^|\s)(?:摘要|標題)[:：]\s*(\S{2,40})")
 _INLINE_DISCLAIMER_RE = re.compile(r"(?:⚠️|⚠)?\s*僅為個人投資筆記|(?:🧡)?\s*非任何買賣建議")
 
 
@@ -2024,7 +2026,7 @@ def weekly_article_parts(draft: str, stock_code: str, stock_name: str = "") -> D
     if code:
         suffix = rf"(?:\s*{re.escape(name)})?" if name else ""
         stock_heading = re.compile(rf"^(?:📌\s*)*{re.escape(code)}(?!\d){suffix}(?=$|[\s｜|：:])(?:[\s｜|：:]*)")
-    body, disclaimers = [], []
+    body, disclaimers, summary = [], [], ""
     for line in lines:
         stripped = line.strip()
         if not stripped:
@@ -2044,6 +2046,12 @@ def weekly_article_parts(draft: str, stock_code: str, stock_name: str = "") -> D
         if stripped in ("⚠️ 僅為個人投資筆記", "🧡 非任何買賣建議"):
             disclaimers.append(stripped)
             continue
+        found = _SUMMARY_RE.search(stripped)
+        if found and not summary:
+            summary = found.group(1).strip()
+            stripped = (stripped[:found.start()] + " " + stripped[found.end():]).strip()
+            if not stripped:
+                continue
         # slash 指令打不出換行：免責兩句常接在正文最後一行，抽出來放到小字註解，正文不重複一次
         disclaimers += [x.strip() for x in _INLINE_DISCLAIMER_RE.findall(stripped)]
         stripped = _INLINE_DISCLAIMER_RE.sub("", stripped).strip()
@@ -2052,14 +2060,15 @@ def weekly_article_parts(draft: str, stock_code: str, stock_name: str = "") -> D
         body.append(stripped)
     text = "\n".join(body).strip()
     title = f"{stock_name}（{code}）" if stock_name else code
-    return {"title": title, "body": text, "disclaimers": disclaimers or ["⚠️ 僅為個人投資筆記", "🧡 非任何買賣建議"]}
+    return {"title": title, "body": text, "summary": summary,
+            "disclaimers": disclaimers or ["⚠️ 僅為個人投資筆記", "🧡 非任何買賣建議"]}
 
 
 # ============================================================
 # 人工文章自動排版：Gemini 只重新分段、加固定小標、把數字整理成資料列；程式逐字核對，不通過就用原文排版
 # ============================================================
 
-WEEKLY_LAYOUT_VERSION = "weekly-note-v5-no-rows"
+WEEKLY_LAYOUT_VERSION = "weekly-note-v6-levels"
 LAYOUT_HEADINGS = ("技術面", "籌碼面", "操作觀察")
 LAYOUT_SCHEMA = {
     "type": "object",
@@ -2072,9 +2081,14 @@ LAYOUT_SCHEMA = {
                 "label": {"type": "string"}, "value": {"type": "string"}}, "required": ["label", "value"]}},
         },
         "required": ["heading", "paragraphs"],
-    }}},
+    }},
+        "levels": {"type": "array", "items": {"type": "object", "properties": {
+            "kind": {"type": "string", "enum": ["壓力", "支撐"]},
+            "price": {"type": "string"}, "note": {"type": "string"}}, "required": ["kind", "price", "note"]}}},
     "required": ["sections"],
 }
+LAYOUT_MAX_LEVELS = 2
+LAYOUT_LEVEL_NOTE = 14
 _LAYOUT_NUMBER_RE = re.compile(r"\d[\d,]*(?:\.\d+)?")
 _LAYOUT_STRIP_RE = re.compile(r"[\s*`，。、；：:,.!?！？（）()「」『』【】《》〈〉…\-—～~｜|/／%％]+")
 LAYOUT_LEFTOVER_RATIO = 0.12     # 扣掉段落與資料列後原文剩下的字（刪掉的開頭語、資料列改寫的名稱）最多占全文比例
@@ -2101,7 +2115,11 @@ def layout_prompt(body: str, retry_reason: str = "", others: Sequence[str] = ())
            "{\"label\":\"調整後勝率\",\"value\":\"約67%\"}；整理進 rows 的那一句要從段落刪掉，不要重複。"
            "後面還接著補充說明的數字句（例如「近70日買進約2,120萬元，目前仍持有」）不要抽成 rows，留在段落，避免意思跑掉。\n"
            if LAYOUT_ROWS else "4. rows 一律輸出空陣列；金額、勝率等數字都留在原句裡，不要抽出來。\n") +
-        "5. 去掉 **、emoji 等格式符號；不要加任何原文沒有的內容。\n" + other + "\n"
+        "5. 去掉 **、emoji 等格式符號；不要加任何原文沒有的內容。\n" + other +
+        f"7. levels：從技術面文字中，挑最多 {LAYOUT_MAX_LEVELS} 個原文明確寫出的價位做成價位卡；"
+        "kind 是壓力（現價上方、賣壓）或支撐（現價下方、防守），price 照抄原文的數字加單位（例「794 元」），"
+        f"note 是 {LAYOUT_LEVEL_NOTE} 字以內、用原文用詞的簡短說明（例「9/23 避雷針」「5 月起上升趨勢線」）。"
+        "原文沒有寫出具體價位就輸出空陣列；levels 只是摘要，段落文字照樣保留完整原句。\n\n"
         f"原文：\n{body}"
     )
 
@@ -2128,7 +2146,10 @@ def parse_layout(data: Any) -> Optional[Dict[str, Any]]:
         rows = [r for r in rows if r["label"] and r["value"]]
         if paragraphs or rows:
             sections.append({"heading": sec["heading"], "paragraphs": paragraphs, "rows": rows})
-    return {"sections": sections} if sections else None
+    levels = [{"kind": str(v.get("kind") or "").strip(), "price": str(v.get("price") or "").strip(),
+               "note": str(v.get("note") or "").replace("**", "").strip()}
+              for v in data.get("levels") or [] if isinstance(v, dict)]
+    return {"sections": sections, "levels": [v for v in levels if v["price"]]} if sections else None
 
 
 def _sentences(text: str) -> List[str]:
@@ -2153,6 +2174,19 @@ def verify_layout(body: str, layout: Dict[str, Any], others: Sequence[str] = ())
     rows = [r for s in layout["sections"] for r in s["rows"]]
     if rows and not LAYOUT_ROWS:
         return False, "資料列已停用，數字要留在原句"
+    levels = layout.get("levels") or []
+    if len(levels) > LAYOUT_MAX_LEVELS:
+        return False, f"價位卡 {len(levels)} 個，最多 {LAYOUT_MAX_LEVELS} 個"
+    body_numbers = set(_layout_numbers([body]))
+    for level in levels:
+        if level.get("kind") not in ("壓力", "支撐"):
+            return False, f"價位卡種類不對：{level.get('kind')}"
+        numbers = set(_layout_numbers([level.get("price", "")]))
+        if not numbers or not numbers <= body_numbers:
+            return False, f"價位卡價格不是原文的數字：{level.get('price')}"
+        note = level.get("note", "")
+        if len(note) > LAYOUT_LEVEL_NOTE or not set(_layout_numbers([note])) <= body_numbers:
+            return False, f"價位卡說明太長或有原文沒有的數字：{note}"
     if len(rows) > LAYOUT_MAX_ROWS:
         return False, f"資料列 {len(rows)} 列，最多 {LAYOUT_MAX_ROWS} 列"
     long_label = next((r["label"] for r in rows if len(r["label"]) > LAYOUT_MAX_LABEL), "")
@@ -2161,7 +2195,7 @@ def verify_layout(body: str, layout: Dict[str, Any], others: Sequence[str] = ())
     foreign = next((r["label"] for r in rows if _other_stock_row(body, r, others)), "")
     if foreign:
         return False, f"資料列「{foreign}」是其他股票的數字，要留在段落"
-    expected = set(_layout_numbers([body]))
+    expected = body_numbers
     actual = set(_layout_numbers(paragraphs + [r["label"] for r in rows] + [r["value"] for r in rows]))
     if expected != actual:
         missing = sorted(expected - actual)[:3]
@@ -2235,7 +2269,7 @@ def tidy_layout(layout: Dict[str, Any]) -> Dict[str, Any]:
     for k, (i, row) in enumerate(rows):
         if k not in dropped_rows:
             sections[i]["rows"].append(_tidy_row(row))
-    return {"sections": [s for s in sections if s["paragraphs"] or s["rows"]]}
+    return {"sections": [s for s in sections if s["paragraphs"] or s["rows"]], "levels": list(layout.get("levels") or [])}
 
 
 _LEAD_IN_RE = re.compile(r"^(?:權證籌碼方面|權證籌碼上|權證籌碼|權證方面|籌碼方面|籌碼面|籌碼上|技術面上|技術面|技術上|"
@@ -2346,6 +2380,18 @@ def rule_layout(body: str, others: Sequence[str] = ()) -> Optional[Dict[str, Any
                     paragraphs.append(text)
             sec["paragraphs"] = paragraphs
     return {"sections": [s for s in sections if s["paragraphs"] or s["rows"]]}
+
+
+def weekly_text_data(layout: Dict[str, Any], article: Dict[str, Any], header: Dict[str, str],
+                     keep_words=()) -> Dict[str, Any]:
+    """10-18 新版週精選文字圖：大標題＋摘要句（管理員寫才有）＋01／02／03 小標＋技術面價位卡＋操作觀察框。
+    段落照抄原文、句子不拆；價位卡只放技術面提到的價位（壓力紅、支撐綠）。"""
+    notes = [re.sub(r"^[^\w一-鿿]+", "", str(d)).strip() for d in article.get("disclaimers") or []]
+    return {"header": header, "summary": article.get("summary", ""),
+            "sections": [{"heading": sec["heading"], "paragraphs": [x for x in sec["paragraphs"] if x.strip()],
+                          "levels": list(layout.get("levels") or []) if sec["heading"] == "技術面" else []}
+                         for sec in layout["sections"] if sec["paragraphs"]],
+            "keep_words": list(keep_words), "note": "※ " + "｜".join(n for n in notes if n)}
 
 
 def layout_card(layout: Dict[str, Any], title: str, label: str, disclaimers: List[str], keep_words=()) -> Dict[str, Any]:

@@ -7045,9 +7045,10 @@ class AceQueryEngine:
             chart_panels.append({"branch_card": {"branch": warrant_rows[0]["text"], "tags": [], "label": f"資料日 {data_date}".strip(),
                                                  "sections": warrant_rows[1:], "weekly_note": True}, "hide_text": True})
         if layout:
-            card = weekly_pick.layout_card(layout, article["title"], f"資料日 {data_date}".strip(), article["disclaimers"], keep_words=branches)
-            article_panels = [{"branch_card": card, "hide_text": True,
-                               "footer_text": "股市艾斯  /  日 K 為收盤資料，非盤中即時行情"}]
+            # 10-18 新版文字圖：大標題＋摘要句（管理員寫「摘要：…」才有）＋01／02／03＋技術面價位卡＋操作觀察框
+            header = {"title": f"{code} {name}｜週精選", "subtitle": "權證分點觀察",
+                      "date": f"資料日 {str(data_date).replace('-', '/')}" if data_date else ""}
+            article_panels = [{"weekly_text": weekly_pick.weekly_text_data(layout, article, header, keep_words=branches)}]
         else:
             article_panels = [{"article": article}]
         if layout_note:

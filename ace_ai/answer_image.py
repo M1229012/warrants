@@ -2830,6 +2830,174 @@ def draw_ai_card(draw, y: float, data: dict) -> int:
     return height
 
 
+# ============================================================
+# 10-18 週精選文字圖（新版）：大標題＋摘要句＋01／02／03 小標＋技術面價位卡＋操作觀察框
+# 段落照抄原文、句子不拆；分點名稱粗體且不斷行；標點不放行首；最後一行不留孤字。
+# ============================================================
+WT_BODY, WT_LH = 28, 46
+WEEKLY_HEADER_H = 250
+_WT_NO_START = '，。、；：！？）」』％%'
+_WT_LEVEL_STYLE = {'壓力': (UP_BG, UP), '支撐': (DOWN_BG, DOWN)}
+
+
+def _is_weekly_text_panel(panel: dict) -> bool:
+    return isinstance((panel or {}).get('weekly_text'), dict)
+
+
+def _wt_units(text: str, keep_words) -> list[tuple[str, bool]]:
+    """切成不可拆的單位：分點名稱（粗體）、英數串（762、1,198、70.9%）、單一字。"""
+    words = sorted({str(w) for w in keep_words or () if str(w)}, key=len, reverse=True)
+    out, i = [], 0
+    while i < len(text):
+        hit = next((w for w in words if text.startswith(w, i)), None)
+        if hit:
+            out.append((hit, True))
+            i += len(hit)
+            continue
+        j = i
+        while j < len(text) and text[j].isascii() and (text[j].isalnum() or text[j] in '.,/%'):
+            j += 1
+        if j > i:
+            out.append((text[i:j], False))
+            i = j
+            continue
+        out.append((text[i], False))
+        i += 1
+    return out
+
+
+def _wt_wrap(text: str, keep_words, size: int, width: float) -> list[list[tuple[str, bool]]]:
+    lines, cur, used = [], [], 0.0
+    for unit, bold in _wt_units(clean(text), keep_words):
+        w = font(size, bold).getlength(unit)
+        if cur and used + w > width:
+            if unit[0] in _WT_NO_START and len(cur) == 1:
+                pass                              # 這行只有一個單位：標點直接接在後面，不產生空行
+            elif unit[0] in _WT_NO_START:         # 標點不放行首：連同前一個單位一起換行，不超出右邊界
+                prev = cur.pop()
+                lines.append(cur)
+                cur, used = [prev], font(size, prev[1]).getlength(prev[0])
+            else:
+                lines.append(cur)
+                cur, used = [], 0.0
+                if unit == ' ':
+                    continue
+        cur.append((unit, bold))
+        used += w
+    if cur:
+        lines.append(cur)
+    if len(lines) > 1 and len(lines[-1]) <= 2 and len(lines[-2]) > 4:   # 最後一行只剩「在。」：借 2 個單位下來
+        lines[-1] = lines[-2][-2:] + lines[-1]
+        lines[-2] = lines[-2][:-2]
+    return lines
+
+
+def _wt_para(draw, x: float, y: float, text: str, keep_words, width: float) -> int:
+    lines = _wt_wrap(text, keep_words, WT_BODY, width)
+    if draw is not None:
+        for i, line in enumerate(lines):
+            cx = x
+            for unit, bold in line:
+                draw.text((cx, y + i * WT_LH), unit, font=font(WT_BODY, bold), fill=INK)
+                cx += font(WT_BODY, bold).getlength(unit)
+    return len(lines) * WT_LH
+
+
+def _wt_section_head(draw, x0: float, x1: float, y: float, no: str, title: str, divider: bool) -> int:
+    top = y + (30 if divider else 0)
+    if draw is not None:
+        if divider:
+            draw.line((x0, y, x1, y), fill=LINE, width=1)
+        draw.rounded_rectangle((x0, top, x0 + 58, top + 44), radius=10, fill=ACCENT)
+        draw.text((x0 + 29, top + 22), no, font=font(24, True), fill='white', anchor='mm')
+        draw.text((x0 + 76, top + 22), title, font=font(32, True), fill=INK, anchor='lm')
+    return (30 if divider else 0) + 44 + 22
+
+
+def _wt_levels(draw, x0: float, x1: float, y: float, levels: list[dict]) -> int:
+    """技術面價位卡：左右兩格，壓力淡紅底、支撐淡綠底；價格大字，說明一般字。"""
+    if not levels:
+        return 0
+    gap, box_h = 20, 84
+    half = (x1 - x0 - gap) / 2
+    if draw is not None:
+        for k, level in enumerate(levels[:2]):
+            bx = x0 + k * (half + gap)
+            bg, ink = _WT_LEVEL_STYLE.get(level.get('kind'), (TILE_BG, INK))
+            mid = y + box_h / 2
+            draw.rounded_rectangle((bx, y, bx + half, y + box_h), radius=14, fill=bg)
+            draw.text((bx + 24, mid), level.get('kind', ''), font=font(22, True), fill=ink, anchor='lm')
+            px = bx + 24 + font(22, True).getlength(level.get('kind', '')) + 20
+            price, price_size = fit(level.get('price', ''), 34, half - (px - bx) - 40, True, 26)
+            draw.text((px, mid), price, font=font(price_size, True), fill=INK, anchor='lm')
+            nx = px + font(price_size, True).getlength(price) + 22
+            note, note_size = fit(level.get('note', ''), 24, bx + half - nx - 20, False, 18)
+            if note:
+                draw.line((nx - 11, y + 26, nx - 11, y + box_h - 26), fill='#D0D5DD', width=2)
+                draw.text((nx + 4, mid), note, font=font(note_size), fill=INK, anchor='lm')
+    return box_h + 34
+
+
+def weekly_text_card(draw, y: float, data: dict, dry: bool) -> int:
+    x0, x1 = MARGIN, WIDTH - MARGIN
+    ix0, ix1 = x0 + 40, x1 - 40
+    width = ix1 - ix0
+    pen = None if dry else draw
+    cy = y + 36
+    summary = str(data.get('summary') or '').strip()
+    if summary:
+        if pen is not None:
+            draw.rectangle((ix0, cy + 4, ix0 + 6, cy + 46), fill=ACCENT)
+            text, size = fit(summary, 36, width - 30, True, 28)
+            draw.text((ix0 + 24, cy + 25), text, font=font(size, True), fill=INK, anchor='lm')
+        cy += 50 + 30
+    keep = data.get('keep_words') or ()
+    sections = data.get('sections') or []
+    for k, sec in enumerate(sections):
+        cy += _wt_section_head(pen, ix0, ix1, cy, f'{k + 1:02d}', sec.get('heading', ''), divider=bool(summary) or k > 0)
+        paragraphs = sec.get('paragraphs') or []
+        if sec.get('heading') == '操作觀察':
+            inner = width - 60
+            text_h = sum(_wt_para(None, 0, 0, t, keep, inner) for t in paragraphs) + 18 * max(0, len(paragraphs) - 1)
+            if pen is not None:
+                draw.rounded_rectangle((ix0, cy, ix1, cy + text_h + 40), radius=14, fill=ACCENT_BG)
+                draw.rectangle((ix0, cy, ix0 + 6, cy + text_h + 40), fill=ACCENT)
+                ty = cy + 20
+                for t in paragraphs:
+                    ty += _wt_para(draw, ix0 + 34, ty, t, keep, inner) + 18
+            cy += text_h + 40 + 24
+            continue
+        for t in paragraphs:
+            cy += _wt_para(pen, ix0, cy, t, keep, width) + 18
+        levels = sec.get('levels') or []
+        if levels:
+            cy += _wt_levels(pen, ix0, ix1, cy, levels)
+        cy += 16
+    note = str(data.get('note') or '')
+    if note:
+        if pen is not None:
+            text_at(draw, (ix0, cy), note, 20, MUTED)
+        cy += 40
+    return int(cy - y)
+
+
+def weekly_text_block(draw, y: float, data: dict) -> int:
+    """先量高度畫白底卡片，再畫內容（底框不能蓋掉文字）。"""
+    height = weekly_text_card(None, y, data, True)
+    draw.rounded_rectangle((MARGIN, y, WIDTH - MARGIN, y + height), radius=20, fill='white', outline=LINE)
+    weekly_text_card(draw, y, data, False)
+    return height
+
+
+def draw_weekly_header(draw, head: dict) -> None:
+    """週精選文字圖頁首：大標「2379 瑞昱｜週精選」、下一行「權證分點觀察」、右側資料日。"""
+    text, size = fit(str(head.get('title', '')), 52, CONTENT - 20, True, 36)
+    draw.text((MARGIN, 150), text, font=font(size, True), fill=INK, anchor='lm')
+    draw.text((MARGIN, 205), str(head.get('subtitle', '')), font=font(28), fill=MUTED, anchor='lm')
+    if head.get('date'):
+        draw.text((WIDTH - MARGIN, 205), str(head['date']), font=font(24), fill=MUTED, anchor='rm')
+
+
 def _is_branch_panel(panel: dict) -> bool:
     return isinstance((panel or {}).get('branch_card'), dict)
 
@@ -3603,19 +3771,21 @@ def render_answer(question: str, answer: str, panels: list[dict] | None = None,
     review_panels = [p for p in panels if _is_review_panel(p)]
     branch_panels = [p for p in panels if _is_branch_panel(p)]
     ai_panels = [p for p in panels if _is_ai_card_panel(p)]
+    weekly_text_panels = [p for p in panels if _is_weekly_text_panel(p)]
     panels = [p for p in panels if not _is_sector_panel(p) and not _is_article_panel(p)
               and not _is_contribution_panel(p) and not _is_review_panel(p) and not _is_branch_panel(p)
-              and not _is_ai_card_panel(p)]
+              and not _is_ai_card_panel(p) and not _is_weekly_text_panel(p)]
     compare = _compare_mode(panels)
     if compare:
         # 兩檔比較：K 線縮短、不畫分點標註，兩張評分卡合併成一張並排比較表，圖片長度約減半。
         panels = [{**p, 'compact': True} for p in panels]
-    question_lines = wrap(clean(question), 31, CONTENT - 12, True)
-    header_height = 155 + len(question_lines) * 47
+    weekly_head = next((p['weekly_text'].get('header') for p in weekly_text_panels if p['weekly_text'].get('header')), None)
+    question_lines = [] if weekly_head else wrap(clean(question), 31, CONTENT - 12, True)
+    header_height = WEEKLY_HEADER_H if weekly_head else 155 + len(question_lines) * 47
     # 交易覆盤：文字改由覆盤卡呈現（有行數上限），不再另外排整段文字，圖片才不會一直變長
     # AI 解讀卡已包含回答全文（含延續上一題與資料時間），不再另外排文字區塊。
     ai_panels = [dict(p, ai_card=_brief_ai(p['ai_card'])) for p in ai_panels]
-    hide_text = (sector_panels or article_panels or review_panels or ai_panels
+    hide_text = (sector_panels or article_panels or review_panels or ai_panels or weekly_text_panels
                  or any(p.get('hide_text') for p in branch_panels))
     blocks = []
     if not hide_text and str(answer or '').strip():
@@ -3631,6 +3801,7 @@ def render_answer(question: str, answer: str, panels: list[dict] | None = None,
     panels_height += sum(review_card(None, 0, p['review'], True) + 24 for p in review_panels)
     panels_height += sum(branch_card(None, 0, p['branch_card'], True) + 24 for p in branch_panels)
     panels_height += sum(ai_card(None, 0, p['ai_card'], True) + 24 for p in ai_panels)
+    panels_height += sum(weekly_text_card(None, 0, p['weekly_text'], True) + 24 for p in weekly_text_panels)
     height = header_height + panels_height + body_height + (40 if clean_display else 112)
     if review_panels:
         print(f"📝 交易覆盤圖片｜render height={height}px", flush=True)
@@ -3638,6 +3809,8 @@ def render_answer(question: str, answer: str, panels: list[dict] | None = None,
     draw = ImageDraw.Draw(image)
     draw.rectangle((MARGIN, 43, MARGIN + 48, 48), fill=ACCENT)
     header_brand(draw, title, 28, '示範資料・非真實行情' if demo else 'ACE / RESEARCH')
+    if weekly_head:
+        draw_weekly_header(draw, weekly_head)
     for i, line in enumerate(question_lines):
         text_at(draw, (MARGIN, 124 + i * 47), line, 31, bold=True)
     y = header_height
@@ -3666,6 +3839,8 @@ def render_answer(question: str, answer: str, panels: list[dict] | None = None,
         y += branch_card(draw, y, panel['branch_card'], False) + 24
     for panel in ai_panels:
         y += draw_ai_card(draw, y, panel['ai_card']) + 24
+    for panel in weekly_text_panels:
+        y += weekly_text_block(draw, y, panel['weekly_text']) + 24
     if blocks:
         draw.rounded_rectangle((MARGIN, y, WIDTH - MARGIN, y + body_height), radius=20, fill='white', outline=LINE)
     cursor = y + 30
@@ -3684,7 +3859,7 @@ def render_answer(question: str, answer: str, panels: list[dict] | None = None,
                         23 if small else 29, MUTED if small else INK)
         cursor += block.height
     if not clean_display:draw.line((MARGIN, height - 71, WIDTH - MARGIN, height - 71), fill=LINE)
-    if article_panels:
+    if article_panels or weekly_text_panels:
         footer = '股市艾斯  /  日 K 為收盤資料，非盤中即時行情'
     elif sector_panels:
         live = any((p.get('sector') or {}).get('live_time') for p in sector_panels)
