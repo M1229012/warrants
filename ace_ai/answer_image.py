@@ -1351,9 +1351,20 @@ def _legend_item_w(item: dict) -> float:
 
 def _legend_layout(panel: dict, width: float) -> tuple[list[tuple[int, float, str, object]], int]:
     """關鍵價位圖例（10-18 方案 A）：單行「壓力 ● 784.44 布林上軌 ｜ 支撐 ● 756.33 最大量區上緣 746.67 …」。
-    壓力／支撐用紅綠色字當小標、中間細直線隔開；價格粗體、名稱一般字，同一行；各組由近到遠，
-    右側有標框的價位加同色圓點。放不下時依實際字寬換行（對齊在小標後面），不截字。回傳 ([(列, x, 種類, 內容)], 列數)。"""
+    壓力／支撐用紅綠色字當小標、中間細直線隔開；價格粗體、名稱一般字；各組由近到遠，右側有標框的價位加同色圓點。
+    一律只排一行：放不下時從離收盤最遠的參考價位開始省略（右側有標框的兩個一定保留），不換第二行、不截字。
+    回傳 ([(列, x, 種類, 內容)], 列數)。"""
     tagged, rest = _chart_levels(panel)
+    # 由近到遠；放不下就把最遠的那個拿掉再排一次
+    rest = sorted(rest, key=lambda it: abs(it['pct']) if it['pct'] is not None else 1e9)
+    while True:
+        placed, rows = _legend_place(tagged, rest, width)
+        if rows <= 1 or not rest:
+            return placed, rows
+        rest = rest[:-1]
+
+
+def _legend_place(tagged: list[dict], rest: list[dict], width: float) -> tuple[list[tuple[int, float, str, object]], int]:
     marked = {id(x) for x in tagged}
     placed: list[tuple[int, float, str, object]] = []
     row, x, first = 0, 0.0, True
