@@ -5547,8 +5547,13 @@ class AceQueryEngine:
         # 有人會把「/ace 族群資金流向」整串貼進輸入框；前綴要拿掉，否則會被當成族群名稱去查。
         question = strip_command_prefix(question)
         compact = re.sub(r"\s+", "", question)
+        # 管理員貼上週精選文章：最先判斷。文章裡的「10/05 買超」「融資」「型態」「多檔股名」
+        # 會被覆盤、融資、型態驗證、清單排行等判斷誤攔，所以排在所有判斷前面。
+        if admin_mode and image is None and weekly_pick.is_manual_draft_question(question):
+            self.log(f"使用者問題（/ace）：{question[:120]}｜判定為貼上週精選文字")
+            return self._answer_weekly_manual_draft(question, context_key, started)
         access = self._access()
-        margin_allowed = bool(access and access.admin_mode and not access.simulation)
+        margin_allowed =bool(access and access.admin_mode and not access.simulation)
         if re.search(r'融資|融券|券資比', question) and not margin_allowed:
             return AnswerResult('融資券資料目前僅供管理員使用 /ace 查詢；/ask 可查技術分析與現股籌碼資料。',
                                 'admin_only', 0, time.perf_counter()-started, as_text=True, cacheable=False)
@@ -5598,10 +5603,6 @@ class AceQueryEngine:
                 return AnswerResult(text=hint if is_admin else "「本週精選」目前只開放管理員使用；一般個股、族群、權證分點問題可以照常詢問。",
                                     route="weekly_pick_hint", gemini_calls=0, elapsed=time.perf_counter() - started)
             return self._answer_general(question, context_key, on_queue, started, compact)
-        # 管理員自己貼文字：直接當成目前草稿，不經過 AI，也不做數字核對（文字是人寫的）。
-        # 要排在自訂清單之前：文章裡常有「型態」和多檔股名（含「大量」這種一般用語股名），會被誤判成清單排行。
-        if image is None and weekly_pick.is_manual_draft_question(question):
-            return self._answer_weekly_manual_draft(question, context_key, started)
         # 管理員上傳股票清單截圖，或一次給 3 檔以上代號問誰型態最好 → 自訂清單型態排行。
         custom_compare = is_custom_ranking_question(question)
         if not custom_compare and _CUSTOM_RANK_WORDS_RE.search(question):

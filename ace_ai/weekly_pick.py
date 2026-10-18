@@ -2464,21 +2464,41 @@ def normalize_draft_text(text: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", value).strip()
 
 
+# 寬鬆說法（只有管理員會用）：「精選文字改成 <整篇>」這類，只要後面真的貼了一整篇就當成套用文字
+_LOOSE_DRAFT_PATTERNS = ("精選文字改成", "精選文字改為", "精選文字換成", "精選改成", "精選改為", "精選換成",
+                         "文章改成", "文章換成", "全文改成", "全文換成", "內容改成", "內容換成")
+
+
+def _draft_stock_code(text: str) -> str:
+    """文章的股票代號：先找「📌 2379」「週精選 2379」這種標頭，找不到才取第一個 4 碼數字（避免抓到 2026 年份）。"""
+    compact = re.sub(r"\s+", "", str(text or ""))
+    match = re.search(r"(?:📌|[週周]精選[｜|：:]?)(?:📌)*([1-9]\d{3})(?!\d)", compact)
+    return match.group(1) if match else extract_stock_code(compact)
+
+
+def _looks_like_article(compact: str) -> bool:
+    return len(compact) >= 150 and compact.count("。") >= 3
+
+
 def is_manual_draft_question(text: str) -> bool:
     compact = re.sub(r"\s+", "", str(text or ""))
-    if not extract_stock_code(compact):
+    if not _draft_stock_code(compact):
         return False
-    return any(k in compact for k in _MANUAL_DRAFT_PATTERNS) or "權證分點觀察" in compact
+    if any(k in compact for k in _MANUAL_DRAFT_PATTERNS) or "權證分點觀察" in compact:
+        return True
+    # 寬鬆：貼了一整篇，又有「精選文字改成」或週精選字樣，就當成套用文字（短的修改指令仍走 AI 改稿）
+    return _looks_like_article(compact) and (any(k in compact for k in _LOOSE_DRAFT_PATTERNS)
+                                             or re.search(r"[週周]精選", compact) is not None)
 
 
 def extract_manual_draft(text: str) -> Tuple[str, str]:
     """回傳（股票代號, 文章內容）；抓不到內容時回傳空字串。"""
     raw = str(text or "")
-    code = extract_stock_code(re.sub(r"\s+", "", raw))
+    code = _draft_stock_code(raw)
     if not code:
         return "", ""
     body = raw
-    for keyword in _MANUAL_DRAFT_PATTERNS:
+    for keyword in _MANUAL_DRAFT_PATTERNS + _LOOSE_DRAFT_PATTERNS:
         position = body.find(keyword)
         if position >= 0:
             body = body[position + len(keyword):]
