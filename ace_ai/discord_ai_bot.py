@@ -1312,6 +1312,30 @@ def branch_store_window_sections(d: Dict[str, Any]) -> List[Dict[str, Any]]:
     return sections
 
 
+def weekly_warrant_average_text(warrants: Sequence[Dict[str, Any]]) -> str:
+    """週精選權證明細一行：仍持有、未到期的權證，依剩餘張數加權平均剩餘天數／價內外／槓桿。"""
+    held = [w for w in warrants if (w.get("remaining_lots") or 0) > 0
+            and (w.get("days_left") is None or w["days_left"] > 0)]
+    if not held:
+        return f"權證 {len(warrants)} 檔，已全部賣出或到期"
+
+    def weighted(key: str) -> Optional[float]:
+        pairs = [(float(w[key]), float(w["remaining_lots"])) for w in held if w.get(key) is not None]
+        total = sum(lots for _, lots in pairs)
+        return sum(v * lots for v, lots in pairs) / total if total else None
+
+    days, money, lev = weighted("days_left"), weighted("moneyness_now"), weighted("leverage_now")
+    parts = [f"持有權證 {len(held)} 檔"]
+    if days is not None:
+        parts.append(f"平均剩餘 {days:.0f} 天")
+    if money is not None:
+        parts.append(f"平均{'價內' if money >= 0 else '價外'} {abs(money):.0f}%")
+    if lev is not None:
+        parts.append(f"平均槓桿 {lev:.1f} 倍")
+    parts.append(f"剩餘 {sum(float(w['remaining_lots']) for w in held):,.0f} 張")
+    return "｜".join(parts)
+
+
 def branch_store_warrant_sections(d: Dict[str, Any]) -> List[Dict[str, Any]]:
     """買了哪些權證（歷史庫版，精簡）：習慣 4 格 → 每檔標的一張 5 欄表（權證、剩餘、天期、價內外、槓桿）→ 一行註解。"""
     sections: List[Dict[str, Any]] = [{"type": "badge", "text": f"近 {d.get('trading_days')} 個交易日｜{d.get('period_start')}～{d.get('period_end')}"}]
@@ -6947,7 +6971,7 @@ class AceQueryEngine:
         local_market_cache.delete_state(self._draft_state_key(context_key))
 
     def _weekly_warrant_sections(self, code: str, branches: Sequence[str]) -> List[Dict[str, Any]]:
-        """週精選圖：文章提到的分點在這檔買了哪些權證（剩餘張數、剩餘天數、價內外、槓桿）。
+        """週精選圖：文章提到的分點在這檔的權證，每個分點一行平均數據（10-18：不逐檔列權證）。
         只用權證歷史庫版（有現在的天期、槓桿）；沒有就略過，不影響其他區塊。"""
         calls = [ToolCall("get_branch_warrant_detail", {"branch_name": b, "days": 70, "stock_code": code}) for b in list(branches)[:3]]
         if not calls:
@@ -6964,19 +6988,13 @@ class AceQueryEngine:
                 self.log(f"週精選權證明細略過：{code}｜{(d or {}).get('branch', '')}｜{(d or {}).get('reason') or result.error or '沒有歷史庫明細'}")
                 continue
             group = d["groups"][0]
-            rows = []
-            for w in group["warrants"][:6]:
-                days_left, money_now, lev_now = w.get("days_left"), w.get("moneyness_now"), w.get("leverage_now")
-                rows.append([f"{w['warrant_code']} {w['warrant_name']}".strip(), w.get("remaining_text") or "-",
-                             ("已到期" if days_left <= 0 else f"{days_left}天") if days_left is not None else "-",
-                             f"{'價內' if money_now >= 0 else '價外'}{abs(money_now):.0f}%" if money_now is not None else "-",
-                             f"{lev_now:.1f}倍" if lev_now is not None else "-"])
-            if not rows:
+            if not group.get("warrants"):
                 continue
-            head = [f"權證明細｜{d.get('branch', '')}", group.get("event_codes") or ""]
-            sections.append({"type": "heading", "text": "｜".join(x for x in head if x), "weekly_note": True})
-            sections.append({"type": "table", "columns": ["權證", "剩餘張數", "剩餘天數", "價內外", "槓桿"],
-                             "widths": (0.40, 0.15, 0.15, 0.15, 0.15), "signed": (), "accent": ("剩餘張數", "槓桿"), "rows": rows})
+            head = "｜".join(x for x in (d.get("branch", ""), group.get("event_codes") or "") if x)
+            sections.append({"type": "paragraph", "weekly_note": True,
+                             "text": f"{head}：{weekly_warrant_average_text(group['warrants'])}"})
+        if sections:
+            sections.insert(0, {"type": "heading", "text": "權證明細（依剩餘張數加權平均）", "weekly_note": True})
         return sections
 
     def _answer_weekly_article_image(self, context_key: str, started: float) -> AnswerResult:
@@ -7052,8 +7070,8 @@ class AceQueryEngine:
         else:
             panels = list(panels) + [{"article": article}]
             if warrant_rows:
-                panels.append({"branch_card": {"branch": "權證明細", "tags": [], "label": f"資料日 {data_date}".strip(),
-                                               "sections": warrant_rows, "weekly_note": True}, "hide_text": True})
+                panels.append({"branch_card": {"branch": warrant_rows[0]["text"], "tags": [], "label": f"資料日 {data_date}".strip(),
+                                               "sections": warrant_rows[1:], "weekly_note": True}, "hide_text": True})
         if layout_note:
             image_text += f"\n\n※ {layout_note}"
         return AnswerResult(

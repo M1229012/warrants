@@ -29,7 +29,7 @@ WIDTH = 1440
 MARGIN = 64
 CONTENT = WIDTH - MARGIN * 2
 # K 線卡片垂直配置：標題＋收盤＋均線／布林數值卡｜價格區｜日期軸＋成交量｜價量分布圖例＋布林狀態。
-CHART_HEAD = 260
+CHART_HEAD = 218        # 10-18：均線改成單行（原本 4 格數值卡 98px），標題區縮短
 CHART_PRICE_BASE = 306
 CHART_VOLUME_BLOCK = 156
 CHART_FOOT = 114
@@ -703,6 +703,7 @@ def _retail_height(panel: dict) -> int:
 
 def panel_height(panel: dict) -> int:
     return (CHART_HEIGHT - (CAPTION_H if panel.get("clean_display") else 0) + _price_extra(panel) + sum(mark_lanes(panel)) + _inst_height(panel) + _retail_height(panel)
+            + _level_legend_height(panel)
             + _flow_height(panel) + _trade_height(panel) + mark_legend(None, panel, 0, True))
 
 
@@ -1271,6 +1272,150 @@ def draw_value_tiles(draw, x: float, y: float, width: float, last: dict, show_bo
         tx += w + gap
 
 
+MA_LINE_H = 44
+
+
+def draw_ma_line(draw, x: float, y: float, width: float, last: dict) -> None:
+    """10-18：均線單行（小色線＋名稱＋價格），顏色同圖上均線；不重複寫站上／跌破幾 %。"""
+    draw.rounded_rectangle((x, y, x + width, y + MA_LINE_H), radius=12, fill=TILE_BG)
+    cell = width / len(MA_COLORS)
+    mid = y + MA_LINE_H / 2
+    for i, (key, color) in enumerate(MA_COLORS.items()):
+        tx = x + 22 + i * cell
+        draw.line((tx, mid, tx + 22, mid), fill=color, width=3)
+        draw.text((tx + 30, mid), key, font=font(19), fill=MUTED, anchor='lm')
+        value = _finite(last.get(key))
+        text, size = fit(number(value) if value is not None else '—', 21, cell - 52 - font(19).getlength(key) - 22, True)
+        draw.text((tx + 30 + font(19).getlength(key) + 10, mid), text, font=font(size, True), fill=INK, anchor='lm')
+
+
+# ---------- 10-18：關鍵價位改標在 K 線上（右側價格框＋日期軸下方圖例），不再另畫關鍵價位表 ----------
+LEVELS_ON_CHART = True
+LEVEL_TAG_MAX = 2
+LEVEL_TAG_H = 28
+LEVEL_TAG_FONT = 17
+_TAG_COLORS = (('三角上緣', '#C76C00'), ('三角下緣', '#1478B5'), ('量區', '#1A9E8A'), ('布林', '#667085'))
+_TAG_SPARE = '#7A5AF8'
+
+
+def _levels_on_chart(card: dict | None) -> bool:
+    """覆盤持股卡（有成本／自訂列數）與比較卡照舊用表格；其他型態卡的價位改畫在 K 線上。"""
+    return bool(LEVELS_ON_CHART and card and not card.get('compact') and not card.get('level_limits')
+                and _finite(card.get('cost_price')) is None)
+
+
+def _is_ma_level(label: str) -> bool:
+    return bool(re.match(r'MA\d+', str(label))) or str(label) == '布林中軌'
+
+
+def _level_display_name(label: str, panel: dict) -> str:
+    """三角線保留候選／參考身分，不因精簡變成已確認支撐。"""
+    if '三角' not in label:
+        return label
+    view = panel.get('member_triangle') or {}
+    rows = view.get('rows') or []
+    if view.get('candidate'):
+        return label + '（候選）'
+    if rows and rows[-1].get('reference'):
+        return label + '（參考）'
+    return label
+
+
+def _chart_levels(panel: dict) -> tuple[list[dict], list[dict]]:
+    """(右側標框的價位, 其他參考價位)：只取既有關鍵價位裡的非均線項目；標框取離收盤最近、且在圖內的最多 2 個。"""
+    card = panel.get('scorecard') or panel.get('key_levels')
+    if panel.get('compact') or not panel.get('bars') or not _levels_on_chart(card):
+        return [], []
+    items = []
+    for kind, label, price, pct in _level_rows(card):
+        if kind not in ('壓力', '支撐') or _is_ma_level(label) or _finite(price) is None:
+            continue
+        items.append({'label': label, 'name': _level_display_name(str(label), panel), 'price': float(price),
+                      'pct': _finite(pct)})
+    low, high = _price_range(panel['bars'])
+    inside = [x for x in items if low <= x['price'] <= high]
+    tagged = sorted(inside, key=lambda x: abs(x['pct']) if x['pct'] is not None else 1e9)[:LEVEL_TAG_MAX]
+    used = []
+    for item in tagged:
+        color = next((c for word, c in _TAG_COLORS if word in item['label']), ACCENT)
+        item['color'] = _TAG_SPARE if color in used else color
+        used.append(item['color'])
+    tagged.sort(key=lambda x: -x['price'])
+    rest = [x for x in items if x not in tagged]
+    return tagged, rest
+
+
+def _price_range(bars: list) -> tuple[float, float]:
+    """與週報主程式 adjust_candle_price_ylim 一致：Y 軸只看 K 棒高低，下留 11%、上留 5%。"""
+    low, high = min(b['Low'] for b in bars), max(b['High'] for b in bars)
+    span = max(high - low, abs(high) * .005, .01)
+    return low - span * .11, high + span * .05
+
+
+def _level_legend_rows(panel: dict, width: float) -> list[list[tuple[float, dict, bool]]]:
+    """圖例排版：第一行（可換行）＝右側已標框的色點＋價格＋名稱；之後＝其他參考價位小字。依實際字寬換行。"""
+    tagged, rest = _chart_levels(panel)
+    rows: list[list[tuple[float, dict, bool]]] = []
+    for group, main in ((tagged, True), (rest, False)):
+        row, used = [], 0.0
+        for item in group:
+            text = f"{number(item['price'])} {item['name']}"
+            w = (18 + font(19, True).getlength(text)) if main else font(17).getlength(text)
+            if row and used + w > width:
+                rows.append(row)
+                row, used = [], 0.0
+            row.append((used, item, main))
+            used += w + 34
+        if row:
+            rows.append(row)
+    return rows
+
+
+def _level_legend_height(panel: dict) -> int:
+    rows = _level_legend_rows(panel, CONTENT - 200)
+    return sum(30 if r[0][2] else 26 for r in rows) + (8 if rows else 0)
+
+
+def draw_level_legend(draw, x: float, y: float, panel: dict) -> None:
+    for row in _level_legend_rows(panel, CONTENT - 200):
+        main = row[0][2]
+        mid = y + (15 if main else 13)
+        for dx, item, _ in row:
+            text = f"{number(item['price'])} {item['name']}"
+            if main:
+                draw.ellipse((x + dx, mid - 6, x + dx + 12, mid + 6), fill=item['color'])
+                draw.text((x + dx + 18, mid), text, font=font(19, True), fill=INK, anchor='lm')
+            else:
+                draw.text((x + dx, mid), text, font=font(17), fill=MUTED, anchor='lm')
+        y += 30 if main else 26
+
+
+def draw_level_tags(draw, tagged: list[dict], py, right: float, price_top: float, price_bottom: float) -> None:
+    """右側窄欄的價格框：真正價位用短標記畫在正確座標；框太近時上下錯開，用細引線接回（都在繪圖區外，不碰 K 棒）。"""
+    if not tagged:
+        return
+    items = sorted(((py(t['price']), t) for t in tagged), key=lambda x: x[0])
+    half = LEVEL_TAG_H / 2
+    pos: list[float] = []
+    for true_y, _ in items:
+        pos.append(max(true_y, pos[-1] + LEVEL_TAG_H + 6) if pos else true_y)
+    shift = max(0.0, pos[-1] + half - price_bottom)
+    pos = [p - shift for p in pos]
+    shift = max(0.0, price_top - (pos[0] - half))
+    pos = [p + shift for p in pos]
+    for (true_y, item), label_y in zip(items, pos):
+        color = item['color']
+        draw.line((right + 2, true_y, right + 9, true_y), fill=color, width=2)
+        draw.line((right + 9, true_y, right + 14, label_y), fill=color, width=1)
+        text = number(item['price'])
+        # 欄寬 118px：指數（47,058.30）這種長數字用 16 級字，數字不截斷
+        text_font = font(LEVEL_TAG_FONT if len(text) <= 8 else LEVEL_TAG_FONT - 1, True)
+        w = text_font.getlength(text) + 12
+        draw.rounded_rectangle((right + 14, label_y - half, right + 14 + w, label_y + half), radius=6,
+                               fill='white', outline=color, width=1)
+        draw.text((right + 14 + w / 2, label_y), text, font=text_font, fill=color, anchor='mm')
+
+
 def _date_ticks(bars: list, step: float) -> list[int]:
     """每 5 根（間距太窄時 10、15…）標一個日期，從最後一根往回數，確保最新一天一定有日期。"""
     interval = 5 * max(1, math.ceil(math.ceil(64 / max(step, 1e-6)) / 5))
@@ -1352,13 +1497,13 @@ def draw_chart(draw, y: int, panel: dict) -> None:
         draw.rounded_rectangle((chip_x, y + 80, chip_x + chip_w, y + 116), radius=18, fill=UP_BG if change >= 0 else DOWN_BG)
         draw.text((chip_x + chip_w / 2, y + 98), chip, font=font(22, True), fill=color, anchor='mm')
     show_bollinger = not panel.get("hide_bollinger", False)
-    draw_value_tiles(draw, x0 + 32, y + 136, CONTENT - 64, last, show_bollinger)
+    draw_ma_line(draw, x0 + 32, y + 132, CONTENT - 64, last)
     # 不畫三角線時（/ask）也不放「橘上緣、藍下緣、虛線」圖說，避免說明找不到線。
     if panel.get('member_triangle') and not panel.get('hide_triangle_lines'):
         import member_pattern
         label = member_pattern.chart_label(panel['member_triangle'])
         label, label_size = fit(label, 18, CONTENT - 64, False, 14)
-        text_at(draw, (x0 + 32, y + 236), label, label_size, MUTED)
+        text_at(draw, (x0 + 32, y + 186), label, label_size, MUTED)
 
     lane_top, lane_bottom = mark_lanes(panel)
     extra = lane_top + lane_bottom + _price_extra(panel)
@@ -1367,12 +1512,11 @@ def draw_chart(draw, y: int, panel: dict) -> None:
     bottom = top + CHART_PRICE_BASE + extra
     # 有標註時價格只畫在中間，上方標籤帶放 ▼／綠圈、下方標籤帶放 ▲／紅圈（沒有就不留白）。
     price_top, price_bottom = top + lane_top, bottom - lane_bottom
-    lows = [b['Low'] for b in bars]
-    highs = [b['High'] for b in bars]
     # 與週報主程式 adjust_candle_price_ylim 一致：Y 軸只看 K 棒高低，下留 11%、上留 5%；均線／布林超出價格區就裁掉
-    low, high = min(lows), max(highs)
-    span = max(high - low, abs(high) * .005, .01)
-    low, high = low - span * .11, high + span * .05
+    low, high = _price_range(bars)
+    # 10-18：價格刻度移到左側（右側窄欄留給關鍵價位框），左邊界依刻度實際字寬決定
+    tick_values = [low + (high - low) * i / 4 for i in range(5)]
+    left = x0 + 24 + max(font(19).getlength(number(v)) for v in tick_values) + 12
     draw_observed_marks(draw, panel, price_top, price_bottom)
     py = lambda value: price_bottom - (value - low) / (high - low) * (price_bottom - price_top)
     step = (right - left) / len(bars)
@@ -1387,7 +1531,7 @@ def draw_chart(draw, y: int, panel: dict) -> None:
         value = low + (high - low) * i / 4
         gy = py(value)
         draw.line((left, gy, right, gy), fill=LINE, width=1)
-        text_at(draw, (right + 14, gy - 10), number(value), 20, MUTED)
+        draw.text((left - 10, gy), number(value), font=font(19), fill=MUTED, anchor='rm')
     if not panel.get('compact'):
         draw_marks(draw, panel, px, py, step, price_top, price_bottom)
     for i, bar in enumerate(bars):
@@ -1426,6 +1570,8 @@ def draw_chart(draw, y: int, panel: dict) -> None:
 
 
     draw_member_triangle(draw, panel, px, py, left, right, price_top, price_bottom)
+    tagged_levels, _ = _chart_levels(panel)
+    draw_level_tags(draw, tagged_levels, py, right, price_top, price_bottom)
 
     # 日期軸緊貼價格區下方；月份切換的日期用粗體，方便看出 K 棒落在哪個月。
     axis_y = bottom + 2
@@ -1441,6 +1587,11 @@ def draw_chart(draw, y: int, panel: dict) -> None:
         draw.text((label_x, axis_y + 9), bars[i]['date'][5:], font=font(18, new_month),
                   fill=INK if new_month else MUTED, anchor='mt')
 
+    # 10-18：價位圖例（色點＝右側價格框的名稱；小字＝其他參考價位）放在日期軸下方、成交量上方
+    legend_h = _level_legend_height(panel)
+    if legend_h:
+        draw_level_legend(draw, left, bottom + 40, panel)
+        bottom += legend_h
     # 成交量標題列：今日量＋均量線圖例（單位張，Volume 為股數）。
     if not panel.get('clean_display'):
         legend = '價量分布｜紅：最大量區  /  橘：第二大量區  /  藍：其他價位' if profile_rectangles else '價量分布暫無有效資料'
@@ -1503,7 +1654,7 @@ def draw_chart(draw, y: int, panel: dict) -> None:
     if retail_h:
         draw_retail_ratio(draw, vbottom + 14 + inst_h, left, right, px, step, bars, panel['retail'])
     inst_h += retail_h
-    below = y + CHART_HEIGHT - (CAPTION_H if panel.get("clean_display") else 0) + extra + inst_h
+    below = y + CHART_HEIGHT - (CAPTION_H if panel.get("clean_display") else 0) + extra + inst_h + legend_h
     if _flow_height(panel):
         draw_branch_flow(draw, below, left, right, px, step, bars, panel['branch_flow'])
         below += _flow_height(panel)
@@ -1779,6 +1930,8 @@ def scorecard(draw, y: float, card: dict, dry: bool) -> int:
     """型態分數＋五大項＋主要得分／失分＋均線扣抵一列＋關鍵價位＋追蹤分點動向（精簡版）；dry=True 只量測高度。"""
     x0, x1, pad = MARGIN, WIDTH - MARGIN, 36
     px, width = x0 + pad, CONTENT - pad * 2
+    if card.get('levels_only') and _levels_on_chart(card):
+        return 0            # 10-18：只有關鍵價位的卡，價位已畫在 K 線上，不再另畫表格卡
     if not dry:
         draw.rounded_rectangle((x0, y, x1, y + scorecard(None, 0, card, True)), radius=20, fill='white', outline=LINE)
     h = 30
@@ -1878,18 +2031,22 @@ def _scorecard_tail(draw, y: float, h: float, px: float, width: float, card: dic
     if not compact and not card.get('levels_only'):   # 價位表保留均線說明，不重複扣抵列
         h += _deduction_chips(draw, px, y + h, width, card, dry) + 18
 
-    levels = _level_rows(card)
+    if _levels_on_chart(card):
+        levels = None       # 10-18：價位改畫在 K 線上；底層價位資料保留給 AI 核對，只是不重複畫表格
+    else:
+        levels = _level_rows(card)
     note = ('均線、大量區與三角參考線；突破後原支撐可能轉為壓力' if card.get('levels_only') else '離收盤最近的壓力與支撐' if compact
             else '均線、附近大量區與布林上下軌中，離收盤最近的壓力與支撐（大量區太遠時省略）')
-    h += _sub_heading(draw, px, y + h, '關鍵價位', note, width, dry)
-    if levels:
-        if not dry:
-            _draw_level_table(draw, px, y + h, width, levels, card)
-        h += TABLE_HEAD_H + sum(_level_row_heights(levels, card, width)) + 26
-    else:
-        if not dry:
-            text_at(draw, (px, y + h), '目前沒有可用的價位資料', 21, MUTED)
-        h += 34 + 34
+    if levels is not None:
+        h += _sub_heading(draw, px, y + h, '關鍵價位', note, width, dry)
+        if levels:
+            if not dry:
+                _draw_level_table(draw, px, y + h, width, levels, card)
+            h += TABLE_HEAD_H + sum(_level_row_heights(levels, card, width)) + 26
+        else:
+            if not dry:
+                text_at(draw, (px, y + h), '目前沒有可用的價位資料', 21, MUTED)
+            h += 34 + 34
 
     if card.get('levels_only'):
         return math.ceil(h + 12)
@@ -3285,7 +3442,8 @@ def price_footer(panels: list[dict] | None) -> str:
 
 def panel_block_height(panel: dict) -> int:
     card = panel.get('scorecard') or panel.get('key_levels')
-    return panel_height(panel) + 24 + (scorecard(None, 0, card, True) + 24 if card else 0)
+    card_h = scorecard(None, 0, card, True) if card else 0
+    return panel_height(panel) + 24 + (card_h + 24 if card_h else 0)
 
 
 def add_center_watermarks(image: Image.Image) -> Image.Image:
@@ -3459,9 +3617,10 @@ def render_answer(question: str, answer: str, panels: list[dict] | None = None,
         draw_chart(draw, y, panel)
         y += panel_height(panel) + 24
         price_card = panel.get('scorecard') or panel.get('key_levels')
-        if price_card and not compare:
+        card_h = scorecard(None, 0, price_card, True) if price_card and not compare else 0
+        if card_h:
             scorecard(draw, y, price_card, False)
-            y += scorecard(None, 0, price_card, True) + 24
+            y += card_h + 24
     if compare:
         y += compare_card(draw, y, panels, False) + 24
     for panel in contribution_panels:
