@@ -1338,83 +1338,90 @@ def _price_range(bars: list) -> tuple[float, float]:
     return low - span * .11, high + span * .05
 
 
-LEGEND_ROW_H = 40
-LEGEND_ITEM_GAP = 30
-LEGEND_W = CONTENT - 154            # 和 K 線繪圖區同寬（left＝x0+36、right＝x1-118）
+LEGEND_ROW_H = 56                  # 10-18 方案 1：價位條高度（和上方均線列同一種條狀樣式）
+LEGEND_ITEM_GAP = 34
+LEGEND_BLOCK_W = 92                # 左側「支撐／壓力」實心標籤塊
+LEGEND_W = CONTENT - 64            # 和上方均線列同寬
 _LEGEND_KIND_INK = {'壓力': UP, '支撐': DOWN}
+_LEGEND_KIND_TINT = {'壓力': '#FDF1F1', '支撐': '#EEF8F5'}
 
 
 def _legend_item_w(item: dict) -> float:
-    return ((22 if item['marked'] else 0) + font(24, True).getlength(number(item['price'])) + 8
+    return ((22 if item['marked'] else 0) + font(26, True).getlength(number(item['price'])) + 8
             + font(21).getlength(item['name']))
 
 
-def _legend_layout(panel: dict, width: float) -> tuple[list[tuple[int, float, str, object]], int]:
-    """關鍵價位圖例（10-18 方案 A）：單行「壓力 ● 784.44 布林上軌 ｜ 支撐 ● 756.33 最大量區上緣 746.67 …」。
-    壓力／支撐用紅綠色字當小標、中間細直線隔開；價格粗體、名稱一般字；各組由近到遠，右側有標框的價位加同色圓點。
-    一律只排一行：放不下時從離收盤最遠的參考價位開始省略（右側有標框的兩個一定保留），不換第二行、不截字。
-    回傳 ([(列, x, 種類, 內容)], 列數)。"""
+def _legend_layout(panel: dict, width: float) -> tuple[list[tuple[float, str, object]], bool]:
+    """關鍵價位條（10-18 方案 1）：淺色底整條，左邊實心「支撐」（綠）／「壓力」（紅）標籤塊，
+    後面接價位（價格粗體大字＋名稱），價位之間細直線隔開；右側有標框的價位加同色圓點。
+    一律只排一條：放不下時從離收盤最遠的參考價位開始省略（右側有標框的兩個一定保留），不換行、不截字。
+    回傳 ([(x, 種類, 內容)], 是否有內容)。"""
     tagged, rest = _chart_levels(panel)
-    # 由近到遠；放不下就把最遠的那個拿掉再排一次
-    rest = sorted(rest, key=lambda it: abs(it['pct']) if it['pct'] is not None else 1e9)
+    rest = sorted(rest, key=lambda it: abs(it['pct']) if it['pct'] is not None else 1e9)   # 由近到遠
     while True:
-        placed, rows = _legend_place(tagged, rest, width)
-        if rows <= 1 or not rest:
-            return placed, rows
+        placed, end = _legend_place(tagged, rest, width)
+        if end <= width or not rest:
+            return placed, bool(placed)
         rest = rest[:-1]
 
 
-def _legend_place(tagged: list[dict], rest: list[dict], width: float) -> tuple[list[tuple[int, float, str, object]], int]:
+def _legend_place(tagged: list[dict], rest: list[dict], width: float) -> tuple[list[tuple[float, str, object]], float]:
+    """排一條：回傳 ([(x, 'block'|'item'|'sep', 內容)], 最右邊的 x（含右側留白）)。"""
     marked = {id(x) for x in tagged}
-    placed: list[tuple[int, float, str, object]] = []
-    row, x, first = 0, 0.0, True
+    placed: list[tuple[float, str, object]] = []
+    x = 0.0
     for kind in ('壓力', '支撐'):
         group = sorted((it for it in tagged + rest if it['kind'] == kind),
                        key=lambda it: it['price'], reverse=(kind == '支撐'))
         if not group:
             continue
-        items = [dict(it, marked=id(it) in marked) for it in group]
-        head_w = font(21, True).getlength(kind) + 14
-        if not first:
-            if x + 32 + head_w + _legend_item_w(items[0]) > width:
-                row, x = row + 1, 0.0
-            else:
-                placed.append((row, x + 2, 'divider', None))
-                x += 32
-        placed.append((row, x, 'label', kind))
-        x += head_w
-        indent = x
-        for item in items:
-            w = _legend_item_w(item)
-            if x > indent and x + w > width:
-                row, x = row + 1, indent
-            placed.append((row, x, 'item', item))
-            x += w + LEGEND_ITEM_GAP
-        first = False
-    return placed, (row + 1 if placed else 0)
+        placed.append((x, 'block', kind))
+        x += LEGEND_BLOCK_W + 22
+        for k, item in enumerate(group):
+            if k:
+                placed.append((x - LEGEND_ITEM_GAP / 2, 'sep', kind))
+            item = dict(item, marked=id(item) in marked)
+            placed.append((x, 'item', item))
+            x += _legend_item_w(item) + LEGEND_ITEM_GAP
+    return placed, (x - LEGEND_ITEM_GAP + 22 if placed else 0.0)
 
 
 def _level_legend_height(panel: dict) -> int:
-    _, rows = _legend_layout(panel, LEGEND_W)
-    return rows * LEGEND_ROW_H + 10 if rows else 0
+    _, has = _legend_layout(panel, LEGEND_W)
+    return LEGEND_ROW_H + 18 if has else 0
 
 
 def draw_level_legend(draw, x: float, y: float, width: float, panel: dict) -> None:
-    placed, _ = _legend_layout(panel, LEGEND_W)
-    for row, dx, kind, value in placed:
-        mid = y + row * LEGEND_ROW_H + LEGEND_ROW_H / 2
-        if kind == 'divider':
-            draw.line((x + dx, mid - 15, x + dx, mid + 15), fill='#D0D5DD', width=2)
-        elif kind == 'label':
-            draw.text((x + dx, mid), value, font=font(21, True), fill=_LEGEND_KIND_INK[value], anchor='lm')
-        else:
+    placed, has = _legend_layout(panel, LEGEND_W)
+    if not has:
+        return
+    h, top = LEGEND_ROW_H, y
+    mid = top + h / 2
+    blocks = [(dx, kind) for dx, k, kind in placed if k == 'block']
+    # 底色：第一組的淡色鋪滿整條（圓角），第二組從它的標籤塊開始改成自己的淡色
+    draw.rounded_rectangle((x, top, x + LEGEND_W, top + h), radius=12, fill=_LEGEND_KIND_TINT[blocks[0][1]])
+    for dx, kind in blocks[1:]:
+        draw.rounded_rectangle((x + dx, top, x + LEGEND_W, top + h), radius=12, fill=_LEGEND_KIND_TINT[kind])
+        draw.rectangle((x + dx, top, x + dx + 12, top + h), fill=_LEGEND_KIND_TINT[kind])
+    for dx, k, value in placed:
+        if k == 'block':
+            ink = _LEGEND_KIND_INK[value]
+            if dx == 0:
+                draw.rounded_rectangle((x, top, x + LEGEND_BLOCK_W, top + h), radius=12, fill=ink)
+                draw.rectangle((x + LEGEND_BLOCK_W - 12, top, x + LEGEND_BLOCK_W, top + h), fill=ink)
+            else:
+                draw.rectangle((x + dx, top, x + dx + LEGEND_BLOCK_W, top + h), fill=ink)
+            draw.text((x + dx + LEGEND_BLOCK_W / 2, mid), value, font=font(23, True), fill='white', anchor='mm')
+        elif k == 'sep':
+            draw.line((x + dx, top + 16, x + dx, top + h - 16), fill='#D0D5DD', width=2)
+        elif k == 'item':
             cx = x + dx
             if value['marked']:
                 draw.ellipse((cx, mid - 7, cx + 14, mid + 7), fill=value['color'])
                 cx += 22
             price = number(value['price'])
-            draw.text((cx, mid), price, font=font(24, True), fill=INK, anchor='lm')
-            cx += font(24, True).getlength(price) + 8
+            draw.text((cx, mid), price, font=font(26, True), fill=INK, anchor='lm')
+            cx += font(26, True).getlength(price) + 8
             draw.text((cx, mid), value['name'], font=font(21), fill=INK, anchor='lm')
 
 
@@ -1628,7 +1635,7 @@ def draw_chart(draw, y: int, panel: dict) -> None:
     # 10-18：價位圖例（色點＝右側價格框的名稱；小字＝其他參考價位）放在日期軸下方、成交量上方
     legend_h = _level_legend_height(panel)
     if legend_h:
-        draw_level_legend(draw, left, bottom + 40, right - left, panel)
+        draw_level_legend(draw, x0 + 32, bottom + 40, LEGEND_W, panel)   # 和上方均線列同寬、同左緣
         bottom += legend_h
     # 成交量標題列：今日量＋均量線圖例（單位張，Volume 為股數）。
     if _caption_h(panel):
