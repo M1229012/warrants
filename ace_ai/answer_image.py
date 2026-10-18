@@ -434,6 +434,21 @@ def _flow_table_rows(events: list[dict]) -> list[dict]:
     return ordered + extras
 
 
+def _legend_branch_lines(rows: list, width: float) -> list[list[tuple[float, str, str, str]]]:
+    """分點圖例並排：每個分點（色點＋名稱＋編號／筆數）量實際字寬，一排放得下就並排，放不下換行。"""
+    lines, line, used = [], [], 0.0
+    for name, color, detail in rows:
+        w = 24 + font(19, True).getlength(name) + 12 + font(18).getlength(detail)
+        if line and used + w > width:
+            lines.append(line)
+            line, used = [], 0.0
+        line.append((used, name, color, detail))
+        used += w + 40
+    if line:
+        lines.append(line)
+    return lines
+
+
 def mark_legend(draw, panel: dict, top: float, dry: bool) -> int:
     """K 線卡片底部的分點標註說明。
 
@@ -473,6 +488,10 @@ def mark_legend(draw, panel: dict, top: float, dry: bool) -> int:
                 f"減碼／待對帳 {len(plain)} 筆" if plain else "") if x)
             prefix = "編號 " + "、".join(str(n) for n in numbered) if numbered else "本期無 A～E 事件"
             rows.append((name, color, f"{prefix}｜{detail}" if detail else prefix))
+        # 10-18：說明文字依寬度換行（不截字）；各分點併成一排，放不下才換行
+        note = '編號＝買進事件；同編號賣出＝出清；減碼對應下表買進，未對應＝待對帳'
+        note_lines = wrap(note, 18, int(width - 232), False)
+        row_lines = _legend_branch_lines(rows, width)
         if not dry:
             sy = top + h + 7
             half = 7
@@ -481,16 +500,17 @@ def mark_legend(draw, panel: dict, top: float, dry: bool) -> int:
             sx = x0 + 110
             draw.polygon([(sx, sy - half), (sx + 2 * half, sy - half), (sx + half, sy + half)], fill=DOWN)
             draw.text((sx + 22, sy), '賣超', font=font(18), fill=INK, anchor='lm')
-            draw.text((x0 + 232, sy), '編號＝買進事件；同編號賣出＝出清；減碼對應下表買進，未對應＝待對帳',
-                      font=font(18), fill=MUTED, anchor='lm')
-            ly = sy + 30
-            for name, color, detail in rows:
-                draw.ellipse((x0, ly - 7, x0 + 14, ly + 7), fill=color)
-                draw.text((x0 + 24, ly), name, font=font(19, True), fill=INK, anchor='lm')
-                draw.text((x0 + 24 + font(19, True).getlength(name) + 16, ly), detail,
-                          font=font(18), fill=MUTED, anchor='lm')
+            for i, line in enumerate(note_lines):
+                draw.text((x0 + 232, sy + i * 26), line, font=font(18), fill=MUTED, anchor='lm')
+            ly = sy + 30 + (len(note_lines) - 1) * 26
+            for line in row_lines:
+                for dx, name, color, detail in line:
+                    draw.ellipse((x0 + dx, ly - 7, x0 + dx + 14, ly + 7), fill=color)
+                    draw.text((x0 + dx + 24, ly), name, font=font(19, True), fill=INK, anchor='lm')
+                    draw.text((x0 + dx + 24 + font(19, True).getlength(name) + 12, ly), detail,
+                              font=font(18), fill=MUTED, anchor='lm')
                 ly += 30
-        h += 38 + len(rows) * 30
+        h += 38 + (len(note_lines) - 1) * 26 + len(row_lines) * 30
         # 圖例下方接上和一般問答相同的明細表（編號／分點／事件／買進日／金額／後續動作）。
         table_rows = _flow_table_rows(events)
         if table_rows:
@@ -1353,41 +1373,54 @@ def _price_range(bars: list) -> tuple[float, float]:
 
 
 def _level_legend_rows(panel: dict, width: float) -> list[list[tuple[float, dict, bool]]]:
-    """圖例排版：第一行（可換行）＝右側已標框的色點＋價格＋名稱；之後＝其他參考價位小字。依實際字寬換行。"""
+    """圖例排版：同一排依序放「右側已標框的色點＋價格＋名稱」與其他參考價位（10-18：併成一排、不用灰字）；
+    依實際字寬換行，不截字。"""
     tagged, rest = _chart_levels(panel)
     rows: list[list[tuple[float, dict, bool]]] = []
-    for group, main in ((tagged, True), (rest, False)):
-        row, used = [], 0.0
-        for item in group:
-            text = f"{number(item['price'])} {item['name']}"
-            w = (18 + font(19, True).getlength(text)) if main else font(17).getlength(text)
-            if row and used + w > width:
-                rows.append(row)
-                row, used = [], 0.0
-            row.append((used, item, main))
-            used += w + 34
-        if row:
+    row, used = [], 0.0
+    for item, main in [(x, True) for x in tagged] + [(x, False) for x in rest]:
+        text = f"{number(item['price'])} {item['name']}"
+        w = (18 + font(19, True).getlength(text)) if main else font(19).getlength(text)
+        if row and used + w > width:
             rows.append(row)
+            row, used = [], 0.0
+        row.append((used, item, main))
+        used += w + 30
+    if row:
+        rows.append(row)
     return rows
 
 
 def _level_legend_height(panel: dict) -> int:
     rows = _level_legend_rows(panel, CONTENT - 200)
-    return sum(30 if r[0][2] else 26 for r in rows) + (8 if rows else 0)
+    return len(rows) * 30 + (8 if rows else 0)
 
 
 def draw_level_legend(draw, x: float, y: float, panel: dict) -> None:
     for row in _level_legend_rows(panel, CONTENT - 200):
-        main = row[0][2]
-        mid = y + (15 if main else 13)
-        for dx, item, _ in row:
+        mid = y + 15
+        for dx, item, main in row:
             text = f"{number(item['price'])} {item['name']}"
             if main:
                 draw.ellipse((x + dx, mid - 6, x + dx + 12, mid + 6), fill=item['color'])
                 draw.text((x + dx + 18, mid), text, font=font(19, True), fill=INK, anchor='lm')
             else:
-                draw.text((x + dx, mid), text, font=font(17), fill=MUTED, anchor='lm')
-        y += 30 if main else 26
+                draw.text((x + dx, mid), text, font=font(19), fill=INK, anchor='lm')
+        y += 30
+
+
+def _tag_positions(tagged: list[dict], py, price_top: float, price_bottom: float) -> list[float]:
+    """價格框的中心 y（由上往下）：照真正價位放，太近就往下錯開，超出價格區再整組推回。"""
+    if not tagged:
+        return []
+    half = LEVEL_TAG_H / 2
+    pos: list[float] = []
+    for true_y in sorted(py(t['price']) for t in tagged):
+        pos.append(max(true_y, pos[-1] + LEVEL_TAG_H + 6) if pos else true_y)
+    shift = max(0.0, pos[-1] + half - price_bottom)
+    pos = [p - shift for p in pos]
+    shift = max(0.0, price_top - (pos[0] - half))
+    return [p + shift for p in pos]
 
 
 def draw_level_tags(draw, tagged: list[dict], py, right: float, price_top: float, price_bottom: float) -> None:
@@ -1396,13 +1429,7 @@ def draw_level_tags(draw, tagged: list[dict], py, right: float, price_top: float
         return
     items = sorted(((py(t['price']), t) for t in tagged), key=lambda x: x[0])
     half = LEVEL_TAG_H / 2
-    pos: list[float] = []
-    for true_y, _ in items:
-        pos.append(max(true_y, pos[-1] + LEVEL_TAG_H + 6) if pos else true_y)
-    shift = max(0.0, pos[-1] + half - price_bottom)
-    pos = [p - shift for p in pos]
-    shift = max(0.0, price_top - (pos[0] - half))
-    pos = [p + shift for p in pos]
+    pos = _tag_positions(tagged, py, price_top, price_bottom)
     for (true_y, item), label_y in zip(items, pos):
         color = item['color']
         draw.line((right + 2, true_y, right + 9, true_y), fill=color, width=2)
@@ -1514,9 +1541,6 @@ def draw_chart(draw, y: int, panel: dict) -> None:
     price_top, price_bottom = top + lane_top, bottom - lane_bottom
     # 與週報主程式 adjust_candle_price_ylim 一致：Y 軸只看 K 棒高低，下留 11%、上留 5%；均線／布林超出價格區就裁掉
     low, high = _price_range(bars)
-    # 10-18：價格刻度移到左側（右側窄欄留給關鍵價位框），左邊界依刻度實際字寬決定
-    tick_values = [low + (high - low) * i / 4 for i in range(5)]
-    left = x0 + 24 + max(font(19).getlength(number(v)) for v in tick_values) + 12
     draw_observed_marks(draw, panel, price_top, price_bottom)
     py = lambda value: price_bottom - (value - low) / (high - low) * (price_bottom - price_top)
     step = (right - left) / len(bars)
@@ -1527,11 +1551,15 @@ def draw_chart(draw, y: int, panel: dict) -> None:
         draw.rectangle(rectangle, fill=fill)
     for i in ticks:
         draw.line((px(i), top, px(i), bottom), fill=GRID, width=1)
+    tagged_levels, _ = _chart_levels(panel)
+    tag_label_ys = _tag_positions(tagged_levels, py, price_top, price_bottom)
     for i in range(5):
         value = low + (high - low) * i / 4
         gy = py(value)
         draw.line((left, gy, right, gy), fill=LINE, width=1)
-        draw.text((left - 10, gy), number(value), font=font(19), fill=MUTED, anchor='rm')
+        # 價格刻度維持在右側；和關鍵價位框太近的那格刻度數字不畫，避免文字重疊
+        if all(abs(gy - ty) > LEVEL_TAG_H for ty in tag_label_ys):
+            text_at(draw, (right + 14, gy - 10), number(value), 20, MUTED)
     if not panel.get('compact'):
         draw_marks(draw, panel, px, py, step, price_top, price_bottom)
     for i, bar in enumerate(bars):
@@ -1570,7 +1598,6 @@ def draw_chart(draw, y: int, panel: dict) -> None:
 
 
     draw_member_triangle(draw, panel, px, py, left, right, price_top, price_bottom)
-    tagged_levels, _ = _chart_levels(panel)
     draw_level_tags(draw, tagged_levels, py, right, price_top, price_bottom)
 
     # 日期軸緊貼價格區下方；月份切換的日期用粗體，方便看出 K 棒落在哪個月。

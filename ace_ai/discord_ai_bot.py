@@ -1312,6 +1312,9 @@ def branch_store_window_sections(d: Dict[str, Any]) -> List[Dict[str, Any]]:
     return sections
 
 
+WEEKLY_WARRANT_DETAIL = True      # 週精選 K 線那張圖的權證明細（每分點一行加權平均）
+
+
 def weekly_warrant_average_text(warrants: Sequence[Dict[str, Any]]) -> str:
     """週精選權證明細一行：仍持有、未到期的權證，依剩餘張數加權平均剩餘天數／價內外／槓桿。"""
     held = [w for w in warrants if (w.get("remaining_lots") or 0) > 0
@@ -7055,28 +7058,29 @@ class AceQueryEngine:
         layout, layout_note, layout_calls = None, "", 0
         if session.get("manual") and not session.get("layout_off"):
             layout, layout_note, layout_calls = self._weekly_layout(context_key, session, article["body"])
-        warrant_rows = self._weekly_warrant_sections(code, branches)
+        # 10-18：拆成兩張圖（長輩用手機看一張太多內容）：第 1 張 K 線＋型態評分＋權證明細，第 2 張精選文字
+        chart_panels = list(panels)
+        warrant_rows = self._weekly_warrant_sections(code, branches) if WEEKLY_WARRANT_DETAIL else []
+        if warrant_rows:
+            chart_panels.append({"branch_card": {"branch": warrant_rows[0]["text"], "tags": [], "label": f"資料日 {data_date}".strip(),
+                                                 "sections": warrant_rows[1:], "weekly_note": True}, "hide_text": True})
         if layout:
             card = weekly_pick.layout_card(layout, article["title"], f"資料日 {data_date}".strip(), article["disclaimers"], keep_words=branches)
-            if warrant_rows:
-                # 權證明細接在籌碼面那段後面（下一個小標或註解之前）；沒有籌碼面就放在註解前
-                sections = card["sections"]
-                start = next((i for i, s in enumerate(sections) if s.get("type") == "heading" and s.get("text") == "籌碼面"), None)
-                at = next((i for i, s in enumerate(sections) if (start is None or i > start)
-                           and (s.get("type") == "note" or (start is not None and s.get("type") == "heading"))), len(sections))
-                card["sections"] = sections[:at] + warrant_rows + sections[at:]
-            panels = list(panels) + [{"branch_card": card, "hide_text": True,
-                                      "footer_text": "股市艾斯  /  日 K 為收盤資料，非盤中即時行情"}]
+            article_panels = [{"branch_card": card, "hide_text": True,
+                               "footer_text": "股市艾斯  /  日 K 為收盤資料，非盤中即時行情"}]
         else:
-            panels = list(panels) + [{"article": article}]
-            if warrant_rows:
-                panels.append({"branch_card": {"branch": warrant_rows[0]["text"], "tags": [], "label": f"資料日 {data_date}".strip(),
-                                               "sections": warrant_rows[1:], "weekly_note": True}, "hide_text": True})
+            article_panels = [{"article": article}]
         if layout_note:
             image_text += f"\n\n※ {layout_note}"
+        elapsed = time.perf_counter() - started
+        article_image = AnswerResult(text=image_text, route="weekly_article_image", gemini_calls=0, elapsed=elapsed,
+                                     cacheable=False, panels=article_panels, layout="weekly_article",
+                                     weekly={"image_title": title}, image_title=title)
+        # 第 1 張只有 K 線相關卡片：text 留空，免得文章被當成文字卡再畫一次
         return AnswerResult(
-            text=image_text, route="weekly_article_image", gemini_calls=layout_calls, elapsed=time.perf_counter()-started,
-            cacheable=False, panels=panels, layout="weekly_article", weekly={"image_title": title},
+            text="", route="weekly_article_image", gemini_calls=layout_calls, elapsed=elapsed,
+            cacheable=False, panels=chart_panels, layout="weekly_article", weekly={"image_title": title},
+            followups=[article_image],
         )
 
     def _answer_admin_moneydj_image(self, question: str, started: float) -> AnswerResult:
