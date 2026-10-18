@@ -1351,7 +1351,7 @@ def _chart_levels(panel: dict) -> tuple[list[dict], list[dict]]:
         if kind not in ('壓力', '支撐') or _is_ma_level(label) or _finite(price) is None:
             continue
         items.append({'label': label, 'name': _level_display_name(str(label), panel), 'price': float(price),
-                      'pct': _finite(pct)})
+                      'pct': _finite(pct), 'kind': kind})
     low, high = _price_range(panel['bars'])
     inside = [x for x in items if low <= x['price'] <= high]
     tagged = sorted(inside, key=lambda x: abs(x['pct']) if x['pct'] is not None else 1e9)[:LEVEL_TAG_MAX]
@@ -1372,20 +1372,40 @@ def _price_range(bars: list) -> tuple[float, float]:
     return low - span * .11, high + span * .05
 
 
-def _level_legend_rows(panel: dict, width: float) -> list[list[tuple[float, dict, bool]]]:
-    """圖例排版：同一排依序放「右側已標框的色點＋價格＋名稱」與其他參考價位（10-18：併成一排、不用灰字）；
-    依實際字寬換行，不截字。"""
+LEGEND_ROW_H = 38
+_LEGEND_KIND = {'壓力': (UP_BG, UP), '支撐': (DOWN_BG, DOWN)}
+
+
+def _legend_tokens(panel: dict) -> list[tuple[str, object, float]]:
+    """圖例依「壓力｜支撐」分組，各組由近到遠；右側有標框的價位加同色圓點。回傳 (種類, 內容, 寬度)。"""
     tagged, rest = _chart_levels(panel)
-    rows: list[list[tuple[float, dict, bool]]] = []
+    marked = {id(x) for x in tagged}
+    tokens: list[tuple[str, object, float]] = []
+    for kind in ('壓力', '支撐'):
+        group = [x for x in tagged + rest if x['kind'] == kind]
+        group.sort(key=lambda x: x['price'], reverse=(kind == '支撐'))
+        if not group:
+            continue
+        tokens.append(('badge', kind, font(18, True).getlength(kind) + 22))
+        for item in group:
+            item = dict(item, marked=id(item) in marked)
+            w = (22 if item['marked'] else 0) + font(21, True).getlength(number(item['price'])) + 8                 + font(20).getlength(item['name'])
+            tokens.append(('item', item, w))
+    return tokens
+
+
+def _level_legend_rows(panel: dict, width: float) -> list[list[tuple[float, str, object]]]:
+    """依實際字寬換行，不截字；分組標籤不會單獨留在行尾。"""
+    tokens = _legend_tokens(panel)
+    rows: list[list[tuple[float, str, object]]] = []
     row, used = [], 0.0
-    for item, main in [(x, True) for x in tagged] + [(x, False) for x in rest]:
-        text = f"{number(item['price'])} {item['name']}"
-        w = (20 + font(21, True).getlength(text)) if main else font(21).getlength(text)
-        if row and used + w > width:
+    for i, (kind, value, w) in enumerate(tokens):
+        need = w + (tokens[i + 1][2] + 10 if kind == 'badge' and i + 1 < len(tokens) else 0)
+        if row and used + need > width:
             rows.append(row)
             row, used = [], 0.0
-        row.append((used, item, main))
-        used += w + 30
+        row.append((used, kind, value))
+        used += w + (10 if kind == 'badge' else 30)
     if row:
         rows.append(row)
     return rows
@@ -1393,20 +1413,29 @@ def _level_legend_rows(panel: dict, width: float) -> list[list[tuple[float, dict
 
 def _level_legend_height(panel: dict) -> int:
     rows = _level_legend_rows(panel, CONTENT - 200)
-    return len(rows) * 34 + (8 if rows else 0)
+    return len(rows) * LEGEND_ROW_H + (6 if rows else 0)
 
 
 def draw_level_legend(draw, x: float, y: float, panel: dict) -> None:
+    """關鍵價位圖例：［壓力］● 784.44 布林上軌　［支撐］● 756.33 最大量區上緣　746.67 第二大量區上緣 …"""
     for row in _level_legend_rows(panel, CONTENT - 200):
-        mid = y + 17
-        for dx, item, main in row:
-            text = f"{number(item['price'])} {item['name']}"
-            if main:
-                draw.ellipse((x + dx, mid - 7, x + dx + 14, mid + 7), fill=item['color'])
-                draw.text((x + dx + 20, mid), text, font=font(21, True), fill=INK, anchor='lm')
-            else:
-                draw.text((x + dx, mid), text, font=font(21), fill=INK, anchor='lm')
-        y += 34
+        mid = y + LEGEND_ROW_H / 2
+        for dx, kind, value in row:
+            if kind == 'badge':
+                bg, ink = _LEGEND_KIND[value]
+                w = font(18, True).getlength(value) + 22
+                draw.rounded_rectangle((x + dx, mid - 14, x + dx + w, mid + 14), radius=14, fill=bg)
+                draw.text((x + dx + w / 2, mid), value, font=font(18, True), fill=ink, anchor='mm')
+                continue
+            cx = x + dx
+            if value['marked']:
+                draw.ellipse((cx, mid - 7, cx + 14, mid + 7), fill=value['color'])
+                cx += 22
+            price = number(value['price'])
+            draw.text((cx, mid), price, font=font(21, True), fill=INK, anchor='lm')
+            cx += font(21, True).getlength(price) + 8
+            draw.text((cx, mid), value['name'], font=font(20), fill=INK, anchor='lm')
+        y += LEGEND_ROW_H
 
 
 def _tag_positions(tagged: list[dict], py, price_top: float, price_bottom: float) -> list[float]:
