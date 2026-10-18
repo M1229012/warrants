@@ -7011,16 +7011,15 @@ class AceQueryEngine:
             events = group.get("event_codes") or ""
             sections.append({"type": "heading", "text": d.get("branch", "") + (f"｜{events} 事件" if events else ""),
                              "weekly_note": True})
-            tiles = weekly_warrant_tiles(group["warrants"])
-            # 10-18：大字數字卡（長輩用手機看得清楚）；全部賣完／到期就寫一句話
-            sections.append({"type": "tiles", "items": tiles} if tiles else
-                            {"type": "paragraph", "weekly_note": True, "text": weekly_warrant_average_text(group["warrants"])})
-            # 10-18：數字卡下面列出完整權證名單（每檔權證一列）
+            # 10-18：一張表就好——每檔權證一列，最後一列「全部」＝依剩餘張數加權平均（粗體），不另畫大數字卡
+            rows = [weekly_warrant_row(w) for w in group["warrants"]]
+            tiles = {t["label"]: t["value"] for t in weekly_warrant_tiles(group["warrants"])}
+            if tiles and len(rows) > 1:
+                rows.append(["全部（加權平均）", tiles["剩餘張數"], tiles["平均剩餘"], tiles["平均價內外"], tiles["平均槓桿"]])
             sections.append({"type": "table", "columns": ["權證", "剩餘張數", "剩餘天數", "價內外", "槓桿"],
-                             "widths": (0.40, 0.15, 0.15, 0.15, 0.15), "signed": (), "accent": ("剩餘張數", "槓桿"),
-                             "rows": [weekly_warrant_row(w) for w in group["warrants"]]})
+                             "widths": (0.40, 0.15, 0.15, 0.15, 0.15), "signed": (), "accent": (), "rows": rows})
         if sections:
-            sections.insert(0, {"type": "heading", "text": "權證明細｜依剩餘張數加權平均", "weekly_note": True})
+            sections.insert(0, {"type": "heading", "text": "權證明細", "weekly_note": True})
         return sections
 
     def _answer_weekly_article_image(self, context_key: str, started: float) -> AnswerResult:

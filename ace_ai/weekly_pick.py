@@ -2082,7 +2082,7 @@ LAYOUT_MAX_ROWS = 4
 # 10-18：數字不再抽成資料列（抽走後原句變成「華南永昌台中 10/05 買超，目前…」少了金額，資料列又和內文重複）；
 # 改 True 可恢復舊行為
 LAYOUT_ROWS = False
-LAYOUT_PARAGRAPH_CHARS = 80      # 圖片段落：約 2 句、80 字左右分段，手機上比較好讀
+LAYOUT_PARAGRAPH_CHARS = 130     # 圖片段落：約 130 字一段（太碎反而難讀），句子不拆開
 LAYOUT_MAX_LABEL = 14
 
 
@@ -2350,7 +2350,7 @@ def rule_layout(body: str, others: Sequence[str] = ()) -> Optional[Dict[str, Any
 
 
 def _reading_chunks(text: str) -> List[str]:
-    """把一段長文依句號切成約 LAYOUT_PARAGRAPH_CHARS 字的小段；句子不拆開，太短的最後一段併回前一段。"""
+    """把一段長文依句號切成約 LAYOUT_PARAGRAPH_CHARS 字的段落；句子不拆開，太短（< 40 字）的最後一段併回前一段。"""
     sentences = [x for x in re.findall(r"[^。！？]+[。！？]?", str(text or "")) if x.strip()]
     chunks: List[str] = []
     for sentence in sentences:
@@ -2358,7 +2358,7 @@ def _reading_chunks(text: str) -> List[str]:
             chunks[-1] += sentence
         else:
             chunks.append(sentence)
-    if len(chunks) > 1 and len(chunks[-1]) < 20:
+    if len(chunks) > 1 and len(chunks[-1]) < 40:
         chunks[-2] += chunks.pop()
     return [c.strip() for c in chunks if c.strip()]
 
@@ -2368,7 +2368,7 @@ def layout_card(layout: Dict[str, Any], title: str, label: str, disclaimers: Lis
     sections: List[Dict[str, Any]] = []
     for index, sec in enumerate(layout["sections"]):
         sections.append({"type": "heading", "text": sec["heading"], "weekly_note": True, "divider": index > 0})
-        # 10-18：一整塊長文在手機上難讀 → 約 2 句、80 字一段（不在句子中間切），段落之間留白
+        # 10-18：一整塊長文在手機上難讀，切太碎又零散 → 約 130 字一段（不在句子中間切），段落之間留白
         merged = "".join(p.strip() for p in sec["paragraphs"] if p.strip())
         for chunk in _reading_chunks(merged):
             sections.append({"type": "paragraph", "text": chunk, "weekly_note": True, "keep_words": list(keep_words)})

@@ -1265,14 +1265,14 @@ def draw_ma_line(draw, x: float, y: float, width: float, last: dict) -> None:
     cell = width / len(MA_COLORS)
     mid = y + MA_LINE_H / 2
     for i, (key, color) in enumerate(MA_COLORS.items()):
-        tx = x + 18 + i * cell
-        # 10-18：名稱改成均線色底白字膠囊（原本細色線太小，不放大看不出哪條是哪條）
-        pill_w = font(21, True).getlength(key) + 24
-        draw.rounded_rectangle((tx, mid - 16, tx + pill_w, mid + 16), radius=16, fill=color)
-        draw.text((tx + pill_w / 2, mid), key, font=font(21, True), fill='white', anchor='mm')
+        tx = x + 22 + i * cell
+        # 10-18：色線加粗加長、名稱用同色字，不用放大也對得出是哪條線；價格維持黑色粗體
+        draw.line((tx, mid, tx + 30, mid), fill=color, width=5)
+        draw.text((tx + 40, mid), key, font=font(21, True), fill=color, anchor='lm')
         value = _finite(last.get(key))
-        text, size = fit(number(value) if value is not None else '—', 27, cell - pill_w - 30, True)
-        draw.text((tx + pill_w + 12, mid), text, font=font(size, True), fill=INK, anchor='lm')
+        name_w = font(21, True).getlength(key)
+        text, size = fit(number(value) if value is not None else '—', 26, cell - 40 - name_w - 34, True)
+        draw.text((tx + 40 + name_w + 12, mid), text, font=font(size, True), fill=INK, anchor='lm')
 
 
 # ---------- 10-18：關鍵價位改標在 K 線上（右側價格框＋日期軸下方圖例），不再另畫關鍵價位表 ----------
@@ -2848,25 +2848,6 @@ def _tone_color(text: str, tone: str) -> str:
     return {'up': UP, 'down': DOWN}.get(tone, INK)
 
 
-_EMPHASIS_RE = re.compile(r"\d[\d,]*(?:\.\d+)?\s*(?:[～~]\s*\d[\d,]*(?:\.\d+)?\s*)?(?:萬元|億元|元|%|％|天|筆|張|倍)")
-EMPHASIS_INK = '#8B6428'
-
-
-def _draw_emphasis_line(draw, x: float, y: float, line: str, size: int) -> None:
-    """一行文字：數字＋單位（762 元、約 525 萬元、62%、15 天）粗體金色，其餘照常。"""
-    cursor, last = x, 0
-    for match in _EMPHASIS_RE.finditer(line):
-        plain = line[last:match.start()]
-        if plain:
-            text_at(draw, (cursor, y), plain, size, INK)
-            cursor += font(size).getlength(plain)
-        text_at(draw, (cursor, y), match.group(), size, EMPHASIS_INK, True)
-        cursor += font(size, True).getlength(match.group())
-        last = match.end()
-    if line[last:]:
-        text_at(draw, (cursor, y), line[last:], size, INK)
-
-
 def _wrap_weekly_note(text: str, size: int, width: float, keep_words=()) -> list[str]:
     """Weekly paragraphs only: keep the article's tracked branch names together."""
     words = sorted({str(w) for w in keep_words if str(w)}, key=len, reverse=True)
@@ -3289,17 +3270,14 @@ def _branch_section(draw, x0: float, x1: float, y: float, section: dict, dry: bo
         return total + 8
     if kind == 'paragraph':
         weekly = bool(section.get('weekly_note'))
-        # 10-18：週精選文字行距加大、段落間多留白；價位／金額／勝率用粗體金色標出，掃一眼就找得到數字
-        size, line_height = (28, 48) if weekly else (25, 38)
-        lines = (_wrap_weekly_note(section.get('text', ''), size, width - 24, section.get('keep_words', ()))
+        # 10-18：週精選文字行距略加大、段落之間留白；不加顏色強調，維持乾淨的閱讀版面
+        size, line_height = (28, 46) if weekly else (25, 38)
+        lines = (_wrap_weekly_note(section.get('text', ''), size, width, section.get('keep_words', ()))
                  if weekly else wrap(section.get('text', ''), size, width, False))
         if not dry:
             for i, line in enumerate(lines):
-                if weekly:
-                    _draw_emphasis_line(draw, x0, y + i * line_height, line, size)
-                else:
-                    text_at(draw, (x0, y + i * line_height), line, size, INK)
-        return len(lines) * line_height + (26 if weekly else 14)
+                text_at(draw, (x0, y + i * line_height), line, size, INK)
+        return len(lines) * line_height + (22 if weekly else 14)
     if kind == 'badge':
         if not dry:
             w = font(20, True).getlength(section['text']) + 32
