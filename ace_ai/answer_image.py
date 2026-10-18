@@ -1338,44 +1338,44 @@ def _price_range(bars: list) -> tuple[float, float]:
     return low - span * .11, high + span * .05
 
 
-LEGEND_ROW_H = 66
-LEGEND_ITEM_GAP = 34
+LEGEND_ROW_H = 40
+LEGEND_ITEM_GAP = 30
 LEGEND_W = CONTENT - 154            # 和 K 線繪圖區同寬（left＝x0+36、right＝x1-118）
-_LEGEND_KIND = {'壓力': (UP_BG, UP), '支撐': (DOWN_BG, DOWN)}
+_LEGEND_KIND_INK = {'壓力': UP, '支撐': DOWN}
 
 
 def _legend_item_w(item: dict) -> float:
-    price_w = font(25, True).getlength(number(item['price'])) + (22 if item['marked'] else 0)
-    return max(price_w, font(19).getlength(item['name']))
+    return ((22 if item['marked'] else 0) + font(24, True).getlength(number(item['price'])) + 8
+            + font(21).getlength(item['name']))
 
 
 def _legend_layout(panel: dict, width: float) -> tuple[list[tuple[int, float, str, object]], int]:
-    """關鍵價位圖例（10-18 重新排版）：淺灰底一條，左邊［壓力］右邊［支撐］，中間直線隔開；
-    每個價位上行大字價格、下行名稱，價格和名稱上下對齊不混在一起；各組由近到遠，右側有標框的加同色圓點。
-    放不下時依實際字寬換行（對齊在組別標籤後面），不截字。回傳 ([(列, x, 種類, 內容)], 列數)。"""
+    """關鍵價位圖例（10-18 方案 A）：單行「壓力 ● 784.44 布林上軌 ｜ 支撐 ● 756.33 最大量區上緣 746.67 …」。
+    壓力／支撐用紅綠色字當小標、中間細直線隔開；價格粗體、名稱一般字，同一行；各組由近到遠，
+    右側有標框的價位加同色圓點。放不下時依實際字寬換行（對齊在小標後面），不截字。回傳 ([(列, x, 種類, 內容)], 列數)。"""
     tagged, rest = _chart_levels(panel)
     marked = {id(x) for x in tagged}
     placed: list[tuple[int, float, str, object]] = []
-    row, x, first = 0, 18.0, True
+    row, x, first = 0, 0.0, True
     for kind in ('壓力', '支撐'):
-        group = sorted((x_ for x_ in tagged + rest if x_['kind'] == kind),
+        group = sorted((it for it in tagged + rest if it['kind'] == kind),
                        key=lambda it: it['price'], reverse=(kind == '支撐'))
         if not group:
             continue
         items = [dict(it, marked=id(it) in marked) for it in group]
-        head_w = font(19, True).getlength(kind) + 26
+        head_w = font(21, True).getlength(kind) + 14
         if not first:
-            if x + 56 + head_w + _legend_item_w(items[0]) > width - 18:
-                row, x = row + 1, 18.0
+            if x + 32 + head_w + _legend_item_w(items[0]) > width:
+                row, x = row + 1, 0.0
             else:
-                placed.append((row, x + 22, 'divider', None))
-                x += 56
-        placed.append((row, x, 'badge', kind))
-        x += head_w + 18
+                placed.append((row, x + 2, 'divider', None))
+                x += 32
+        placed.append((row, x, 'label', kind))
+        x += head_w
         indent = x
         for item in items:
             w = _legend_item_w(item)
-            if x > indent and x + w > width - 18:
+            if x > indent and x + w > width:
                 row, x = row + 1, indent
             placed.append((row, x, 'item', item))
             x += w + LEGEND_ITEM_GAP
@@ -1385,31 +1385,26 @@ def _legend_layout(panel: dict, width: float) -> tuple[list[tuple[int, float, st
 
 def _level_legend_height(panel: dict) -> int:
     _, rows = _legend_layout(panel, LEGEND_W)
-    return rows * LEGEND_ROW_H + 30 if rows else 0
+    return rows * LEGEND_ROW_H + 10 if rows else 0
 
 
 def draw_level_legend(draw, x: float, y: float, width: float, panel: dict) -> None:
-    placed, rows = _legend_layout(panel, LEGEND_W)
-    if not rows:
-        return
-    draw.rounded_rectangle((x, y, x + width, y + rows * LEGEND_ROW_H + 12), radius=14, fill=TILE_BG)
+    placed, _ = _legend_layout(panel, LEGEND_W)
     for row, dx, kind, value in placed:
-        top = y + 6 + row * LEGEND_ROW_H
-        mid = top + LEGEND_ROW_H / 2
+        mid = y + row * LEGEND_ROW_H + LEGEND_ROW_H / 2
         if kind == 'divider':
-            draw.line((x + dx, top + 10, x + dx, top + LEGEND_ROW_H - 10), fill='#D0D5DD', width=2)
-        elif kind == 'badge':
-            bg, ink = _LEGEND_KIND[value]
-            w = font(19, True).getlength(value) + 26
-            draw.rounded_rectangle((x + dx, mid - 17, x + dx + w, mid + 17), radius=17, fill=bg)
-            draw.text((x + dx + w / 2, mid), value, font=font(19, True), fill=ink, anchor='mm')
+            draw.line((x + dx, mid - 15, x + dx, mid + 15), fill='#D0D5DD', width=2)
+        elif kind == 'label':
+            draw.text((x + dx, mid), value, font=font(21, True), fill=_LEGEND_KIND_INK[value], anchor='lm')
         else:
             cx = x + dx
             if value['marked']:
-                draw.ellipse((cx, top + 15, cx + 14, top + 29), fill=value['color'])
+                draw.ellipse((cx, mid - 7, cx + 14, mid + 7), fill=value['color'])
                 cx += 22
-            draw.text((cx, top + 22), number(value['price']), font=font(25, True), fill=INK, anchor='lm')
-            draw.text((x + dx, top + 50), value['name'], font=font(19), fill=INK, anchor='lm')
+            price = number(value['price'])
+            draw.text((cx, mid), price, font=font(24, True), fill=INK, anchor='lm')
+            cx += font(24, True).getlength(price) + 8
+            draw.text((cx, mid), value['name'], font=font(21), fill=INK, anchor='lm')
 
 
 def _tag_positions(tagged: list[dict], py, price_top: float, price_bottom: float) -> list[float]:
@@ -3270,14 +3265,13 @@ def _branch_section(draw, x0: float, x1: float, y: float, section: dict, dry: bo
         return total + 8
     if kind == 'paragraph':
         weekly = bool(section.get('weekly_note'))
-        # 10-18：週精選文字行距略加大、段落之間留白；不加顏色強調，維持乾淨的閱讀版面
-        size, line_height = (28, 46) if weekly else (25, 38)
+        size, line_height = (28, 44) if weekly else (25, 38)
         lines = (_wrap_weekly_note(section.get('text', ''), size, width, section.get('keep_words', ()))
                  if weekly else wrap(section.get('text', ''), size, width, False))
         if not dry:
             for i, line in enumerate(lines):
                 text_at(draw, (x0, y + i * line_height), line, size, INK)
-        return len(lines) * line_height + (22 if weekly else 14)
+        return len(lines) * line_height + 14
     if kind == 'badge':
         if not dry:
             w = font(20, True).getlength(section['text']) + 32

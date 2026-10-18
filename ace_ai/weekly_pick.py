@@ -2082,7 +2082,6 @@ LAYOUT_MAX_ROWS = 4
 # 10-18：數字不再抽成資料列（抽走後原句變成「華南永昌台中 10/05 買超，目前…」少了金額，資料列又和內文重複）；
 # 改 True 可恢復舊行為
 LAYOUT_ROWS = False
-LAYOUT_PARAGRAPH_CHARS = 130     # 圖片段落：約 130 字一段（太碎反而難讀），句子不拆開
 LAYOUT_MAX_LABEL = 14
 
 
@@ -2349,29 +2348,15 @@ def rule_layout(body: str, others: Sequence[str] = ()) -> Optional[Dict[str, Any
     return {"sections": [s for s in sections if s["paragraphs"] or s["rows"]]}
 
 
-def _reading_chunks(text: str) -> List[str]:
-    """把一段長文依句號切成約 LAYOUT_PARAGRAPH_CHARS 字的段落；句子不拆開，太短（< 40 字）的最後一段併回前一段。"""
-    sentences = [x for x in re.findall(r"[^。！？]+[。！？]?", str(text or "")) if x.strip()]
-    chunks: List[str] = []
-    for sentence in sentences:
-        if chunks and len(chunks[-1]) + len(sentence) <= LAYOUT_PARAGRAPH_CHARS:
-            chunks[-1] += sentence
-        else:
-            chunks.append(sentence)
-    if len(chunks) > 1 and len(chunks[-1]) < 40:
-        chunks[-2] += chunks.pop()
-    return [c.strip() for c in chunks if c.strip()]
-
-
 def layout_card(layout: Dict[str, Any], title: str, label: str, disclaimers: List[str], keep_words=()) -> Dict[str, Any]:
     """排版結果 → 和其他研究筆記同一套卡片（金色小標、段落、淺底資料列、註解）。"""
     sections: List[Dict[str, Any]] = []
     for index, sec in enumerate(layout["sections"]):
         sections.append({"type": "heading", "text": sec["heading"], "weekly_note": True, "divider": index > 0})
-        # 10-18：一整塊長文在手機上難讀，切太碎又零散 → 約 130 字一段（不在句子中間切），段落之間留白
+        # 每個小標底下一段完整文字：句子接在一起自然換行，不在句號處拆成好幾段（10-18 試過分段，使用者覺得更怪，改回）
         merged = "".join(p.strip() for p in sec["paragraphs"] if p.strip())
-        for chunk in _reading_chunks(merged):
-            sections.append({"type": "paragraph", "text": chunk, "weekly_note": True, "keep_words": list(keep_words)})
+        if merged:
+            sections.append({"type": "paragraph", "text": merged, "weekly_note": True, "keep_words": list(keep_words)})
         if sec["rows"]:
             # 原文數字以緊湊行內資訊呈現，不為單筆數字建立滿版小格
             sections.append({"type": "stats", "presentation": "inline", "items": [{"label": r["label"], "value": r["value"]} for r in sec["rows"]]})

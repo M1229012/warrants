@@ -1312,15 +1312,7 @@ def branch_store_window_sections(d: Dict[str, Any]) -> List[Dict[str, Any]]:
     return sections
 
 
-WEEKLY_WARRANT_DETAIL = True      # 週精選 K 線那張圖的權證明細（每分點一行加權平均）
-
-
-def weekly_warrant_average_text(warrants: Sequence[Dict[str, Any]]) -> str:
-    """權證明細的一行文字版（全部賣完時用，也給 Log／測試看）；數字和數字卡同一套加權平均。"""
-    tiles = weekly_warrant_tiles(warrants)
-    if not tiles:
-        return f"權證 {len(warrants)} 檔，已全部賣出或到期"
-    return "｜".join(f"{t['label']} {t['value']}" for t in tiles)
+WEEKLY_WARRANT_DETAIL = True      # 週精選 K 線那張圖的權證明細（每分點一張表，列出完整權證名單）
 
 
 def weekly_warrant_row(w: Dict[str, Any]) -> List[str]:
@@ -1330,28 +1322,6 @@ def weekly_warrant_row(w: Dict[str, Any]) -> List[str]:
             ("已到期" if days_left <= 0 else f"{days_left} 天") if days_left is not None else "-",
             f"{'價內' if money_now >= 0 else '價外'} {abs(money_now):.0f}%" if money_now is not None else "-",
             f"{lev_now:.1f} 倍" if lev_now is not None else "-"]
-
-
-def weekly_warrant_tiles(warrants: Sequence[Dict[str, Any]]) -> List[Dict[str, str]]:
-    """週精選權證明細數字卡：持有檔數、平均剩餘天數、平均價內外、平均槓桿、剩餘張數（依剩餘張數加權）。"""
-    held = [w for w in warrants if (w.get("remaining_lots") or 0) > 0
-            and (w.get("days_left") is None or w["days_left"] > 0)]
-    if not held:
-        return []
-    total = sum(float(w["remaining_lots"]) for w in held)
-
-    def weighted(key: str) -> Optional[float]:
-        pairs = [(float(w[key]), float(w["remaining_lots"])) for w in held if w.get(key) is not None]
-        lots = sum(x for _, x in pairs)
-        return sum(v * x for v, x in pairs) / lots if lots else None
-
-    days, money, lev = weighted("days_left"), weighted("moneyness_now"), weighted("leverage_now")
-    return [{"label": "持有權證", "value": f"{len(held)} 檔", "tone": "ink"},
-            {"label": "平均剩餘", "value": f"{days:.0f} 天" if days is not None else "-", "tone": "ink"},
-            {"label": "平均價內外", "value": (f"{'價內' if money >= 0 else '價外'} {abs(money):.0f}%") if money is not None else "-",
-             "tone": "ink"},
-            {"label": "平均槓桿", "value": f"{lev:.1f} 倍" if lev is not None else "-", "tone": "accent"},
-            {"label": "剩餘張數", "value": f"{total:,.0f} 張", "tone": "ink"}]
 
 
 def branch_store_warrant_sections(d: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -7011,11 +6981,8 @@ class AceQueryEngine:
             events = group.get("event_codes") or ""
             sections.append({"type": "heading", "text": d.get("branch", "") + (f"｜{events} 事件" if events else ""),
                              "weekly_note": True})
-            # 10-18：一張表就好——每檔權證一列，最後一列「全部」＝依剩餘張數加權平均（粗體），不另畫大數字卡
+            # 10-18：一張表列出完整名單（每檔權證一列），不加平均列、不畫數字卡
             rows = [weekly_warrant_row(w) for w in group["warrants"]]
-            tiles = {t["label"]: t["value"] for t in weekly_warrant_tiles(group["warrants"])}
-            if tiles and len(rows) > 1:
-                rows.append(["全部（加權平均）", tiles["剩餘張數"], tiles["平均剩餘"], tiles["平均價內外"], tiles["平均槓桿"]])
             sections.append({"type": "table", "columns": ["權證", "剩餘張數", "剩餘天數", "價內外", "槓桿"],
                              "widths": (0.40, 0.15, 0.15, 0.15, 0.15), "signed": (), "accent": (), "rows": rows})
         if sections:
