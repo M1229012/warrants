@@ -24,7 +24,7 @@ import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 import pandas as pd
 
@@ -2011,6 +2011,9 @@ def find_weekly_candidate(stock_code: str, log: Callable[[str], None] = print, c
     return stock, metadata
 
 
+_INLINE_DISCLAIMER_RE = re.compile(r"(?:⚠️|⚠)?\s*僅為個人投資筆記|(?:🧡)?\s*非任何買賣建議")
+
+
 def weekly_article_parts(draft: str, stock_code: str, stock_name: str = "") -> Dict[str, Any]:
     """移除獨立標頭或行首標頭，保留同一行的正文與原文段落。"""
     lines = normalize_draft_text(draft).splitlines()
@@ -2041,6 +2044,11 @@ def weekly_article_parts(draft: str, stock_code: str, stock_name: str = "") -> D
         if stripped in ("⚠️ 僅為個人投資筆記", "🧡 非任何買賣建議"):
             disclaimers.append(stripped)
             continue
+        # slash 指令打不出換行：免責兩句常接在正文最後一行，抽出來放到小字註解，正文不重複一次
+        disclaimers += [x.strip() for x in _INLINE_DISCLAIMER_RE.findall(stripped)]
+        stripped = _INLINE_DISCLAIMER_RE.sub("", stripped).strip()
+        if not stripped:
+            continue
         body.append(stripped)
     text = "\n".join(body).strip()
     title = f"{stock_name}（{code}）" if stock_name else code
@@ -2051,7 +2059,7 @@ def weekly_article_parts(draft: str, stock_code: str, stock_name: str = "") -> D
 # 人工文章自動排版：Gemini 只重新分段、加固定小標、把數字整理成資料列；程式逐字核對，不通過就用原文排版
 # ============================================================
 
-WEEKLY_LAYOUT_VERSION = "weekly-note-v3-preserve-body"
+WEEKLY_LAYOUT_VERSION = "weekly-note-v4-row-owner"
 LAYOUT_HEADINGS = ("技術面", "籌碼面", "操作觀察")
 LAYOUT_SCHEMA = {
     "type": "object",
@@ -2074,18 +2082,22 @@ LAYOUT_MAX_ROWS = 4
 LAYOUT_MAX_LABEL = 14
 
 
-def layout_prompt(body: str, retry_reason: str = "") -> str:
+def layout_prompt(body: str, retry_reason: str = "", others: Sequence[str] = ()) -> str:
     retry = f"\n※ 上一次排版沒通過核對：{retry_reason}。請修正後重新輸出，仍然只能照抄原文。\n" if retry_reason else ""
+    other = (f"6. 文中也提到其他股票（{'、'.join(others)}）：這些股票的金額、勝率留在段落，不可抽成 rows；"
+             "rows 只放本檔的數字，避免讀者誤認成本檔。\n") if others else ""
     return (retry +
         "你是排版編輯。下面是一篇已經寫好的個股觀察文章，請只做排版，輸出 JSON。\n"
-        f"1. 分成最多三段，小標只能用：{'、'.join(LAYOUT_HEADINGS)}（沒有內容的段落不要輸出），依原文順序。\n"
+        f"1. 分成最多三段，小標只能用：{'、'.join(LAYOUT_HEADINGS)}（沒有內容的段落不要輸出），依原文順序。"
+        "大盤盤勢、個股走勢強弱、型態與價位放技術面；籌碼面只放分點、權證、法人買賣的內容，"
+        "一句同時講盤勢和法人時，依整句主旨決定。\n"
         "2. 段落內的句子必須逐字照抄原文，不可改寫、增減字詞、換同義詞或改數字；只能重新分段（太長拆開、零碎的合併）。\n"
         "3. 句首和小標意思重複的開頭語要刪掉，例如「技術面來看，」「權證籌碼方面，」「操作上，」。\n"
         f"4. 籌碼面裡的金額、勝率、持有天數這類數字，最多 {LAYOUT_MAX_ROWS} 個可以整理成 rows：label 是簡短名稱，"
         "value 只放數字和單位，例如 {\"label\":\"近70日4筆事件買進\",\"value\":\"約2,120萬元\"}、"
         "{\"label\":\"調整後勝率\",\"value\":\"約67%\"}；整理進 rows 的那一句要從段落刪掉，不要重複。"
         "後面還接著補充說明的數字句（例如「近70日買進約2,120萬元，目前仍持有」）不要抽成 rows，留在段落，避免意思跑掉。\n"
-        "5. 去掉 **、emoji 等格式符號；不要加任何原文沒有的內容。\n\n"
+        "5. 去掉 **、emoji 等格式符號；不要加任何原文沒有的內容。\n" + other + "\n"
         f"原文：\n{body}"
     )
 
@@ -2115,7 +2127,20 @@ def parse_layout(data: Any) -> Optional[Dict[str, Any]]:
     return {"sections": sections} if sections else None
 
 
-def verify_layout(body: str, layout: Dict[str, Any]) -> Tuple[bool, str]:
+def _sentences(text: str) -> List[str]:
+    return [x for x in re.findall(r"[^。；;\n]+[。；;]?", str(text or "")) if x.strip()]
+
+
+def _other_stock_row(body: str, row: Dict[str, str], others: Sequence[str]) -> bool:
+    """資料列的數字只出現在講其他股票的句子：放到資料列會被當成本檔的數字。"""
+    numbers = set(_layout_numbers([row["value"]]))
+    if not numbers or not others:
+        return False
+    owners = [s for s in _sentences(body) if numbers <= set(_layout_numbers([s]))]
+    return bool(owners) and all(any(o in s for o in others) for s in owners)
+
+
+def verify_layout(body: str, layout: Dict[str, Any], others: Sequence[str] = ()) -> Tuple[bool, str]:
     """排版結果逐句核對：
     - 段落拆成子句（，；。），每個子句都要是原文逐字的片段（中間抽走一句到資料列可以，改寫、新增字不行）
     - 原文每個數字都要出現、不能有原文沒有的數字（重複可以，由 tidy_layout 去重）
@@ -2127,6 +2152,9 @@ def verify_layout(body: str, layout: Dict[str, Any]) -> Tuple[bool, str]:
     long_label = next((r["label"] for r in rows if len(r["label"]) > LAYOUT_MAX_LABEL), "")
     if long_label:
         return False, f"資料列名稱太長：{long_label}"
+    foreign = next((r["label"] for r in rows if _other_stock_row(body, r, others)), "")
+    if foreign:
+        return False, f"資料列「{foreign}」是其他股票的數字，要留在段落"
     expected = set(_layout_numbers([body]))
     actual = set(_layout_numbers(paragraphs + [r["label"] for r in rows] + [r["value"] for r in rows]))
     if expected != actual:
@@ -2210,7 +2238,7 @@ _LEAD_IN_RE = re.compile(r"^(?:權證籌碼方面|權證籌碼上|權證籌碼|�
 _HEADING_WORDS = {
     "技術面": {"均線": 1, "型態": 1, "布林": 1, "季線": 1, "月線": 1, "年線": 1, "K線": 1, "扣抵": 1, "趨勢": 1,
             "盤整": 1, "震盪": 1, "量能": 1, "大量區": 1, "翻揚": 1, "下彎": 1, "上揚": 1, "多頭": 1, "空頭": 1,
-            "長紅": 1, "長黑": 1, "突破": 0.5, "整理": 0.5},
+            "長紅": 1, "長黑": 1, "大盤": 1, "櫃買": 1, "盤勢": 1, "逆勢": 1, "下殺": 1, "突破": 0.5, "整理": 0.5},
     "籌碼面": {"分點": 1, "權證": 1, "籌碼": 1, "買進": 1, "買超": 1, "賣超": 1, "勝率": 1, "持有": 1, "事件": 1,
             "部位": 1, "主力": 1, "外資": 1, "投信": 1, "法人": 1, "加碼": 1, "減碼": 1, "追打": 1, "布局": 1, "佈局": 1},
     "操作觀察": {"追價": 1.5, "追高": 1.5, "拉回": 1.5, "回檔": 1.5, "觀察": 1.5, "停損": 1.5, "跌破": 1.5, "進場": 1.5,
@@ -2246,9 +2274,22 @@ def _ordered_headings(blocks: List[str]) -> List[str]:
     return out
 
 
-def _extract_rows(paragraph: str, room: int) -> Tuple[str, List[Dict[str, str]]]:
-    rows, kept = [], []
-    clauses = _CLAUSE_RE.findall(paragraph)
+def _extract_rows(paragraph: str, room: int, others: Sequence[str] = ()) -> Tuple[str, List[Dict[str, str]]]:
+    rows: List[Dict[str, str]] = []
+    kept: List[str] = []
+    for sentence in _sentences(paragraph):
+        if any(o in sentence for o in others):
+            kept.append(sentence)          # 其他股票的數字留在句子裡，不抽成本檔資料列
+        else:
+            _extract_sentence_rows(sentence, room, rows, kept)
+    text = "".join(kept).strip()
+    if text and text[-1] in "，,；;":
+        text = text[:-1] + "。"
+    return text, rows
+
+
+def _extract_sentence_rows(sentence: str, room: int, rows: List[Dict[str, str]], kept: List[str]) -> None:
+    clauses = _CLAUSE_RE.findall(sentence)
     for i, clause in enumerate(clauses):
         core = clause.strip("，,；;。 ")
         match = _ROW_TAIL_RE.match(core)
@@ -2263,13 +2304,9 @@ def _extract_rows(paragraph: str, room: int) -> Tuple[str, List[Dict[str, str]]]
             rows.append({"label": label, "value": match.group(2).strip()})
             continue
         kept.append(clause)
-    text = "".join(kept).strip()
-    if text and text[-1] in "，,；;":
-        text = text[:-1] + "。"
-    return text, rows
 
 
-def rule_layout(body: str) -> Optional[Dict[str, Any]]:
+def rule_layout(body: str, others: Sequence[str] = ()) -> Optional[Dict[str, Any]]:
     """不靠 AI 的排版：依關鍵字判斷小標、刪掉和小標重複的開頭語、籌碼數字抽成資料列。只刪減與搬動原句。"""
     blocks = [re.sub(r"\*\*|`", "", b).strip() for b in re.split(r"\n+", str(body or "")) if b.strip()]
     single = len(blocks) == 1
@@ -2297,7 +2334,7 @@ def rule_layout(body: str) -> Optional[Dict[str, Any]]:
         if sec["heading"] == "籌碼面":
             paragraphs = []
             for paragraph in sec["paragraphs"]:
-                text, rows = _extract_rows(paragraph, LAYOUT_MAX_ROWS - len(sec["rows"]))
+                text, rows = _extract_rows(paragraph, LAYOUT_MAX_ROWS - len(sec["rows"]), others)
                 sec["rows"] += rows
                 if text:
                     paragraphs.append(text)
