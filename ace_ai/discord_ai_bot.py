@@ -5598,6 +5598,10 @@ class AceQueryEngine:
                 return AnswerResult(text=hint if is_admin else "「本週精選」目前只開放管理員使用；一般個股、族群、權證分點問題可以照常詢問。",
                                     route="weekly_pick_hint", gemini_calls=0, elapsed=time.perf_counter() - started)
             return self._answer_general(question, context_key, on_queue, started, compact)
+        # 管理員自己貼文字：直接當成目前草稿，不經過 AI，也不做數字核對（文字是人寫的）。
+        # 要排在自訂清單之前：文章裡常有「型態」和多檔股名（含「大量」這種一般用語股名），會被誤判成清單排行。
+        if image is None and weekly_pick.is_manual_draft_question(question):
+            return self._answer_weekly_manual_draft(question, context_key, started)
         # 管理員上傳股票清單截圖，或一次給 3 檔以上代號問誰型態最好 → 自訂清單型態排行。
         custom_compare = is_custom_ranking_question(question)
         if not custom_compare and _CUSTOM_RANK_WORDS_RE.search(question):
@@ -5610,9 +5614,6 @@ class AceQueryEngine:
         admin_reply = self._answer_admin_command(question, started, context_key)
         if admin_reply is not None:
             return admin_reply
-        # 管理員自己貼文字：直接當成目前草稿，不經過 AI，也不做數字核對（文字是人寫的）。
-        if weekly_pick.is_manual_draft_question(question):
-            return self._answer_weekly_manual_draft(question, context_key, started)
         # 週精選草稿是獨立的編輯 session，只有管理員指令會進到這裡。
         if weekly_pick.is_weekly_draft_question(question):
             with self._weekly_lock:
