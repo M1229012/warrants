@@ -2874,6 +2874,22 @@ def watch_plan(payload: Dict[str, Any]) -> Dict[str, Any]:
                        "上方壓力_由近到遠": pick(sorted(resistances, key=lambda x: _plan_num(x.get("price")) or 1e18)),
                        "上方均線_扣抵條件": sorted(upper, key=lambda r: r["價位"]),
                        "下方均線_回測觀察": sorted(lower, key=lambda r: -r["價位"])}
+    # 10-20：三角股的技術資料在顯示範圍收窄後只剩三角欄位（聯電、華邦電）→ 改用圖上最後一根 K 棒與圖上的關鍵價位補算
+    for code, stock in ((payload.get("chart_context") or {}).get("stocks") or {}).items():
+        code = str(code)
+        bar = stock.get("last_bar") or {}
+        levels = stock.get("key_levels") or {}
+        close = _plan_num(bar.get("Close"))
+        values = {k: _plan_num(bar.get(k)) for k in ("MA5", "MA10", "MA20", "MA60")}
+        values = {k: v for k, v in values.items() if v is not None}
+        if code in plans or close is None or len(values) < 4:
+            continue
+        tech = {"stock_code": code, "close": close, "moving_averages": {k: {"value": v} for k, v in values.items()},
+                "ma_alignment": ma_alignment_text(values), "ma_deduction": levels.get("ma_deduction") or {}}
+        card = {"stock_code": code, "supports_below_close": levels.get("supports_below_close") or [],
+                "resistances_above_close": levels.get("resistances_above_close") or []}
+        plans.update(watch_plan({"tool_results": {f"get_technical_analysis:{code}": tech,
+                                                  f"get_pattern_scorecard:{code}": card}}))
     return plans
 
 
@@ -8507,7 +8523,7 @@ class AceQueryEngine:
             issues = facts.check(text)
             if not issues:
                 return text
-            if any("候選" in i for i in issues):
+            if any("候選" in reason for _, reasons in issues for reason in reasons):   # check 回傳 [(句子, [原因…])]
                 fixed = soften_candidate_triangle(text)
                 if fixed != text:
                     softened.append(text[:40])
@@ -8550,6 +8566,10 @@ class AceQueryEngine:
     def _repair_ai_card(self, raw_card: Dict[str, Any], removed: List[str], payload: Dict[str, Any],
                         facts: "FactSheet") -> Tuple[Optional[Dict[str, Any]], List[str]]:
         """10-20：核對刪太多時，把被刪的句子與原因交給 AI 改寫一次（不是重新回答）；改寫後再核對。"""
+        clock = getattr(_QUESTION_CLOCK, "state", None)
+        if clock and clock.get("deadline") and clock["deadline"] - time.monotonic() < 10:
+            self.log("AI 修正略過｜剩餘時間不足（整題快逾時），保留刪句後的解讀")
+            return None, removed
         lines = "\n".join(f"- {r}" for r in removed[:8])
         prompt = (build_final_prompt(payload) + "\n\n【修正上一次的解讀】你上一次輸出的 JSON：\n"
                   + json.dumps(raw_card, ensure_ascii=False) + "\n以下句子和資料不符，已被系統刪除（【】內是原因）：\n" + lines
