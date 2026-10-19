@@ -1213,7 +1213,8 @@ _TAG_SPARE = '#7A5AF8'
 
 def _levels_on_chart(card: dict | None) -> bool:
     """覆盤持股卡（有成本／自訂列數）與比較卡照舊用表格；其他型態卡的價位改畫在 K 線上。"""
-    return bool(LEVELS_ON_CHART and card and not card.get('compact') and not card.get('level_limits')
+    # 10-20：型態＋籌碼整合頁的精簡評分卡（card compact）也改畫在 K 線上；兩檔比較圖由 _chart_levels 看 panel compact 排除
+    return bool(LEVELS_ON_CHART and card and not card.get('level_limits')
                 and _finite(card.get('cost_price')) is None)
 
 
