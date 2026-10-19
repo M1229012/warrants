@@ -314,7 +314,7 @@ def structure_card(panel):
     return {"branch_card": {"branch": f"{panel['stock_code']} {panel.get('stock_name', '')}｜{name}",
             "label": "型態重點", "tags": [], "sections": sections}, "member_structure": True}
 
-def news_panel(data):
+def news_panel(data, limit=3):
     sections, seen = [], set()
     articles = sorted(data.get("articles") or [], key=lambda a: str(a.get("date") or ""), reverse=True)
     selected = []
@@ -323,7 +323,7 @@ def news_panel(data):
         key = a.get("event_key") or re.sub(r"\s", "", title)
         if not title or key in seen: continue
         seen.add(key); selected.append(a)
-        if len(selected) == 3: break
+        if len(selected) >= limit: break
     for a in selected:
         source = a.get("source") or urlparse(str(a.get("url") or "")).netloc or "來源未標示"
         sections.append({"type": "paragraph", "text": f"{a.get('date') or '日期未提供'}｜{source}：{a['title']}"})
@@ -382,7 +382,7 @@ def scoped_payload(payload, context):
     payload = deepcopy(payload); payload["chart_context"] = deepcopy(context)
     for key, data in list((payload.get("tool_results") or {}).items()):
         if context.get("compound") and key.split(":")[0] == "get_recent_news" and isinstance(data, dict):
-            data["articles"] = news_panel(data)["news_articles"]
+            data["articles"] = news_panel(data, limit=15)["news_articles"]   # 10-20：同事件去重後最多 15 則都給 AI（圖上不列清單）
         stock = context.get("stocks", {}).get(data.get("stock_code"), {}) if isinstance(data, dict) else {}
         if stock and not stock.get("show_bollinger", True):
             data = _without_bollinger(data)

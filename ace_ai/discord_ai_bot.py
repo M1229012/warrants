@@ -672,14 +672,14 @@ class QueryPlan:
 
 
 def chart_codes_for_plan(plan: QueryPlan, codes: Sequence[str]) -> List[str]:
-    """Resolved needs govern chart inclusion; never keyword-match the question."""
+    """Resolved needs govern chart inclusion; never keyword-match the question.
+    10-20：預設圖片就是型態圖——需求表裡有的股票（只問新聞也算）都畫 K 線；使用者排除的股票不畫。"""
     unique = list(dict.fromkeys(codes))
     if plan.needs is None:
         return unique
     per_stock = plan.needs.get("per_stock")
     if isinstance(per_stock, dict):
-        return [code for code in unique if set(per_stock.get(code) or []) &
-                {"analysis", "technical", "cost", "price", "institutional", "warrant"}]
+        return [code for code in unique if per_stock.get(code)]
     # Compatibility for plans assembled outside _answer_uncached_impl: derive
     # from actual scheduled tools, not parsed stocks or the original question.
     visual = {"get_stock_overview", "get_technical_analysis", "get_pattern_scorecard",
@@ -2518,7 +2518,8 @@ FINAL_TECH_RULES = """技術面規則：
 - 布林依 bollinger 的 position、signals、width_trend、squeeze、band_walk、breakout 欄位判讀。影線穿越不等於收盤突破，壓縮不預測方向，觸軌不代表反轉。均線扣抵推算是「收盤維持不變」的條件推算，不是預測。"""
 
 FINAL_NEWS_RULES = """新聞規則：只能用 get_recent_news 的 title、summary、content、summary_points（「公司名:本公司…」是公司重大訊息，屬事實）。
-- 同一事件的多篇報導合併，整理成 2～4 點：發生什麼事、關鍵數字（只用 content／summary 出現過的）、來源與日期；不要逐條重列標題。
+- 同一事件的多篇報導合併，歸納成 2～4 個重點：發生什麼事、關鍵數字（只用 content／summary 出現過的）、日期；圖上沒有新聞清單，不要逐條列標題、不寫媒體名稱。
+- 問新聞時解讀以新聞為主：先講新聞重點和對公司的影響，型態只用 1～2 句帶過（目前位置與最關鍵的一個價位），不展開技術分析。
 - 聳動字眼不是事實；法人目標價、獲利預估要寫「某機構估計」。content_source 為「RSS 摘要」或「僅標題」時只描述標題寫到的事實。
 - 可能利多、可能利空／風險分開說明（寫在 why 裡，不用【】標題），只寫新聞提到的因素；沒有利空就寫「新聞內容未提及明顯利空，但資訊有限」。summary 用 1 句說明份量與待確認資訊，不下漲跌結論。"""
 
@@ -3087,7 +3088,10 @@ def build_final_prompt(payload: Dict[str, Any]) -> str:
     if payload.get("chart_context"):
         sections.append(MEMBER_PATTERN_RULES)
         if payload["chart_context"].get("compound"):
-            sections.append("本題為不同股票的複合需求，逐項回答但不自行比較；新聞最多3個事件、保留日期來源與期間限制。answer直接各答一句，why總計180～260字；scenarios最多2個、每個60～100字；summary留空。新聞表已顯示標題，解讀其影響與限制，不重列標題。不得漏答任何需求。")
+            sections.append("本題含新聞與 K 線圖：逐項回答需求，不自行比較不同股票，不得漏答任何需求。圖上沒有列新聞標題，"
+                            "新聞是本題重點：answer 直接回答新聞重點；why 約 150～230 字，歸納 2～4 個重點事件與對公司的影響、還要確認的地方；"
+                            "被問新聞的股票，型態只用 1～2 句帶過（目前位置與最關鍵的一個價位），使用者另外明確問型態的股票照型態規則回答。"
+                            "scenarios 最多 1 個（新聞後續要確認的事或關鍵價位），summary 留空。")
     payload_json = json.dumps(payload.get("tool_results") or {}, ensure_ascii=False, separators=(",", ":"), default=tools.json_safe)
     needs_part = ("圖上實際內容（JSON）：\n" + json.dumps(payload["chart_context"], ensure_ascii=False, separators=(",", ":"), default=tools.json_safe) + "\n\n") if payload.get("chart_context") else ""
     if payload.get("needs"):        # 10-08：需求表實際內容（每項需求、排除、比較資料）
@@ -7903,8 +7907,7 @@ class AceQueryEngine:
             self.log(f"必要資料檢查：不交給 AI｜{data_notice}")
         news_results = [r.data for r in results if r.ok and r.name == "get_recent_news"]
         compound = bool(news_results and any(p.get("bars") for p in panels))
-        if compound:
-            panels.extend(member_pattern.news_panel(data) for data in news_results)
+        # 10-20：新聞不再列標題卡（使用者：不用列出參考哪些新聞，講重點就好）；新聞內容只給 AI
         if getattr(self, "_request_local", None) is not None:
             self._request_local.member_chart_context = member_pattern.chart_context(panels, compound)
         text, llm_ok = self._compose(question, plan, results, stats)
