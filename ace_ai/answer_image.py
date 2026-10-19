@@ -18,6 +18,8 @@ LINE = '#E4E7EC'
 ACCENT = '#A17936'
 UP = '#E85D5D'
 DOWN = '#2CB39A'
+# 10-20：文字專用的深紅／深綠（原本綠字 #2CB39A 在白底對比只有約 2.6:1，手機上年輕人都看不清楚）；圖形仍用 UP／DOWN
+UP_TEXT, DOWN_TEXT = '#D33A3A', '#0B7A60'
 TILE_BG = '#F6F7F9'
 GRID = '#EEF0F3'
 UP_BG, DOWN_BG = '#FDECEC', '#E3F5F1'
@@ -978,7 +980,7 @@ def draw_retail_ratio(draw, top: float, left: float, right: float, px, step: flo
         lx = left + font(21, True).getlength(title) + 18
         ratio = float(info.get('ratio_pct') or 0)
         text = f'{ratio:+.2f}%'
-        draw.text((lx, y0 + 17), text, font=font(21, True), fill=UP if ratio > 0 else DOWN if ratio < 0 else INK, anchor='lm')
+        draw.text((lx, y0 + 17), text, font=font(21, True), fill=UP_TEXT if ratio > 0 else DOWN_TEXT if ratio < 0 else INK, anchor='lm')
         lx += font(21, True).getlength(text) + 16
         detail = f"散戶多 {int(info.get('retail_long') or 0):,}／空 {int(info.get('retail_short') or 0):,} 口"
         if n == 0:
@@ -1252,7 +1254,7 @@ def draw_value_tiles(draw, x: float, y: float, width: float, last: dict, show_bo
             pct = (close / value - 1) * 100
             word = ('站上' if pct >= 0 else '跌破') if not dashed else ('高於' if pct >= 0 else '低於')
             text, size = fit(f'{word} {pct:+.1f}%', 17, w - 28)
-            text_at(draw, (tx + 14, y + 70), text, size, UP if pct >= 0 else DOWN)
+            text_at(draw, (tx + 14, y + 70), text, size, UP_TEXT if pct >= 0 else DOWN_TEXT)
         tx += w + gap
 
 
@@ -1296,7 +1298,7 @@ LEVELS_ON_CHART = True
 LEVEL_TAG_MAX = 2
 LEVEL_TAG_H = 32
 LEVEL_TAG_FONT = 20
-_TAG_COLORS = (('三角上緣', '#C76C00'), ('三角下緣', '#1478B5'), ('量區', '#1A9E8A'), ('布林', '#667085'))
+_TAG_COLORS = (('三角上緣', '#C76C00'), ('三角下緣', '#1478B5'), ('量區', '#0B7F6B'), ('布林', '#667085'))
 _TAG_SPARE = '#7A5AF8'
 
 
@@ -1368,7 +1370,7 @@ LEGEND_ROW_H = 56                  # 10-18 方案 1：價位條高度（和上�
 LEGEND_ITEM_GAP = 34
 LEGEND_BLOCK_W = 92                # 左側「支撐／壓力」實心標籤塊
 LEGEND_W = CONTENT - 64            # 和上方均線列同寬
-_LEGEND_KIND_INK = {'壓力': UP, '支撐': DOWN}
+_LEGEND_KIND_INK = {'壓力': UP_TEXT, '支撐': DOWN_TEXT}
 _LEGEND_KIND_TINT = {'壓力': '#FDF1F1', '支撐': '#EEF8F5'}
 
 
@@ -1553,7 +1555,7 @@ def draw_chart(draw, y: int, panel: dict) -> None:
         draw.text((x1 - 32, y + 70), f"資料至 {last['date']} {intraday.get('time', '')}", font=font(18), fill=MUTED, anchor='rt')
     else:
         draw.text((x1 - 32, y + 34), f"資料至 {last['date']}", font=font(22), fill=MUTED, anchor='rt')
-    color = UP if (change or 0) >= 0 else DOWN
+    color = UP_TEXT if (change or 0) >= 0 else DOWN_TEXT
     price_label = '成交' if live else '收盤'
     draw.text((x0 + 32, y + 112), price_label, font=font(22), fill=MUTED, anchor='ls')
     price_x = x0 + 32 + font(22).getlength(price_label) + 12
@@ -1741,7 +1743,7 @@ def draw_chart(draw, y: int, panel: dict) -> None:
 
 GRADE_STYLE = {'結構偏強': (GOOD_BG, GOOD_INK), '中性偏多': ('#F1F8F5', GOOD_INK), '結構中性': (TILE_BG, '#344054'),
                '中性偏弱': ('#FEF8F0', WARN_INK), '結構偏弱': (WARN_BG, WARN_INK)}
-LEVEL_STYLE = {'壓力': (UP_BG, UP), '現價': (ACCENT_BG, ACCENT), '成本': (COST_BG, COST_INK), '支撐': (DOWN_BG, DOWN)}
+LEVEL_STYLE = {'壓力': (UP_BG, UP_TEXT), '現價': (ACCENT_BG, ACCENT), '成本': (COST_BG, COST_INK), '支撐': (DOWN_BG, DOWN_TEXT)}
 LEVEL_ROW_H = 38
 LEVEL_MAX_RESISTANCES, LEVEL_MAX_SUPPORTS, BRANCH_MAX_ROWS, REASON_MAX_ITEMS = 1, 2, 4, 3
 SCORE_ROW_H = 30
@@ -1824,7 +1826,7 @@ def _deduction_outlook(info: dict) -> tuple[str, str]:
             # Legacy cache has no computed tomorrow threshold: present only
             # today's direction with its original down/flat/up color.
             return public_ma_condition(info), {'下彎': DOWN, '走平': MUTED}.get(info.get('direction_now'), UP)
-        return public_ma_condition(info), DOWN if risk else UP
+        return public_ma_condition(info), DOWN_TEXT if risk else UP_TEXT
     return {'上揚': ('續揚', INK), '下彎': ('續彎', INK)}.get(info.get('direction_now'), ('走平', MUTED))
 
 
@@ -1884,7 +1886,7 @@ def _draw_level_table(draw, x, y, width, rows, card) -> None:
         draw.text((x + 470, mid), number(price), font=font(22, True), fill=INK, anchor='rm')
         if kind != '現價' and pct is not None:
             pct = float(pct)
-            draw.text((x + 590, mid), f'{pct:+.2f}%', font=font(20), fill=UP if pct > 0 else DOWN if pct < 0 else MUTED, anchor='rm')
+            draw.text((x + 590, mid), f'{pct:+.2f}%', font=font(20), fill=UP_TEXT if pct > 0 else DOWN_TEXT if pct < 0 else MUTED, anchor='rm')
         if kind != '現價':
             note, color = _level_note(label, card)
             if note:
@@ -1936,7 +1938,7 @@ def _deduction_chips(draw, x, y, width, card, dry) -> int:
         outlook, color = _deduction_outlook(info)
         trend = info.get('deduct_trend')
         if trend and not info.get('turn'):
-            color = UP if trend == '扣低' else DOWN if trend == '扣高' else color
+            color = UP_TEXT if trend == '扣低' else DOWN_TEXT if trend == '扣高' else color
         chips.append((f'{key} {outlook}', color))
     widths = [font(19, True).getlength(t) + 26 for t, _ in chips]
     start = x + font(20, True).getlength(label) + 16
@@ -2338,7 +2340,7 @@ def _rank_card(draw, x: float, y: float, width: float, row: dict, technical: boo
         draw.text((tx + mw / 2, cy + 3), market, font=font(17, True), fill=MUTED, anchor='mm')
     # 右側：分數＋分級（型態排行）或漲跌幅（漲幅排行）
     change = _finite(row.get('change_pct'))
-    change_color = UP if (change or 0) > 0 else DOWN if (change or 0) < 0 else MUTED
+    change_color = UP_TEXT if (change or 0) > 0 else DOWN_TEXT if (change or 0) < 0 else MUTED
     if group_row:
         # 族群列：型態排行顯示中位型態分數，漲幅排行顯示中位漲幅。
         score = _finite(row.get('pattern_score'))
@@ -2435,7 +2437,7 @@ def _other_rows_table(draw, x: float, y: float, width: float, rows: list[dict], 
         draw.text((x + 96, mid), text, font=font(size), fill=INK, anchor='lm')
         change = _finite(row.get('change_pct'))
         change_text = f'{change:+.2f}%' if change is not None else '—'
-        change_color = UP if (change or 0) > 0 else DOWN if (change or 0) < 0 else MUTED
+        change_color = UP_TEXT if (change or 0) > 0 else DOWN_TEXT if (change or 0) < 0 else MUTED
         if group_rows:
             median = _finite(row.get('pattern_score'))
             value = f'{median:.1f}' if median is not None else change_text
@@ -2695,7 +2697,7 @@ def contribution_card(draw, y: float, data: dict, dry: bool) -> int:
     title = f"{data.get('index_name', '')}"
     text_at(draw, (ix + 16, y + 26), title, 26, INK, True)
     if points is not None:
-        color = UP if points > 0 else DOWN if points < 0 else MUTED
+        color = UP_TEXT if points > 0 else DOWN_TEXT if points < 0 else MUTED
         tx = ix + 16 + font(26, True).getlength(title) + 14
         draw.text((tx, y + 44), f'{points:+.2f} 點', font=font(30, True), fill=color, anchor='lm')
 
@@ -3051,8 +3053,8 @@ def _tone_color(text: str, tone: str) -> str:
         return ACCENT
     if tone in ('signed', 'auto'):
         value = str(text).strip()
-        return UP if value.startswith('+') else DOWN if value.startswith('-') and value != '-' else INK
-    return {'up': UP, 'down': DOWN}.get(tone, INK)
+        return UP_TEXT if value.startswith('+') else DOWN_TEXT if value.startswith('-') and value != '-' else INK
+    return {'up': UP_TEXT, 'down': DOWN_TEXT}.get(tone, INK)
 
 
 def _wrap_weekly_note(text: str, size: int, width: float, keep_words=()) -> list[str]:
@@ -3290,7 +3292,8 @@ def _branch_section(draw, x0: float, x1: float, y: float, section: dict, dry: bo
             bold = str(row[0]).startswith('全部')
             cells = []
             for c, cell in enumerate(row):
-                strong = c == 0 or bold or (c < len(columns) and columns[c] in accent)
+                # 10-20：正負數字欄加粗（手機上紅綠細字看不清楚）
+                strong = c == 0 or bold or (c < len(columns) and (columns[c] in accent or columns[c] in signed))
                 room = (edges[0] - x0 if c == 0 else edges[c] - edges[c - 1]) - 26
                 badge = str(row_badges[r]) if c == 0 and r < len(row_badges) else ''
                 if badge:
@@ -3504,7 +3507,8 @@ def branch_card(draw, y: float, data: dict, dry: bool) -> int:
     x0, x1 = MARGIN, WIDTH - MARGIN
     ix0, ix1 = x0 + 36, x1 - 36
     meta_lines=wrap(data.get('compact_meta',''),16,ix1-ix0) if data.get('compact_meta') else []
-    head_h = 96+max(0,len(meta_lines)-1)*23
+    # 10-20：分點動向卡（clean_display）沒有註解列時標題區收緊，不留空白
+    head_h = 96+max(0,len(meta_lines)-1)*23 if meta_lines or not data.get('clean_display') else 76
     body = sum(_branch_section(None, ix0, ix1, 0, s, True) for s in data.get('sections') or [])
     height = int(head_h + body + 24)
     if dry:

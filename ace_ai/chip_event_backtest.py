@@ -421,11 +421,6 @@ def _branch_kind(b,habits):
 
 def _brief_spot_card(payload):
     data=payload['spot'];sections=[]
-    ready=data.get('readiness') or {'resolved_days':data.get('complete_days',0),'requested_days':data.get('requested_days',70)}
-    done=int(ready['resolved_days']);wanted=int(ready['requested_days'])
-    progress=f'近70日 {done}/{wanted}日已確認'+('（補齊中）' if done<wanted else '')
-    history='歷史 '+data.get('history_start','')+'～'+data.get('history_end','')
-    metadata=progress+'  ｜  '+history
     try:
         habits=overnight_habit.habits()[0]
     except Exception:
@@ -460,7 +455,8 @@ def _brief_spot_card(payload):
     if not data.get('branches'):sections.append({'type':'paragraph','text':'目前沒有可顯示的分點動向'})
     sections.extend(_margin_sections(payload))
     return {'branch':f"{payload['stock_code']} {payload['stock_name']}｜分點動向",'label':data.get('period_end',''),
-            'tags':[],'clean_display':True,'compact_meta':metadata,'layout_version':VERSION,'sections':sections}
+            # 10-20：使用者要求拿掉標題下方灰色註解（近70日已確認／歷史區間）
+            'tags':[],'clean_display':True,'layout_version':VERSION,'sections':sections}
 
 
 def branch_card(payload,detailed=False,page=1):
