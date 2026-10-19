@@ -1236,22 +1236,31 @@ def _level_display_name(label: str, panel: dict) -> str:
 
 
 def _chart_levels(panel: dict) -> tuple[list[dict], list[dict]]:
-    """(右側標框的價位, 其他參考價位)：只取既有關鍵價位裡的非均線項目；標框取離收盤最近、且在圖內的最多 2 個。"""
+    """(右側標框的價位, 其他參考價位)：取既有關鍵價位；均線已在上方均線列，原則上不重複列。
+    10-20：壓力、支撐各至少一個——某一邊附近只有均線（例：聯電壓力只有 MA60），就補那一邊最近的均線，
+    往上漲時才知道哪裡是壓力。標框優先壓力、支撐各一個（離收盤最近、在圖內），不足再補最近的。"""
     card = panel.get('scorecard') or panel.get('key_levels')
     if panel.get('compact') or not panel.get('bars') or not _levels_on_chart(card):
         return [], []
+    rows = [r for r in _level_rows(card) if r[0] in ('壓力', '支撐') and _finite(r[2]) is not None]
+    by_gap = lambda r: abs(_finite(r[3])) if _finite(r[3]) is not None else 1e9
     items = []
-    for kind, label, price, pct in _level_rows(card):
-        if kind not in ('壓力', '支撐') or _is_ma_level(label) or _finite(price) is None:
-            continue
-        items.append({'label': label, 'name': _level_display_name(str(label), panel), 'price': float(price),
-                      'pct': _finite(pct), 'kind': kind})
+    for kind in ('壓力', '支撐'):
+        side = [r for r in rows if r[0] == kind]
+        picked = [r for r in side if not _is_ma_level(r[1])] or ([min(side, key=by_gap)] if side else [])
+        for _, label, price, pct in picked:
+            items.append({'label': label, 'name': _level_display_name(str(label), panel), 'price': float(price),
+                          'pct': _finite(pct), 'kind': kind})
     low, high = _price_range(panel['bars'])
     inside = [x for x in items if low <= x['price'] <= high]
-    tagged = sorted(inside, key=lambda x: abs(x['pct']) if x['pct'] is not None else 1e9)[:LEVEL_TAG_MAX]
+    near = sorted(inside, key=lambda x: abs(x['pct']) if x['pct'] is not None else 1e9)
+    tagged = [next(x for x in near if x['kind'] == kind) for kind in ('壓力', '支撐') if any(x['kind'] == kind for x in near)]
+    tagged += [x for x in near if x not in tagged]
+    tagged = tagged[:LEVEL_TAG_MAX]
     used = []
     for item in tagged:
-        color = next((c for word, c in _TAG_COLORS if word in item['label']), ACCENT)
+        color = next((c for word, c in _TAG_COLORS if word in item['label']), None) \
+            or MA_COLORS.get('MA20' if item['label'] == '布林中軌' else item['label'], ACCENT)
         item['color'] = _TAG_SPARE if color in used else color
         used.append(item['color'])
     tagged.sort(key=lambda x: -x['price'])
@@ -1595,6 +1604,7 @@ GRADE_STYLE = {'結構偏強': (GOOD_BG, GOOD_INK), '中性偏多': ('#F1F8F5', 
                '中性偏弱': ('#FEF8F0', WARN_INK), '結構偏弱': (WARN_BG, WARN_INK)}
 LEVEL_STYLE = {'壓力': (UP_BG, UP), '現價': (ACCENT_BG, ACCENT), '成本': (COST_BG, COST_INK), '支撐': (DOWN_BG, DOWN)}
 LEVEL_ROW_H = 38
+SHOW_SCORE_REASONS = False   # 10-20：評分卡不畫「主要得分／主要失分」兩欄（圖太長、和 AI 解讀重複）
 LEVEL_MAX_RESISTANCES, LEVEL_MAX_SUPPORTS, BRANCH_MAX_ROWS, REASON_MAX_ITEMS = 1, 2, 4, 3
 SCORE_ROW_H = 30
 BRANCH_ROW_H = 38
@@ -1937,7 +1947,8 @@ def scorecard(draw, y: float, card: dict, dry: bool) -> int:
         h += box_h + 20
 
     # hide_reasons＝週精選：文章已經在解讀型態，不再重複列主要得分／失分（均線扣抵與關鍵價位保留）
-    if hide_score or card.get('hide_reasons'):
+    # 10-20：使用者要求正式版評分卡一律不畫主要得分／失分（SHOW_SCORE_REASONS）；得分資料照樣給 AI 解讀
+    if hide_score or card.get('hide_reasons') or not SHOW_SCORE_REASONS:
         return _scorecard_tail(draw, y, h, px, width, card, dry)
     half = (width - 40) / 2
     plus = _short_reasons(card.get('plus_reasons'), lost=False)
