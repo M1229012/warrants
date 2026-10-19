@@ -14,7 +14,7 @@ from pathlib import Path
 import statistics
 import threading
 import time
-from typing import Any, Callable, Dict, List, Optional
+from typing import Tuple, Any, Callable, Dict, List, Optional
 
 import warrant_ai_tools as tools
 import local_market_cache
@@ -199,6 +199,7 @@ def rank_groups(mode: str, limit: int = 10) -> Dict[str, Any]:
 # 算失敗的股票：code → 當時最後一根 K 棒日期。同一根 K 棒不再每輪重算（有新 K 棒才再試），
 # 避免資料不足的冷門股每 5 分鐘重跑一次、Log 一直刷。
 _FAILED_AT: Dict[str, str] = {}
+_FAIL_TRIES: Dict[Tuple[str, str], int] = {}   # 10-08：暫時錯誤同一根 K 棒最多試 3 次
 
 
 def score_pending(budget_seconds: float = SCORE_BUDGET, log: Callable[[str], None] = print,
@@ -219,9 +220,19 @@ def score_pending(budget_seconds: float = SCORE_BUDGET, log: Callable[[str], Non
         # 10-06：失敗紀錄存本地 DB；重新部署不再整批重算失敗股（每次重啟都燒 FinMind 額度）
         _FAILED_AT.update({k: v for k, v in (local_market_cache.get_state("pattern_score_failed", {}) or {}).items()
                            if k not in _FAILED_AT})
+        # 10-20：本地完全沒有日K的股票（族群名冊約 350 檔：ETF、興櫃、官方日行情沒有的）不列入待算——
+        # 分數只用本地底庫算，這些永遠算不出來，舊寫法每輪都重試、「尚待」永遠降不到 0。
+        universe = [c for c in universe if last_bars.get(c)]
+        stamps = {c: tools.source_stamp(c) for c in universe}
         todo = [c for c in universe
-                if (not last_bars.get(c) or scored.get(c) != last_bars[c])
-                and not (last_bars.get(c) and _FAILED_AT.get(c) == last_bars[c])]
+                if scored.get(c) != last_bars[c] and _FAILED_AT.get(c) != stamps[c]]
+        # 10-08：日期相同但底庫 OHLCV 被更正（指紋不同）也要重算
+        same_day = [c for c in universe if last_bars.get(c) and scored.get(c) == last_bars[c] and c not in set(todo)]
+        for code, (_, basis) in local_market_cache.latest_pattern_score_basis(same_day).items():
+            fp_old = next((part[3:] for part in basis.split("｜") if part.startswith("fp=")), "")
+            src_old = next((part[4:] for part in basis.split("｜") if part.startswith("src=")), "")
+            if not fp_old or fp_old != local_market_cache.bars_fingerprint(code) or src_old != stamps[code]:
+                todo.append(code)
         before_keys, batch = tools.CACHE.snapshot_keys(), 0
         for code in todo:
             if time.monotonic() - started > budget_seconds:
@@ -233,10 +244,14 @@ def score_pending(budget_seconds: float = SCORE_BUDGET, log: Callable[[str], Non
                 before_keys = tools.CACHE.snapshot_keys()
             try:
                 # 背景優先權：不搶使用者的即時行情額度，也不接盤中報價（分數只用收盤 K 棒）。
-                with tools.api_priority("background"):
+                with tools.api_priority("background"), tools.local_only():   # 10-08：重算分數純底庫
                     tech = tools.get_technical_analysis(code)
                     vp = tools.get_volume_profile(code)
                     extras = weekly_pick._technical_extras(code)
+                    bundle = tools._load_price_bundle(code)
+                    tech = dict(tech, input_fp=bundle.get("input_fp", ""), source_fp=bundle.get("source_fp", ""))
+                if not str(tech.get("signal_status") or "").startswith("收盤確認"):
+                    raise tools.ToolDataError("尚未確認收盤，不寫正式排行")
                 score = weekly_pick.score_pattern(tech, vp, extras, weekly_pick.WeeklyPickConfig())
                 if not math.isfinite(float(score["score"])):
                     raise ValueError("score not finite")
@@ -246,15 +261,19 @@ def score_pending(budget_seconds: float = SCORE_BUDGET, log: Callable[[str], Non
                 local_market_cache.save_pattern_score(
                     code, str(score_date).replace("/", "-"), float(score["score"]),
                     weekly_pick.pattern_grade(score["score"]), score.get("components"),
-                    str(tech.get("signal_status") or ""))
+                    tools.score_basis(tech), rule=weekly_pick.pattern_rule_version())
                 done += 1
                 _FAILED_AT.pop(code, None)
                 if last_bars.get(code) and str(score_date).replace("/", "-") != last_bars[code]:
-                    _FAILED_AT[code] = last_bars[code]   # 算得出但日期對不上最後 K 棒：同一根 K 棒不再每輪重算
-            except Exception:
+                    _FAILED_AT[code] = stamps[code]   # 算得出但日期對不上最後 K 棒：同一根 K 棒不再每輪重算
+            except Exception as exc:
                 failed += 1
                 if last_bars.get(code):
-                    _FAILED_AT[code] = last_bars[code]
+                    # 資料不足／背景額度保留（ToolDataError）：等新 K 棒；網路或服務暫時錯誤：同一根 K 棒再試，最多 3 次
+                    tries = _FAIL_TRIES.get((code, stamps[code]), 0) + 1
+                    _FAIL_TRIES[(code, stamps[code])] = tries
+                    if (isinstance(exc, tools.ToolDataError) and not isinstance(exc, tools.ToolSourceError)) or tries >= 3:
+                        _FAILED_AT[code] = stamps[code]
         pending = max(0, len(todo) - done - failed)
         if done or failed:
             log(f"📈 型態分數底庫：新增 {done} 檔｜失敗 {failed}｜尚待 {pending}｜{time.monotonic()-started:.0f} 秒")
