@@ -2678,7 +2678,7 @@ def _compact_tool_data(name: str, data: Dict[str, Any], has_scorecard: bool) -> 
         for b in spot.get("branches") or []:
             row = {k: b[k] for k in keep if b.get(k) not in (None, "", [], {})}
             if b.get("moneydj"):
-                row["avg_prices"] = b["moneydj"]      # 不帶資料來源名稱，避免 AI 寫進解讀
+                row["avg_prices"] = chip_event_backtest.price_summary(b, spot)   # 和表格同一組期間；不帶資料來源名稱
             if (b.get("overnight") or {}).get("recent_match"):
                 row["overnight_recent"] = True
             rows.append(row)
@@ -8028,22 +8028,37 @@ class AceQueryEngine:
         view = "latest"
         gateway = getattr(self, "gateway", None)
         if gateway is not None:
-            schema = {"type": "object", "properties": {"view": {"type": "string", "enum": ["latest", "rank20", "key"]}},
-                      "required": ["view"]}
+            schema = {"type": "object", "properties": {"view": {"type": "string", "enum": ["latest", "rank20", "key"]},
+                                                       "days": {"type": "integer"}},
+                      "required": ["view", "days"]}
             prompt = ("判斷這個台股現股籌碼問題想看哪一組券商分點，只輸出 JSON。"
                       "latest＝一般問籌碼好不好、今天誰買誰賣、會不會隔日沖；"
                       "rank20＝問近20日或最近一段時間的買超／賣超排名、最近誰買最多；"
-                      "key＝問關鍵分點、主力是誰、誰在主導、誰最賺。問題：" + question)
+                      "key＝問關鍵分點、主力是誰、誰在主導、誰最賺。"
+                      "days：問題有明確問一段時間（近5日、近20天、近一個月、近兩週、這週、近一季）就換算成交易日數"
+                      "（一週＝5、一個月＝20、一季＝60）；沒有特別問時間填 0。問題：" + question)
             try:
                 result = gateway.generate(prompt, purpose="intent", schema=schema, temperature=0.0)
                 if result.ok:
-                    view = str(json.loads(result.text).get("view") or "latest")
+                    parsed_view = json.loads(result.text)
+                    view = str(parsed_view.get("view") or "latest")
+                    try:
+                        self.__dict__.setdefault("_chip_days_cache", {})[question] = max(0, min(250, int(parsed_view.get("days") or 0)))
+                    except (TypeError, ValueError):
+                        pass
             except Exception as exc:
                 self.log(f"籌碼分點視角判斷略過：{type(exc).__name__}: {exc}")
         cache[question] = view if view in ("latest", "rank20", "key") else "latest"
         if len(cache) > 500:
             cache.pop(next(iter(cache)))
         return cache[question]
+
+    def _chip_days(self, question: str) -> int:
+        """10-20：問題特別問的期間（交易日數）；沒問時間＝0（均價顯示最新一天）。和 _chip_view 同一次 AI 判斷。"""
+        if not question:
+            return 0
+        self._chip_view(question)
+        return int(self.__dict__.get("_chip_days_cache", {}).get(question, 0))
 
     def _prepare_event_backtest(self, code: str, name: str = "", report=None, branch_name: str = "", question: str = ""):
         if code in tools.INDEX_CODES:
@@ -8058,6 +8073,7 @@ class AceQueryEngine:
             result = chip_event_backtest.prepare(code, name, report=report,
                 allow_margin=allow_margin, branch_name=branch_name, view=view)
             all_branches=result['spot'].pop('all_branches',result['spot']['branches'])
+            result['spot']['price_days'] = 0 if branch_name else self._chip_days(question)   # 均價欄期間（沒問＝最新一天）
             if re.search(r'隔日[沖衝充]|隔天.{0,4}(?:賣|倒貨|出貨)',question) and not branch_name:
                 # 10-15：不再改成「曾有隔日賣出紀錄」的舊分點；沿用最新一天大買／大賣優先的挑選，隔日沖由徽章與 AI 說明
                 result['spot']['overnight_question']=True

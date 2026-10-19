@@ -24,7 +24,7 @@ REVISION = os.getenv("MONEYDJ_URL_REVISION", "2018_07_31_1").strip()
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
            "Accept": "*/*", "Referer": "https://pscnetsecrwd.moneydj.com/"}
 ENABLED = os.getenv("TEST_MONEYDJ_SPOT_COST", "1").strip().lower() not in ("0", "false", "no")
-HISTORY = max(1, int(os.getenv("TEST_MONEYDJ_SPOT_DAYS", "20")))       # 近 N 筆，算近 20 日買進均價
+HISTORY = max(1, int(os.getenv("TEST_MONEYDJ_SPOT_DAYS", "60")))       # 近 N 筆（10-20：20→60，問近一季也算得出均價；同樣 1 請求）
 RATE_START = float(os.getenv("TEST_MONEYDJ_SPOT_RATE", "1.0"))          # 每秒請求數（Bot 比回測保守）
 RATE_MIN, RATE_MAX = 0.2, max(1.0, float(os.getenv("TEST_MONEYDJ_SPOT_RATE_MAX", "2.0")))
 BACKOFF, RECOVER, RECOVER_AFTER = 0.5, 1.15, 20
@@ -162,7 +162,24 @@ def summarize(rows, date):
     return {"date": date, "days": len(days),
             "buy_avg_day": avg(today[3], today[1]) if today else None,
             "sell_avg_day": avg(today[4], today[2]) if today else None,
-            "buy_avg_period": avg(buy_amt, buy_sh), "period_buy_lots": round(buy_sh / 1000)}
+            "buy_avg_period": avg(buy_amt, buy_sh), "period_buy_lots": round(buy_sh / 1000),
+            # 10-20：逐日（日期, 買股, 賣股, 買金額, 賣金額），依問題期間算均價（period_avg）
+            "daily": [list(x) for x in days]}
+
+
+def period_avg(info, start):
+    """start（含）之後各日加總的買／賣均價：({buy, sell, buy_lots, covered})；covered＝明細涵蓋整段期間。
+    舊快取沒有逐日明細回 None。"""
+    daily = (info or {}).get("daily")
+    if not daily:
+        return None
+    rows = [x for x in daily if str(x[0]) >= str(start)]
+    buy_sh, sell_sh = sum(x[1] for x in rows), sum(x[2] for x in rows)
+    buy_amt, sell_amt = sum(x[3] for x in rows), sum(x[4] for x in rows)
+    avg = lambda amt, sh: round(amt / sh, 2) if sh > 0 else None
+    covered = len(daily) < HISTORY or str(daily[0][0]) <= str(start)
+    return {"buy": avg(buy_amt, buy_sh), "sell": avg(sell_amt, sell_sh), "buy_lots": round(buy_sh / 1000),
+            "covered": covered}
 
 
 def costs(code, date, names):

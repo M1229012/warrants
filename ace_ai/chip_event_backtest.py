@@ -9,6 +9,7 @@ import time
 from statistics import median
 from collections import defaultdict
 
+import moneydj_spot_cost
 import overnight_habit
 import spot_chip
 
@@ -235,6 +236,7 @@ def branch_study(dates,complete_dates,rows,prices,branch_name='',action_dates=()
     return {'available':bool(dates),'period_start':observation[0] if observation else '',
         'period_end':observation[-1] if observation else '', 'history_start':dates[0] if dates else '',
         'history_end':dates[-1] if dates else '', 'complete_days':len(complete.intersection(observation)),
+        'recent_dates':list(observation),   # 10-20：均價依問題期間（近 N 個交易日）找起始日
         'requested_days':len(observation),'history_complete_days':len(complete.intersection(dates)),
         'branches':selected,'all_branches':studied,'compared_branches':len(studied),'view':'branch' if branch_name else view,
         'background':summarize(prices,[],background)['20'],'share_adjusted_window':bool(recent_action),
@@ -354,17 +356,46 @@ def _net_share(net,share):
     return f'{net:+,.0f}（{share:.1f}%）' if share is not None else f'{net:+,.0f}'
 
 
-def _day_prices(b):
+def window_start(data, days):
+    """近 days 個交易日的第一天；交易日不夠就取最早一天。"""
+    dates=data.get('recent_dates') or []
+    return '' if not dates else dates[-days] if len(dates)>=days else dates[0]
+
+
+def price_days(data):
+    """10-20：問題有特別問時間（近5日、近一個月…）＝那段期間（交易日數）；沒問＝0（最新一天）。"""
+    try:
+        return max(0,int(data.get('price_days') or 0))
+    except (TypeError,ValueError):
+        return 0
+
+
+def price_summary(b, data):
+    """表格「買／賣均價」欄的數字：沒問時間＝最新一天；有問＝那段期間加總均價。給 AI 的也是同一組。"""
     m=b.get('moneydj') or {}
-    buy,sell=m.get('buy_avg_day'),m.get('sell_avg_day')
+    days=price_days(data)
+    if days<=1:
+        return {'period':'當日','buy':m.get('buy_avg_day'),'sell':m.get('sell_avg_day')}
+    got=moneydj_spot_cost.period_avg(m,window_start(data,days))
+    if not got:
+        return {'period':f'近{days}日','buy':None,'sell':None}
+    return {'period':f'近{days}日','buy':got['buy'],'sell':got['sell'],'covered':got['covered']}
+
+
+def _day_prices(b, data=None):
+    p=price_summary(b,data or {})
+    buy,sell=p.get('buy'),p.get('sell')
     if buy is None and sell is None:return '—'
     return f"{buy:,.2f}" if sell is None else f"／{sell:,.2f}" if buy is None else f"{buy:,.2f}／{sell:,.2f}"
 
 
-def _cost_gap(b):
-    """現價對成本：有 MoneyDJ 近20日買進均價就用真實均價，否則用買超日收盤加權並標（估）。"""
+def _cost_gap(b, data=None):
+    """現價對成本：有 MoneyDJ 近20日買進均價就用真實均價，否則用買超日收盤加權並標（估）。
+    10-20：明細改抓 60 筆，近 20 日均價改用「近 20 個交易日」逐日加總（不是近 20 筆）。"""
     cost,ret=b.get('estimated_buy_cost'),b.get('estimated_return_pct')
-    real=(b.get('moneydj') or {}).get('buy_avg_period')
+    m=b.get('moneydj') or {}
+    got=moneydj_spot_cost.period_avg(m,window_start(data or {},20)) if (data or {}).get('recent_dates') else None
+    real=got['buy'] if got else m.get('buy_avg_period')
     if real and cost and ret is not None:
         close=cost*(1+ret/100)
         return pct((close/real-1)*100,True)
@@ -402,6 +433,8 @@ def _brief_spot_card(payload):
     view=data.get('view')
     priced=any(b.get('moneydj') for b in data.get('branches',[]))   # 10-15：有 MoneyDJ 均價才多一欄
     basis={'latest':'依最新交易日淨買賣超','rank20':'依近20日淨買賣超'}.get(view,'')
+    days=price_days(data)
+    price_col=('當日' if days<=1 else f'近{days}日')+'買／賣均價'
     # 依 rank_label 分組：買超前3／賣超前3（主力分點、指定分點為一組），讓讀者知道為何列出這些分點
     groups=[]
     for b in data.get('branches',[]):
@@ -411,19 +444,15 @@ def _brief_spot_card(payload):
         if not groups or groups[-1][0]!=name:groups.append((name,[],[]))
         row=[b['branch'],_latest_action(b),_net_share(b['observed_net_5'],b.get('volume_pct_5')),
             _net_share(b['observed_net_20'],b.get('volume_pct_20'))]
-        if priced:row.append(_day_prices(b))
-        row.append(_cost_gap(b))
+        if priced:row.append(_day_prices(b,data))
+        row.append(_cost_gap(b,data))
         groups[-1][1].append(row)
         groups[-1][2].append(_branch_kind(b,habits))
     for name,rows,badges in groups:
-        if view=='key' and name=='賣超前3':
-            # 10-20：主力模式的賣方只放分點＋近 20 日淨賣超（賣方沒有成本意義），表格短、字大
-            sections+=[{'type':'heading','text':'主力賣超｜依近20日淨賣超｜張數'},
-                {'type':'table','columns':['券商分點','近20日（占量）'],'widths':[.5,.5],
-                 'signed':['近20日（占量）'],'accent':[],'rows':[[r[0],r[3]] for r in rows],'row_badges':badges}]
-            continue
-        sections+=[{'type':'heading','text':name+(f'｜{basis}' if basis else '')+'｜張數'},
-            {'type':'table','columns':['券商分點','當日（占量）','近5日（占量）','近20日（占量）']+(['當日買／賣均價'] if priced else [])+['現價對成本'],
+        # 10-20：主力模式的賣方用和買方同一張完整表格（上下欄位對齊）；只差標題
+        heading=('主力賣超｜依近20日淨賣超' if view=='key' and name=='賣超前3' else name+(f'｜{basis}' if basis else ''))
+        sections+=[{'type':'heading','text':heading+'｜張數'},
+            {'type':'table','columns':['券商分點','當日（占量）','近5日（占量）','近20日（占量）']+([price_col] if priced else [])+['現價對成本'],
              'widths':[.22,.16,.16,.16,.16,.14] if priced else [.28,.18,.18,.19,.17],
              'signed':['當日（占量）','近5日（占量）','近20日（占量）','現價對成本'],'accent':[],
              'rows':rows,'row_badges':badges}]
