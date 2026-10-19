@@ -4893,6 +4893,19 @@ def drop_source_mentions(text: str) -> str:
     return "".join(p for p in parts if not (_SOURCE_NAME_RE.search(p) or _SOURCE_INTRO_RE.search(p))).strip()
 
 
+FACT_REPAIR_ENABLE = os.getenv("DISCORD_AI_FACT_REPAIR", "1").strip().lower() in ("1", "true", "yes", "on")
+
+
+def soften_candidate_triangle(text: str) -> str:
+    """10-20：三角只是候選時，AI 常寫成「三角收斂」「三角上緣」「有效突破」整句被刪。
+    改成「三角收斂候選」「三角候選上緣」「越過」再核對一次，通過就保留，不必刪句。"""
+    t = re.sub(r"(三角收斂|上升三角|下降三角|對稱三角)(?!候選)", r"\1候選", str(text or ""))
+    t = re.sub(r"三角(?:收斂)?(?:候選)?(上緣|下緣)", r"三角候選\1", t)
+    t = re.sub(r"(?:有效|正式|確認|已經|已)(?:向上)?突破|突破(?:成功|確認|成立)", "越過", t)
+    t = re.sub(r"(?:有效|正式|確認|已經|已)(?:向下)?跌破", "跌落", t)
+    return t
+
+
 def split_answer_head(text: str, limit: int = 80) -> Tuple[str, str]:
     """10-20：結論只留第一句（≤limit 字）；其餘回傳給呼叫端接到「為什麼」。第一句就超過 limit 時整段保留。"""
     text = str(text or "").strip()
@@ -8457,14 +8470,27 @@ class AceQueryEngine:
         self._set_ai_card(None)
         return card
 
-    def _check_ai_card(self, card: Dict[str, Any], payload: Dict[str, Any], facts: "FactSheet") -> Optional[Dict[str, Any]]:
-        """每個欄位各自做事實核對：刪掉對不上原始資料的句子；結論被刪光或刪太多就整張不用。"""
+    def _check_ai_card(self, card: Dict[str, Any], payload: Dict[str, Any], facts: "FactSheet",
+                       removed_out: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
+        """每個欄位各自做事實核對：刪掉對不上原始資料的句子；結論被刪光或刪太多就整張不用。
+        10-20：候選三角沒寫「候選」先由程式改寫再核對，通過就保留（不刪句）；被刪的句子回傳給 removed_out（AI 修正用）。"""
         before = len(ai_card_text(card))
-        removed_all: List[str] = []
+        removed_all: List[str] = [] if removed_out is None else removed_out
+        softened: List[str] = []
 
         def clean(text: str) -> str:
-            if not text or not facts.check(text):
+            if not text:
                 return text
+            issues = facts.check(text)
+            if not issues:
+                return text
+            if any("候選" in i for i in issues):
+                fixed = soften_candidate_triangle(text)
+                if fixed != text:
+                    softened.append(text[:40])
+                    text = fixed
+                    if not facts.check(text):
+                        return text
             pruned, removed = prune_ungrounded_sentences(text, payload, facts)
             removed_all.extend(removed)
             if pruned and removed:
@@ -8488,6 +8514,8 @@ class AceQueryEngine:
             head = re.split(r"(?<=[。！？])", card["why"], maxsplit=1)[0]
             card["answer"] = head.strip()
             card["why"] = card["why"][len(head):].strip()
+        if softened:
+            self.log(f"事實核對（解讀卡）：候選三角補上「候選」{len(softened)} 處｜{'；'.join(softened[:4])}")
         if removed_all:
             self.log(f"事實核對（解讀卡）：刪除 {len(removed_all)} 句｜{'；'.join(r for r in removed_all[:6])}")
         # 10-16：標題句還在就保留解讀（只刪錯的句子）；只有連標題都補不回來才改用規則式回答
@@ -8495,6 +8523,28 @@ class AceQueryEngine:
             self.log("事實核對未通過（解讀卡），改用規則式回答")
             return None
         return card
+
+    def _repair_ai_card(self, raw_card: Dict[str, Any], removed: List[str], payload: Dict[str, Any],
+                        facts: "FactSheet") -> Tuple[Optional[Dict[str, Any]], List[str]]:
+        """10-20：核對刪太多時，把被刪的句子與原因交給 AI 改寫一次（不是重新回答）；改寫後再核對。"""
+        lines = "\n".join(f"- {r}" for r in removed[:8])
+        prompt = (build_final_prompt(payload) + "\n\n【修正上一次的解讀】你上一次輸出的 JSON：\n"
+                  + json.dumps(raw_card, ensure_ascii=False) + "\n以下句子和資料不符，已被系統刪除（【】內是原因）：\n" + lines
+                  + "\n請只修正這些句子：照原因改寫（候選三角一律寫「候選」，不可寫成型態成立或突破；均線排列照 MA5／MA10／MA20／MA60"
+                    " 實際數值寫，四條沒有依序排好就不要寫多頭／空頭排列；數字只能用資料裡有的），其餘內容盡量保留，重新輸出完整 JSON。")
+        try:
+            result = self.gateway.generate(prompt, purpose="final_repair", schema=AI_CARD_SCHEMA, temperature=0.2)
+        except Exception as exc:
+            self.log(f"AI 修正略過｜{type(exc).__name__}: {exc}")
+            return None, removed
+        card = parse_ai_card(result.text) if result.ok else None
+        if card is None:
+            self.log(f"AI 修正失敗｜{result.error or '格式不符'}")
+            return None, removed
+        again: List[str] = []
+        checked = self._check_ai_card(card, payload, facts, again)
+        self.log(f"AI 修正｜原本刪 {len(removed)} 句 → 修正後刪 {len(again)} 句｜{'採用' if checked is not None and len(again) < len(removed) else '不採用'}")
+        return checked, again
 
     def _attach_late_ai(self, result):
         local=getattr(self,'_request_local',None)
@@ -8623,7 +8673,13 @@ class AceQueryEngine:
             self.log("AI 解讀卡 JSON 無法解析，改用規則式回答")
             return f"（AI 回覆格式異常，這次不附 AI 解讀）\n\n{rule_answer}", False
         if card is not None:
-            card = self._check_ai_card(card, payload, facts)
+            raw_card, removed = dict(card), []
+            card = self._check_ai_card(card, payload, facts, removed)
+            if removed and FACT_REPAIR_ENABLE and (card is None or len(removed) >= 2
+                                                   or (raw_card.get("scenarios") and not card.get("scenarios"))):
+                fixed, fixed_removed = self._repair_ai_card(raw_card, removed, payload, facts)
+                if fixed is not None and len(fixed_removed) < len(removed):
+                    card = fixed
             if card is None:
                 return f"（AI 文字中有內容無法對應到原始資料，這次不附 AI 解讀）\n\n{rule_answer}", False
             for key in ("answer", "why", "summary"):
