@@ -1259,18 +1259,26 @@ def draw_value_tiles(draw, x: float, y: float, width: float, last: dict, show_bo
 MA_LINE_H = 52
 
 
-def draw_ma_line(draw, x: float, y: float, width: float, last: dict) -> None:
-    """10-18：均線單行（小色線＋名稱＋價格），顏色同圖上均線；不重複寫站上／跌破幾 %。"""
+def draw_ma_line(draw, x: float, y: float, width: float, last: dict, show_bollinger: bool = False) -> None:
+    """10-18：均線單行（色線＋同色名稱＋價格），顏色同圖上均線；不重複寫站上／跌破幾 %。
+    10-20：畫布林時同一行最後加「上軌／下軌」（灰色虛線圖例同圖上布林虛線；名稱用短字，6 項一行放得下）。"""
     draw.rounded_rectangle((x, y, x + width, y + MA_LINE_H), radius=12, fill=TILE_BG)
-    cell = width / len(MA_COLORS)
+    items = [(key, key, color, False) for key, color in MA_COLORS.items()]
+    if show_bollinger:
+        items += [('BB_UPPER', '上軌', BAND_COLORS['BB_UPPER'], True), ('BB_LOWER', '下軌', BAND_COLORS['BB_LOWER'], True)]
+    cell = width / len(items)
     mid = y + MA_LINE_H / 2
-    for i, (key, color) in enumerate(MA_COLORS.items()):
+    for i, (key, label, color, dashed) in enumerate(items):
         tx = x + 22 + i * cell
-        # 10-18：色線加粗加長、名稱用同色字，不用放大也對得出是哪條線；價格維持黑色粗體
-        draw.line((tx, mid, tx + 30, mid), fill=color, width=5)
-        draw.text((tx + 40, mid), key, font=font(21, True), fill=color, anchor='lm')
+        # 色線加粗加長、名稱用同色字，不用放大也對得出是哪條線；價格維持黑色粗體
+        if dashed:
+            for s_ in (0, 11, 22):
+                draw.line((tx + s_, mid, tx + s_ + 7, mid), fill=color, width=4)
+        else:
+            draw.line((tx, mid, tx + 30, mid), fill=color, width=5)
+        draw.text((tx + 40, mid), label, font=font(21, True), fill=color, anchor='lm')
         value = _finite(last.get(key))
-        name_w = font(21, True).getlength(key)
+        name_w = font(21, True).getlength(label)
         text, size = fit(number(value) if value is not None else '—', 26, cell - 40 - name_w - 34, True)
         draw.text((tx + 40 + name_w + 12, mid), text, font=font(size, True), fill=INK, anchor='lm')
 
@@ -1540,7 +1548,7 @@ def draw_chart(draw, y: int, panel: dict) -> None:
         draw.rounded_rectangle((chip_x, y + 80, chip_x + chip_w, y + 116), radius=18, fill=UP_BG if change >= 0 else DOWN_BG)
         draw.text((chip_x + chip_w / 2, y + 98), chip, font=font(22, True), fill=color, anchor='mm')
     show_bollinger = not panel.get("hide_bollinger", False)
-    draw_ma_line(draw, x0 + 32, y + 132, CONTENT - 64, last)
+    draw_ma_line(draw, x0 + 32, y + 132, CONTENT - 64, last, show_bollinger)
     # 不畫三角線時（/ask）也不放「橘上緣、藍下緣、虛線」圖說，避免說明找不到線。
     if panel.get('member_triangle') and not panel.get('hide_triangle_lines'):
         import member_pattern
