@@ -7451,25 +7451,12 @@ class AceQueryEngine:
         「台積電、聯發科型態」（第一段只有股名）或「2330和2454型態比較」不拆。"""
         if getattr(parsed, "split_child", False) or getattr(parsed, "needs_preset", None) is not None:
             return None
-        if len(parsed.stocks) < 2 or _COMPARE_RE.search(question) or parsed.sector or parsed.branches:
+        if not 2 <= len(parsed.stocks) <= 4 or _COMPARE_RE.search(question) or self._WHICH_RE.search(question):
             return None
-        clauses = [c.strip() for c in self._CLAUSE_SEP_RE.split(question) if c and c.strip()]
-        if len(clauses) < 2:
+        if parsed.sector or parsed.branches or any(c in tools.INDEX_CODES for c, _ in parsed.stocks):
             return None
-        parts = []
-        for clause in clauses:
-            try:
-                one = self.parser.parse(clause, access=self._access())
-            except Exception:
-                return None
-            if len(one.stocks) != 1:
-                return None
-            code, name = one.stocks[0]
-            rest = clause.replace(code, "").replace(name or code, "")
-            if len(re.sub(r"[^一-鿿]", "", rest)) < 2:
-                return None                       # 這段只有股名（例如「台積電、聯發科型態」）：共用後面的問題，不拆
-            parts.append((clause, one))
-        if len({one.stocks[0][0] for _, one in parts}) != len(parts):
+        parts = self._clause_parts(question) or self._shared_parts(question, parsed)
+        if not parts:
             return None
         self.log("拆成多張圖（依句子）｜" + "｜".join(c for c, _ in parts))
         results = []
@@ -7481,6 +7468,58 @@ class AceQueryEngine:
         return replace(first, followups=list(first.followups) + results[1:],
                        gemini_calls=sum(r.gemini_calls for r in results),
                        elapsed=time.perf_counter() - started, cacheable=all(r.cacheable for r in results))
+
+    _WHICH_RE = re.compile(r"哪[一個檔支家]|誰")      # 「哪檔比較強」「誰比較好」是比較題
+    _JOIN_CHARS = "、，, "
+
+    def _parse_one(self, text: str) -> Optional[ParsedQuestion]:
+        try:
+            one = self.parser.parse(text, access=self._access())
+        except Exception:
+            return None
+        return one if len(one.stocks) == 1 else None
+
+    def _clause_parts(self, question: str) -> List[Tuple[str, ParsedQuestion]]:
+        """各段各問一檔不同的事（「2330最近30天新聞，2344型態」）。"""
+        clauses = [c.strip() for c in self._CLAUSE_SEP_RE.split(question) if c and c.strip()]
+        if len(clauses) < 2:
+            return []
+        parts = []
+        for clause in clauses:
+            one = self._parse_one(clause)
+            if one is None:
+                return []
+            code, name = one.stocks[0]
+            rest = clause.replace(code, "").replace(name or code, "")
+            if len(re.sub(r"[^一-鿿]", "", rest)) < 2:
+                return []                         # 這段只有股名：共用後面的問題，改走 _shared_parts
+            parts.append((clause, one))
+        return parts if len({one.stocks[0][0] for _, one in parts}) == len(parts) else []
+
+    def _shared_parts(self, question: str, parsed: ParsedQuestion) -> List[Tuple[str, ParsedQuestion]]:
+        """同一個問題問好幾檔（「台積電、聯發科型態」）→ 每檔一題（「台積電型態」「聯發科型態」）。
+        拿掉其他股名時，前面的頓號／逗號／和跟與及一起拿掉、後面只拿標點，股名本身含「和」（和碩）不會被切壞。"""
+        parts = []
+        for code, name in parsed.stocks:
+            text = question
+            for other, other_name in parsed.stocks:
+                if other == code:
+                    continue
+                for token in sorted({other, other_name} - {""}, key=len, reverse=True):
+                    text = re.sub("[、，, ]*(?:和|跟|與|及)?[、，, ]*" + re.escape(token) + "[、，, ]*", "", text)
+            text = text.strip("、，, ")
+            candidates = ([text[1:]] if text[:1] in "和跟與及" else []) + [text]
+            one = None
+            for candidate in candidates:
+                one = self._parse_one(candidate)
+                if one is not None and one.stocks[0][0] == code:
+                    text = candidate
+                    break
+                one = None
+            if one is None:
+                return []
+            parts.append((text, one))
+        return parts
 
     def _upgrade_to_pattern_page(self, plan: QueryPlan, parsed: ParsedQuestion) -> None:
         """10-20：預設圖片就是型態圖。一般個股路線（最近有什麼消息、股價…）也排型態頁資料（關鍵價位、三大法人副圖），
