@@ -23,6 +23,7 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tupl
 import pandas as pd
 
 import local_market_cache
+import spot_history
 import warrant_ai_tools as tools
 
 SOURCE_URL = "https://fubon-ebrokerdj.fbs.com.tw/z/zc/zco/zco.djhtm"
@@ -45,8 +46,13 @@ QUICK_FILL_SECONDS = float(os.getenv("DISCORD_AI_SPOT_QUICK_FILL_SECONDS", "4") 
 # 一般現股籌碼題（full／latest）同步階段只確保最近完整日，總時間上限；70 日歷史一律交給背景
 SYNC_BUDGET = float(os.getenv("DISCORD_AI_SPOT_SYNC_BUDGET", "10") or 10)
 # 單頁讀取逾時（秒）：來源很慢時不要一頁等 20 秒
-# 10-06：12 條連線時 6～12% 頁面卡滿 10 秒；正常頁 0.5～2 秒，改 4 秒逾時＋重抓
+# 10-05：12 條連線抓一年時 6～12% 頁面卡滿 10 秒；正常頁 0.5～2 秒，改 4 秒逾時＋立即重抓比較快
 HTTP_READ_TIMEOUT = float(os.getenv("DISCORD_AI_SPOT_HTTP_TIMEOUT", "4") or 4)
+# 第一次查詢同步補一年分點的等待上限（秒）；0＝關閉（只補 70 日、其餘交給背景）
+YEAR_SYNC_BUDGET = float(os.getenv("DISCORD_AI_SPOT_YEAR_SYNC_BUDGET", "60") or 0)
+# 10-20：背景是否把問過的股票補滿一年（1＝補一年；0＝背景只補近 70 日，一年分點等會員查詢時同步補）。
+# 預設 0：一年背景補抓會讓 CPU 長時間空轉（10-19 測試版約 0.38 vCPU 連續數天），有人問才補就夠。
+YEAR_BACKGROUND = os.getenv("DISCORD_AI_SPOT_YEAR_BACKGROUND", "0").strip().lower() in ("1", "true", "yes", "on")
 # 背景補資料排隊上限（排隊中＋執行中的股票數）；滿了這次就不排，下次有人查再試
 MAX_PENDING_BACKFILLS = max(1, int(os.getenv("DISCORD_AI_SPOT_MAX_PENDING_BACKFILLS", "24") or 24))
 # 來源連續失敗幾次就停止本輪，並讓新的抓取暫停 SOURCE_COOLDOWN 秒（已在 DB 的資料照常回答）
@@ -235,11 +241,11 @@ def _acquire_source(deadline: float, background: bool) -> bool:
             _FOREGROUND_WAITING[0] -= 1
 
 
-def _note_source(ok: bool) -> bool:
+def _note_source(ok: bool, limit: int = 0) -> bool:
     """全程式累計富邦連續失敗次數（不同會員、不同請求都算）；達 SOURCE_FAIL_LIMIT 就冷卻，成功就歸零。回傳是否剛觸發冷卻。"""
     with _SOURCE_GUARD:
         _SOURCE_STATE["fails"] = 0 if ok else _SOURCE_STATE.get("fails", 0) + 1
-        tripped = _SOURCE_STATE["fails"] >= SOURCE_FAIL_LIMIT
+        tripped = _SOURCE_STATE["fails"] >= max(SOURCE_FAIL_LIMIT, limit)
         if tripped:
             _SOURCE_STATE["fails"] = 0
     if tripped:
@@ -577,10 +583,21 @@ def _fetch_status(state: str, stock_code: str, date: str, latest_date: str) -> s
     return "source_error"                                             # blocked／錯誤頁／找不到表格
 
 
-def ensure_days(stock_code: str, dates: Sequence[str], budget: float = BACKFILL_BUDGET,
+def ensure_days(stock_code, dates, *args, **kwargs):
+    # Pin active jobs so LRU cannot remove data halfway through a fetch.
+    with spot_history.active(stock_code):
+        if not spot_history.tracked(stock_code):
+            if kwargs.get('background'):
+                return {'fetched':0,'remaining':len(dates),'evicted':1}
+            spot_history.touch(stock_code)
+        return _ensure_days_inner(stock_code, dates, *args, **kwargs)
+
+
+def _ensure_days_inner(stock_code: str, dates: Sequence[str], budget: float = BACKFILL_BUDGET,
                 now: Optional[datetime] = None, fetch_source=open_source, latest_date: str = "",
                 bar_dates: Optional[Sequence[str]] = None, lock_wait: Optional[float] = None,
-                background: bool = False, retry_pending: bool = False) -> Dict[str, int]:
+                background: bool = False, retry_pending: bool = False,
+                max_errors: int = 3, fail_streak: int = SOURCE_FAIL_LIMIT) -> Dict[str, int]:
     """只補還沒確認的日期（新→舊）；每抓完一天立刻寫 SQLite；同股票同時只有一個執行緒在補（拿到鎖後重讀狀態，
     同一 stock＋date 不會重抓），全域同時最多 MAX_CONCURRENCY。latest_date＝目前最新交易日（查不到資料時判 pending_update）。
     回傳的 remaining 是「重新讀 DB 後仍未確認」的天數（嘗試過≠完成）。bar_dates 保留相容，不再用來判斷停牌。
@@ -607,15 +624,18 @@ def ensure_days(stock_code: str, dates: Sequence[str], budget: float = BACKFILL_
             deadline = time.monotonic() + budget
             # 會員這一題用 PARALLEL 條連線並行抓（每條各自的 session）；前景與背景共用動態設定，selenium 模式維持 1 條
             batch_settings = fetch_settings()
-            workers = 1 if FETCHER == "selenium" else min(batch_settings['parallel'], len(missing))
+            workers = 1 if background or FETCHER == "selenium" else min(batch_settings['parallel'], len(missing))
             queue, guard, failure = deque(missing), threading.Lock(), []
             state = {"fetched": 0, "errors": 0, "streak": 0, "busy": 0, "stop": False, "retry_seen": False, "health_errors": 0}
             request_id = str(getattr(tools._API_REQUEST_LOCAL, "request_id", "") or "")
 
             def work() -> None:
                 _FETCH_DEADLINE.at = deadline
+                _FETCH_DEADLINE.background = background
                 try:
                     _work()
+                except HistoryBudgetReached:
+                    with guard: state["stop"] = True
                 except local_market_cache.DBError as exc:
                     with guard:
                         failure.append(exc)
@@ -627,6 +647,7 @@ def ensure_days(stock_code: str, dates: Sequence[str], budget: float = BACKFILL_
                     note_fetch_health(batch_settings, failed=True, code=stock_code)
                     print(f"現股工作連線錯誤｜{stock_code}｜{type(exc).__name__}: {exc}", flush=True)
                 finally:
+                    _FETCH_DEADLINE.background = False
                     _FETCH_DEADLINE.at = 0.0   # 單一連線時在呼叫端執行緒跑，不能把截止時間留給下一題
 
             def _work() -> None:
@@ -671,16 +692,16 @@ def ensure_days(stock_code: str, dates: Sequence[str], budget: float = BACKFILL_
                                         failed = _fetch_one(fetch, stock_code, date, latest_date)
                                     finally:
                                         _SEMAPHORE.release()
-                        tripped = _note_source(not failed)   # 跨請求累計：不同會員各失敗一次也會觸發冷卻
+                        tripped = _note_source(not failed, fail_streak)   # 跨請求累計：不同會員各失敗一次也會觸發冷卻
                         with guard:
                             state["fetched"] += 1
                             state["errors"] += int(failed)
                             state["streak"] = state["streak"] + 1 if failed else 0
-                            if (tripped or state["streak"] >= SOURCE_FAIL_LIMIT) and not state["stop"]:
+                            if (tripped or state["streak"] >= fail_streak) and not state["stop"]:
                                 state["stop"] = True
                                 if not tripped:
                                     _trip_source()   # 來源異常（被擋、連線失敗）時不要一路打完 70 天
-                            elif state["errors"] >= 3:
+                            elif state["errors"] >= max_errors:
                                 state["stop"] = True
                         time.sleep(REQUEST_GAP)
 
@@ -726,7 +747,26 @@ def ensure_days(stock_code: str, dates: Sequence[str], budget: float = BACKFILL_
             lock.release()
 
 
+class HistoryBudgetReached(Exception):pass
+
+_HISTORY_RATE_LOCK=threading.Lock()
+HISTORY_REQUESTS_PER_HOUR=max(1,min(600,int(os.getenv('DISCORD_AI_SPOT_HISTORY_REQUESTS_PER_HOUR','120'))))
+
+def _take_history_budget():
+    if spot_history.usage()['pause']:return False
+    with _HISTORY_RATE_LOCK:
+        hour=int(time.time()//3600)
+        state=local_market_cache.get_state('spot_history_hourly_budget',{}) or {}
+        used=int(state.get('used',0)) if state.get('hour')==hour else 0
+        if used>=HISTORY_REQUESTS_PER_HOUR:return False
+        local_market_cache.set_state('spot_history_hourly_budget',{'hour':hour,'used':used+1})
+        return True
+
+
 def _fetch_one(fetch, stock_code: str, date: str, latest_date: str) -> bool:
+    if getattr(_FETCH_DEADLINE, 'background', False) and not _take_history_budget():
+        _FETCH_DEADLINE.at = 0.0
+        raise HistoryBudgetReached('背景每小時上限或容量保護')
     """抓一天、驗證、寫入（同一個 transaction）；回傳 True＝來源失敗。DBError 往上丟。"""
     started = time.perf_counter()
     try:
@@ -761,8 +801,12 @@ def _background_pool() -> ThreadPoolExecutor:
     global _BACKGROUND_POOL
     with _BACKGROUND_GUARD:
         if _BACKGROUND_POOL is None:
-            _BACKGROUND_POOL = ThreadPoolExecutor(max_workers=BACKGROUND_WORKERS, thread_name_prefix="spot-backfill")
+            _BACKGROUND_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="spot-backfill")
         return _BACKGROUND_POOL
+
+
+_STALL: Dict[str, Tuple[int, int, float]] = {}   # 代號 → (仍缺日數, 連續補不動輪數, 暫停到)
+STALL_ROUNDS, STALL_PAUSE = 3, 6 * 3600
 
 
 def continue_in_background(stock_code: str, dates: Sequence[str], latest_date: str,
@@ -771,6 +815,9 @@ def continue_in_background(stock_code: str, dates: Sequence[str], latest_date: s
     code = str(stock_code)
     if source_cooling():
         return False   # 來源冷卻中：不排背景，下次有人查再試
+    stall = _STALL.get(code)
+    if stall and stall[1] >= STALL_ROUNDS and time.monotonic() < stall[2]:
+        return False   # 10-16：連續多輪補不動（例 3585 每輪仍缺 74 日）：暫停背景重試，避免白耗資料源
     with _BACKGROUND_GUARD:
         if code in _BACKGROUND or len(_BACKGROUND) >= MAX_PENDING_BACKFILLS:
             return False
@@ -782,6 +829,12 @@ def continue_in_background(stock_code: str, dates: Sequence[str], latest_date: s
             result = ensure_days(code, dates, budget=BACKGROUND_BUDGET, fetch_source=fetch_source,
                                  latest_date=latest_date, lock_wait=BACKGROUND_BUDGET, background=True)
             print(f"📚 現股分點背景補資料｜{code}｜嘗試 {result.get('fetched', 0)} 日｜仍未確認 {result.get('remaining', 0)}", flush=True)
+            left = int(result.get('remaining', 0) or 0)
+            prev = _STALL.get(code)
+            rounds = (prev[1] + 1) if prev and left and left >= prev[0] else 0
+            _STALL[code] = (left, rounds, time.monotonic() + STALL_PAUSE)
+            if rounds == STALL_ROUNDS:
+                print(f"⏸️ 現股分點背景補資料暫停｜{code}｜連續 {rounds} 輪仍缺 {left} 日｜{STALL_PAUSE // 3600:.0f} 小時後再試", flush=True)
         except Exception as exc:
             print(f"⚠️ 現股分點背景補資料失敗｜{code}｜{type(exc).__name__}: {exc}", flush=True)
         finally:
@@ -974,7 +1027,12 @@ def build_report(stock_code: str, mode: str = "full", now: Optional[datetime] = 
     mode=latest：只確保最近完整日，不排背景、不掃 70 日。
     calendar＝呼叫端已算好的 candidate_dates() 結果（同一題重用，不重查行事曆）。
     本地資料庫讀取失敗時丟 local_market_cache.DBError（不當成沒資料去整批重抓）。"""
+    spot_history.touch(stock_code)
     now = now or tools.taipei_now()
+    if mode == "full" and fetch_source is open_source:
+        # 第一次查：一年分點同步補齊才出圖（已齊的股票只讀狀態表）；不算進下面 70 日的等待預算。
+        # 測試注入的假來源不走這段，避免單元測試真的去排一年抓取。
+        ensure_year(stock_code, now)
     t0 = time.perf_counter()
     dates, today_state = calendar if calendar is not None else candidate_dates(now)
     if not dates:
@@ -999,12 +1057,6 @@ def build_report(stock_code: str, mode: str = "full", now: Optional[datetime] = 
         state = ((step.get("statuses") or local_market_cache.spot_day_status(stock_code, [date])).get(date) or {}).get("status")
         if state == "complete" or step.get("cooldown"):
             break
-    left = deadline - time.monotonic()
-    if mode == "full" and left > 1 and not progress.get("cooldown") and not progress.get("errors"):
-        step = ensure_days(stock_code, dates, budget=left, now=now, fetch_source=fetch_source,
-                           latest_date=dates[-1], lock_wait=0.5)
-        progress["fetched"] += step.get("fetched", 0)
-        progress["errors"] += step.get("errors", 0)
     left = deadline - time.monotonic()
     if mode == "quick" and not progress.get("cooldown") and not progress.get("errors"):
         # 10-08：70 日窗口只缺少數幾天時，出圖前先同步補（通常 1～2 秒），直接顯示 70/70，不必靠事後換圖
@@ -1057,7 +1109,7 @@ def build_report(stock_code: str, mode: str = "full", now: Optional[datetime] = 
 # ============================================================
 
 TODAY_PREFETCH_ENABLE = os.getenv("DISCORD_AI_SPOT_TODAY_PREFETCH_ENABLE", "1").strip() != "0"
-TODAY_QUEUE_MAX = max(1, int(os.getenv("DISCORD_AI_SPOT_TODAY_QUEUE_MAX", "300") or 300))
+TODAY_QUEUE_MAX = min(spot_history.MAX_STOCKS, max(1, int(os.getenv("DISCORD_AI_SPOT_TODAY_QUEUE_MAX", "200") or 200)))
 TODAY_PREFETCH_BUDGET = float(os.getenv("DISCORD_AI_SPOT_TODAY_PREFETCH_BUDGET", "120") or 120)
 _QUEUE_KEY = "spot_today_queue"
 _QUEUE_GUARD = threading.Lock()
@@ -1081,50 +1133,118 @@ def remember_for_today(stock_code: str, now: Optional[datetime] = None) -> None:
 
 
 _HISTORY_KEY = "spot_history_queue"
-HISTORY_QUEUE_MAX = max(1, int(os.getenv("DISCORD_AI_SPOT_HISTORY_QUEUE_MAX", "500") or 500))
+HISTORY_QUEUE_MAX = min(spot_history.MAX_STOCKS, max(1, int(os.getenv("DISCORD_AI_SPOT_HISTORY_QUEUE_MAX", "200") or 200)))
 
 
 _HISTORY_NEW: List[str] = []
 
 
 def remember_history(stock_code: str) -> None:
-    """會員問過的股票（任何題型）先記在記憶體；背景維護時才寫進 SQLite 待補清單（問答流程不碰資料庫）。"""
+    """會員問过的股票立即更新持久化LRU；待補清單交背景維護，不阻塞下載。"""
     code = str(stock_code or "").strip()
     if code and code[:4].isdigit():
+        spot_history.touch(code)
         with _QUEUE_GUARD:
             if code not in _HISTORY_NEW and len(_HISTORY_NEW) < HISTORY_QUEUE_MAX:
                 _HISTORY_NEW.append(code)
 
 
-def prefetch_history(now: Optional[datetime] = None, fetch_source=open_source, max_submit: int = 4) -> Dict[str, Any]:
-    """背景維護每輪呼叫：清單上還沒補滿 70 日的股票交給背景 worker（同一檔只排一次）；補滿的從清單移除。
-    會員查詢優先（背景 worker 數有限、來源冷卻就停）。"""
-    if source_cooling():
-        return {"skipped": True}
+def year_dates(now: datetime) -> List[str]:
+    """近一年交易日（不含今天，今天要過 TODAY_READY 才算）。"""
+    today = now.strftime('%Y-%m-%d')
+    cutoff = (now - timedelta(days=365)).strftime('%Y-%m-%d')
+    return [d for d in trading_dates(now, 270)
+            if cutoff <= d < today or (d == today and now.strftime('%H:%M') >= TODAY_READY)]
+
+
+def ensure_year(stock_code: str, now: Optional[datetime] = None, budget: float = 0.0,
+                fetch_source=open_source) -> Dict[str, Any]:
+    """會員第一次查某檔：同步把一年分點補齊（PARALLEL 條連線、約 30～60 秒），補完再出圖。
+    會員問完拿不到回測通常不會再問，所以不交給背景慢慢補。已補齊的股票只讀一次狀態表就返回。"""
+    budget = budget or YEAR_SYNC_BUDGET
+    if budget <= 0 or source_cooling():
+        return {}
+    now = now or tools.taipei_now()
+    dates = year_dates(now)
+    if not dates or not _unresolved(stock_code, dates):
+        return {}
+    began = time.monotonic()
+    result = ensure_days(stock_code, dates, budget=budget, now=now, fetch_source=fetch_source,
+                         latest_date=dates[-1], lock_wait=2.0,
+                         max_errors=max(3, len(dates) // 8), fail_streak=max(SOURCE_FAIL_LIMIT, 8))
+    # 回測要一年價格：沿用背景的配套日K（同一檔一段時間只抓一次）
+    if spot_history.price_check_due(stock_code):
+        try:
+            spot_history.mark_price_check(stock_code)
+            with tools.api_priority('background'):
+                frame, market, _ = tools.core().fetch_stock_data_yf(stock_code, period='400d')
+            frame = tools._formal_daily_frame(tools._drop_invalid_bars(stock_code, frame, '分點一年日K'))
+            spot_history.save_prices(stock_code, frame, market, 'FinMind')
+        except Exception as exc:
+            print(f'⚠️ 分點一年日K略過｜{stock_code}｜{type(exc).__name__}: {exc}', flush=True)
+    print(f"📚 一年分點同步補齊｜{stock_code}｜{len(dates)} 日｜抓 {result.get('fetched', 0)}｜"
+          f"錯誤 {result.get('errors', 0)}｜仍未確認 {result.get('remaining', 0)}｜{time.monotonic() - began:.1f} 秒", flush=True)
+    return result
+
+
+def prefetch_history(now=None, fetch_source=open_source, max_submit=1):
+    """One-year target, one background job; source-date probe gates older downloads."""
+    now=now or tools.taipei_now()
+    if source_cooling() or spot_history.usage()['pause']:return {'skipped':True}
     with _QUEUE_GUARD:
-        fresh, _HISTORY_NEW[:] = list(_HISTORY_NEW), []
-        codes = list(local_market_cache.get_state(_HISTORY_KEY, []) or [])
-        codes = (codes + [c for c in fresh if c not in codes])[-HISTORY_QUEUE_MAX:]
-        if fresh:
-            local_market_cache.set_state(_HISTORY_KEY, codes)       # 重啟後接著補
-    if not codes:
-        return {"skipped": True}
-    dates, _ = candidate_dates(now or tools.taipei_now())
-    if not dates:
-        return {"skipped": True}
-    finished, submitted = [], 0
+        fresh,_HISTORY_NEW[:]=list(_HISTORY_NEW),[]
+        tracked=spot_history.codes()[:HISTORY_QUEUE_MAX]
+        queued=list(local_market_cache.get_state(_HISTORY_KEY,[]) or [])
+        codes=[c for c in fresh+queued+tracked if c in tracked]
+        codes=list(dict.fromkeys(codes))[:HISTORY_QUEUE_MAX]
+        local_market_cache.set_state(_HISTORY_KEY,codes)
+    if not codes:return {'skipped':True}
+    dates=trading_dates(now,270)
+    cutoff=(now-timedelta(days=365)).strftime('%Y-%m-%d')
+    dates=[d for d in dates if cutoff<=d<now.strftime('%Y-%m-%d') or (d==now.strftime('%Y-%m-%d') and now.strftime('%H:%M')>=TODAY_READY)]
+    if not dates:return {'skipped':True}
+    submitted=0
     for code in codes:
-        if submitted >= max_submit:
+        if submitted>=min(1,max_submit):break
+        with _BACKGROUND_GUARD:
+            if code in _BACKGROUND:continue
+        # Probe the oldest exact date once a day. Existing complete date proves access.
+        statuses=local_market_cache.spot_day_status(code,dates)
+        if not YEAR_BACKGROUND:
+            # 10-20：背景只補近 70 日（不探測一年、不抓一年日K）；一年分點由 ensure_year 在會員查詢時補
+            if _unresolved(code,dates[-70:],statuses):
+                submitted+=continue_in_background(code,dates[-70:],dates[-1],(),fetch_source)
+            codes=codes[1:]+codes[:1]
             break
-        if not _unresolved(code, dates, local_market_cache.spot_day_status(code, dates)):
-            finished.append(code)
-            continue
-        submitted += continue_in_background(code, dates, dates[-1], (), fetch_source)
-    if finished:
-        with _QUEUE_GUARD:
-            left = [c for c in (local_market_cache.get_state(_HISTORY_KEY, []) or []) if c not in finished]
-            local_market_cache.set_state(_HISTORY_KEY, left)
-    return {"submitted": submitted, "finished": len(finished), "queue": len(codes) - len(finished)}
+        probe=local_market_cache.get_state('spot_year_probe:'+code,{}) or {}
+        proven=(statuses.get(dates[0]) or {}).get('status')=='complete'
+        if not proven and probe.get('day')!=now.strftime('%Y-%m-%d'):
+            result=ensure_days(code,[dates[0]],budget=12,now=now,fetch_source=fetch_source,latest_date=dates[-1],background=True,lock_wait=0)
+            if result.get('busy') or result.get('evicted'):continue
+            status=(local_market_cache.spot_day_status(code,[dates[0]]).get(dates[0]) or {}).get('status')
+            proven=status=='complete'
+            local_market_cache.set_state('spot_year_probe:'+code,{'day':now.strftime('%Y-%m-%d'),'date':dates[0],'available':proven})
+            print(f'📚 一年分點來源探測｜{code}｜{dates[0]}｜{status}｜未證實不大量補舊日',flush=True)
+        elif not proven:proven=bool(probe.get('available'))
+        target=dates if proven else dates[-70:]
+        # Price history: max one stock per maintenance cycle; no blanket market expansion.
+        if proven and spot_history.price_check_due(code):
+            try:
+                with spot_history.active(code):
+                    if not spot_history.tracked(code):continue
+                    spot_history.mark_price_check(code)
+                    with tools.api_priority('background'):
+                        frame,market,_=tools.core().fetch_stock_data_yf(code,period='400d')
+                    frame=tools._formal_daily_frame(tools._drop_invalid_bars(code,frame,'分點一年日K'))
+                    spot_history.save_prices(code,frame,market,'FinMind')
+            except Exception as exc:print(f'⚠️ 分點配套日K略過｜{code}｜{type(exc).__name__}: {exc}',flush=True)
+        if _unresolved(code,target,statuses):
+            submitted+=continue_in_background(code,target,dates[-1],(),fetch_source)
+        # Rotate fairly; completed stocks stay enrolled for new trading days.
+        codes=codes[1:]+codes[:1]
+        break
+    local_market_cache.set_state(_HISTORY_KEY,[c for c in codes if c in spot_history.codes()][:HISTORY_QUEUE_MAX])
+    return {'submitted':submitted,'finished':0,'queue':len(codes)}
 
 
 def prefetch_today(now: Optional[datetime] = None, fetch_source=open_source,

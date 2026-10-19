@@ -2357,6 +2357,9 @@ def _save_daily_cache(code, frame, market="", source="", confirmed=True):
     import sqlite3
     try:
         local_market_cache.save_bars(code, frame, market=market, source=source, confirmed=confirmed)
+        if confirmed:
+            import spot_history
+            spot_history.save_prices(code, frame, market, source)
     except (sqlite3.Error, OSError) as exc:
         print(f"⚠️ {code} 日K快取寫入失敗｜來源={source}｜資料庫={local_market_cache.DB_PATH}｜"
               f"{type(exc).__name__}: {exc}｜保留本次來源資料供後續核實；未保存到磁碟", flush=True)
@@ -2428,7 +2431,7 @@ def _formal_daily_frame(frame: pd.DataFrame) -> pd.DataFrame:
     return closed
 
 
-def _load_price_bundle(stock_code: str) -> Dict[str, Any]:
+def _load_price_bundle(stock_code: str, spot_history_mode: bool = False) -> Dict[str, Any]:
     """日K：FinMind 為主、失敗改富果日K；盤中再接上富果即時報價。指標沿用 calculate_indicators。"""
     kf = core()
     if str(stock_code or "").strip().upper() in INDEX_CODES:
@@ -2494,6 +2497,15 @@ def _load_price_bundle(stock_code: str) -> Dict[str, Any]:
 
     def build() -> Dict[str, Any]:
         daily_df, market, daily_source = daily() if getattr(_LOCAL_ONLY, "on", False) else _cached(f"price_daily_{code}_{source_stamp(code)}", TTL_PRICE_SECONDS, daily)
+        if spot_history_mode:
+            # 10-20（測試版移植）：分點回測要一年價格；問過的股票另存一年日K（spot_history），和近期日K合併
+            import spot_history
+            archived = spot_history.load_prices(code)
+            if archived is not None and not archived.empty:
+                daily_df = pd.concat([archived, daily_df]).sort_index()
+                daily_df = daily_df[~daily_df.index.duplicated(keep='last')]
+                cutoff = pd.Timestamp(taipei_now().date()) - pd.Timedelta(days=365)
+                daily_df = daily_df.loc[daily_df.index >= cutoff]
         daily_df = _formal_daily_frame(daily_df)
         merged, intraday = _append_intraday_bar(code, daily_df, market)
         gaps = _missing_trading_days(merged)

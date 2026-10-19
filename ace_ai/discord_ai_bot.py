@@ -57,6 +57,7 @@ import sector_radar
 import trade_review
 import review_language
 import stock_banter
+import chip_event_backtest
 import member_usage_stats
 
 # 主程式每算一檔股票都會印「📅 週報統計區間」，Bot 一題會印上百行，把真正的訊息洗掉。
@@ -100,6 +101,8 @@ import sector_roster
 import local_market_cache
 import spot_chip
 import overnight_habit
+import moneydj_spot_cost
+import spot_history
 from weekly_pick import is_weekly_pick_question
 
 
@@ -2625,6 +2628,28 @@ def _compact_tool_data(name: str, data: Dict[str, Any], has_scorecard: bool) -> 
         return None  # 成本位置、支撐壓力、量區型態都已整理在評分卡
     # 權證分點只在會員明確問權證時才和評分卡一起出現（「權證籌碼和型態」），要送給 AI，否則 AI 無法回答權證那一半
     data = dict(data)
+    if name == "get_spot_event_backtest":
+        # 10-16：只送表格上那幾家分點的摘要；逐日紀錄、波段事件與統計不送（原本一題 7～13 萬字）
+        spot = data.get("spot") or {}
+        keep = ("branch", "rank_label", "status", "latest_net", "latest_volume_pct", "observed_net_5", "volume_pct_5",
+                "observed_net_20", "volume_pct_20", "buy_days_20", "estimated_buy_cost", "estimated_return_pct")
+        rows = []
+        for b in spot.get("branches") or []:
+            row = {k: b[k] for k in keep if b.get(k) not in (None, "", [], {})}
+            if b.get("moneydj"):
+                row["avg_prices"] = chip_event_backtest.price_summary(b, spot)   # 和表格同一組期間；不帶資料來源名稱
+            if (b.get("overnight") or {}).get("recent_match"):
+                row["overnight_recent"] = True
+            rows.append(row)
+        slim = {"period_end": spot.get("period_end"), "view": spot.get("view"), "branches": rows}
+        for k in ("overnight", "overnight_question"):
+            if spot.get(k):
+                slim[k] = spot[k]
+        out = {k: data[k] for k in ("stock_code", "stock_name") if data.get(k)}
+        out["spot"] = slim
+        if (data.get("margin") or {}).get("events"):
+            out["margin"] = {"events": data["margin"]["events"][-3:]}
+        return out
     if name == "get_technical_analysis":
         data["bollinger"] = {k: v for k, v in (data.get("bollinger") or {}).items() if k in _BOLLINGER_KEEP}
         import kline_patterns
@@ -2696,12 +2721,39 @@ def _compact_tool_data(name: str, data: Dict[str, Any], has_scorecard: bool) -> 
     return _drop_keys(data)
 
 
+def _spot_price_ai_scope(name, data):
+    """Label AI price inputs by stock/branch and period; never change computed values."""
+    if name not in {'get_spot_chip_summary','get_spot_branch_flow','get_spot_event_backtest'} or not isinstance(data,dict):
+        return data
+    scoped=dict(data);references=[]
+    vwap=data.get('vwap') or {}
+    if isinstance(vwap,dict) and vwap.get('vwap') is not None:
+        scoped['vwap']=dict(vwap,scope='整檔股票，非任何券商分點',
+            label='全股成交量加權收盤參考價',definition='每日股票收盤價以全股成交量加權；非實際成交均價、分點成本或持股成本')
+        references.append(dict(scope='stock',label='全股成交量加權收盤參考價',value=vwap['vwap'],days=vwap.get('days')))
+    for row in data.get('continuity') or []:
+        if row.get('est_cost') is not None:
+            references.append(dict(scope='branch',branch=row.get('branch'),label='分點買超日收盤加權參考價',
+                value=row['est_cost'],days=20,definition='觀察到的淨買超日，以淨買超張數加權當日收盤價；非分點實際買價或持股成本'))
+    if data.get('est_cost_20d') is not None:
+        references.append(dict(scope='branch',branch=data.get('branch'),label='分點買超日收盤加權參考價',
+            value=data['est_cost_20d'],days=20))
+    for row in (data.get('spot') or {}).get('branches') or []:
+        if row.get('estimated_buy_cost') is not None:
+            references.append(dict(scope='branch',branch=row.get('branch'),label='分點買超日收盤加權參考價',
+                value=row['estimated_buy_cost'],period='近70交易日；公司行動時以實際可比期間為準',
+                definition='與回測圖卡同一數值；現價相對此價的差距不是實際獲利'))
+    scoped['price_references']=references
+    return scoped
+
+
 def build_final_payload(question: str, results: Sequence[tools.ToolResult]) -> Dict[str, Any]:
     has_scorecard = any(r.ok and r.name == "get_pattern_scorecard" for r in results)
     tool_results: Dict[str, Any] = {}
     for result in results:
         if result.ok:
             data = _compact_tool_data(result.name, result.data, has_scorecard)
+            data = _spot_price_ai_scope(result.name, data)
             if data is None:
                 continue
         else:
@@ -2775,7 +2827,11 @@ FINAL_OVERNIGHT_RULES = ("【隔日沖：給一般投資人看的白話回答】
                          "例如「凱基-城中在漲停價大量鎖單買進約當天成交量 10%」；常做隔日沖又鎖漲停＝明天開盤賣壓風險最高。"
                          "不要把 est_cost、分點買超日收盤加權參考價或觀察估均價說成分點成本或買進均價（那是多日收盤的估算）。"
                          "可以說「常做隔日沖」「通常隔天會賣掉大半」。不可說同一分點就是同一個人，不可保證明天一定賣；"
-                         "資料不足時只說「目前看不出明顯的隔日沖買盤」，不要講原因細節。")
+                         "資料不足時只說「目前看不出明顯的隔日沖買盤」，不要講原因細節。"
+                         "verify_previous_day 有 reversed＝true 時，先說今天的賣壓來源，例如「今天的賣壓主要來自昨天鎖漲停買進的凱基-城中出場，賣出約 1,800 張、"
+                         "占今天成交量約 9%」，賣出量用 next_day_net_lots、比例用 day_volume_lots 計算；只賣掉一部分時補一句還有多少沒出、後面可能還有賣壓。"
+                         "不要用「確認」「證實」「判定」是隔日沖這類字。reversed＝false（昨天的買盤今天沒賣）就完全不提，"
+                         "今天的賣壓改從成交量與主要賣超券商是誰來說明。")
 FINAL_SPOT_RULES = ("【現股分點籌碼】get_spot_chip_summary 是券商分點的買賣超（單位：張），不是三大法人，也不是權證分點。"
                     "先回答原句需求：問哪些分點持續買進，依continuity的買超天數與cumulative_buy_top3指認；當日Top5不等於持續買進。使用者用了比喻就自然接住整句，再說具體證據。只有工具提供技術資料時才整合技術面，不為了固定格式杜撰技術結構；只提供現股資料時用最新 Top5 買賣超、近 5／20 日淨集中度與判讀、"
                     "主要累積買超分點、量價加權均價（vwap 欄位；是日收盤×成交量的估算，不是成交金額算的正式 VWAP，要稱「量價加權均價（估）」）與現價差距說明籌碼是否支持目前結構；兩者矛盾要講清楚。"
@@ -2786,10 +2842,10 @@ FINAL_SPOT_BRANCH_RULES = ("【單一現股分點】get_spot_branch_flow 是某�
                            "來源每日只列前段分點，沒上榜的日子視為 0，是近似值；外資券商分點不等於外資法人。"
                            "圖上已經有每日買賣超柱與累積線，文字要解讀這個分點在做什麼（布局、加碼、調節、出貨或短進短出），不要逐日念數字："
                            "累積線的高低點（cumulative_peak／cumulative_trough）落在哪段時間、和同期股價（price_path、close）是否同步；"
-                           "最近 5／20 日是在延續還是轉向；估算成本 est_cost_20d 與現價的關係；股價相對均線的位置只當背景一句。"
+                           "最近 5／20 日是在延續還是轉向；分點買超日收盤加權參考價與現價的差距（不得稱真實成本）；股價相對均線的位置只當背景一句。"
                            "只引用 1～3 個關鍵數字；資料日期不是今天時要說明資料截至哪天。"
                            "輸出解讀卡時：answer＝一句話判斷這個分點的動向；why 2～3 句；scenarios 給空陣列；"
-                           "summary 一句說接下來要觀察什麼（可用均線或估算成本當觀察價位），不可給買賣指令。")
+                           "summary 一句說接下來要觀察什麼（可用工具提供的均線或技術支撐壓力當觀察價位；不得僅以分點參考價當支撐壓力），不可給買賣指令。")
 
 
 FINAL_WARRANT_HABIT_RULES = ("【分點挑權證的習慣】get_branch_warrant_detail 是某個分點近 N 日買進的權證清單，habits 是買進當下的統計"
@@ -2808,6 +2864,16 @@ FINAL_WARRANT_HABIT_RULES = ("【分點挑權證的習慣】get_branch_warrant_d
 
 FINAL_FUTURES_RULES = ("【台指期未平倉】只陳述口數與前一日變化，並說明未平倉含現貨避險部位、不能單獨當多空訊號；不可用它推論明天漲跌，也不可給買賣建議。"
                        "get_retail_futures＝小台／微台散戶多空比（散戶＝全市場未平倉扣掉三大法人），只陳述比例、散戶多單／空單口數與前一日變化，不可當成反向指標下結論。")
+
+
+FINAL_SPOT_PRICE_RULES = ("【現股價格歸屬，必須遵守】price_references標明每個價格的對象、期間及來源。"
+    "vwap是整檔股票的全股成交量加權收盤參考價，不屬於任何分點；continuity.est_cost與est_cost_20d才是對應分點近20日買超日收盤加權參考價。"
+    "get_spot_event_backtest.spot.branches[].estimated_buy_cost是該分點回測圖卡的近70日可比期間參考價；不能與20日價格互換。"
+    "提到價格時同一句明確寫出全股或分點名稱與期間，不在分點名稱後直接接全股價格造成錯誤歸屬。"
+    "若同一分點同時有20日與70日數值，以這次圖卡對應期間為準；需要比較時分別標明期間。"
+    "不得把以上參考價稱為真實持股成本、實際成交均價、已實現報酬；現價高於參考價只表示價格差距，不證明分點正在獲利。"
+    "參考價本身不能證明支撐、壓力、盤整成本支撐或買盤防守；支撐壓力只能依工具提供的技術價位與結構解讀。"
+    "值缺失時不要拿全股參考價代替分點均價，也不要自行填值。保持原問句的客製化回應及自然接梗，不把這些規則或計算說明逐條寫給使用者。")
 
 
 def build_final_prompt(payload: Dict[str, Any]) -> str:
@@ -2838,10 +2904,14 @@ def build_final_prompt(payload: Dict[str, Any]) -> str:
         sections.append(FINAL_FUTURES_RULES)
     if "get_top_warrant_buy_stocks" in names:
         sections.append(FINAL_RANK_RULES)
+    if names & {"get_spot_chip_summary", "get_spot_branch_flow", "get_spot_event_backtest"}:
+        sections.append(FINAL_SPOT_PRICE_RULES)
     if "get_spot_chip_summary" in names:
         sections.append(FINAL_SPOT_RULES)
-        if _OVERNIGHT_ASK_RE.search(str(payload.get("question") or "")):
-            sections.append(FINAL_OVERNIGHT_RULES)      # 10-15：問隔日沖用白話規則
+    if names & {"get_spot_chip_summary", "get_spot_event_backtest"} and _OVERNIGHT_ASK_RE.search(str(payload.get("question") or "")):
+        sections.append(FINAL_OVERNIGHT_RULES)      # 10-15：問隔日沖，不論走型態＋籌碼或分點動向，都用白話規則
+    if "get_spot_event_backtest" in names:
+        sections.append("現股分點動向（10-15）：解讀中不可寫出任何資料來源名稱（MoneyDJ、富邦、FinMind、證交所等）。分點有 avg_prices 時是實際成交金額算出的均價（buy_avg_day／sell_avg_day＝當日買／賣均價、buy_avg_period＝近20日買進均價），比估成本可靠，可用來說明成交發生在什麼價位（例如是否在漲停價附近買進、隔日以什麼價位賣出），不代表持股成本，也不能推論支撐或賣壓；沒有 avg_prices 的分點不要寫價格。answer 先給一個明確看法（籌碼偏多／偏空／多空拉鋸），再用一句話說主因；why 依序寫：支持這個看法的證據、與看法矛盾的證據、接下來確認或推翻看法的條件（例如賣壓是否集中在少數分點、承接買盤是否延續、轉賣且跌破哪個技術價位代表承接轉弱）；不可推定交易者的持有期限、心理、套牢、停損或防守意願，均價只是期間成交均價，不等於目前剩餘持股成本；最多引用 2～3 個關鍵數字，不逐家列分點張數、比率與均價。表格已列出各分點張數與估成本，解讀要分析買賣結構，例如：近5日與近20日淨買賣超的差異（買賣超是否集中在最近幾天）、是否有隔日沖型買盤、外資與本土券商買賣方向是否相反、買盤集中或分散；不要逐一念各分點的張數與參考價。不要引用任何波段／事件的勝率、平均報酬、筆數或「歷史勝率較高」這類說法；主要看 volume_pct_5＝近5日淨買賣超占成交量、latest_net＝最新一天加碼或調節、retention_pct＝近20日買進量還留著的比例、estimated_return_pct＝現價對估成本（買超日收盤加權，不是實際成本）；成熟波段樣本很少，samples 未達 20 筆時不要引用波段勝率、達標比例或報酬中位數。現股波段統計：使用觀察到的上榜資料，波段累積達規模門檻才成立，次日開盤模擬買進，5/10/20交易日收盤計算。不是實際持股或獲利。主畫面20日，達3%/5%是期末比例，不能把盤中曾達標或漲0.01%算達標。成熟波段少於5笔時使用逐筆紀錄，不拿百分比推論未來。median_return_pct為報酬中位數，median_entry_depth_pct為相對進場價最深跌幅中位數；與worst_drawdown_pct不同，最高漲幅和最深跌幅無先後順序。background為同期間、同進場及排除規則的股價參考，40有效日以下不顯示比例。overnight為本股票本分點的大額買超後隔日反向紀錄：未上榜不是零，不代表同一客戶、真實出場或其他股票也隔日沖；少量配對只陳述事實。estimated_return_pct只是現價相對觀察估均價，非實際損益。沒有margin就省略融資；存在才依實際事件回應，不推論大戶身分。沿用原問句客製回覆與接梗，先回答問題，避免逐行念表；計算方法與例行註解留Log，不在圖片生成免責小字，但資料不足時需用正常文字明確回答。")
     if "get_spot_branch_flow" in names:
         sections.append(FINAL_SPOT_BRANCH_RULES)
     if "get_branch_warrant_detail" in names:
@@ -4395,6 +4465,18 @@ _PREDICTION_RE = re.compile(r"(?:有望|可望|將會?|即將)?(?:開啟|展開|
 _SCENARIO_TITLE_FIX = (("多方續攻", "轉強條件"), ("空方續殺", "轉弱條件"))
 
 
+_SOURCE_NAME_RE = re.compile(r"MoneyDJ|FinMind|eBroker|Goodinfo|CMoney|Fugle|富果", re.IGNORECASE)
+_SOURCE_INTRO_RE = re.compile(r"(?:資料|數據|均價|價格|統計|成本)[^。；]{0,6}(?:來自|取自|來源為|來源是|根據)[^。；]{0,8}(?:富邦|證交所|櫃買中心|交易所|券商網站)")
+
+
+def drop_source_mentions(text: str) -> str:
+    """10-16：解讀不介紹資料來源。含資料源名稱或「資料來自富邦」的句子拿掉；「富邦-台北買超」這類分點名稱照常保留。"""
+    if not text or not (_SOURCE_NAME_RE.search(text) or _SOURCE_INTRO_RE.search(text)):
+        return text
+    parts = re.split(r"(?<=[。！？；])", str(text))
+    return "".join(p for p in parts if not (_SOURCE_NAME_RE.search(p) or _SOURCE_INTRO_RE.search(p))).strip()
+
+
 def drop_warrant_listing(text: str, results) -> str:
     """10-15：分點權證明細表已逐檔列出權證；解讀文字中提到權證代號／名稱或逐檔條列的句子直接拿掉（不重呼叫 Gemini）。"""
     keys = set()
@@ -4729,16 +4811,22 @@ REQUIRED_MODULE_API = {
     "discord_access": ("_CHIP_WORD_RE", "require_sector"),
     "warrant_ai_tools": ("get_market_institutional", "prefetch_sheet_tables", "_reserve_fugle_slot", "check_sheet_version", "err_text",
                          "chart_marks_for_stock"),
-    "answer_image": ("wrap_cell", "public_ma_condition"),
+    "answer_image": ("wrap_cell", "observed_mark_layout", "CHIP_LAYOUT_VERSION", "public_ma_condition"),
+    "chip_event_backtest": ("event_marks", "branch_card", "VERSION"),
+    "moneydj_spot_cost": ("costs", "period_avg"),
     "weekly_pick": ("layout_card", "verify_layout"),
     "market_data": ("RECENT_DAYS",),
     "warrant_store": ("StoreShrunk",),
-    "spot_chip": ("_official_trading_dates", "remember_history", "prefetch_history"),
+    "spot_history": ("VERSION", "active", "maintain", "load_prices"),
+    "spot_chip": ("_official_trading_dates", "remember_history", "prefetch_history", "ensure_year"),
     "kline_patterns": ("detect", "names", "ai_pattern_facts", "user_triangle", "LAST_TRI_INFO"),
     "log_switch": ("enabled", "parse_command", "set_many", "status_text"),
     "sector_analysis": ("live_group_ranking",),
     "market_scan": ("value_liquid_codes", "EXCLUDED_NAMES"),
 }
+
+
+CHIP_VERSION = "chip-events-year-v11"   # 10-20：現股籌碼（回測卡＋圖片排版）同一批版本
 
 
 def module_version_problems() -> List[str]:
@@ -4751,6 +4839,10 @@ def module_version_problems() -> List[str]:
         except Exception as exc:
             problems.append(f"{name}.py 無法載入（{type(exc).__name__}）")
             continue
+        if name in ("chip_event_backtest", "answer_image"):
+            version = getattr(module, "VERSION" if name == "chip_event_backtest" else "CHIP_LAYOUT_VERSION", "未知")
+            if version != CHIP_VERSION:
+                problems.append(f"{name}.py 版本 {version}，需要 {CHIP_VERSION}")
         missing = [a for a in attrs if not hasattr(module, a)]
         if missing:
             problems.append(f"{name}.py 缺少 {'、'.join(missing)}")
@@ -5339,7 +5431,7 @@ class AceQueryEngine:
         # 快取鍵值用「補完股票之後」的問題，避免 A 使用者的「那它的壓力在哪」拿到 B 使用者的答案；籌碼類型分開快取。
         # 族群追問（「那哪檔最強」）要帶族群名稱與模式，不同族群的同一句追問不能共用答案
         sector = parsed.sector or {}
-        key = "|".join(['技術70現股30融資管理員v19扣抵明日價位',compact, ",".join(c for c, _ in parsed.stocks), str(parsed.cost_price or ""), ",".join(parsed.branches),
+        key = "|".join(['技術70現股30融資管理員v19扣抵明日價位_籌碼v11',compact, ",".join(c for c, _ in parsed.stocks), str(parsed.cost_price or ""), ",".join(parsed.branches),
                         "chip=" + parsed.chip,
                         "sector=" + str(sector.get("name") or sector.get("industry") or "") + ":" + str(sector.get("mode") or "")])
         key = self._access_cache_key(key)
@@ -5399,6 +5491,7 @@ class AceQueryEngine:
         # 10-06：這一題用到的現股資料只要還在背景補（籌碼、型態＋籌碼、指定分點…所有問法），補完就整題重算換圖
         # 10-08：出圖時已交給背景（圖上有「補齊中」）的股票，回答完不管背景補完沒都要排換圖；已補完的立即重算
         waits = [f for f in (spot_chip.background_future(c, include_done=True) for c in spot_chip.pending_codes()) if f is not None]
+        waits += self._request_local.__dict__.pop("moneydj_futures", None) or []   # 10-15：分點均價補完也換圖
         fut = None
         if waits and result.spot_refresh is None:
             fut = Future()
@@ -5511,8 +5604,9 @@ class AceQueryEngine:
         if _OVERNIGHT_ASK_RE.search(parsed.original or ""):
             try:
                 payload["overnight"] = overnight_habit.check(code, report)
-            except Exception as exc:   # 判斷不出來：照常解讀，AI 依規則說看不出明顯隔日沖
+            except Exception as exc:   # 慣性表算不出來：照常回答型態＋籌碼，AI 依規則說明無法判斷
                 self.log(f"隔日沖判斷略過：{type(exc).__name__}: {exc}")
+                payload["overnight"] = {"unavailable": True}
         return payload
 
     def _answer_warrant_chip(self, parsed: ParsedQuestion, question: str, started: float) -> AnswerResult:
@@ -5578,7 +5672,7 @@ class AceQueryEngine:
         self._perf_add("spot_prepare", time.perf_counter() - prepare_started)
         complete = [d for d in dates if (statuses.get(d) or {}).get("status") == "complete"]
         # 最新完整交易日變了就換 key，舊答案不會被繼續拿出來；/ace 測試不讀寫正式快取。
-        key = self._access_cache_key(f"spot|{code}|{mode}|{complete[-1] if complete else ''}|{len(complete)}|q={stock_banter.answer_question_key(question)}")
+        key = self._access_cache_key(f"spot_events_v10_price_scope_v1|{code}|{mode}|{complete[-1] if complete else ''}|{len(complete)}|q={stock_banter.answer_question_key(question)}")
         if not simulation:
             hit, cached = self._answer_cache.get(key)
             if hit:
@@ -5594,32 +5688,55 @@ class AceQueryEngine:
             else:
                 card = spot_chip.progress_card(code, name, report)
             return self._spot_alert(self._spot_result(card, title, False, started, f"{code} 現股分點資料建置中"), report, code)
-        card = spot_chip.report_card(report, code, name)
+        card = spot_chip.report_card(dict(report, history=[]), code, name)
         text = (f"{code} {name} 現股分點籌碼｜資料日期 {latest}｜歷史 {report.get('available_days')}/{report.get('requested_days')}｜"
                 f"買超 {', '.join(x['branch'] for x in report.get('latest_top_buy') or [])}｜"
                 f"賣超 {', '.join(x['branch'] for x in report.get('latest_top_sell') or [])}")
         result = self._spot_result(card, title, True, started, text)
         # 使用同一份報表解讀，沒有額外抓價或再次抓 70 日；缺資料卡仍走上方備援。
         payload = dict(spot_chip.summary_payload(report), stock_code=code, stock_name=name,
-                       continuity=report.get("continuity") or [], history=report.get("history") or [])
+                       continuity=report.get("continuity") or [])
+        backtest = self._prepare_event_backtest(code, name, report=report, question=question)
+        extra_panels = []
+        chart_results = self._run_tools([ToolCall("get_chart_panel", {"stock_code": code, "with_marks": False}),
+                                        ToolCall("get_institutional_flow", {"stock_code": code, "days": 70})]) if backtest else []
+        charts = [dict(t.data) for t in chart_results if t.name == 'get_chart_panel' and t.ok]
+        inst = next((t.data for t in chart_results if t.name == 'get_institutional_flow' and t.ok), {})
+        for panel in charts:
+            self._attach_daily_institutional(panel, inst)
+        study_results = [tools.ToolResult("get_spot_chip_summary", True, payload)] + [t for t in chart_results if t.ok]
+        if backtest:
+            study_results.append(tools.ToolResult("get_spot_event_backtest", True, backtest))
+            for panel in charts:
+                self._attach_observed_marks(panel, backtest, question)
+            extra_panels.append({"branch_card": self._event_card(backtest, question), "hide_text": True})
+            margin = chip_event_backtest.margin_card(backtest)
+            if margin:
+                extra_panels.append({"branch_card": margin, "hide_text": True})
         stats = AnswerStats()
         ai_text, llm_ok = self._compose(question, QueryPlan(route="rule_spot_chip", need_final_llm=True),
-                                        [tools.ToolResult("get_spot_chip_summary", True, payload)], stats)
+                                        study_results, stats)
         ai_card = self._take_ai_card()
         result = replace(result, text=ai_text if ai_card else text,
-                         panels=result.panels + ([{"ai_card": ai_card}] if ai_card else []),
+                         panels=(charts + extra_panels if backtest else result.panels) + ([{"ai_card": ai_card}] if ai_card else []),
                          gemini_calls=stats.gemini_calls, elapsed=time.perf_counter() - started,
                          cacheable=llm_ok, input_tokens=stats.input_tokens,
                          output_tokens=stats.output_tokens, total_tokens=stats.total_tokens,
                          token_source=stats.token_source,
                          errors=[] if llm_ok else ["現股分點 AI 解讀失敗"])
+        result = self._attach_late_ai(result)
         self.log(f"現股籌碼解讀｜{code}｜Gemini {stats.gemini_calls} 次｜成功={bool(ai_card)}")
         full = ((mode == "latest" or report.get("available_days", 0) >= report.get("requested_days", spot_chip.REQUESTED_DAYS))
                 and not (report.get("progress") or {}).get("background"))
         fut = None if full or simulation else spot_chip.background_future(code)
+        cost_jobs = [] if simulation else (self._request_local.__dict__.pop("moneydj_futures", None) or [])
+        cost_only = fut is None and bool(cost_jobs)
+        if cost_only:
+            fut = cost_jobs[0]                     # 10-15：只剩 MoneyDJ 分點均價在補：補完一樣整題重算換圖
         if fut is not None:
             # 10-06：資料還在背景補：圖上註明，補完後重算並換掉原訊息的圖（會員不用重問）
-            note = (f"歷史資料補齊中（已確認 {report.get('available_days')}／{report.get('requested_days')} 日），"
+            note = ("分點買賣均價補抓中，完成後自動更新本圖" if cost_only else
+                    f"歷史資料補齊中（已確認 {report.get('available_days')}／{report.get('requested_days')} 日），"
                     "約 1 分鐘內自動更新本圖")
             panels = [dict(p) for p in result.panels]
             for p in panels:
@@ -5630,14 +5747,16 @@ class AceQueryEngine:
             result = replace(result, panels=panels, late_ai=None, spot_refresh=dict(
                 future=fut, expires=time.monotonic() + SPOT_REFRESH_SECONDS,
                 rerun=lambda: self._rerun_spot(parsed, question, access)))
-        if full and not simulation and result.cacheable:
+        if full and not simulation:
+            self._bind_late_cache(result, key)
+        if full and not simulation and result.cacheable and not cost_only:
             # build_report 已讀過整個窗口的狀態，直接用（原本這裡逐日各查一次 DB）
             complete_now = (list(report["complete_all"]) if "complete_all" in report else
                             [d for d, info in local_market_cache.spot_day_status(code, dates).items()
                              if (info or {}).get("status") == "complete"])
             complete_now.sort()
             self._answer_cache.set(self._access_cache_key(
-                f"spot|{code}|{mode}|{complete_now[-1] if complete_now else ''}|{len(complete_now)}|q={stock_banter.answer_question_key(question)}"), result,
+                f"spot_events_v10_price_scope_v1|{code}|{mode}|{complete_now[-1] if complete_now else ''}|{len(complete_now)}|q={stock_banter.answer_question_key(question)}"), result,
                 self.config.answer_cache_seconds)
         return result
 
@@ -5672,7 +5791,7 @@ class AceQueryEngine:
         def cache_key() -> str:
             statuses = local_market_cache.spot_day_status(code, dates)
             complete = [d for d in dates if (statuses.get(d) or {}).get("status") == "complete"]
-            return self._access_cache_key(f"spot_branch|{code}|{spot_chip._branch_key(branch)}|"
+            return self._access_cache_key(f"spot_branch_events_v10_price_scope_v1|{code}|{spot_chip._branch_key(branch)}|"
                                           f"{complete[-1] if complete else ''}|{len(complete)}|q={stock_banter.answer_question_key(question)}")
         if not simulation:
             hit, cached = self._answer_cache.get(cache_key())
@@ -5688,21 +5807,37 @@ class AceQueryEngine:
                 card = spot_chip.progress_card(code, name, report)
             return self._spot_result(card, title, False, started, f"{code} 現股分點資料建置中")
         flow = spot_chip.branch_flow(code, branch, report)
-        if not flow["found"]:
+        backtest = self._prepare_event_backtest(code, name, report=report, branch_name=flow["branch"], question=question)
+        retained = bool(backtest and any(b.get("records") for b in backtest["spot"]["branches"]))
+        if not flow["found"] and not retained:
             card = spot_chip.message_card(f"{code} {name}", f"{branch}｜近 {flow['window_days']} 個交易日沒有上榜",
                                           "來源每日只列買賣超前段分點，這段期間該分點都不在前段。")
             return self._spot_result(card, title, False, started, f"{code} {branch} 現股分點：近期未上榜")
-        chart = self._run_tools([ToolCall("get_chart_panel", {"stock_code": code, "with_marks": False})])[0]
+        chart_results = self._run_tools([ToolCall("get_chart_panel", {"stock_code": code, "with_marks": False}),
+                                        ToolCall("get_institutional_flow", {"stock_code": code, "days": 70})])
+        chart = next(t for t in chart_results if t.name == 'get_chart_panel')
         panel = dict(chart.data) if chart.ok else {"stock_code": code, "error": "K 線資料暫時無法取得；以下保留分點解讀。"}
         panel["marks"] = {}
-        panel["branch_flow"] = spot_chip.branch_flow_panel(flow)
+        self._attach_daily_institutional(panel, next((t.data for t in chart_results if t.name == "get_institutional_flow" and t.ok), {}))
         name = name or panel.get("stock_name", "")
+        panel['branch_flow']={'branch':flow['branch'],'daily':dict(flow.get('daily') or {})}
+        self.log(f"副圖版本 v10｜{code} {flow['branch']}｜分點柱線={len(panel['branch_flow']['daily'])}日｜法人資料={len(panel.get('institutional') or [])}日｜現股K線標記=0")
         payload = spot_chip.branch_flow_payload(flow, code, name, panel.get("bars") or [])
-        results = [tools.ToolResult("get_spot_branch_flow", True, payload)]
+        payload.pop("est_cost_20d", None)
+        results = [tools.ToolResult("get_spot_branch_flow", True, payload)] + [t for t in chart_results if t.ok]
+        if backtest:
+            self._attach_observed_marks(panel, backtest, question, flow['branch'])
+            results.append(tools.ToolResult("get_spot_event_backtest", True, backtest))
         stats = AnswerStats()
         text, llm_ok = self._compose(question, QueryPlan(route="rule_spot_branch", need_final_llm=True), results, stats)
         ai_card = self._take_ai_card()
-        panels = [panel] + ([{"ai_card": ai_card}] if ai_card else [])
+        panels = [panel]
+        if backtest:
+            panels.append({"branch_card": self._event_card(backtest, question), "hide_text": True})
+            margin = chip_event_backtest.margin_card(backtest)
+            if margin:
+                panels.append({"branch_card": margin, "hide_text": True})
+        panels += ([{"ai_card": ai_card}] if ai_card else [])
         elapsed = time.perf_counter() - started
         self.log(f"現股分點明細｜{code} {flow['branch']}｜上榜 {flow['listed_days']}/{flow['window_days']}｜"
                  f"Gemini {stats.gemini_calls} 次｜總耗時 {elapsed:.2f}s")
@@ -7109,7 +7244,8 @@ class AceQueryEngine:
             else:
                 self._fallback_branch_marks(panel, code, results)
             panels.append(panel)
-        if getattr(parsed, "spot_combo", False):
+        pattern_page = plan.route in ("rule_pattern", "rule_top_warrant", "rule_index_compare") or plan.pattern
+        if getattr(parsed, "spot_combo", False) and not pattern_page:
             spot_panel, spot_data = self._spot_combo_section(parsed)
             if spot_data:
                 results.append(tools.ToolResult("get_spot_chip_summary", True, spot_data))
@@ -7191,6 +7327,17 @@ class AceQueryEngine:
                 if card:
                     panel["scorecard"] = card
                     results.append(tools.ToolResult("get_pattern_scorecard", True, card))
+                # 10-20（測試版移植）：型態＋現股籌碼：K 線下接分點動向卡（和現股籌碼頁同一張），取代舊「籌碼重點」
+                if not (getattr(parsed, "spot_combo", False) and panel.get("bars")):
+                    continue
+                data = self._prepare_event_backtest(panel["stock_code"], panel.get("stock_name", ""), question=question)
+                if data:
+                    results.append(tools.ToolResult("get_spot_event_backtest", True, data))
+                    self._attach_observed_marks(panel, data, question)
+                    panels.append({"branch_card": self._event_card(data, question), "hide_text": True})
+                    margin = chip_event_backtest.margin_card(data)
+                    if margin:
+                        panels.append({"branch_card": margin, "hide_text": True})
         self._attach_chart_levels(panels, results, parsed.cost_price)
         contribution = next((r.data for r in results if r.name == "get_index_contribution" and r.ok), None)
         markets = list((contribution or {}).get("markets") or [])
@@ -7363,6 +7510,138 @@ class AceQueryEngine:
                             output_tokens=int(result.get("output_tokens") or 0),
                             total_tokens=int(result.get("total_tokens") or 0),
                             token_source=str(result.get("token_source") or "none"))
+
+    @staticmethod
+    def _attach_daily_institutional(panel, flow):
+        dates = {str(b['date']).replace('/', '-'): b['date'] for b in panel.get('bars') or []}
+        rows = []
+        for row in flow.get('rows') or []:
+            day = str(row.get('date', '')).replace('/', '-')
+            if day not in dates:
+                continue
+            try:
+                if not all(math.isfinite(float(row[k])) for k in ('foreign', 'invest', 'dealer')):
+                    continue
+            except (KeyError, TypeError, ValueError):
+                continue
+            rows.append(dict(row, date=dates[day]))
+        if rows:
+            panel['institutional'] = rows
+            panel['institutional_daily_only'] = True
+            panel['institutional_cumulative_separate'] = True
+
+    @staticmethod
+    def _attach_observed_marks(panel, data, question, branch=''):
+        finance = bool(re.search(r'融資.*(?:點位|明細|進出|買賣)', question))
+        if branch:
+            scoped=next((b for b in data.get('spot',{}).get('branches',[]) if b.get('branch')==branch),None)
+            if scoped:
+                panel['branch_flow']={'branch':branch,'daily':{r['date']:r['net'] for r in scoped.get('records',[])}}
+        # Daily spot trading belongs in the subchart, never in K-line annotation lanes.
+        panel.pop('observed_event_marks', None)
+        data.pop('display_marks', None)
+        marks = chip_event_backtest.event_marks(data, panel.get('bars') or [], '', finance)
+        if marks:
+            panel['observed_event_marks'] = marks
+            data['display_marks'] = marks
+
+    @staticmethod
+    def _event_card(data, question):
+        detailed = bool(re.search(r'明細|詳細|歷史操作|買賣點位|進出點位|第\s*\d+\s*頁|(?:5|10)\s*日回測', question))
+        match = re.search(r'第\s*(\d+)\s*頁', question)
+        card = chip_event_backtest.branch_card(data, detailed=detailed, page=int(match.group(1)) if match else 1)
+        print(f"🧩 分點排版 v10｜{'詳細明細' if detailed else '精簡主畫面'}｜{data.get('stock_code', '')}｜分點 {len(data.get('spot', {}).get('branches', []))} 家", flush=True)
+        return card
+
+    def _attach_moneydj_cost(self, code: str, spot: Dict[str, Any]) -> None:
+        """10-15：MoneyDJ 分點買賣均價。有快取就掛上；沒有就排背景（單執行緒＋限流），本題先出圖，
+        補完後由 spot_refresh 整題重算覆蓋原圖；抓不到就不顯示價格。"""
+        branches = spot.get("branches") or []
+        date = str(spot.get("period_end") or "")
+        if not branches or not date:
+            return
+        try:
+            have, job = moneydj_spot_cost.costs(code, date, [b["branch"] for b in branches])
+        except Exception as exc:
+            self.log(f"MoneyDJ 分點均價略過｜{code}｜{type(exc).__name__}: {exc}")
+            return
+        for b in branches:
+            if have.get(b["branch"]):
+                b["moneydj"] = have[b["branch"]]
+        if job is not None and not job.done():
+            local = getattr(self, "_request_local", None)
+            if local is not None:
+                local.moneydj_futures = list(getattr(local, "moneydj_futures", None) or []) + [job]
+                local.spot_partial = True          # 價格還在補：這題不寫入回答快取
+            self.log(f"MoneyDJ 分點均價背景補抓｜{code}｜{date}｜{sum(1 for b in branches if 'moneydj' not in b)} 家")
+
+    def _chip_view(self, question: str) -> str:
+        """10-15：AI 讀整句判斷現股籌碼要看哪一組分點（不寫死關鍵字）；判斷失敗一律用最新一天。"""
+        cache = self.__dict__.setdefault("_chip_view_cache", {})
+        if question in cache:
+            return cache[question]
+        view = "latest"
+        gateway = getattr(self, "gateway", None)
+        if gateway is not None:
+            schema = {"type": "object", "properties": {"view": {"type": "string", "enum": ["latest", "rank20", "key"]},
+                                                       "days": {"type": "integer"}},
+                      "required": ["view", "days"]}
+            prompt = ("判斷這個台股現股籌碼問題想看哪一組券商分點，只輸出 JSON。"
+                      "latest＝一般問籌碼好不好、今天誰買誰賣、會不會隔日沖；"
+                      "rank20＝問近20日或最近一段時間的買超／賣超排名、最近誰買最多；"
+                      "key＝問關鍵分點、主力是誰、誰在主導、誰最賺。"
+                      "days：問題有明確問一段時間（近5日、近20天、近一個月、近兩週、這週、近一季）就換算成交易日數"
+                      "（一週＝5、一個月＝20、一季＝60）；沒有特別問時間填 0。問題：" + question)
+            try:
+                result = gateway.generate(prompt, purpose="intent", schema=schema, temperature=0.0)
+                if result.ok:
+                    parsed_view = json.loads(result.text)
+                    view = str(parsed_view.get("view") or "latest")
+                    try:
+                        self.__dict__.setdefault("_chip_days_cache", {})[question] = max(0, min(250, int(parsed_view.get("days") or 0)))
+                    except (TypeError, ValueError):
+                        pass
+            except Exception as exc:
+                self.log(f"籌碼分點視角判斷略過：{type(exc).__name__}: {exc}")
+        cache[question] = view if view in ("latest", "rank20", "key") else "latest"
+        if len(cache) > 500:
+            cache.pop(next(iter(cache)))
+        return cache[question]
+
+    def _chip_days(self, question: str) -> int:
+        """10-20：問題特別問的期間（交易日數）；沒問時間＝0（均價顯示最新一天）。和 _chip_view 同一次 AI 判斷。"""
+        if not question:
+            return 0
+        self._chip_view(question)
+        return int(self.__dict__.get("_chip_days_cache", {}).get(question, 0))
+
+    def _prepare_event_backtest(self, code: str, name: str = "", report=None, branch_name: str = "", question: str = ""):
+        if code in tools.INDEX_CODES:
+            return None
+        access = self._access()
+        # 保留現股權限；會員與 /ask 即使是管理員本人使用，也不抓融資。
+        if access is not None and not access.entitlement.spot:
+            return None
+        allow_margin = bool(access and access.admin_mode and not access.simulation)
+        try:
+            view = "latest" if branch_name or not question else self._chip_view(question)
+            result = chip_event_backtest.prepare(code, name, report=report,
+                allow_margin=allow_margin, branch_name=branch_name, view=view)
+            all_branches=result['spot'].pop('all_branches',result['spot']['branches'])
+            result['spot']['price_days'] = 0 if branch_name else self._chip_days(question)   # 均價欄期間（沒問＝最新一天）
+            if re.search(r'隔日[沖衝充]|隔天.{0,4}(?:賣|倒貨|出貨)',question) and not branch_name:
+                # 10-15：不再改成「曾有隔日賣出紀錄」的舊分點；沿用最新一天大買／大賣優先的挑選，隔日沖由徽章與 AI 說明
+                result['spot']['overnight_question']=True
+                try:   # 10-15：全市場常做隔日沖的分點＋今日買超占成交量%，讓 AI 直接點名
+                    result['spot']['overnight']=overnight_habit.check(code, report or {})
+                except Exception as exc:
+                    self.log(f"隔日沖判斷略過：{type(exc).__name__}: {exc}")
+            self._attach_moneydj_cost(code, result['spot'])
+            self.log(f"現股回測｜{code}｜分點 {len(result['spot']['branches'])} 家｜融資事件 {len((result.get('margin') or {}).get('events', []))}")
+            return result
+        except Exception as exc:
+            self.log(f"現股回測略過｜{code}｜{type(exc).__name__}: {exc}")
+            return None
 
     def _attach_chart_levels(self, panels: List[Dict[str, Any]], results: Sequence[tools.ToolResult],
                              cost_price: Optional[float]) -> None:
@@ -7563,9 +7842,15 @@ class AceQueryEngine:
             for key in ("answer", "why", "summary"):
                 card[key] = drop_directives(card.get(key, ""))
                 card[key] = drop_warrant_listing(card[key], results)
-            card["scenarios"] = [dict(x, text=drop_directives(x["text"]), title=drop_directives(fix_scenario_title(x.get("title", ""))))
+                card[key] = drop_source_mentions(card[key])
+            card["scenarios"] = [dict(x, text=drop_source_mentions(drop_directives(x["text"])),
+                                      title=drop_source_mentions(drop_directives(fix_scenario_title(x.get("title", "")))))
                                  for x in card.get("scenarios") or []]
             card["scenarios"] = [x for x in card["scenarios"] if x["text"]]
+            if not card['answer'] and card.get('why'):
+                # 10-16：標題句因來源字樣等被清掉：拿「為什麼」第一句當標題，不讓整張解讀消失
+                head = re.split(r"(?<=[。！？])", card["why"], maxsplit=1)[0]
+                card['answer'], card['why'] = head.strip(), card['why'][len(head):].strip()
             if not card['answer']:
                 return 'AI文字未通過檢查，本次僅提供可核實的圖表與資料。\n\n'+rule_answer, False
             if stock_banter.holding_question(question):
@@ -8365,6 +8650,12 @@ def _market_maintenance_loop(stop: threading.Event) -> None:
             # 會員問過的股票（任何題型）：背景補滿 70 日現股分點，重啟後接著補（清單存 SQLite）
             try:
                 spot_chip.prefetch_history(now=tools.taipei_now())
+                storage=spot_history.usage()
+                day=tools.taipei_now().strftime('%Y-%m-%d')
+                notified=local_market_cache.get_state('spot_history_capacity_alert',{}) or {}
+                if storage['warning'] and notified.get('day')!=day:
+                    notify_admin(f"現股歷史容量提醒｜{storage['bytes']/1e9:.2f}GB / {storage['limit_bytes']/1e9:.2f}GB｜{storage['stocks']}檔｜背景補齊{'暫停' if storage['pause'] else '受限速保護'}")
+                    local_market_cache.set_state('spot_history_capacity_alert',{'day':day})
             except Exception as exc:
                 print(f"⚠️ 現股分點歷史待補略過｜{type(exc).__name__}: {exc}", flush=True)
             if int(market_data.coverage().get("days") or 0) >= 20:
@@ -8666,7 +8957,7 @@ def run_discord_bot(config: BotConfig) -> None:
             # 只上傳部分檔案：新舊版混用，某些功能會在執行時才壞掉（09-27 AI 回答失敗就是這樣）
             notify_admin("❌ 檔案版本不一致，請把 ace_ai 資料夾整批重新上傳：" + "；".join(stale))
         else:
-            print("✅ 必要模組介面檢查通過", flush=True)
+            print(f"✅ 必要模組介面檢查通過｜現股籌碼 {CHIP_VERSION}", flush=True)
 
     async def handle_question(interaction: "discord.Interaction", question: str, admin_mode: bool,
                               attachment=None) -> None:

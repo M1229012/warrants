@@ -18,6 +18,8 @@ LINE = '#E4E7EC'
 ACCENT = '#A17936'
 UP = '#E85D5D'
 DOWN = '#2CB39A'
+# 10-20：文字專用的深紅／深綠（原本綠字 #2CB39A 在白底對比只有約 2.6:1，手機上看不清楚）；圖形仍用 UP／DOWN
+UP_TEXT, DOWN_TEXT = '#D33A3A', '#0B7A60'
 TILE_BG = '#F6F7F9'
 GRID = '#EEF0F3'
 UP_BG, DOWN_BG = '#FDECEC', '#E3F5F1'
@@ -65,6 +67,7 @@ TABLE_HEAD_H = 34
 CENTER_WATERMARK_TEXT = '股市艾斯\n台股DC討論群'
 CENTER_WATERMARK_COLOR = '#1D2B44'
 CENTER_WATERMARK_ALPHA = 0.06
+CHIP_LAYOUT_VERSION = 'chip-events-year-v11'
 CENTER_WATERMARK_FONT_SIZE = 200
 CENTER_WATERMARK_ROTATION = 18
 
@@ -208,9 +211,10 @@ def _log_truncation(text: str) -> None:
 def wrap_cell(text: str, size: int, width: float, bold: bool = False, minimum: int = 18, max_lines: int = 3) -> tuple[list[str], int]:
     """表格／清單欄位用：先縮字（最多縮到 minimum），還放不下就換行（最多 max_lines 行），不截斷。"""
     text = str(text)
-    while size > minimum and font(size, bold).getlength(text) > width:
+    paragraphs = text.splitlines() or ['']
+    while size > minimum and max(font(size, bold).getlength(t) for t in paragraphs) > width:
         size -= 1
-    lines = wrap(text, size, int(max(20, width)), bold) or ['']
+    lines = [line for t in paragraphs for line in (wrap(t, size, int(max(20, width)), bold) or [''])]
     if len(lines) > max_lines:
         _log_truncation(text)
         lines = lines[:max_lines]
@@ -548,10 +552,10 @@ def _draw_mark_table(draw, x: float, y: float, width: float, events: list[dict])
         mid = ry + MARK_ROW_H / 2
         action, action_color = _mark_action(e)
         cells = {
-            '分點': (e.get('branch', ''), 19, INK, True),
-            '買進日': (e.get('buy_date', '')[5:], 19, INK, False),
+            '分點': (e.get('branch', ''), 22, INK, True),          # 10-20：手機閱讀放大
+            '買進日': (e.get('buy_date', '')[5:], 22, INK, False),
             '權證買進金額': (e.get('buy_amount_text', ''), 23, UP, True),   # 10-20：金額放大
-            '後續動作': (action, 18, action_color, action_color != INK),
+            '後續動作': (action, 21, action_color, action_color != INK),
         }
         cx = x
         for label, w in columns:
@@ -586,6 +590,33 @@ def _draw_mark_table(draw, x: float, y: float, width: float, events: list[dict])
         ry += MARK_ROW_H
 
 
+def observed_mark_layout(panel):
+    bars = panel.get('bars') or []
+    dates = {str(b['date']).replace('/', '-'): i for i,b in enumerate(bars)}
+    left, right = MARGIN + 36, WIDTH - MARGIN - 118
+    step = (right-left)/max(1,len(bars))
+    result = []; ends = {'buy': [], 'sell': []}
+    for mark in sorted(panel.get('observed_event_marks') or [], key=lambda m:m['date']):
+        i = dates.get(str(mark['date']).replace('/', '-'))
+        if i is None: continue
+        x = left+(i+.5)*step; side=mark['side']; lane=0
+        while lane<len(ends[side]) and x-ends[side][lane]<38: lane+=1
+        if lane==len(ends[side]): ends[side].append(x)
+        else: ends[side][lane]=x
+        result.append(dict(mark,x=x,lane=lane))
+    return result, (len(ends['sell'])*34+10 if ends['sell'] else 0), (len(ends['buy'])*34+10 if ends['buy'] else 0)
+
+
+def draw_observed_marks(draw,panel,price_top,price_bottom):
+    items,_,_=observed_mark_layout(panel)
+    for m in items:
+        x=m['x']; buying=m['side']=='buy'; color=UP if buying else DOWN
+        cy=price_bottom+25+m['lane']*34 if buying else price_top-25-m['lane']*34
+        draw.ellipse((x-13,cy-13,x+13,cy+13),fill=color)
+        label=str(m['no']);f=font(16,True)
+        draw.text((x-f.getlength(label)/2,cy-10),label,font=f,fill='white')
+
+
 def mark_lanes(panel: dict) -> tuple[int, int]:
     """（上方標籤帶, 下方標籤帶）高度。
 
@@ -608,7 +639,8 @@ def mark_lanes(panel: dict) -> tuple[int, int]:
     trades = [t for t in (panel or {}).get('trades') or [] if t.get('date') in dates]
     top = top or any(t.get('side') == 'sell' for t in trades)
     bottom = bottom or any(t.get('side') == 'buy' for t in trades)
-    return (MARK_LANE if top else 0), (MARK_LANE if bottom else 0)
+    _, observed_top, observed_bottom = observed_mark_layout(panel)
+    return max(MARK_LANE if top else 0, observed_top), max(MARK_LANE if bottom else 0, observed_bottom)
 
 
 def _price_extra(panel: dict) -> int:
@@ -628,7 +660,8 @@ def _inst_height(panel: dict) -> int:
     panel = panel or {}
     if not ((panel.get('institutional') or (panel.get('futures') or {}).get('rows')) and panel.get('bars')):
         return 0
-    return INST_BLOCK_H - (36 if _retail_height(panel) else 0)   # 下面還有散戶副圖：這張不標日期，收掉日期列的高度
+    height = 290 if panel.get('institutional_daily_only') and panel.get('institutional') else INST_BLOCK_H
+    return height - (36 if _retail_height(panel) else 0)   # 下面還有散戶副圖：這張不標日期，收掉日期列的高度
 
 
 def _trade_height(panel: dict) -> int:
@@ -690,28 +723,70 @@ def trade_detail_lines(panel):
     return lines
 
 
+def observed_cumulative(values, carry_missing=False):
+    """Sum only observed values; gaps remain gaps rather than zero-trade days."""
+    running=0.;result=[]
+    for value in values:
+        value=_finite(value)
+        if value is None:result.append(running if carry_missing else None)
+        else:
+            running+=value;result.append(running)
+    return result
+
+
+def _draw_gapped_line(draw, values, px, py, color, width=3):
+    segment=[]
+    for i,value in enumerate(values):
+        if value is None:
+            if len(segment)>1:draw.line(segment,fill=color,width=width)
+            elif segment:
+                x,y=segment[0];draw.ellipse((x-2,y-2,x+2,y+2),fill=color)
+            segment=[]
+        else:segment.append((px(i),py(value)))
+    if len(segment)>1:draw.line(segment,fill=color,width=width)
+    if segment:
+        x,y=segment[-1];draw.ellipse((x-3,y-3,x+3,y+3),fill=color)
+
+
 def draw_institutional(draw, top: float, left: float, right: float, px, step: float, bars: list, rows: list,
                        focus: str = '', unit: str = '張', title: str = '', cumulative: bool = True,
-                       today_label: str = '今日', extra: str = '', dates: bool = True) -> None:
+                       today_label: str = '今日', extra: str = '', dates: bool = True, block_height: int = INST_BLOCK_H, cumulative_keys=()) -> None:
     """法人買賣超（和 K 線同一組日期座標）：每日柱（單一法人＝紅買綠賣；三大法人＝堆疊）＋整段 K 線期間的累積金線。
     右側雙刻度：灰＝每日柱、金＝累積線；下方日期與 K 線對齊。"""
     by_date = {r['date']: r for r in rows}
     series = [c for c in INST_COLORS if c[0] == focus] or list(INST_COLORS)
     single = len(series) == 1
     title = title or (f'{series[0][1]}買賣超' if single else '三大法人買賣超')
-    text_at(draw, (left, top + 6), title, 22, INK, True)
     last = by_date.get(bars[-1]['date']) or (rows[-1] if rows else {})
-    lx = left + font(22, True).getlength(title) + 28
-    for key, label, color in series:
-        value = float(last.get(key) or 0)
-        if single:
-            draw.rectangle((lx, top + 12, lx + 8, top + 28), fill=UP)
-            draw.rectangle((lx + 8, top + 12, lx + 16, top + 28), fill=DOWN)
-        else:
-            draw.rectangle((lx, top + 12, lx + 16, top + 28), fill=color)
-        text = f'{today_label if single else label} {_inst_num(value, unit)}{unit}'
-        draw.text((lx + 22, top + 20), text, font=font(19), fill=INK, anchor='lm')
-        lx += 22 + font(19).getlength(text) + 22
+    curves=[]
+    for key,label,color in series:
+        if key in cumulative_keys:
+            values=observed_cumulative([by_date.get(b['date'],{}).get(key) for b in bars])
+            curves.append((key,label,color,values))
+    if not cumulative:
+        text_at(draw,(left,top+4),title+('｜每日柱＋累積線' if curves else '｜每日'),26,INK,True)
+        draw.text((right,top+8),'資料 '+str(last.get('date','')),font=font(19),fill=MUTED,anchor='rt')
+        third=(right-left)/len(series)
+        for j,(key,label,color) in enumerate(series):
+            lx=left+j*third
+            draw.rectangle((lx,top+47,lx+16,top+63),fill=color)
+            text=label+' '+_inst_num(float(last.get(key) or 0),unit)+unit
+            curve=next((v for k,_,_,v in curves if k==key),None)
+            if curve is not None:
+                observed=next((v for v in reversed(curve) if v is not None),None)
+                text+='／累積 '+(_inst_num(observed,unit)+unit if observed is not None else '未取得')
+            text,size=fit(text,20,third-30,False,16)
+            draw.text((lx+25,top+55),text,font=font(size),fill=INK,anchor='lm')
+        lx=right
+    else:
+        text_at(draw, (left, top + 6), title, 22, INK, True)
+        lx = left + font(22, True).getlength(title) + 28
+        for key,label,color in series:
+            value=float(last.get(key) or 0)
+            draw.rectangle((lx,top+12,lx+16,top+28),fill=(UP if value>=0 else DOWN) if single else color)
+            text=f'{today_label if single else label} {_inst_num(value,unit)}{unit}'
+            draw.text((lx+22,top+20),text,font=font(19),fill=INK,anchor='lm')
+            lx+=22+font(19).getlength(text)+22
     daily = [None if bar['date'] not in by_date else sum(float(by_date[bar['date']].get(k) or 0) for k, *_ in series)
              for bar in bars]
     cums, running = [], 0.0
@@ -728,7 +803,7 @@ def draw_institutional(draw, top: float, left: float, right: float, px, step: fl
         room = right - lx
         text, size = fit(extra, 18, max(80, room), False, 14)
         draw.text((lx, top + 20), text, font=font(size), fill=MUTED, anchor='lm')
-    ctop, cbottom = top + 48, top + INST_BLOCK_H - 52
+    ctop, cbottom = top + (82 if not cumulative else 48), top + block_height - 52
     mid = (ctop + cbottom) / 2
     half_h = (cbottom - ctop) / 2
     ticks = _date_ticks(bars, step)
@@ -765,6 +840,13 @@ def draw_institutional(draw, top: float, left: float, right: float, px, step: fl
     if points:
         ex, ey = points[-1]
         draw.ellipse((ex - 5, ey - 5, ex + 5, ey + 5), fill=ACCENT)
+    if curves:
+        line_peak=max([abs(v) for _,_,_,vs in curves for v in vs if v is not None]+[1.])*1.15
+        for key,_,_,values in curves:
+            color='#2467B2' if key=='foreign' else '#C27511'
+            _draw_gapped_line(draw,values,px,lambda v:mid-v/line_peak*half_h,color,3)
+        for sign,yy in ((1,ctop+48),(-1,cbottom-48)):
+            draw.text((right+10,yy),f'{sign*line_peak/1.15:+,.0f}',font=font(16),fill=ACCENT,anchor='lm')
     edge = half_h / 1.15
     for sign, yy in ((1, mid - edge), (-1, mid + edge)):
         text_at(draw, (right + 10, yy - 22 if cumulative else yy - 12), f'{sign * peak / 1.15:+,.0f}', 16, MUTED)
@@ -865,7 +947,7 @@ def draw_retail_ratio(draw, top: float, left: float, right: float, px, step: flo
         lx = left + font(21, True).getlength(title) + 18
         ratio = float(info.get('ratio_pct') or 0)
         text = f'{ratio:+.2f}%'
-        draw.text((lx, y0 + 17), text, font=font(21, True), fill=UP if ratio > 0 else DOWN if ratio < 0 else INK, anchor='lm')
+        draw.text((lx, y0 + 17), text, font=font(21, True), fill=UP_TEXT if ratio > 0 else DOWN_TEXT if ratio < 0 else INK, anchor='lm')
         lx += font(21, True).getlength(text) + 16
         detail = f"散戶多 {int(info.get('retail_long') or 0):,}／空 {int(info.get('retail_short') or 0):,} 口"
         if n == 0:
@@ -900,70 +982,37 @@ def draw_retail_ratio(draw, top: float, left: float, right: float, px, step: flo
         draw.text((label_x, axis_y + 6), bars[i]['date'][5:], font=font(17), fill=MUTED, anchor='mt')
 
 
-def draw_branch_flow(draw, top: float, left: float, right: float, px, step: float, bars: list, flow: dict) -> None:
-    """單一現股分點：每日買賣超柱＋累積線（分點日期 YYYY-MM-DD，K 棒日期 YYYY/MM/DD）。
-    沒上榜的日子不畫柱；累積線在分點窗口開始前不畫，窗口之後（例如今天分點未更新）沿用最後一個值。"""
-    daily = flow.get('daily') or {}
-    cumulative = flow.get('cumulative') or {}
-    title = f"{flow.get('branch', '')}｜現股分點買賣超"
-    text_at(draw, (left, top + 6), title, 22, INK, True)
-    lx = left + font(22, True).getlength(title) + 28
-    draw.rectangle((lx, top + 12, lx + 8, top + 28), fill=UP)
-    draw.rectangle((lx + 8, top + 12, lx + 16, top + 28), fill=DOWN)
-    text = str(flow.get('latest_label') or '')
-    draw.text((lx + 22, top + 20), text, font=font(19), fill=INK, anchor='lm')
-    lx += 22 + font(19).getlength(text) + 26
-    draw.line((lx, top + 20, lx + 22, top + 20), fill=ACCENT, width=3)
-    draw.text((lx + 30, top + 20), str(flow.get('total_label') or ''), font=font(19, True), fill=INK, anchor='lm')
-    stats, size = fit(flow.get('stats') or '', 18, right - left)
-    text_at(draw, (left, top + 40), stats, size, MUTED)
-
-    ordered = sorted(cumulative)
-    cums, j, value = [], 0, None
-    for bar in bars:
-        iso = bar['date'].replace('/', '-')
-        while j < len(ordered) and ordered[j] <= iso:
-            value = cumulative[ordered[j]]
-            j += 1
-        cums.append(value)
-    values = [daily.get(bar['date'].replace('/', '-')) for bar in bars]
-    ctop, cbottom = top + 84, top + FLOW_BLOCK_H - 68
-    mid = (ctop + cbottom) / 2
-    ticks = _date_ticks(bars, step)
-    for i in ticks:
-        draw.line((px(i), ctop, px(i), cbottom), fill=GRID, width=1)
-    bar_peak = max([abs(v) for v in values if v] + [1.0]) * 1.15
-    cum_peak = max([abs(v) for v in cums if v is not None] + [1.0]) * 1.15
-    half_h = (cbottom - ctop) / 2
-    for i, v in enumerate(values):
-        if not v:
-            continue
-        a, b = sorted((mid, mid - v / bar_peak * half_h))
-        draw.rectangle((px(i) - max(1, step * .32), a, px(i) + max(1, step * .32), max(a + 1, b)), fill=UP if v > 0 else DOWN)
-    for sx in range(int(left), int(right), 12):
-        draw.line((sx, mid, min(sx + 6, right), mid), fill=LINE, width=1)
-    segment = []
-    for i, v in enumerate(cums):
-        if v is None:
-            continue
-        segment.append((px(i), mid - v / cum_peak * half_h))
-    if len(segment) > 1:
-        draw.line(segment, fill=ACCENT, width=3)
-    if segment:
-        ex, ey = segment[-1]
-        draw.ellipse((ex - 5, ey - 5, ex + 5, ey + 5), fill=ACCENT)
-    edge = half_h / 1.15
-    for sign, yy in ((1, mid - edge), (-1, mid + edge)):
-        text_at(draw, (right + 10, yy - 22), f'{sign * bar_peak / 1.15:+,.0f}', 16, MUTED)
-        text_at(draw, (right + 10, yy - 2), f'{sign * cum_peak / 1.15:+,.0f}', 16, ACCENT)
-    text_at(draw, (right + 10, mid - 10), '0', 16, MUTED)
-    axis_y = cbottom + 4
-    draw.line((left, axis_y, right, axis_y), fill=LINE, width=1)
-    for i in ticks:
-        label_x = max(left + 26, min(px(i), right - 26))
-        draw.text((label_x, axis_y + 8), bars[i]['date'][5:], font=font(17), fill=MUTED, anchor='mt')
-    note, size = fit(flow.get('note') or '', 16, right - left)
-    text_at(draw, (left, axis_y + 36), note, size, MUTED)
+def draw_branch_flow(draw, top, left, right, px, step, bars, flow):
+    """Observed daily net bars plus a visible-window cumulative line; never fill missing days."""
+    daily=flow.get('daily') or {}
+    values=[_finite(daily.get(str(b['date']).replace('/','-'))) for b in bars]
+    cums=observed_cumulative(values,carry_missing=True)
+    text_at(draw,(left,top+4),str(flow.get('branch',''))+'｜現股買賣超',26,INK,True)
+    draw.rectangle((left,top+48,left+9,top+64),fill=UP)
+    draw.rectangle((left+9,top+48,left+18,top+64),fill=DOWN)
+    draw.text((left+28,top+56),'每日淨買賣超（張）',font=font(22),fill=INK,anchor='lm')
+    lx=left+(right-left)*.47
+    draw.line((lx,top+56,lx+25,top+56),fill=ACCENT,width=3)
+    last=next((v for v in reversed(cums) if v is not None),None)
+    text='本圖觀察累積 '+(f'{last:+,.0f}張' if last is not None else '尚無資料')
+    draw.text((lx+33,top+56),text,font=font(22),fill=ACCENT,anchor='lm')
+    ctop,cbottom=top+88,top+FLOW_BLOCK_H-42
+    mid=(ctop+cbottom)/2;half=(cbottom-ctop)/2
+    bar_peak=max([abs(v) for v in values if v is not None]+[1.])*1.15
+    cum_peak=max([abs(v) for v in cums if v is not None]+[1.])*1.15
+    for i in _date_ticks(bars,step):draw.line((px(i),ctop,px(i),cbottom),fill=GRID,width=1)
+    for i,v in enumerate(values):
+        if v is None or v==0:continue
+        a,b=sorted((mid,mid-v/bar_peak*half));x=px(i);w=max(1,step*.32)
+        draw.rectangle((x-w,a,x+w,max(a+1,b)),fill=UP if v>0 else DOWN)
+    draw.line((left,mid,right,mid),fill=LINE,width=1)
+    _draw_gapped_line(draw,cums,px,lambda v:mid-v/cum_peak*half,ACCENT)
+    for sign,yy in ((1,ctop+14),(-1,cbottom-14)):
+        draw.text((right+10,yy-10),f'{sign*bar_peak/1.15:+,.0f}',font=font(16),fill=MUTED,anchor='lm')
+        draw.text((right+10,yy+10),f'{sign*cum_peak/1.15:+,.0f}',font=font(16),fill=ACCENT,anchor='lm')
+    draw.text((right+10,mid),'0',font=font(16),fill=MUTED,anchor='lm')
+    for i in _date_ticks(bars,step):
+        draw.text((max(left+26,min(px(i),right-26)),cbottom+12),bars[i]['date'][5:],font=font(17),fill=MUTED,anchor='mt')
 
 
 def draw_trade_legend(draw, top: float, left: float, panel: dict) -> None:
@@ -1171,11 +1220,19 @@ def draw_value_tiles(draw, x: float, y: float, width: float, last: dict) -> None
             pct = (close / value - 1) * 100
             word = ('站上' if pct >= 0 else '跌破') if not dashed else ('高於' if pct >= 0 else '低於')
             text, size = fit(f'{word} {pct:+.1f}%', 17, w - 28)
-            text_at(draw, (tx + 14, y + 70), text, size, UP if pct >= 0 else DOWN)
+            text_at(draw, (tx + 14, y + 70), text, size, UP_TEXT if pct >= 0 else DOWN_TEXT)
         tx += w + gap
 
 
 MA_LINE_H = 52
+
+
+def price_text(value) -> str:
+    """10-20：手機閱讀——千元以上的價格不顯示小數（2,476.00 → 2,476），一行不用擠到縮字。"""
+    v = _finite(value)
+    if v is None:
+        return '—'
+    return f'{v:,.0f}' if abs(v) >= 1000 else number(v)
 
 
 def draw_ma_line(draw, x: float, y: float, width: float, last: dict, show_bollinger: bool = False) -> None:
@@ -1198,7 +1255,7 @@ def draw_ma_line(draw, x: float, y: float, width: float, last: dict, show_bollin
         draw.text((tx + 40, mid), label, font=font(21, True), fill=color, anchor='lm')
         value = _finite(last.get(key))
         name_w = font(21, True).getlength(label)
-        text, size = fit(number(value) if value is not None else '—', 26, cell - 40 - name_w - 34, True)
+        text, size = fit(price_text(value), 26, cell - 40 - name_w - 34, True)
         draw.text((tx + 40 + name_w + 12, mid), text, font=font(size, True), fill=INK, anchor='lm')
 
 
@@ -1207,7 +1264,7 @@ LEVELS_ON_CHART = True
 LEVEL_TAG_MAX = 2
 LEVEL_TAG_H = 32
 LEVEL_TAG_FONT = 20
-_TAG_COLORS = (('三角上緣', '#C76C00'), ('三角下緣', '#1478B5'), ('量區', '#1A9E8A'), ('布林', '#667085'))
+_TAG_COLORS = (('三角上緣', '#C76C00'), ('三角下緣', '#1478B5'), ('量區', '#0B7F6B'), ('布林', '#667085'))
 _TAG_SPARE = '#7A5AF8'
 
 
@@ -1279,12 +1336,12 @@ LEGEND_ROW_H = 56                  # 10-18 方案 1：價位條高度（和上�
 LEGEND_ITEM_GAP = 34
 LEGEND_BLOCK_W = 92                # 左側「支撐／壓力」實心標籤塊
 LEGEND_W = CONTENT - 64            # 和上方均線列同寬
-_LEGEND_KIND_INK = {'壓力': UP, '支撐': DOWN}
+_LEGEND_KIND_INK = {'壓力': UP_TEXT, '支撐': DOWN_TEXT}
 _LEGEND_KIND_TINT = {'壓力': '#FDF1F1', '支撐': '#EEF8F5'}
 
 
 def _legend_item_w(item: dict) -> float:
-    return ((22 if item['marked'] else 0) + font(26, True).getlength(number(item['price'])) + 8
+    return ((22 if item['marked'] else 0) + font(26, True).getlength(price_text(item['price'])) + 8
             + font(21).getlength(item['name']))
 
 
@@ -1356,7 +1413,7 @@ def draw_level_legend(draw, x: float, y: float, width: float, panel: dict) -> No
             if value['marked']:
                 draw.ellipse((cx, mid - 7, cx + 14, mid + 7), fill=value['color'])
                 cx += 22
-            price = number(value['price'])
+            price = price_text(value['price'])
             draw.text((cx, mid), price, font=font(26, True), fill=INK, anchor='lm')
             cx += font(26, True).getlength(price) + 8
             draw.text((cx, mid), value['name'], font=font(21), fill=INK, anchor='lm')
@@ -1387,7 +1444,7 @@ def draw_level_tags(draw, tagged: list[dict], py, right: float, price_top: float
         color = item['color']
         draw.line((right + 2, true_y, right + 9, true_y), fill=color, width=2)
         draw.line((right + 9, true_y, right + 14, label_y), fill=color, width=1)
-        text = number(item['price'])
+        text = price_text(item['price'])
         # 欄寬 118px：指數（47,058.30）這種 9 碼以上的長數字用 17 級字，數字不截斷、框不超出卡片
         text_font = font(LEVEL_TAG_FONT if len(text) <= 8 else LEVEL_TAG_FONT - 3, True)
         w = text_font.getlength(text) + 12
@@ -1425,7 +1482,7 @@ def draw_chart(draw, y: int, panel: dict) -> None:
         draw.text((x1 - 32, y + 70), f"資料至 {last['date']} {intraday.get('time', '')}", font=font(18), fill=MUTED, anchor='rt')
     else:
         draw.text((x1 - 32, y + 34), f"資料至 {last['date']}", font=font(22), fill=MUTED, anchor='rt')
-    color = UP if (change or 0) >= 0 else DOWN
+    color = UP_TEXT if (change or 0) >= 0 else DOWN_TEXT
     price_label = '成交' if live else '收盤'
     draw.text((x0 + 32, y + 112), price_label, font=font(22), fill=MUTED, anchor='ls')
     price_x = x0 + 32 + font(22).getlength(price_label) + 12
@@ -1446,12 +1503,9 @@ def draw_chart(draw, y: int, panel: dict) -> None:
     bottom = top + CHART_PRICE_BASE + extra
     # 有標註時價格只畫在中間，上方標籤帶放 ▼／綠圈、下方標籤帶放 ▲／紅圈（沒有就不留白）。
     price_top, price_bottom = top + lane_top, bottom - lane_bottom
-    lows = [b['Low'] for b in bars]
-    highs = [b['High'] for b in bars]
     # 與週報主程式 adjust_candle_price_ylim 一致：Y 軸只看 K 棒高低，下留 11%、上留 5%；均線／布林超出價格區就裁掉
-    low, high = min(lows), max(highs)
-    span = max(high - low, abs(high) * .005, .01)
-    low, high = low - span * .11, high + span * .05
+    low, high = _price_range(bars)
+    draw_observed_marks(draw, panel, price_top, price_bottom)
     py = lambda value: price_bottom - (value - low) / (high - low) * (price_bottom - price_top)
     step = (right - left) / len(bars)
     px = lambda i: left + (i + .5) * step
@@ -1469,7 +1523,7 @@ def draw_chart(draw, y: int, panel: dict) -> None:
         draw.line((left, gy, right, gy), fill=LINE, width=1)
         # 價格刻度在右側；和關鍵價位框太近的那格刻度數字不畫，避免文字重疊
         if all(abs(gy - ty) > LEVEL_TAG_H for ty in tag_label_ys):
-            tick = number(value)
+            tick = price_text(value)
             tick_size = 23 if len(tick) <= 8 else 20       # 指數的長數字維持 20 級，不超出卡片
             text_at(draw, (right + 14, gy - tick_size // 2), tick, tick_size, MUTED)
     if not panel.get('compact'):
@@ -1521,7 +1575,7 @@ def draw_chart(draw, y: int, panel: dict) -> None:
         new_month = month != previous_month
         previous_month = month
         label_x = max(left + 26, min(x, right - 26))
-        draw.text((label_x, axis_y + 9), bars[i]['date'][5:], font=font(18, new_month),
+        draw.text((label_x, axis_y + 9), bars[i]['date'][5:], font=font(21, new_month),   # 10-20：18 → 21
                   fill=INK if new_month else MUTED, anchor='mt')
 
     # 10-20：關鍵價位條（壓力／支撐）放在日期軸下方、成交量上方，和上方均線列同寬
@@ -1539,19 +1593,19 @@ def draw_chart(draw, y: int, panel: dict) -> None:
         text_at(draw, (left, bottom + 66), state, state_size, INK)
     bottom += _caption_h(panel)
     label_y = bottom + 58
-    draw.text((left, label_y), '成交量', font=font(20), fill=MUTED, anchor='lm')
-    lx = left + font(20).getlength('成交量') + 18
+    draw.text((left, label_y), '成交量', font=font(22), fill=MUTED, anchor='lm')
+    lx = left + font(22).getlength('成交量') + 18
     today_volume = _finite(last.get('Volume'))
     if today_volume is not None:
         text = f'今日 {today_volume / 1000:,.0f} 張'
-        draw.text((lx, label_y), text, font=font(19, True), fill=INK, anchor='lm')
-        lx += font(19, True).getlength(text) + 24
+        draw.text((lx, label_y), text, font=font(22, True), fill=INK, anchor='lm')
+        lx += font(22, True).getlength(text) + 24
     for key, mv_color in MV_COLORS.items():
         value = _finite(last.get(key))
         draw.line((lx, label_y, lx + 20, label_y), fill=mv_color, width=3)
         text = f"{key} {value / 1000:,.0f} 張" if value is not None else f'{key} —'
-        draw.text((lx + 28, label_y), text, font=font(19), fill=INK, anchor='lm')
-        lx += 28 + font(19).getlength(text) + 24
+        draw.text((lx + 28, label_y), text, font=font(21), fill=INK, anchor='lm')
+        lx += 28 + font(21).getlength(text) + 24
     vtop, vbottom = bottom + 84, bottom + CHART_VOLUME_BLOCK
     for i in ticks:
         draw.line((px(i), vtop, px(i), vbottom), fill=GRID, width=1)
@@ -1578,8 +1632,11 @@ def draw_chart(draw, y: int, panel: dict) -> None:
     if panel.get('institutional'):
         draw_institutional(draw, vbottom + 14, left, right, px, step, bars, panel['institutional'],
                            panel.get('institutional_focus', ''), panel.get('institutional_unit', '張'),
+                           cumulative=not panel.get('institutional_daily_only'),   # 10-20：現股籌碼頁只畫每日
                            today_label=panel.get('institutional_day', '今日'),
-                           extra=panel.get('institutional_extra', ''), dates=last_sub)
+                           extra=panel.get('institutional_extra', ''), dates=last_sub,
+                           block_height=290 if panel.get('institutional_daily_only') else INST_BLOCK_H,
+                           cumulative_keys=())
     elif inst_h:
         draw_futures(draw, vbottom + 14, left, right, px, step, bars, dict(futures, _dates=last_sub))
     retail_h = _retail_height(panel)
@@ -1602,7 +1659,7 @@ def draw_chart(draw, y: int, panel: dict) -> None:
 
 GRADE_STYLE = {'結構偏強': (GOOD_BG, GOOD_INK), '中性偏多': ('#F1F8F5', GOOD_INK), '結構中性': (TILE_BG, '#344054'),
                '中性偏弱': ('#FEF8F0', WARN_INK), '結構偏弱': (WARN_BG, WARN_INK)}
-LEVEL_STYLE = {'壓力': (UP_BG, UP), '現價': (ACCENT_BG, ACCENT), '成本': (COST_BG, COST_INK), '支撐': (DOWN_BG, DOWN)}
+LEVEL_STYLE = {'壓力': (UP_BG, UP_TEXT), '現價': (ACCENT_BG, ACCENT), '成本': (COST_BG, COST_INK), '支撐': (DOWN_BG, DOWN_TEXT)}
 LEVEL_ROW_H = 38
 SHOW_SCORE_REASONS = False   # 10-20：評分卡不畫「主要得分／主要失分」兩欄（圖太長、和 AI 解讀重複）
 LEVEL_MAX_RESISTANCES, LEVEL_MAX_SUPPORTS, BRANCH_MAX_ROWS, REASON_MAX_ITEMS = 1, 2, 4, 3
@@ -1693,10 +1750,10 @@ def _deduction_outlook(info: dict) -> tuple[str, str]:
     if info.get('turn_text') or info.get('limit_proof'):
         risk = info.get('change_dir') == '下彎' or (info.get('direction_now') == '上揚' and info.get('change_dir') == '走平')
         if risk:
-            return public_ma_condition(info), DOWN
+            return public_ma_condition(info), DOWN_TEXT
         if info.get('change_dir') == '上揚':
-            return public_ma_condition(info), UP
-        return public_ma_condition(info), {'下彎': DOWN, '走平': MUTED}.get(info.get('direction_now'), UP)
+            return public_ma_condition(info), UP_TEXT
+        return public_ma_condition(info), {'下彎': DOWN_TEXT, '走平': MUTED}.get(info.get('direction_now'), UP_TEXT)
     return {'上揚': ('續揚', INK), '下彎': ('續彎', INK)}.get(info.get('direction_now'), ('走平', MUTED))
 
 
@@ -1754,7 +1811,7 @@ def _draw_level_table(draw, x, y, width, rows, card) -> None:
         draw.text((x + 470, mid), number(price), font=font(22, True), fill=INK, anchor='rm')
         if kind != '現價' and pct is not None:
             pct = float(pct)
-            draw.text((x + 590, mid), f'{pct:+.2f}%', font=font(20), fill=UP if pct > 0 else DOWN if pct < 0 else MUTED, anchor='rm')
+            draw.text((x + 590, mid), f'{pct:+.2f}%', font=font(20), fill=UP_TEXT if pct > 0 else DOWN_TEXT if pct < 0 else MUTED, anchor='rm')
         if kind != '現價':
             note, color = _level_note(label, card)
             if note:
@@ -1806,7 +1863,7 @@ def _deduction_chips(draw, x, y, width, card, dry) -> int:
         outlook, color = _deduction_outlook(info)
         trend = info.get('deduct_trend')
         if trend and not info.get('turn'):
-            color = UP if trend == '扣低' else DOWN if trend == '扣高' else color
+            color = UP_TEXT if trend == '扣低' else DOWN_TEXT if trend == '扣高' else color
         chips.append((f'{key} {outlook}', color))
     widths = [font(19, True).getlength(t) + 26 for t, _ in chips]
     start = x + font(20, True).getlength(label) + 16
@@ -2201,7 +2258,7 @@ def _rank_card(draw, x: float, y: float, width: float, row: dict, technical: boo
         draw.text((tx + mw / 2, cy + 3), market, font=font(17, True), fill=MUTED, anchor='mm')
     # 右側：分數＋分級（型態排行）或漲跌幅（漲幅排行）
     change = _finite(row.get('change_pct'))
-    change_color = UP if (change or 0) > 0 else DOWN if (change or 0) < 0 else MUTED
+    change_color = UP_TEXT if (change or 0) > 0 else DOWN_TEXT if (change or 0) < 0 else MUTED
     if group_row:
         # 族群列：型態排行顯示中位型態分數，漲幅排行顯示中位漲幅。
         score = _finite(row.get('pattern_score'))
@@ -2298,7 +2355,7 @@ def _other_rows_table(draw, x: float, y: float, width: float, rows: list[dict], 
         draw.text((x + 96, mid), text, font=font(size), fill=INK, anchor='lm')
         change = _finite(row.get('change_pct'))
         change_text = f'{change:+.2f}%' if change is not None else '—'
-        change_color = UP if (change or 0) > 0 else DOWN if (change or 0) < 0 else MUTED
+        change_color = UP_TEXT if (change or 0) > 0 else DOWN_TEXT if (change or 0) < 0 else MUTED
         if group_rows:
             median = _finite(row.get('pattern_score'))
             value = f'{median:.1f}' if median is not None else change_text
@@ -2558,7 +2615,7 @@ def contribution_card(draw, y: float, data: dict, dry: bool) -> int:
     title = f"{data.get('index_name', '')}"
     text_at(draw, (ix + 16, y + 26), title, 26, INK, True)
     if points is not None:
-        color = UP if points > 0 else DOWN if points < 0 else MUTED
+        color = UP_TEXT if points > 0 else DOWN_TEXT if points < 0 else MUTED
         tx = ix + 16 + font(26, True).getlength(title) + 14
         draw.text((tx, y + 44), f'{points:+.2f} 點', font=font(30, True), fill=color, anchor='lm')
 
@@ -2687,9 +2744,9 @@ def ai_card(draw, y: float, data: dict, dry: bool) -> int:
     cy += 58
     headline, details = _answer_emphasis(data.get('answer', ''))
     if headline:
-        cy += _para(pen, ix0, cy, headline, 32, INK, width, True) + (10 if details else 18)
+        cy += _para(pen, ix0, cy, headline, 36, INK, width, True) + (10 if details else 18)
     if details:
-        cy += _para(pen, ix0, cy, details, 25, INK, width) + 18
+        cy += _para(pen, ix0, cy, details, 29, INK, width) + 18
     if data.get('cost_basis'):
         cy += _para(pen,ix0,cy,data['cost_basis'],20,MUTED,width)+12
 
@@ -2701,29 +2758,29 @@ def ai_card(draw, y: float, data: dict, dry: bool) -> int:
 
     if data.get('why'):
         cy += section('為什麼這樣看')
-        cy += _para(pen, ix0, cy, data['why'], 25, INK, width) + 16
+        cy += _para(pen, ix0, cy, data['why'], 29, INK, width) + 16
     scenarios = [s for s in data.get('scenarios') or [] if s.get('text')][:2]
     if scenarios:
         cy += section(data.get('scenario_title') or ('接下來可能的走法' if len(scenarios) == 1 else '接下來可能的兩種走法'))
         gap = 20
         col = (width - gap * (len(scenarios) - 1)) / len(scenarios)
-        box_h = max(_para(None, 0, 0, s['text'], 23, INK, col - 44) for s in scenarios) + 76
+        box_h = max(_para(None, 0, 0, s['text'], 27, INK, col - 44) for s in scenarios) + 84
         for i, item in enumerate(scenarios):
             fg, bg = AI_SCENARIO_TONES.get(item.get('tone'), AI_SCENARIO_TONES['neutral'])
             bx = ix0 + i * (col + gap)
             if pen:
                 draw.rounded_rectangle((bx, cy, bx + col, cy + box_h), radius=14, fill=bg)
-                title, size = fit(item.get('title', ''), 23, col - 44, True, 16)
+                title, size = fit(item.get('title', ''), 27, col - 44, True, 18)
                 text_at(draw, (bx + 22, cy + 16), title, size, fg, True)
-            _para(pen, bx + 22, cy + 56, item['text'], 23, INK, col - 44)
+            _para(pen, bx + 22, cy + 60, item['text'], 27, INK, col - 44)
         cy += box_h + 18
     if data.get('summary'):
         label_w = font(24, True).getlength('一句話總結') + 36
-        h = _para(None, 0, 0, data['summary'], 25, INK, width - label_w - 24, True) + 30
+        h = _para(None, 0, 0, data['summary'], 29, INK, width - label_w - 24, True) + 30
         if pen:
             draw.rounded_rectangle((ix0, cy, ix1, cy + h), radius=12, fill=ACCENT_BG)
             text_at(draw, (ix0 + 20, cy + 16), '一句話總結', 24, ACCENT, True)
-        _para(pen, ix0 + label_w, cy + 15, data['summary'], 25, INK, width - label_w - 24, True)
+        _para(pen, ix0 + label_w, cy + 15, data['summary'], 29, INK, width - label_w - 24, True)
         cy += h + 16
     if data.get('footer'):
         cy += _para(pen, ix0, cy, data['footer'], 20, MUTED, width) + 4
@@ -2914,8 +2971,8 @@ def _tone_color(text: str, tone: str) -> str:
         return ACCENT
     if tone in ('signed', 'auto'):
         value = str(text).strip()
-        return UP if value.startswith('+') else DOWN if value.startswith('-') and value != '-' else INK
-    return {'up': UP, 'down': DOWN}.get(tone, INK)
+        return UP_TEXT if value.startswith('+') else DOWN_TEXT if value.startswith('-') and value != '-' else INK
+    return {'up': UP_TEXT, 'down': DOWN_TEXT}.get(tone, INK)
 
 
 def _wrap_weekly_note(text: str, size: int, width: float, keep_words=()) -> list[str]:
@@ -3106,31 +3163,45 @@ def _branch_section(draw, x0: float, x1: float, y: float, section: dict, dry: bo
         accent = section.get('accent', ('勝率',))
         # 每格先縮字、放不下就換行（不截斷）；一列的高度取該列最多行的那一格
         layout = []
-        for row in rows:
+        row_badges = section.get('row_badges') or []
+        for r, row in enumerate(rows):
             bold = str(row[0]).startswith('全部')
             cells = []
             for c, cell in enumerate(row):
-                strong = c == 0 or bold or (c < len(columns) and columns[c] in accent)
+                # 10-20：正負數字欄加粗（手機上紅綠細字看不清楚）
+                strong = c == 0 or bold or (c < len(columns) and (columns[c] in accent or columns[c] in signed))
                 room = (edges[0] - x0 if c == 0 else edges[c] - edges[c - 1]) - 26
-                lines, size = wrap_cell(str(cell), 22, max(40, room), strong)
+                badge = str(row_badges[r]) if c == 0 and r < len(row_badges) else ''
+                if badge:
+                    room -= font(16, True).getlength(badge) + 26
+                base_size = 20 if columns[c] == '目前動向' else 26 if c == 0 else 24   # 10-20：手機閱讀放大
+                lines, size = wrap_cell(str(cell), base_size, max(40, room), strong, minimum=19, max_lines=6)
                 cells.append((lines, size, strong))
-            layout.append((max(row_h, max((len(l) for l, _, _ in cells), default=1) * 28 + 18), cells))
+            layout.append((max(row_h, max((len(l) for l, _, _ in cells), default=1) * 31 + 18), cells))
         if not dry:
             draw.rounded_rectangle((x0, y, x1, y + head_h), radius=10, fill=TILE_BG)
             for c, name in enumerate(columns):
                 cx = x0 + 18 if c == 0 else edges[c] - 18
-                draw.text((cx, y + head_h / 2), name, font=font(20, True), fill=MUTED, anchor='lm' if c == 0 else 'rm')
+                draw.text((cx, y + head_h / 2), name, font=font(21, True), fill=MUTED, anchor='lm' if c == 0 else 'rm')
             ry = y + head_h
             for r, (row, (height, cells)) in enumerate(zip(rows, layout)):
                 if r % 2:
                     draw.rectangle((x0, ry, x1, ry + height), fill='#FAFBFC')
                 for c, (cell, (lines, size, strong)) in enumerate(zip(row, cells)):
                     cx = x0 + 18 if c == 0 else edges[c] - 18
-                    color = _tone_color(cell, 'auto') if columns[c] in signed else (ACCENT if columns[c] in accent else INK)
-                    top = ry + height / 2 - (len(lines) - 1) * 14
+                    color = MUTED if columns[c] == '目前動向' else _tone_color(cell, 'auto') if columns[c] in signed else (ACCENT if columns[c] in accent else INK)
+                    top = ry + height / 2 - (len(lines) - 1) * 15.5
                     for i, line in enumerate(lines):
-                        draw_text_emoji(draw, (cx, top + i * 28), line, font(size, strong),
+                        draw_text_emoji(draw, (cx, top + i * 31), line, font(size, strong),
                                         color, 'lm' if c == 0 else 'rm')
+                badge = str(row_badges[r]) if r < len(row_badges) else ''
+                if badge and cells:
+                    lines, size, strong = cells[0]
+                    bx = x0 + 18 + max(font(size, strong).getlength(line) for line in lines) + 10
+                    bw = font(16, True).getlength(badge) + 16
+                    by = ry + height / 2 - 12
+                    draw.rounded_rectangle((bx, by, bx + bw, by + 24), radius=6, fill=ACCENT_BG)
+                    draw.text((bx + 8, by + 12), badge, font=font(16, True), fill=ACCENT, anchor='lm')
                 draw.line((x0, ry + height, x1, ry + height), fill=GRID)
                 ry += height
         return head_h + sum(h for h, _ in layout) + 20
@@ -3310,7 +3381,9 @@ def branch_card(draw, y: float, data: dict, dry: bool) -> int:
     """分點勝率／近期買賣圖卡：數字卡、勝率比較條、事件表、買賣超清單，和 K 線／評分卡同一套卡片風格。"""
     x0, x1 = MARGIN, WIDTH - MARGIN
     ix0, ix1 = x0 + 36, x1 - 36
-    head_h = 96
+    meta_lines=wrap(data.get('compact_meta',''),16,ix1-ix0) if data.get('compact_meta') else []
+    # 10-20：分點動向卡（clean_display）沒有註解列時標題區收緊，不留空白
+    head_h = 96+max(0,len(meta_lines)-1)*23 if meta_lines or not data.get('clean_display') else 76
     body = sum(_branch_section(None, ix0, ix1, 0, s, True) for s in data.get('sections') or [])
     height = int(head_h + body + 24)
     if dry:
@@ -3324,6 +3397,7 @@ def branch_card(draw, y: float, data: dict, dry: bool) -> int:
         draw.text((tag_x + w / 2, y + 48), tag, font=font(19, True), fill=ACCENT, anchor='mm')
         tag_x += w + 10
     draw.text((ix1, y + 48), data.get('label', '權證分點'), font=font(20), fill=MUTED, anchor='rm')
+    for i,line in enumerate(meta_lines):text_at(draw,(ix0,y+70+i*23),line,16,'#98A2B3')
     cursor = y + head_h
     for section in data.get('sections') or []:
         cursor += _branch_section(draw, ix0, ix1, cursor, section, False)
@@ -3582,7 +3656,27 @@ def text_card(text: str) -> dict:
 
 def render_answer(question: str, answer: str, panels: list[dict] | None = None,
                   *, title: str = '艾斯助手｜喬巴｜研究筆記', demo: bool = False) -> Image.Image:
-    panels = panels or []
+    panels = list(panels or [])
+    # 10-20（測試版移植）：現股分點動向頁不畫註解小字與頁尾（改寫進 Log）
+    clean_display=any((p.get('branch_card') or {}).get('clean_display') for p in panels)
+    if clean_display:
+        cleaned=[]
+        for original in panels:
+            item=dict(original)
+            item['clean_display']=True
+            if item.get('ai_card'):
+                card=dict(item['ai_card'])
+                for key in ('footer','cost_basis'):
+                    if card.get(key):print('📝 圖片省略註解｜'+str(card.pop(key)),flush=True)
+                item['ai_card']=card
+            if item.get('branch_card'):
+                card=dict(item['branch_card'])
+                notes=[v for v in card.get('sections',[]) if v.get('type')=='note']
+                for note in notes:print('📝 圖片省略註解｜'+note.get('text',''),flush=True)
+                card['sections']=[v for v in card.get('sections',[]) if v.get('type')!='note']
+                item['branch_card']=card
+            cleaned.append(item)
+        panels=cleaned
     debug_panel = next((p.get("kline_debug") for p in panels if p.get("kline_debug")), None)
     if debug_panel is not None:
         from kline_debug import render
@@ -3625,7 +3719,7 @@ def render_answer(question: str, answer: str, panels: list[dict] | None = None,
     panels_height += sum(branch_card(None, 0, p['branch_card'], True) + 24 for p in branch_panels)
     panels_height += sum(ai_card(None, 0, p['ai_card'], True) + 24 for p in ai_panels)
     panels_height += sum(weekly_text_card(None, 0, p['weekly_text'], True) + 24 for p in weekly_text_panels)
-    height = header_height + panels_height + body_height + 112
+    height = header_height + panels_height + body_height + (40 if clean_display else 112)
     if review_panels:
         print(f"📝 交易覆盤圖片｜render height={height}px", flush=True)
     image = Image.new('RGB', (WIDTH, height), BG)
@@ -3679,7 +3773,7 @@ def render_answer(question: str, answer: str, panels: list[dict] | None = None,
                 text_at(draw, (MARGIN + 36, cursor + i * (36 if small else 45)), line,
                         23 if small else 29, MUTED if small else INK)
         cursor += block.height
-    draw.line((MARGIN, height - 71, WIDTH - MARGIN, height - 71), fill=LINE)
+    if not clean_display:draw.line((MARGIN, height - 71, WIDTH - MARGIN, height - 71), fill=LINE)
     if article_panels or weekly_text_panels:
         footer = '股市艾斯  /  日 K 為收盤資料，非盤中即時行情'
     elif sector_panels:
@@ -3699,7 +3793,8 @@ def render_answer(question: str, answer: str, panels: list[dict] | None = None,
     suffix = next((p.get('footer_suffix') for p in branch_panels if p.get('footer_suffix')), '')
     if suffix:
         footer = f'{footer}｜{suffix}'
-    text_at(draw, (MARGIN, height - 49), footer, 20, MUTED)
+    if not clean_display:text_at(draw, (MARGIN, height - 49), footer, 20, MUTED)
+    else:print("📝 圖片頁尾留Log｜"+footer,flush=True)
     preserved = [(rect,image.crop(rect)) for rect in protected_reviews]
     image = add_center_watermarks(image)
     for rect,crop in preserved:image.paste(crop,rect)

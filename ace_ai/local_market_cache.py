@@ -729,7 +729,7 @@ def _read(sql: str, params: tuple) -> List[tuple]:
 
 
 SPOT_STATUSES = ("complete", "pending_update", "market_closed", "stock_no_trade", "source_error", "retry")
-SPOT_KEEP_CALENDAR_DAYS = 160   # 約 110 個交易日，足夠 70 日統計＋延續性／事件回測
+SPOT_KEEP_CALENDAR_DAYS = 365   # 10-20（測試版移植）：一年；200 檔 LRU 與容量上限由 spot_history 管
 
 
 def save_spot_day(stock_code: str, date: str, rows: Iterable[Dict[str, Any]], status: str,
@@ -795,6 +795,11 @@ def load_spot_rows(stock_code: str, dates: Iterable[str]) -> List[Dict[str, Any]
     rows = _read_strict(f"SELECT date,branch_name,buy,sell,net FROM spot_branch_daily WHERE stock_code=? AND date IN ({marks})",
                         (str(stock_code), *dates))
     return [{"date": r[0], "branch_name": r[1], "buy": float(r[2]), "sell": float(r[3]), "net": float(r[4])} for r in rows]
+
+
+def spot_stock_dates(stock_code: str) -> List[str]:
+    """Read retained complete source dates only. No schema or retention changes."""
+    return [r[0] for r in _read_strict("SELECT date FROM spot_branch_days WHERE stock_code=? AND status='complete' ORDER BY date",(str(stock_code),))]
 
 
 def spot_branch_history(branch_name: str, since: str) -> List[Dict[str, Any]]:
@@ -1087,6 +1092,9 @@ def daily_maintenance(today: str = "") -> Dict[str, int]:
                          "radar_turnover:" + today)):
                     removed[label] = conn.execute(sql, (arg,)).rowcount
                 conn.commit()
+        import spot_history
+        history = spot_history.maintain(today)
+        removed["spot_history_evicted"] = len(history["evicted"])
         removed["daily_bars"] = trim_history(KEEP_DAYS)
         with _LOCK:
             with _db() as conn:

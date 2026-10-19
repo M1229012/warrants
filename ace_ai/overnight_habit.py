@@ -1,6 +1,6 @@
 """隔日沖（測試版 10-15）：分點慣性看全市場，買超當天就判斷，隔天資料進來再驗證。
 
-只讀本機現股分點資料庫（spot_branch_daily／spot_branch_days）與本地日 K 底庫，不連網；慣性表快取 6 小時。
+只讀本機現股分點資料庫（spot_branch_daily／spot_branch_days／spot_history_bars），不連網；慣性表快取 6 小時。
 大量買超＝當天淨買占該股當日成交量 ≥ BIG_SHARE（5%），重押 ≥ HEAVY_SHARE（10%），且 ≥ MIN_LOTS 張（排除極冷門股）；
 門檻依 10-15 實測：上榜買超分點中位數 0.75%、P90 4.4%；當日第 1 大買超中位數 6.4%、P75 11.5%。
 沒有當日成交量的股票日不列入統計（不拿張數代替）。
@@ -15,7 +15,6 @@ import time
 from statistics import median
 
 import local_market_cache as store
-import spot_chip
 
 BIG_SHARE = float(os.getenv("TEST_OVERNIGHT_BIG_SHARE", ".05"))
 HEAVY_SHARE = float(os.getenv("TEST_OVERNIGHT_HEAVY_SHARE", ".10"))
@@ -27,22 +26,21 @@ _LOCK = threading.Lock()
 _CACHE = {"at": 0.0, "table": None, "stocks": 0}
 
 
-def _stock_bars(code):
-    """{日期: (收盤, 成交張數)}：正式版用本地日 K 底庫（spot_chip._bars）。"""
+def _volumes(conn, code=None):
+    """{(股票, 日期): 成交張數}；spot_history_bars 的 volume 是股數。"""
+    sql = "SELECT stock_code, date, volume FROM spot_history_bars WHERE confirmed=1 AND volume>0"
     try:
-        return spot_chip._bars(code)
-    except Exception:
+        rows = conn.execute(sql + (" AND stock_code=?" if code else ""), (code,) if code else ()).fetchall()
+    except Exception:          # 舊資料庫還沒有價格表
         return {}
+    return {(c, d): float(v) / 1000 for c, d, v in rows}
 
 
 def _load():
     with store._connect() as conn:
         days = conn.execute("SELECT stock_code, date FROM spot_branch_days WHERE status='complete' ORDER BY stock_code, date").fetchall()
         rows = conn.execute("SELECT stock_code, date, branch_name, net FROM spot_branch_daily").fetchall()
-    volume = {}
-    for code in {c for c, _ in days}:
-        volume.update({(code, d): v for d, (_, v) in _stock_bars(code).items() if v})
-    return days, rows, volume
+        return days, rows, _volumes(conn)
 
 
 def habits(force=False):
@@ -89,12 +87,18 @@ def habits(force=False):
 
 
 def _limit_up(stock_code, date):
-    """當天是否收漲停（漲幅 ≥ 9.5%）。沒有當天日 K 回傳 None，不拿前一天代替。"""
-    bars = _stock_bars(stock_code)
-    days = sorted(d for d in bars if d <= str(date or ""))
-    if not days or days[-1] != date or len(days) < 2 or not bars[days[-2]][0]:
+    """當天是否收漲停（漲幅 ≥ 9.5%，台股漲停 10% 含跳動單位捨入）。沒有日 K 回傳 None。"""
+    if not date:
         return None
-    return bars[days[-1]][0] / bars[days[-2]][0] - 1 >= .095
+    try:
+        with store._connect() as conn:
+            rows = conn.execute("SELECT date, close FROM spot_history_bars WHERE stock_code=? AND confirmed=1 AND date<=? "
+                                "ORDER BY date DESC LIMIT 2", (stock_code, date)).fetchall()
+    except Exception:
+        return None
+    if len(rows) < 2 or rows[0][0] != date or not rows[1][1]:   # 當天日 K 還沒存：不拿前一天代替
+        return None
+    return rows[0][1] / rows[1][1] - 1 >= .095
 
 
 def _tier(share):
@@ -105,9 +109,8 @@ def check(stock_code, report):
     """最新完整日的主要買盤中，慣性分點佔多少（當天判斷）＋前一日慣性買盤今天有沒有賣（驗證）。"""
     table, universe = habits()
     latest = report.get("latest_complete_date")
-    bars = _stock_bars(stock_code)
-    volume = {(stock_code, d): v for d, (_, v) in bars.items() if v}
     with store._connect() as conn:
+        volume = _volumes(conn, stock_code)
         if not latest:   # 分點動向流程沒有帶報表：直接讀本機最新完整日
             row = conn.execute("SELECT MAX(date) FROM spot_branch_days WHERE stock_code=? AND status='complete'", (stock_code,)).fetchone()
             latest = row[0] if row else None
@@ -142,10 +145,11 @@ def check(stock_code, report):
                 today = dict(conn.execute("SELECT branch_name, net FROM spot_branch_daily WHERE stock_code=? AND date=?",
                                           (stock_code, dates[0])).fetchall())
                 pv = volume.get((stock_code, dates[1]))
+                prev_lock = bool(_limit_up(stock_code, dates[1]))   # 前一天鎖漲停的大量買盤，不是慣性分點也一起驗證
                 out["verify_previous_day"] = [
                     {"branch": b, "buy_date": dates[1], "buy_lots": n, "volume_pct": round(float(n) / pv * 100, 2),
                      "next_day_net_lots": today.get(b, 0), "reversed": -float(today.get(b, 0)) >= float(n) * REVERSE}
-                    for b, n in prev.items() if b in table and pv and float(n) >= MIN_LOTS and float(n) / pv >= BIG_SHARE]
+                    for b, n in prev.items() if (b in table or prev_lock) and pv and float(n) >= MIN_LOTS and float(n) / pv >= BIG_SHARE]
     except Exception:
         pass
     return out

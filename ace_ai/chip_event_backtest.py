@@ -1,0 +1,617 @@
+"""Test-only observed branch accumulation and margin-event outcome study.
+
+No score, no actual broker/account P&L. All prices must be verified, adjusted,
+closed OHLC supplied by the existing price loader. Missing is never zero.
+"""
+import math
+import os
+import time
+from statistics import median
+from collections import defaultdict
+
+import moneydj_spot_cost
+import overnight_habit
+import spot_chip
+
+HORIZONS = (5, 10, 20)
+# 一買一賣成本（手續費 0.1425%×2＋證交稅 0.3%，未打折）；扣掉成本後報酬 > 0 才算贏
+ROUND_TRIP_COST_PCT = max(0., float(os.getenv('TEST_ROUND_TRIP_COST_PCT', '0.585')))
+VERSION = 'chip-events-year-v11'
+
+
+def finite(value):
+    try:
+        value = float(value)
+        return value if math.isfinite(value) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def price_rows(frame):
+    rows={}
+    for index,row in frame.iterrows():
+        values={k.lower():finite(row.get(k)) for k in ('Open','High','Low','Close')}
+        if all(v is not None and v>0 for v in values.values()):
+            volume=finite(row.get('Volume'))
+            values['volume_lots']=volume/1000 if volume is not None and volume>0 else None
+            values['verified']=True
+            rows[str(index)[:10]]=values
+    return dict(sorted(rows.items()))
+
+
+def exclusion_reason(prices,signal,horizon):
+    dates=list(prices)
+    if signal not in prices:return 'missing_signal_price'
+    i=dates.index(signal)
+    if i+horizon>=len(dates):return 'pending'
+    path=[prices[d] for d in dates[i:i+horizon+1]]
+    if any(p.get('verified') is False for p in path):return 'unverified_price'
+    entry=path[1]
+    limit=finite(entry.get('verified_limit_up'))
+    if limit and math.isclose(entry['open'],limit,rel_tol=1e-7,abs_tol=1e-5):return 'open_at_verified_limit'
+    return ''
+
+
+def outcome(prices, signal, horizon):
+    if exclusion_reason(prices,signal,horizon):return None
+    dates=list(prices);i=dates.index(signal)
+    path=[prices[d] for d in dates[i+1:i+horizon+1]]
+    entry=path[0]['open'];peak=entry;worst=0.
+    for bar in path:
+        worst=min(worst,(bar['low']/peak-1)*100)
+        peak=max(peak,bar['close'])
+    return {'return_pct':(path[-1]['close']/entry-1)*100,'drawdown_pct':worst,
+            'max_gain_pct':max(0.,max(b['high'] for b in path)/entry*100-100),
+            'entry_depth_pct':min(0.,min(b['low'] for b in path)/entry*100-100),
+            'signal_date':signal,'entry_date':dates[i+1],'exit_date':dates[i+horizon]}
+
+
+def summarize(prices,signals,background_dates):
+    output={}
+    for h in HORIZONS:
+        mature=[v for d in signals if (v:=outcome(prices,d,h)) is not None]
+        background=[v for d in background_dates if (v:=outcome(prices,d,h)) is not None]
+        excluded=[{'date':d,'reason':exclusion_reason(prices,d,h)} for d in signals if exclusion_reason(prices,d,h) not in ('','pending')]
+        n=len(mature);returns=[v['return_pct'] for v in mature]
+        baseline=sum(v['return_pct'] for v in background)/len(background) if background else None
+        avg=sum(returns)/n if n else None
+        net=[r-ROUND_TRIP_COST_PCT for r in returns]
+        output[str(h)]={'samples':n,'pending':sum(exclusion_reason(prices,d,h)=='pending' for d in signals),
+            'excluded':excluded,'excluded_count':len(excluded),'small_sample':n<5,
+            'avg_return_pct':round(avg,2) if avg is not None else None,
+            'win_rate_pct':round(sum(r>0 for r in net)/n*100,1) if n else None,
+            'avg_net_return_pct':round(sum(net)/n,2) if n else None,
+            'median_net_return_pct':round(median(net),2) if n else None,
+            'cost_pct':ROUND_TRIP_COST_PCT,
+            'median_return_pct':round(median(returns),2) if n else None,
+            'reach_3_pct':round(sum(v>=3-1e-9 for v in returns)/n*100,1) if n else None,
+            'reach_5_pct':round(sum(v>=5-1e-9 for v in returns)/n*100,1) if n else None,
+            'median_entry_depth_pct':round(median(v['entry_depth_pct'] for v in mature),2) if n else None,
+            'median_max_gain_pct':round(median(v['max_gain_pct'] for v in mature),2) if n else None,
+            'worst_drawdown_pct':round(min(v['drawdown_pct'] for v in mature),2) if n else None,
+            'avg_drawdown_pct':round(sum(v['drawdown_pct'] for v in mature)/n,2) if n else None,
+            'stock_background_avg_pct':round(baseline,2) if baseline is not None else None,
+            'background_samples':len(background),
+            'background_reach_3_pct':round(sum(v['return_pct']>=3-1e-9 for v in background)/len(background)*100,1) if len(background)>=40 else None,
+            'background_reach_5_pct':round(sum(v['return_pct']>=5-1e-9 for v in background)/len(background)*100,1) if len(background)>=40 else None,
+            'excess_return_pct':round(avg-baseline,2) if avg is not None and baseline is not None else None,
+            'recent_events':mature[-4:],'events':mature}
+    return output
+
+
+def volume_mean(prices,dates,i):
+    window=dates[max(0,i-19):i+1]
+    values=[finite(prices[d].get('volume_lots')) for d in window]
+    return sum(values)/20 if len(values)==20 and all(v is not None and v>0 for v in values) else None
+
+
+def overnight_study(branch,daily,dates,complete,prices,action_dates=()):
+    ratio=max(.001,float(os.getenv('TEST_OVERNIGHT_BUY_VOLUME_RATIO','.03')))
+    minimum=max(1.,float(os.getenv('TEST_OVERNIGHT_MIN_LOTS','100')))
+    reverse=max(.01,float(os.getenv('TEST_OVERNIGHT_REVERSE_RATIO','.5')))
+    qualifying=checked=unknown=0;pairs=[];actions=set(action_dates)
+    for i,day in enumerate(dates[:-1]):
+        buy=daily[day].get(branch);mean=volume_mean(prices,dates,i)
+        if day not in complete or prices[day].get('verified') is False or day in actions or buy is None or mean is None or buy<max(minimum,mean*ratio):continue
+        qualifying+=1;next_day=dates[i+1]
+        sell=daily[next_day].get(branch)
+        if next_day not in complete or next_day in actions or sell is None or prices[next_day].get('verified') is False:
+            unknown+=1;continue
+        checked+=1
+        if sell<0 and abs(sell)>=max(20.,buy*reverse):
+            pairs.append({'buy_date':day,'sell_date':next_day,'buy_lots':buy,'sell_lots':abs(sell),
+                'reverse_pct':round(abs(sell)/buy*100,1),
+                'buy_volume_pct':round(buy/mean*100,2)})
+    rate=len(pairs)/checked*100 if checked else None
+    label='疑似隔日沖' if checked>=5 and len(pairs)>=3 and rate>=50 else '隔日反向紀錄' if pairs else ''
+    return {'qualifying_buy_days':qualifying,'checked_pairs':checked,'unobserved_next_days':unknown,
+        'reverse_events':len(pairs),'reverse_rate_pct':round(rate,1) if rate is not None else None,
+        'median_reverse_pct':round(median(p['reverse_pct'] for p in pairs),1) if pairs else None,
+        'label':label,'pairs':pairs,'minimum_lots':minimum,'volume_ratio':ratio,'reverse_ratio':reverse}
+
+
+def branch_study(dates,complete_dates,rows,prices,branch_name='',action_dates=(),view='latest'):
+    dates=sorted(set(dates).intersection(prices));complete=set(complete_dates);daily=defaultdict(dict)
+    for row in rows:
+        value=finite(row.get('net'))
+        if value is not None and row.get('date') in complete:daily[row['date']][row['branch_name']]=value
+    observation=dates[-70:];window=dates[-5:]
+    actions=set(action_dates);recent_action=max((d for d in actions if observation and observation[0]<=d<=observation[-1]),default='')
+    comparable=[d for d in observation if not recent_action or d>=recent_action]
+    def active(branch):
+        if len(window)<5 or not set(window).issubset(complete) or set(window)&actions:return False
+        vals=[daily[d].get(branch) for d in window]
+        return sum(v is not None and v>0 for v in vals)>=3 and sum(v for v in vals if v is not None)>0
+    background=[d for d in dates if d in complete]
+    names=[branch_name] if branch_name else sorted({b for values in daily.values() for b in values})
+    threshold_ratio=max(.0001,float(os.getenv('TEST_BRANCH_WAVE_VOLUME_RATIO','.01')))
+    minimum=max(1.,float(os.getenv('TEST_BRANCH_WAVE_MIN_LOTS','20')))
+    studied=[]
+    for b in names:
+        events=[];waves=[];start=last_buy=None;cum=0.;triggered=False;first_sell=None
+        for i,day in enumerate(dates):
+            # A missing source day breaks knowledge continuity; it is NOT a zero-trade day.
+            if day not in complete or day in actions:
+                start=last_buy=None;cum=0.;triggered=False;first_sell=None;continue
+            net=daily[day].get(b)
+            if last_buy is not None and i-last_buy>5:
+                start=last_buy=None;cum=0.;triggered=False;first_sell=None
+            if net is None:continue
+            if net>0:
+                if start is None:start=day;cum=0.;triggered=False;first_sell=None
+                last_buy=i
+            if start is None:continue
+            cum+=net
+            if net<0 and first_sell is None:
+                first_sell=day
+                if triggered and waves and waves[-1]['start_date']==start:waves[-1]['first_observed_sell']=day
+            mean=volume_mean(prices,dates,i)
+            if not triggered and mean is not None and cum>=max(minimum,mean*threshold_ratio) and prices[day].get('verified') is not False:
+                events.append(day);waves.append({'start_date':start,'signal_date':day,'observed_net_at_signal':round(cum,1),
+                    'threshold_lots':round(max(minimum,mean*threshold_ratio),1),'first_observed_sell':first_sell})
+                triggered=True
+        records=[{'date':d,'net':daily[d][b],'reference_close':prices[d]['close'],
+            'action':'buy' if daily[d][b]>0 else 'sell' if daily[d][b]<0 else 'flat'} for d in dates if b in daily[d]]
+        buy_refs=[(prices[d]['close'],daily[d][b]) for d in comparable if daily[d].get(b,0)>0]
+        cost=sum(p*n for p,n in buy_refs)/sum(n for _,n in buy_refs) if buy_refs else None
+        latest=daily[dates[-1]].get(b) if dates else None
+        net5=sum(daily[d].get(b,0) for d in window);net70=sum(daily[d].get(b,0) for d in comparable)
+        is_active=active(b)
+        status='累積・近期調節' if is_active and latest is not None and latest<0 else '持續買進' if is_active else '近期調節' if net5<0 else '近期買超' if net5>0 else '近期未上榜'
+        overnight=overnight_study(b,daily,dates,complete,prices,actions)
+        overnight['recent_match'] = overnight['label']=='疑似隔日沖' and any(q['sell_date'] in window for q in overnight['pairs'])
+        # 10-15：分點動向改看份量與動作（成熟波段樣本太少，不再拿來排序或顯示）
+        last20=dates[-20:];vol5=sum(finite(prices[d].get('volume_lots')) or 0. for d in window)
+        vol20=sum(finite(prices[d].get('volume_lots')) or 0. for d in last20)
+        buy20=sum(max(0.,daily[d].get(b,0)) for d in last20);net20=sum(daily[d].get(b,0) for d in last20)
+        buys20=[d for d in last20 if daily[d].get(b,0)>0]
+        day_vol=finite(prices[dates[-1]].get('volume_lots')) if dates else None
+        studied.append({'branch':b,'active_now':is_active,'status':status,'latest_net':latest,
+            'latest_volume_pct':round(latest/day_vol*100,2) if latest and day_vol else None,
+            'volume_pct_5':round(net5/vol5*100,2) if vol5 else None,
+            'volume_pct_20':round(net20/vol20*100,2) if vol20 else None,
+            'retention_pct':round(max(0.,net20)/buy20*100) if buy20>0 else None,
+            'buy_days_20':len(buys20),'first_buy_20':buys20[0] if buys20 else '',
+            'buy_days_5':sum(daily[d].get(b,0)>0 for d in window),'buy_days_70':sum(daily[d].get(b,0)>0 for d in observation),
+            'observed_net_5':round(net5,1),'observed_net_20':round(sum(daily[d].get(b,0) for d in dates[-20:]),1),
+            'observed_net_70':round(net70,1),'estimated_buy_cost':round(cost,2) if cost else None,
+            'estimated_return_pct':round((prices[max(prices)]['close']/cost-1)*100,2) if cost else None,
+            'signal_dates':events,'wave_events':waves,'metrics':summarize(prices,events,background),
+            'records':records,'overnight':overnight,'selection_reasons':[]})
+    if branch_name:
+        selected=studied
+        for b in selected:b['selection_reasons']=['指定分點']
+    else:
+        # 10-15：依問法選分點。latest＝最新一天買超／賣超各前 3；rank20＝近 20 日買超／賣超各前 3；
+        # key＝近 20 日淨買超前 10 名中，現價對估成本最高的前 3（先看份量再看報酬，避免張數很少的分點）
+        key_net={'latest':'latest_net','rank20':'observed_net_20'}.get(view,'observed_net_20')
+        if view=='key':
+            # 主力分點：排除隔日沖型；近 20 日淨買超至少達最大買超分點的 25%；份量權重 0.65、估算報酬 0.35
+            try:
+                habit=overnight_habit.habits()[0]
+            except Exception:
+                habit={}
+            pool=[b for b in studied if (b['observed_net_20'] or 0)>0 and b['branch'] not in habit
+                  and not b.get('overnight',{}).get('recent_match')]
+            top=max((b['observed_net_20'] for b in pool),default=0)
+            pool=[b for b in pool if b['observed_net_20']>=top*.25]
+            best=max((b.get('estimated_return_pct') or 0 for b in pool),default=0) or 1
+            score=lambda b:.65*b['observed_net_20']/top+.35*max(0.,b.get('estimated_return_pct') or 0)/max(best,1e-9)
+            selected=sorted(pool,key=lambda b:(-score(b),b['branch']))[:3]
+            for i,b in enumerate(selected,1):b['rank_label']=f'主力{i}'
+            # 10-20：主力只看買方會誤導（例：外資大賣時表上全是買盤）→ 補近 20 日淨賣超前 3
+            sells=sorted((b for b in studied if (b['observed_net_20'] or 0)<0),key=lambda b:b['observed_net_20'])[:3]
+            for i,b in enumerate(sells,1):b['rank_label']=f'賣超{i}'
+            selected=selected+sells
+        else:
+            ranked=[b for b in studied if b.get(key_net)]
+            # 買超由多到少，接著賣超由多到少
+            buys=sorted((b for b in ranked if b[key_net]>0),key=lambda b:-b[key_net])[:3]
+            sells=sorted((b for b in ranked if b[key_net]<0),key=lambda b:b[key_net])[:3]
+            for tag,group in (('買超',buys),('賣超',sells)):
+                for i,b in enumerate(group,1):b['rank_label']=f'{tag}{i}'
+            selected=buys+sells
+        if not selected:selected=sorted((b for b in studied if any(r['date'] in window for r in b['records'])),key=lambda b:(-abs(b['observed_net_5']),b['branch']))[:3]
+        for b in selected:b['selection_reasons']=['近期動向']
+    return {'available':bool(dates),'period_start':observation[0] if observation else '',
+        'period_end':observation[-1] if observation else '', 'history_start':dates[0] if dates else '',
+        'history_end':dates[-1] if dates else '', 'complete_days':len(complete.intersection(observation)),
+        'recent_dates':list(observation),   # 10-20：均價依問題期間（近 N 個交易日）找起始日
+        'requested_days':len(observation),'history_complete_days':len(complete.intersection(dates)),
+        'branches':selected,'all_branches':studied,'compared_branches':len(studied),'view':'branch' if branch_name else view,
+        'background':summarize(prices,[],background)['20'],'share_adjusted_window':bool(recent_action),
+        'definition':f'觀察到的買超波段：相隔不超過5交易日歸同一波，累積淨買超達20日均量{threshold_ratio*100:g}%且至少{minimum:g}張才成立；次日開盤起算。一波只成立一次。未上榜不是零，資料缺日中止波段；訊號觀察期仍可能重疊。門檻為測試預設，非已驗證策略。'}
+
+
+def _quantile(values, q):
+    values=sorted(values);pos=(len(values)-1)*q;lo=int(pos);hi=min(lo+1,len(values)-1)
+    return values[lo]+(values[hi]-values[lo])*(pos-lo)
+
+
+def _non_overlap(prices, days, horizon):
+    """同一持有期內的觸發算同一波：進場後 horizon 個交易日內的新觸發不另計（每個天期各自不重疊）。"""
+    order={d:i for i,d in enumerate(prices)};kept=[];last=-10**9
+    for d in days:
+        if order[d]-last>=horizon:
+            kept.append(d);last=order[d]
+    return kept
+
+
+def margin_study(records, prices, action_dates=()):
+    """融資突增事件（測試版）：
+    - 指標＝融資餘額單日淨增張數 ÷ 前20日均量（看張數不看使用率，避免融資限額變動造成假訊號）。
+    - 門檻滾動計算，只用事件日「之前」最多250個交易日（至少120日）的分位數，不偷看未來。
+    - 隔日開盤進場、第5/10/20個交易日收盤出場；每個天期各自不重疊；扣成本後報酬>0才算贏。"""
+    rows = {}
+    for row in records:
+        day = str(row.get('date', ''))[:10]
+        today = finite(row.get('MarginPurchaseTodayBalance'))
+        yesterday = finite(row.get('MarginPurchaseYesterdayBalance'))
+        if day in prices and today is not None and yesterday is not None and today >= 0 and yesterday > 0:
+            rows[day] = {'delta': today - yesterday, 'base': yesterday, 'balance': today,
+                         'action': day in action_dates or any(w in str(row.get('Note', '')) for w in ('分割', '合併', '減資'))}
+    dates = list(prices)
+    window = max(20, int(os.getenv('TEST_MARGIN_ROLLING_DAYS', '250')))
+    minimum = max(20, int(os.getenv('TEST_MARGIN_ROLLING_MIN_DAYS', '120')))
+    delta_q = min(.99, max(.5, float(os.getenv('TEST_MARGIN_DELTA_Q', '0.90'))))
+    level_q = min(.99, max(0., float(os.getenv('TEST_MARGIN_LEVEL_Q', '0.60'))))
+    floor = max(0., float(os.getenv('TEST_MARGIN_MIN_BALANCE_PCT', '0.5'))) / 100
+    ratio, qualifying, background, reductions = {}, [], [], []
+    for i, day in enumerate(dates):
+        mean = volume_mean(prices, dates, i)
+        r = rows.get(day)
+        if r is None or r['action'] or mean is None:
+            continue
+        ratio[day] = r['delta'] / mean
+        past = [d for d in dates[max(0, i - window):i] if d in ratio]
+        if len(past) < minimum:
+            continue
+        background.append(day)
+        delta_thr = _quantile([ratio[d] for d in past], delta_q)
+        level_thr = _quantile([rows[d]['balance'] for d in past], level_q)
+        reduce_thr = _quantile([ratio[d] for d in past], 1 - delta_q)
+        if r['delta'] < 0 and ratio[day] <= reduce_thr:
+            reductions.append({'date': day, 'balance_delta': r['delta'], 'balance_increase_pct': round(r['delta'] / r['base'] * 100, 2)})
+        if r['delta'] > 0 and ratio[day] >= delta_thr and r['delta'] >= r['base'] * floor and r['balance'] >= level_thr:
+            qualifying.append({'date': day, 'balance_delta': r['delta'], 'balance_increase_pct': round(r['delta'] / r['base'] * 100, 2),
+                               'volume_ratio_pct': round(ratio[day] * 100, 2), 'threshold_pct': round(delta_thr * 100, 2)})
+    days = [e['date'] for e in qualifying]
+    metrics = {str(h): summarize(prices, _non_overlap(prices, days, h), background)[str(h)] for h in HORIZONS}
+    waves = set(_non_overlap(prices, days, 5))           # 圖上標記：連續觸發只標第一天
+    events = [e for e in qualifying if e['date'] in waves]
+    return {'events': events, 'reductions': reductions, 'signal_dates': [e['date'] for e in events],
+            'qualifying_days': len(qualifying), 'metrics': metrics, 'tested_days': len(background),
+            'period_start': background[0] if background else '', 'period_end': background[-1] if background else '',
+            'definition': (f'融資餘額單日淨增張數÷前20日均量 ≥ 前{window}個交易日（至少{minimum}日）的PR{delta_q*100:g}，'
+                           f'且餘額 ≥ 同期PR{level_q*100:g}、淨增至少為前日餘額{floor*100:g}%；排除股數調整日。'
+                           f'次日開盤進場、第N個交易日收盤出場，各天期不重疊；扣成本{ROUND_TRIP_COST_PCT:g}%後報酬>0算贏。'
+                           '餘額淨增加不等於實際融資買入額，不能判定大戶或散戶。')}
+
+
+def load_margin_records(code, dates):
+    import local_market_cache as store
+    import warrant_ai_tools as tools
+    if not dates:
+        return []
+    key = 'test_event_margin_v1:' + code
+    old = store.get_state(key, {}) or {}
+    if old.get('start') == dates[0] and old.get('end') == dates[-1] and time.time() - old.get('checked', 0) < 21600:
+        return old.get('rows', [])
+    raw = tools.core()._finmind_get_data('TaiwanStockMarginPurchaseShortSale', data_id=code,
+                                       start_date=dates[0], end_date=dates[-1], allow_empty=True)
+    records = raw.to_dict('records') if hasattr(raw, 'to_dict') else list(raw or [])
+    try:
+        store.set_state(key, {'start': dates[0], 'end': dates[-1], 'checked': time.time(), 'rows': records})
+    except Exception as exc:
+        print(f'⚠️ 測試融資回測快取寫入失敗｜{code}｜{type(exc).__name__}', flush=True)
+    return records
+
+
+def pct(value, signed=False):
+    return '—' if value is None else (f'{value:+.2f}%' if signed else f'{value:.1f}%')
+
+
+def metric_table(metrics):
+    return {'type':'table','columns':['期間','成熟波段','報酬中位數','達3%','達5%','最高漲幅中位數','最深跌幅中位數'],
+        'widths':[.08,.1,.16,.12,.12,.21,.21],'signed':['報酬中位數','最高漲幅中位數','最深跌幅中位數'],
+        'rows':[[f'{h}日',str(m['samples']),pct(m['median_return_pct'],True),pct(m['reach_3_pct']),pct(m['reach_5_pct']),
+            pct(m['median_max_gain_pct'],True),pct(m['median_entry_depth_pct'],True)] for h in HORIZONS for m in [metrics[str(h)]]]}
+
+
+def _margin_sections(payload, detailed=False):
+    data=payload.get('margin')
+    if not data or not data.get('events'):return []
+    m=data['metrics']['20'];event=data['events'][-1];ok=m['samples']>=5
+    return [{'type':'heading','text':'融資突增｜管理員'},
+        {'type':'table','columns':['最近事件','20日樣本','勝率','平均報酬','報酬中位數','最深跌幅中位數'],
+         'widths':[.27,.11,.13,.16,.16,.17],'accent':('勝率',),'signed':('平均報酬','報酬中位數','最深跌幅中位數'),
+         'rows':[[event['date'][5:]+f" 淨增 {event['balance_increase_pct']:+.1f}%",str(m['samples']),
+                 pct(m['win_rate_pct']) if ok else '不足',pct(m['avg_net_return_pct'],True) if ok else '不足',
+                 pct(m['median_net_return_pct'],True),pct(m['median_entry_depth_pct'],True)]]},
+        {'type':'paragraph','text':'報酬已扣一買一賣成本；次日開盤進場、第20個交易日收盤出場'}]
+
+
+def _net_share(net,share):
+    if not net:return '—'
+    return f'{net:+,.0f}（{share:.1f}%）' if share is not None else f'{net:+,.0f}'
+
+
+def window_start(data, days):
+    """近 days 個交易日的第一天；交易日不夠就取最早一天。"""
+    dates=data.get('recent_dates') or []
+    return '' if not dates else dates[-days] if len(dates)>=days else dates[0]
+
+
+def price_days(data):
+    """10-20：問題有特別問時間（近5日、近一個月…）＝那段期間（交易日數）；沒問＝0（最新一天）。"""
+    try:
+        return max(0,int(data.get('price_days') or 0))
+    except (TypeError,ValueError):
+        return 0
+
+
+def price_summary(b, data):
+    """表格「買／賣均價」欄的數字：沒問時間＝最新一天；有問＝那段期間加總均價。給 AI 的也是同一組。"""
+    m=b.get('moneydj') or {}
+    days=price_days(data)
+    if days<=1:
+        return {'period':'當日','buy':m.get('buy_avg_day'),'sell':m.get('sell_avg_day')}
+    got=moneydj_spot_cost.period_avg(m,window_start(data,days))
+    if not got:
+        return {'period':f'近{days}日','buy':None,'sell':None}
+    return {'period':f'近{days}日','buy':got['buy'],'sell':got['sell'],'covered':got['covered']}
+
+
+def _day_prices(b, data=None):
+    p=price_summary(b,data or {})
+    buy,sell=p.get('buy'),p.get('sell')
+    if buy is None and sell is None:return '—'
+    return f"{buy:,.2f}" if sell is None else f"／{sell:,.2f}" if buy is None else f"{buy:,.2f}／{sell:,.2f}"
+
+
+def _cost_gap(b, data=None):
+    """現價對成本：有 MoneyDJ 近20日買進均價就用真實均價，否則用買超日收盤加權並標（估）。
+    10-20：明細改抓 60 筆，近 20 日均價改用「近 20 個交易日」逐日加總（不是近 20 筆）。"""
+    cost,ret=b.get('estimated_buy_cost'),b.get('estimated_return_pct')
+    m=b.get('moneydj') or {}
+    got=moneydj_spot_cost.period_avg(m,window_start(data or {},20)) if (data or {}).get('recent_dates') else None
+    real=got['buy'] if got else m.get('buy_avg_period')
+    if real and cost and ret is not None:
+        close=cost*(1+ret/100)
+        return pct((close/real-1)*100,True)
+    return pct(ret,True)+'（估）' if ret is not None else '—'
+
+
+def _latest_action(b):
+    n=b.get('latest_net')
+    if not n:return '—'
+    share=b.get('latest_volume_pct')
+    return f'{n:+,.0f}（{share:.1f}%）' if share is not None else f'{n:+,.0f}'
+
+
+def _branch_kind(b,habits):
+    """分點屬性徽章：隔日衝（全市場慣性）＞外資＞波段（近20日買 8 天以上）＞短線大買。"""
+    if b['branch'] in habits or b.get('overnight',{}).get('recent_match'):return '隔日衝'
+    tag=spot_chip.broker_tag(b['branch'])
+    if tag:return tag
+    if b.get('buy_days_20',0)>=8:return '波段'
+    if b.get('buy_days_20',0)<=2 and abs(b.get('volume_pct_5') or 0)>=5:return '短線大買'
+    return ''
+
+
+def _brief_spot_card(payload):
+    data=payload['spot'];sections=[]
+    try:
+        habits=overnight_habit.habits()[0]
+    except Exception:
+        habits={}
+    view=data.get('view')
+    priced=any(b.get('moneydj') for b in data.get('branches',[]))   # 10-15：有 MoneyDJ 均價才多一欄
+    basis={'latest':'依最新交易日淨買賣超','rank20':'依近20日淨買賣超'}.get(view,'')
+    days=price_days(data)
+    price_col=('當日' if days<=1 else f'近{days}日')+'買／賣均價'
+    # 依 rank_label 分組：買超前3／賣超前3（主力分點、指定分點為一組），讓讀者知道為何列出這些分點
+    groups=[]
+    for b in data.get('branches',[]):
+        label=str(b.get('rank_label',''))
+        name=('買超前3' if label.startswith('買超') else '賣超前3' if label.startswith('賣超')
+              else '主力分點' if label.startswith('主力') else '指定分點' if view=='branch' else '分點動向')
+        if not groups or groups[-1][0]!=name:groups.append((name,[],[]))
+        row=[b['branch'],_latest_action(b),_net_share(b['observed_net_5'],b.get('volume_pct_5')),
+            _net_share(b['observed_net_20'],b.get('volume_pct_20'))]
+        if priced:row.append(_day_prices(b,data))
+        row.append(_cost_gap(b,data))
+        groups[-1][1].append(row)
+        groups[-1][2].append(_branch_kind(b,habits))
+    for name,rows,badges in groups:
+        # 10-20：主力模式的賣方用和買方同一張完整表格（上下欄位對齊）；只差標題
+        heading=('主力賣超｜依近20日淨賣超' if view=='key' and name=='賣超前3' else name+(f'｜{basis}' if basis else ''))
+        sections+=[{'type':'heading','text':heading+'｜張數'},
+            {'type':'table','columns':['券商分點','當日（占量）','近5日（占量）','近20日（占量）']+([price_col] if priced else [])+['現價對成本'],
+             'widths':[.22,.16,.16,.16,.16,.14] if priced else [.28,.18,.18,.19,.17],
+             'signed':['當日（占量）','近5日（占量）','近20日（占量）','現價對成本'],'accent':[],
+             'rows':rows,'row_badges':badges}]
+    # 10-16：分點表格不放註解，保持乾淨
+    if not data.get('branches'):sections.append({'type':'paragraph','text':'目前沒有可顯示的分點動向'})
+    sections.extend(_margin_sections(payload))
+    return {'branch':f"{payload['stock_code']} {payload['stock_name']}｜分點動向",'label':data.get('period_end',''),
+            # 10-20：使用者要求拿掉標題下方灰色註解（近70日已確認／歷史區間）
+            'tags':[],'clean_display':True,'layout_version':VERSION,'sections':sections}
+
+
+def branch_card(payload,detailed=False,page=1):
+    if not detailed:return _brief_spot_card(payload)
+    data=payload['spot'];branches=data['branches'];sections=[]
+    flows=[];performance=[];small=[];badges=[]
+    ready=data.get('readiness') or {'resolved_days':data.get('complete_days',0),'requested_days':data.get('requested_days',70)}
+    done=int(ready['resolved_days']);wanted=int(ready['requested_days'])
+    sections.append({'type':'paragraph','text':f'近70日資料：{done}/{wanted}日已確認'+('｜補齊中' if done<wanted else '｜本期已齊')})
+    for b in branches:
+        m=b['metrics']['20'];cost=f"{b['estimated_buy_cost']:,.2f}" if b['estimated_buy_cost'] is not None else '—'
+        status=b['status']
+        badges.append('疑似隔日沖' if b.get('overnight',{}).get('recent_match') else '')
+        flows.append([b['branch'],status,f"{b['observed_net_5']:+,.0f}",f"{b['observed_net_70']:+,.0f}",cost,pct(b['estimated_return_pct'],True)])
+        if m['samples']>=5:
+            performance.append([b['branch'],str(m['samples'])+'筆',pct(m['median_return_pct'],True),pct(m['reach_3_pct']),pct(m['reach_5_pct']),pct(m['median_entry_depth_pct'],True)])
+        elif m['samples']:
+            small.append([b['branch'],str(m['samples'])+'筆', '｜'.join(e['signal_date'][5:]+' '+pct(e['return_pct'],True) for e in m['recent_events'])])
+    if flows:
+        sections+=[{'type':'heading','text':'近期動向｜淨買賣超：張'},
+            {'type':'table','columns':['券商分點','目前動向','5日淨超','70日淨超','估計均價','現價相對估均價'],
+             'widths':[.28,.12,.10,.12,.14,.24],'signed':['5日淨超','70日淨超','現價相對估均價'],'rows':flows,'row_badges':badges}]
+    else:sections.append({'type':'paragraph','text':'目前沒有可顯示的分點動向'})
+    if performance or small:
+        sections.append({'type':'paragraph','text':'歷史區間｜'+data.get('history_start','')+'～'+data.get('history_end','')+f"｜已確認{data.get('history_complete_days',0)}日"})
+    if performance:
+        sections+=[{'type':'heading','text':'歷史表現｜次日開盤至第20個交易日收盤'},
+            {'type':'table','columns':['券商分點','成熟波段數','收盤報酬中位數','20日達3%','20日達5%','最深跌幅中位數'],
+             'widths':[.22,.13,.17,.13,.13,.22],'signed':['收盤報酬中位數','最深跌幅中位數'],'accent':['20日達3%','20日達5%'],'rows':performance}]
+    if small:
+        sections.append({'type':'paragraph','text':f'{len(small)}家分點僅有1～4筆成熟波段，逐筆結果請查分點明細'})
+    if not performance and not small:sections.append({'type':'paragraph','text':'歷史表現：尚無完成20日觀察的波段'})
+    base=data.get('background',{})
+    sections.append({'type':'paragraph','text':
+        '同期20日收盤參考｜達3% '+pct(base.get('background_reach_3_pct'))+'・達5% '+pct(base.get('background_reach_5_pct'))
+        if base.get('background_samples',0)>=40 else '同期股價參考：資料不足'})
+    sections.extend(_margin_sections(payload,detailed))
+    if detailed:
+        for b in branches:
+            sections+=[{'type':'heading','text':b['branch']+'｜各期結果'},metric_table(b['metrics'])]
+            m=b['metrics']['20']
+            if 0<m['samples']<5:
+                sections.append({'type':'table','columns':['事件成立','20日收盤報酬'],'widths':[.45,.55],
+                    'signed':['20日收盤報酬'],'rows':[[e['signal_date'],pct(e['return_pct'],True)] for e in m['recent_events']]})
+            if m.get('excluded_count'):
+                labels={'open_at_verified_limit':'開盤觸及漲停，成交可行性未確認','unverified_price':'價格還原未核實','missing_signal_price':'缺少事件日價格'}
+                sections.append({'type':'table','columns':['排除事件日期','原因'],'widths':[.25,.75],
+                    'rows':[[e['date'],labels.get(e['reason'],e['reason'])] for e in m['excluded'][-10:]]})
+            sections.append({'type':'table','columns':['持有期','最大回撤'],'widths':[.4,.6],
+                'rows':[[str(h)+'日',pct(b['metrics'][str(h)]['worst_drawdown_pct'],True)] for h in HORIZONS]})
+            events=b.get('wave_events',[])
+            if events:sections.append({'type':'table','columns':['波段開始','事件成立','首次上榜賣超'],
+                'widths':[.33,.33,.34],'rows':[[e['start_date'],e['signal_date'],e.get('first_observed_sell') or '未觀察到'] for e in events[-10:]]})
+            records=list(reversed(b['records']));start=(max(1,int(page))-1)*20
+            nums={m['date']:str(m['no']) for m in payload.get('display_marks',[]) if m.get('branch')==b['branch']}
+            sections+=[{'type':'heading','text':f'上榜買賣超｜第{page}頁'},
+                {'type':'table','columns':['日期／圖號','方向','淨買賣超','還原收盤'],'widths':[.3,.16,.27,.27],
+                 'signed':['淨買賣超'],'rows':[[r['date']+(' #'+nums[r['date']] if r['date'] in nums else ''),
+                    '買超' if r['net']>0 else '賣超',f"{r['net']:+,.0f}",f"{r['reference_close']:,.2f}"] for r in records[start:start+20]]}]
+            if b.get('overnight',{}).get('pairs'):
+                sections.append({'type':'table','columns':['買超日期','買超張數','隔日賣超日期','賣超張數','反向量比例'],
+                    'widths':[.23,.16,.23,.16,.22],'rows':[[q['buy_date'],f"{q['buy_lots']:,.0f}",q['sell_date'],f"{q['sell_lots']:,.0f}",pct(q['reverse_pct'])] for q in b['overnight']['pairs'][-10:]]})
+    return {'branch':f"{payload['stock_code']} {payload['stock_name']}",'label':data.get('period_end',''),
+            'tags':['70日觀察'],'clean_display':True,'sections':sections}
+
+
+def margin_card(payload):
+    # 管理員融資摘要併入現股卡，避免同一頁另起一張長卡。
+    return None
+
+
+def event_marks(payload, bars, branch_name='', include_margin=False):
+    visible={str(b['date']).replace('/','-') for b in bars};marks=[]
+    if branch_name:
+        for b in payload['spot']['branches']:
+            if b['branch']!=branch_name:continue
+            for r in b['records']:
+                if r['date'] in visible and r['action']!='flat':
+                    marks.append({'date':r['date'],'side':r['action'],'label':'買超' if r['net']>0 else '賣超',
+                                  'value':r['net'],'branch':b['branch'],'kind':'spot'})
+    if include_margin and payload.get('margin'):
+        for event in payload['margin']['events']:
+            if event['date'] in visible:
+                marks.append({'date':event['date'],'side':'buy','label':'融資淨增',
+                              'value':event['balance_delta'],'branch':'融資餘額','kind':'margin'})
+        for r in payload['margin'].get('reductions',[]):
+            if r['date'] in visible:
+                marks.append({'date':r['date'],'side':'sell','label':'融資淨減',
+                              'value':r['balance_delta'],'branch':'融資餘額','kind':'margin'})
+    marks.sort(key=lambda m:(m['date'],m['kind'],m['side']))
+    for i,m in enumerate(marks,1):m['no']=i
+    return marks
+
+
+def prepare(code, name='', as_of='', report=None, allow_margin=False, branch_name='', view='latest'):
+    import spot_history
+    with spot_history.active(code,query=True):
+        return _prepare_inner(code,name,as_of,report,allow_margin,branch_name,view)
+
+
+def _prepare_inner(code, name='', as_of='', report=None, allow_margin=False, branch_name='', view='latest'):
+    import spot_chip
+    import local_market_cache as store
+    import warrant_ai_tools as tools
+    with tools.quote_policy(admin_live=False):
+        bundle = tools._load_price_bundle(code, spot_history_mode=True)
+    frame = tools.closed_frame(bundle)
+    prices = price_rows(frame)
+    actions=bundle.get('corporate_actions') or {}
+    # Lack of corporate-action coverage is not proof that no action occurred.
+    if not actions.get('complete'):
+        for p in prices.values():p['verified']=False
+    verified_limits=store.get_state('spot_verified_limit_up:'+code,{}) or {}
+    from price_adjustment import factor_on_date
+    for day,item in verified_limits.items():
+        if day in prices and isinstance(item,dict) and item.get('verified') and finite(item.get('price')):
+            prices[day]['verified_limit_up']=float(item['price'])*factor_on_date(frame,day)
+    unknown_limits=sum('verified_limit_up' not in p for p in prices.values())
+    print(f'📐 回測價格核實｜{code}｜公司行動完整={bool(actions.get("complete"))}｜未取得核實漲停價={unknown_limits}日（不猜固定10%）',flush=True)
+    prices = {d: p for d, p in prices.items() if not as_of or d <= as_of}
+    if not prices:
+        raise ValueError('沒有核實收盤OHLC，不能回測')
+    import spot_history
+    spot_history.touch(code)
+    report = report if report is not None else spot_chip.build_report(code, 'full')
+    cutoff = min(max(prices), report.get('latest_complete_date') or max(prices))
+    saved = store.spot_stock_dates(code)
+    history_start = min(saved + list(report.get('window_dates', []))) if saved or report.get('window_dates') else min(prices)
+    dates = [d for d in prices if history_start <= d <= cutoff]
+    complete = sorted(set(saved + list(report.get('complete_dates', []))).intersection(dates))
+    rows = store.load_spot_rows(code, complete)
+    from price_adjustment import SHARE_KINDS
+    action_dates = {str(e.get('date', ''))[:10] for e in (bundle.get('corporate_actions') or {}).get('items', [])
+                    if e.get('kind') in SHARE_KINDS or e.get('kind') in ('合併', '減資')}
+    result = {'stock_code': code, 'stock_name': name, 'data_date': max(prices),
+              'version': VERSION, 'spot': branch_study(dates, complete, rows, prices, branch_name, action_dates, view),
+              'price_period_start': min(prices), 'price_period_end': max(prices),
+              'price_basis': '已核實股數還原收盤OHLC；不含盤中棒；現金股利不計入報酬'}
+    result['spot']['readiness']={'resolved_days':report.get('resolved_days',len(report.get('complete_dates',[]))),
+        'requested_days':report.get('requested_days',70)}
+    if allow_margin:
+        try:
+            margin = margin_study(load_margin_records(code, list(prices)), prices, action_dates)
+            # 同期基準（任一天次日開盤買進）只寫 Log 給管理員看，不上會員圖
+            for h in HORIZONS:
+                m = margin['metrics'][str(h)]
+                print(f"📊 融資突增｜{code}｜{h}日｜樣本{m['samples']}｜勝率{m['win_rate_pct']}｜平均淨報酬{m['avg_net_return_pct']}"
+                      f"｜同期平均{m['stock_background_avg_pct']}｜超額{m['excess_return_pct']}", flush=True)
+            print(f"📊 融資突增規則｜{code}｜{margin['definition']}", flush=True)
+            if margin['events']:
+                result['margin'] = margin
+        except Exception as exc:
+            print(f'⚠️ 測試融資事件回測略過｜{code}｜{type(exc).__name__}: {exc}', flush=True)
+    print(f'📊 波段規則｜{code}｜'+result['spot']['definition'],flush=True)
+    for b in result['spot']['branches']:
+        print(f"📊 波段與隔日反向｜{code}｜{b['branch']}｜"+str({'metrics':b['metrics']['20'],'overnight':b['overnight']}),flush=True)
+    print('📊 同期參考｜'+str(result['spot']['background']),flush=True)
+    return result
