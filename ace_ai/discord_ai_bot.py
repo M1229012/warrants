@@ -23,6 +23,7 @@ import asyncio
 import contextvars
 import contextlib
 import hashlib
+import copy
 import json
 import io
 import math
@@ -664,6 +665,7 @@ class QueryPlan:
     uncertain: bool = False     # 規則只認出股票、看不出要問什麼：交給 AI 讀整句分類（10-06）
     needs: Optional[Dict[str, Any]] = None   # 10-08：需求表（要回答什麼、排除什麼、對象），送進最後提示
     brief_quote: bool = False                # 10-16：只問數字＋簡短 AI 看法
+    brief_pattern: Set[str] = field(default_factory=set)   # 10-20：圖照出完整型態圖，但這些股票問的不是型態（AI 型態 1～2 句）
 
     def add(self, name: str, **kwargs: Any) -> None:
         call = ToolCall(name, {k: v for k, v in kwargs.items() if v not in (None, "")})
@@ -679,6 +681,9 @@ def chart_codes_for_plan(plan: QueryPlan, codes: Sequence[str]) -> List[str]:
         return unique
     per_stock = plan.needs.get("per_stock")
     if isinstance(per_stock, dict):
+        if "pattern" in (plan.needs.get("exclude_types") or []):   # 說「不要技術／型態」：只有需要圖的需求才畫
+            return [code for code in unique if set(per_stock.get(code) or []) &
+                    {"analysis", "technical", "cost", "price", "institutional", "warrant"}]
         return [code for code in unique if per_stock.get(code)]
     # Compatibility for plans assembled outside _answer_uncached_impl: derive
     # from actual scheduled tools, not parsed stocks or the original question.
@@ -2519,6 +2524,7 @@ FINAL_TECH_RULES = """技術面規則：
 
 FINAL_NEWS_RULES = """新聞規則：只能用 get_recent_news 的 title、summary、content、summary_points（「公司名:本公司…」是公司重大訊息，屬事實）。
 - 同一事件的多篇報導合併，歸納成 2～4 個重點：發生什麼事、關鍵數字（只用 content／summary 出現過的）、日期；圖上沒有新聞清單，不要逐條列標題、不寫媒體名稱。
+- 優先順序：法說會、財報、月營收、重大訊息與公司公告 ＞ 法人目標價與獲利預估 ＞ 產業與市場報導。期間內有法說會一定要講（新聞有寫到的營收、毛利率、展望、資本支出等重點），並點明是法說會。
 - 問新聞時解讀以新聞為主：先講新聞重點和對公司的影響，型態只用 1～2 句帶過（目前位置與最關鍵的一個價位），不展開技術分析。
 - 聳動字眼不是事實；法人目標價、獲利預估要寫「某機構估計」。content_source 為「RSS 摘要」或「僅標題」時只描述標題寫到的事實。
 - 可能利多、可能利空／風險分開說明（寫在 why 裡，不用【】標題），只寫新聞提到的因素；沒有利空就寫「新聞內容未提及明顯利空，但資訊有限」。summary 用 1 句說明份量與待確認資訊，不下漲跌結論。"""
@@ -3069,6 +3075,10 @@ def build_final_prompt(payload: Dict[str, Any]) -> str:
         sections.append(FINAL_PATTERN_RULES)
     if payload.get("watch_plan"):
         sections.append(FINAL_WATCH_RULES)
+    if payload.get("brief_pattern"):
+        sections.append("【問的不是型態】圖上是完整型態圖，但 payload.brief_pattern 裡的股票，使用者問的是別的（新聞、法人、股價、權證等）："
+                        "解讀以所問內容為主，型態與技術面只用 1～2 句帶過（目前位置＋最關鍵的一個價位），這優先於【觀察重點】的篇幅要求；"
+                        "scenarios 最多 1 個，而且要和所問內容相關。")
     sections.append(FINAL_CARD_FORMAT)
     if payload.get("brief_quote"):
         sections.append("本題只問數字（股價、成交量、漲跌）：圖上雖有完整型態資料，解讀要以回答所問為主。answer 先直接回答數字，"
@@ -7377,12 +7387,20 @@ class AceQueryEngine:
         for code, name in stocks:
             want = set(per_stock[code])
             one = replace(parsed, stocks=[(code, name)], intents=want, original=code, normalized=code, sector=None)
-            if want & {"analysis", "technical", "cost"}:
+            # 10-20：預設圖片就是型態圖——每檔都排型態頁的資料（關鍵價位、三大法人副圖…）；
+            # 問的不是型態（新聞、法人、股價、權證）就記進 brief_pattern，AI 以所問為主、型態 1～2 句帶過
+            if drop & {"analysis", "technical"} and not want & {"analysis", "technical", "cost"}:
+                plan = self.router._stock_plan(one, want, False)       # 使用者說不要技術／型態：照舊不出型態頁
+            else:
                 plan = self.router._pattern_plan(one)
                 merged.pattern = True
                 merged.route = "rule_pattern"
-            else:
-                plan = self.router._stock_plan(one, want, False)
+                if not want & {"analysis", "technical", "cost"}:
+                    merged.brief_pattern.add(code)
+            others = want - {"analysis", "technical", "cost", "news", "institutional", "futures"}
+            if others:
+                for call in self.router._stock_plan(one, others, False).tool_calls:
+                    plan.add(call.name, **call.kwargs)
             if "institutional" in want:
                 plan.add("get_institutional_flow", stock_code=code, days=getattr(parsed, "needs_periods", {}).get((code, "institutional"), 70))
             if "futures" in want:
@@ -7390,7 +7408,7 @@ class AceQueryEngine:
             if "news" in want:
                 plan.add("get_recent_news", stock_code=code)
             excluded_tools = set()
-            if "institutional" in drop or "institutional" not in want: excluded_tools.add("get_institutional_flow")
+            if "institutional" in drop: excluded_tools.add("get_institutional_flow")   # 10-20：型態圖的法人副圖照出，只有說「不要法人」才拿掉
             if "futures" in drop: excluded_tools.add("get_futures_positions")
             if "news" in drop: excluded_tools.add("get_recent_news")
             for call in plan.tool_calls:
@@ -7404,6 +7422,47 @@ class AceQueryEngine:
             # 10-11：需求表排完沒有任何可查項目（例如只剩接不上的族群需求）→ 請使用者補充，不出空白圖卡
             return QueryPlan(route="clarify", clarification="這題的需求暫時無法對應到可查的項目，請補充要看的內容（例如型態、籌碼或所屬族群）。")
         return merged
+
+    _SPLIT_LABELS = (("score", "型態評分"), ("spot", "現股籌碼"), ("price", "股價"), ("institutional", "法人買賣超"), ("warrant", "權證籌碼"))
+
+    def _split_by_stock(self, needs_table: Dict[str, Any], parsed: ParsedQuestion, per_stock: Dict[str, Set[str]],
+                        started: float, stats: "AnswerStats") -> Optional[AnswerResult]:
+        """10-20：兩檔以上、各問不同事情（「2330最近30天新聞，2344型態」）→ 拆成每檔一題、各一張圖，不寫在同一張。
+        同樣問題（比較兩檔型態）、要比較、或有成本／期貨／族群／分點這類需求時不拆。"""
+        stocks = [(c, nm) for c, nm in parsed.stocks if per_stock.get(c)]
+        types = {str(n.get("type")) for n in needs_table.get("needs") or [] if isinstance(n, dict)}
+        if len(stocks) < 2 or types - {"pattern", "news", "price", "institutional", "score", "spot", "chips"}:
+            return None
+        subs = []
+        for code, name in stocks:
+            want = set(per_stock[code])
+            if want & {"cost", "futures", "sector"} or want - {"analysis", "technical", "news", "price", "institutional",
+                                                             "score", "spot", "warrant", "volume_profile"}:
+                return None
+            labels = [label for key, label in self._SPLIT_LABELS if key in want]
+            if want & {"analysis", "technical"} and not want & {"score", "spot"}:
+                labels.insert(0, "型態")
+            if "news" in want:
+                days = getattr(parsed, "needs_periods", {}).get((code, "news"))
+                labels.append(f"近{days}天新聞" if days else "最近新聞")
+            subs.append((f"{name or code}{'、'.join(labels)}", frozenset(want)))
+        if len({w for _, w in subs}) < 2:
+            return None                       # 每檔問的一樣：維持同一張（例如兩檔型態比較）
+        self.log("拆成多張圖｜" + "｜".join(q for q, _ in subs))
+        results = []
+        for (sub, _), (code, name) in zip(subs, stocks):
+            names = {code, name}
+            mine = [n for n in needs_table.get("needs") or [] if isinstance(n, dict)
+                    and (not n.get("targets") or names & {str(t).strip() for t in n.get("targets") or []})]
+            one = copy.deepcopy(parsed)
+            one.stocks, one.original, one.normalized, one.intents = [(code, name)], sub, sub, set(per_stock[code])
+            one.needs_preset = dict({k: v for k, v in needs_table.items() if k not in ("per_stock", "sector_context")}, needs=mine)
+            result = self._answer_uncached_impl(sub, started, one)
+            results.append(replace(result, image_title=result.image_title or sub))
+        first = results[0]
+        return replace(first, followups=list(first.followups) + results[1:],
+                       gemini_calls=stats.gemini_calls + sum(r.gemini_calls for r in results),
+                       elapsed=time.perf_counter() - started, cacheable=all(r.cacheable for r in results))
 
     def _branch_plan_from_needs(self, parsed: ParsedQuestion, per_stock: Dict[str, Set[str]]) -> Optional[QueryPlan]:
         """10-14：需求表判斷這題是在問「指定分點」時，走分點流程（權證明細／事件／部位／績效），
@@ -7618,9 +7677,10 @@ class AceQueryEngine:
                 if "futures" not in parsed.intents:
                     plan.tool_calls = [c for c in plan.tool_calls if c.name != "get_futures_positions"]
         needs_table: Optional[Dict[str, Any]] = None
-        if needs_semantic(parsed) and plan.route not in ("clarify",):
+        preset = getattr(parsed, "needs_preset", None)    # 10-20：拆題的子題沿用已拆好的需求表
+        if (preset is not None or needs_semantic(parsed)) and plan.route not in ("clarify",):
             # 10-08：自然問句交給 AI 整句解析需求表（取代下方分類呼叫），逐檔依需求重建工具清單
-            needs_table = self._parse_needs(question, parsed, stats)
+            needs_table = copy.deepcopy(preset) if preset is not None else self._parse_needs(question, parsed, stats)
             if needs_table is not None:
                 rule_plan = plan
                 per_stock = self._apply_needs(needs_table, parsed)
@@ -7631,6 +7691,9 @@ class AceQueryEngine:
                 if keep_futures and any("散戶" in str(t) for t in needs_table.get("exclude_targets") or []):
                     plan.tool_calls = [c for c in plan.tool_calls if c.name != "get_retail_futures"]   # 「不要散戶多空比」
                 needs_table["per_stock"] = {c: sorted(v) for c, v in per_stock.items()}
+                split = None if keep_futures else self._split_by_stock(needs_table, parsed, per_stock, started, stats)
+                if split is not None:
+                    return split
             else:
                 # 解析失敗：不能照原本可能忽略「不要…」的工具清單執行；改用原分類器（一次）決定主題，最後提示要求只答所問
                 plan = QueryPlan(route="clarify", clarification="題目的需求或排除條件暫時無法確認，請分開描述每檔股票要查的項目。")
@@ -8366,6 +8429,11 @@ class AceQueryEngine:
             return rule_answer, True
         payload = build_final_payload(question, results)
         payload["pattern_focus"] = bool(plan.route == "rule_pattern" or plan.pattern)
+        if getattr(plan, "brief_pattern", None):
+            payload["brief_pattern"] = sorted(plan.brief_pattern)
+            asked = {str(c.kwargs.get("stock_code")) for c in plan.tool_calls if c.kwargs.get("stock_code")}
+            if asked and asked <= set(plan.brief_pattern):
+                payload["pattern_focus"] = False       # 全部股票都不是問型態
         if getattr(plan, "brief_quote", False):
             payload["brief_quote"] = True
         context = getattr(getattr(self, "_request_local", None), "member_chart_context", None)
