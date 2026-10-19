@@ -2588,7 +2588,7 @@ AI_CARD_SCHEMA = {
 }
 
 FINAL_CARD_FORMAT = """輸出格式（艾斯 AI 解讀）：只輸出符合 schema 的 JSON，不要 Markdown、不要星號或條列符號。你是在「解讀」，不是在整理資料：K 線、均線、評分卡與關鍵價位表已經在圖上，文字要說明這些訊號代表什麼。
-- answer：這段會以粗體呈現，只放1～2句結論，通常30～60字、最多80字，第一句直接回答使用者問的事；有 watch_plan 時帶出方向判斷（偏多／偏空／盤整）與最關鍵的一個觀察價位；複合問題直接點出各面向的判斷與最重要限制，不把所有依據塞在這裡。數字只有關鍵價位才引用，不逐項報均線、量比或分點名單；詳情放why。不保證漲跌、不替人決定買賣。
+- answer：這段會以粗體呈現，只放1～2句結論，通常30～60字、最多80字，只寫一句、60 字內（價位要寫在同一句裡，不可另起一句只寫觀察價位）；第一句直接回答使用者問的事；有 watch_plan 且問的是走勢時帶出方向判斷與最關鍵的一個觀察價位；複合問題直接點出各面向的判斷與最重要限制，不把所有依據塞在這裡。數字只有關鍵價位才引用，不逐項報均線、量比或分點名單；詳情放why。不保證漲跌、不替人決定買賣。
 - 支撐／壓力依距離由近到遠寫，最近的先講（含「近價大量區」），不可跳過近的直接講季線。均線扣抵只能引用 turn_text 的明日條件，例如「MA20 明天收至少 955 才續揚」；目前下彎或走平寫「才轉揚」。不可寫「跌停也續揚」「漲停也續彎」「5天後支撐上移」，不列未來3天維持價位、不寫未來方向序列，也不把扣抵條件當成股價必然守住的強支撐。fail_price 是含走平容差的內部門檻，不能當成第一個合法價位；path 是假設收盤不變的內部模擬，不作確定預測。沒有 rise_price_tomorrow 時只說當前方向，不自行補價位。
 - 語氣方向跟著結構走：多頭排列、量增、沿上軌等偏強結構先寫偏強；偏弱先寫偏弱；多空抵銷才寫中性。風險寫成條件（若跌破／若量縮…），不可讓風險蓋過主要判斷，summary 方向和 answer 一致。不寫空泛警語：「風險不容忽視」「需謹慎」「宜保守」「而非追價」「不宜追高」「短期波動風險」這類沒有價位條件的提醒都不要。不可寫「假突破／假跌破」「突破成功／失敗」「型態失效」這類結論。
 - why：回答「為什麼這樣判斷、接下來看哪裡」，2～3 句、約 80～140 字。圖上已經有的數字（各均線值、KD／MACD、量比、法人與分點張數、均價）不要重抄；整段最多引用 2 個價位，而且只能是要觀察的支撐或壓力。用歸納代替列舉（寫「站上所有均線」不寫逐條均線），同方向的證據合併成一句。不寫「從技術面來看」「籌碼方面」這類開場詞。若answer已說清楚可留空。型態與趨勢只能引用kline_patterns，不重報評分或所有指標。寫法範例——不好：「MA5 為 120、MA10 為 118、MA20 為 115，KD 為 75，成交量 3 萬張，股價站上所有均線。」好：「站上所有均線、多頭排列，短線關鍵在 125 前高能否帶量突破；拉回時 MA10 附近守住才算健康整理。」
@@ -3077,7 +3077,8 @@ def build_final_prompt(payload: Dict[str, Any]) -> str:
         sections.append(FINAL_WATCH_RULES)
     if payload.get("brief_pattern"):
         sections.append("【問的不是型態】圖上是完整型態圖，但 payload.brief_pattern 裡的股票，使用者問的是別的（新聞、法人、股價、權證等）："
-                        "解讀以所問內容為主，型態與技術面只用 1～2 句帶過（目前位置＋最關鍵的一個價位），這優先於【觀察重點】的篇幅要求；"
+                        "解讀以所問內容為主：answer 只講所問內容（例如新聞重點），不放技術價位；型態與技術面只在 why 最後用 1～2 句帶過"
+                        "（目前位置＋最關鍵的一個價位），這優先於【觀察重點】的篇幅要求；"
                         "scenarios 最多 1 個，而且要和所問內容相關。")
     sections.append(FINAL_CARD_FORMAT)
     if payload.get("brief_quote"):
@@ -4886,6 +4887,17 @@ def drop_source_mentions(text: str) -> str:
         return text
     parts = re.split(r"(?<=[。！？；])", str(text))
     return "".join(p for p in parts if not (_SOURCE_NAME_RE.search(p) or _SOURCE_INTRO_RE.search(p))).strip()
+
+
+def split_answer_head(text: str, limit: int = 80) -> Tuple[str, str]:
+    """10-20：結論只留第一句（≤limit 字）；其餘回傳給呼叫端接到「為什麼」。第一句就超過 limit 時整段保留。"""
+    text = str(text or "").strip()
+    if len(text) <= limit:
+        return text, ""
+    first = re.match(r".*?[。！？!?][」』”\"]?", text, re.S)
+    if first and len(first.group()) <= limit and text[first.end():].strip():
+        return first.group().strip(), text[first.end():].strip()
+    return text, ""
 
 
 def drop_number_dumps(text: str, limit: int = 4) -> str:
@@ -7423,6 +7435,24 @@ class AceQueryEngine:
             return QueryPlan(route="clarify", clarification="這題的需求暫時無法對應到可查的項目，請補充要看的內容（例如型態、籌碼或所屬族群）。")
         return merged
 
+    def _upgrade_to_pattern_page(self, plan: QueryPlan, parsed: ParsedQuestion) -> None:
+        """10-20：預設圖片就是型態圖。一般個股路線（最近有什麼消息、股價…）也排型態頁資料（關鍵價位、三大法人副圖），
+        AI 以所問為主、型態 1～2 句（brief_pattern）。只問股價的輕量回覆、說「不要技術／型態」的題目照舊。"""
+        if plan.route not in ("rule_stock", "rule_stock_bundle") or plan.pattern or not plan.need_final_llm:
+            return
+        if "pattern" in ((plan.needs or {}).get("exclude_types") or []):
+            return
+        stocks = [(c, nm) for c, nm in parsed.stocks if c not in tools.INDEX_CODES]
+        if not stocks:
+            return
+        for code, name in stocks:
+            one = replace(parsed, stocks=[(code, name)], original=code, normalized=code, sector=None)
+            for call in self.router._pattern_plan(one).tool_calls:
+                plan.add(call.name, **call.kwargs)
+            plan.brief_pattern.add(code)
+        plan.pattern = True
+        self.log(f"型態頁升級｜{','.join(c for c, _ in stocks)}｜AI 以所問為主、型態 1～2 句")
+
     _SPLIT_LABELS = (("score", "型態評分"), ("spot", "現股籌碼"), ("price", "股價"), ("institutional", "法人買賣超"), ("warrant", "權證籌碼"))
 
     def _split_by_stock(self, needs_table: Dict[str, Any], parsed: ParsedQuestion, per_stock: Dict[str, Set[str]],
@@ -7430,14 +7460,18 @@ class AceQueryEngine:
         """10-20：兩檔以上、各問不同事情（「2330最近30天新聞，2344型態」）→ 拆成每檔一題、各一張圖，不寫在同一張。
         同樣問題（比較兩檔型態）、要比較、或有成本／期貨／族群／分點這類需求時不拆。"""
         stocks = [(c, nm) for c, nm in parsed.stocks if per_stock.get(c)]
+        if len(stocks) < 2:
+            return None
         types = {str(n.get("type")) for n in needs_table.get("needs") or [] if isinstance(n, dict)}
-        if len(stocks) < 2 or types - {"pattern", "news", "price", "institutional", "score", "spot", "chips"}:
+        blocked = types & ({"cost", "futures", "members", "rank"} | BRANCH_NEEDS)
+        if blocked:
+            self.log(f"不拆圖｜需求含 {','.join(sorted(blocked))}")
             return None
         subs = []
         for code, name in stocks:
             want = set(per_stock[code])
-            if want & {"cost", "futures", "sector"} or want - {"analysis", "technical", "news", "price", "institutional",
-                                                             "score", "spot", "warrant", "volume_profile"}:
+            if want & {"cost", "futures", "sector"}:
+                self.log(f"不拆圖｜{code} 需求含成本／期貨／族群")
                 return None
             labels = [label for key, label in self._SPLIT_LABELS if key in want]
             if want & {"analysis", "technical"} and not want & {"score", "spot"}:
@@ -7447,6 +7481,7 @@ class AceQueryEngine:
                 labels.append(f"近{days}天新聞" if days else "最近新聞")
             subs.append((f"{name or code}{'、'.join(labels)}", frozenset(want)))
         if len({w for _, w in subs}) < 2:
+            self.log("不拆圖｜每檔問的一樣（維持同一張）")
             return None                       # 每檔問的一樣：維持同一張（例如兩檔型態比較）
         self.log("拆成多張圖｜" + "｜".join(q for q, _ in subs))
         results = []
@@ -7756,6 +7791,7 @@ class AceQueryEngine:
                 plan.tool_calls = list(pattern.tool_calls)
                 self.log(f"權證買進排行第一名：{top['stock_code']} {top.get('stock_name', '')}｜{top.get('event_buy_amount_text')}")
 
+        self._upgrade_to_pattern_page(plan, parsed)
         codes = list(dict.fromkeys([code for code, _ in parsed.stocks] +
                      [c.kwargs["stock_code"] for c in plan.tool_calls if c.kwargs.get("stock_code")]))
         chart_branch = parsed.branches[0] if parsed.branches else ""
@@ -8499,6 +8535,10 @@ class AceQueryEngine:
                 card[key] = drop_source_mentions(card[key])
                 if key in ("why", "summary"):
                     card[key] = drop_number_dumps(card[key])   # 10-20：念數據的句子拿掉
+            # 10-20：結論太長時圖卡會把後半句切成標題下一行小字（例「關鍵觀察 2420 元能否站穩。」）→ 後半段移到「為什麼」開頭
+            card["answer"], spill = split_answer_head(card.get("answer", ""))
+            if spill:
+                card["why"] = (spill + card.get("why", "")).strip()
             card["scenarios"] = [dict(x, text=drop_source_mentions(drop_directives(x["text"])),
                                       title=drop_source_mentions(drop_directives(fix_scenario_title(x.get("title", "")))))
                                  for x in card.get("scenarios") or []]
