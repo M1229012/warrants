@@ -3075,6 +3075,10 @@ def build_final_prompt(payload: Dict[str, Any]) -> str:
         sections.append(FINAL_PATTERN_RULES)
     if payload.get("watch_plan"):
         sections.append(FINAL_WATCH_RULES)
+    if payload.get("compare_page"):
+        sections.append("【兩檔比較，必須照做】只說重點：answer 一句（60 字內）說哪檔結構相對強或弱與主因；why 2～3 句、約 100～160 字，"
+                        "每檔最多引用 1 個關鍵價位；不報型態分數、評分、五大項，不逐條念均線、量區、布林與法人張數（圖上都有）；"
+                        "scenarios 每檔 1 個，title 用股票名稱＋觀察重點（例「台積電｜回測守住」），text 寫該檔要觀察的價位與條件。")
     if payload.get("brief_pattern"):
         sections.append("【問的不是型態】圖上是完整型態圖，但 payload.brief_pattern 裡的股票，使用者問的是別的（新聞、法人、股價、權證等）："
                         "解讀以所問內容為主：answer 只講所問內容（例如新聞重點），不放技術價位；型態與技術面只在 why 最後用 1～2 句帶過"
@@ -4900,19 +4904,23 @@ def split_answer_head(text: str, limit: int = 80) -> Tuple[str, str]:
     return text, ""
 
 
-def drop_number_dumps(text: str, limit: int = 4) -> str:
-    """10-20：一句裡堆 limit 個以上數字＝在念圖上數據（「MA5 為 120、MA10 為 118…」），整句拿掉。
+def drop_number_dumps(text: str, limit: int = 4, total: int = 5) -> str:
+    """10-20：一句裡堆 limit 個以上數字＝在念圖上數據（「MA5 為 120、MA10 為 118…」），整句拿掉；
+    整段累計超過 total 個數字後，後面還帶數字的句子也拿掉（解讀說重點，不把數據全部寫一遍）。
     MA20、日期、近 20 日這類代號／期間不算數字。"""
     if not text:
         return text
     parts = re.split(r"(?<=[。！？；])", str(text))
-    kept = []
+    kept, used = [], 0
     for part in parts:
         plain = part
         for pattern in _EXEMPT_PATTERNS:
             plain = pattern.sub(" ", plain)
-        if len(_NUMBER_RE.findall(plain)) < limit:
-            kept.append(part)
+        count = len(_NUMBER_RE.findall(plain))
+        if count >= limit or (count and used + count > total):
+            continue
+        used += count
+        kept.append(part)
     return "".join(kept).strip()
 
 
@@ -5905,7 +5913,7 @@ class AceQueryEngine:
         # 快取鍵值用「補完股票之後」的問題，避免 A 使用者的「那它的壓力在哪」拿到 B 使用者的答案；籌碼類型分開快取。
         # 族群追問（「那哪檔最強」）要帶族群名稱與模式，不同族群的同一句追問不能共用答案
         sector = parsed.sector or {}
-        key = "|".join([member_pattern.VERSION,'現股分點精簡排版v10價格歸屬v1_正式共用修正1011',compact, ",".join(c for c, _ in parsed.stocks), str(parsed.cost_price or ""), ",".join(parsed.branches),
+        key = "|".join([member_pattern.VERSION,'現股分點精簡排版v10價格歸屬v1_正式共用修正1011_解讀觀察重點拆圖v4',compact, ",".join(c for c, _ in parsed.stocks), str(parsed.cost_price or ""), ",".join(parsed.branches),
                         "chip=" + parsed.chip,
                         "sector=" + str(sector.get("name") or sector.get("industry") or "") + ":" + str(sector.get("mode") or "")])
         if _pirate_pattern_request.get():
@@ -7435,6 +7443,45 @@ class AceQueryEngine:
             return QueryPlan(route="clarify", clarification="這題的需求暫時無法對應到可查的項目，請補充要看的內容（例如型態、籌碼或所屬族群）。")
         return merged
 
+    _CLAUSE_SEP_RE = re.compile(r"[，,、；;。\n]|另外|然後|還有|再來")
+
+    def _split_by_clause(self, question: str, parsed: ParsedQuestion, started: float) -> Optional[AnswerResult]:
+        """10-20：一句話裡分別問兩檔不同的事（「2330最近30天新聞，2344型態」）→ 拆成兩題、各一張圖。
+        依標點切段：每段只提到一檔、各檔不重複、每段還有要問的內容，且整句沒有「比較」才拆；
+        「台積電、聯發科型態」（第一段只有股名）或「2330和2454型態比較」不拆。"""
+        if getattr(parsed, "split_child", False) or getattr(parsed, "needs_preset", None) is not None:
+            return None
+        if len(parsed.stocks) < 2 or _COMPARE_RE.search(question) or parsed.sector or parsed.branches:
+            return None
+        clauses = [c.strip() for c in self._CLAUSE_SEP_RE.split(question) if c and c.strip()]
+        if len(clauses) < 2:
+            return None
+        parts = []
+        for clause in clauses:
+            try:
+                one = self.parser.parse(clause, access=self._access())
+            except Exception:
+                return None
+            if len(one.stocks) != 1:
+                return None
+            code, name = one.stocks[0]
+            rest = clause.replace(code, "").replace(name or code, "")
+            if len(re.sub(r"[^一-鿿]", "", rest)) < 2:
+                return None                       # 這段只有股名（例如「台積電、聯發科型態」）：共用後面的問題，不拆
+            parts.append((clause, one))
+        if len({one.stocks[0][0] for _, one in parts}) != len(parts):
+            return None
+        self.log("拆成多張圖（依句子）｜" + "｜".join(c for c, _ in parts))
+        results = []
+        for clause, one in parts:
+            one.split_child = True
+            result = self._answer_uncached_impl(clause, started, one)
+            results.append(replace(result, image_title=result.image_title or clause))
+        first = results[0]
+        return replace(first, followups=list(first.followups) + results[1:],
+                       gemini_calls=sum(r.gemini_calls for r in results),
+                       elapsed=time.perf_counter() - started, cacheable=all(r.cacheable for r in results))
+
     def _upgrade_to_pattern_page(self, plan: QueryPlan, parsed: ParsedQuestion) -> None:
         """10-20：預設圖片就是型態圖。一般個股路線（最近有什麼消息、股價…）也排型態頁資料（關鍵價位、三大法人副圖），
         AI 以所問為主、型態 1～2 句（brief_pattern）。只問股價的輕量回覆、說「不要技術／型態」的題目照舊。"""
@@ -7680,6 +7727,9 @@ class AceQueryEngine:
                 return AnswerResult(text="目前無法解析問題所需的基本資料，請稍後再試。", route="error", gemini_calls=0, elapsed=time.perf_counter() - started)
         parsed.access = self._access()
         self.log(f"解析結果：{json.dumps(parsed.summary(), ensure_ascii=False)}")
+        split = self._split_by_clause(question, parsed, started)
+        if split is not None:
+            return split
         stocks_only = [c for c, _ in parsed.stocks if c not in tools.INDEX_CODES]
         if stocks_only and re.search(r"融資.*(?:回測|事件|報酬|勝率)|(?:回測|事件).*融資", question):
             parsed.intents.add("technical")
@@ -7827,6 +7877,10 @@ class AceQueryEngine:
             if light or pattern_only or not warrant_visual_query:
                 kwargs["with_marks"] = False
             chart_calls.append(ToolCall("get_chart_panel", kwargs))
+        # 10-20：比較頁（兩檔以上＋比較）不畫評分卡與三大法人副圖；使用者明問法人才保留
+        compare_page = len(codes) >= 2 and (bool(_COMPARE_RE.search(question)) or member_pattern.comparing(plan))
+        if compare_page and "institutional" not in parsed.intents:
+            plan.tool_calls = [c for c in plan.tool_calls if c.name != "get_institutional_flow"]
         planned_calls = list(plan.tool_calls)
         run_results = self._run_tools(planned_calls + chart_calls)
         combined = pre_results + run_results
@@ -7949,7 +8003,8 @@ class AceQueryEngine:
                 panel["disable_compare"] = not member_pattern.comparing(plan)
                 # 10-15：籌碼題（現股／權證／兩種一起、型態＋籌碼）不顯示型態評分；海盜型態照舊
                 chip_question = bool(getattr(parsed, "spot_combo", False) or getattr(parsed, "chip", "") in ("spot", "warrant", "combined"))
-                if (TEST_SHOW_SCORECARD and not chip_question and (not view or member_pattern.wants_score(parsed, plan, code))) or _pirate_pattern_request.get():
+                if (TEST_SHOW_SCORECARD and not chip_question and not compare_page
+                        and (not view or member_pattern.wants_score(parsed, plan, code))) or _pirate_pattern_request.get():
                     # 10-08：正式版還有評分卡，測試版先照正式版顯示，方便比對評分修正；整飾板拿掉時設 0
                     card = self._pattern_scorecard(code, results, parsed.cost_price)
                     with_chips = any(r.name == "get_sheet_stock_chips" and r.ok for r in results)
@@ -8465,6 +8520,9 @@ class AceQueryEngine:
             return rule_answer, True
         payload = build_final_payload(question, results)
         payload["pattern_focus"] = bool(plan.route == "rule_pattern" or plan.pattern)
+        if len({str(c.kwargs.get("stock_code")) for c in plan.tool_calls if c.name == "get_technical_analysis"}) >= 2 and (
+                _COMPARE_RE.search(question) or member_pattern.comparing(plan)):
+            payload["compare_page"] = True
         if getattr(plan, "brief_pattern", None):
             payload["brief_pattern"] = sorted(plan.brief_pattern)
             asked = {str(c.kwargs.get("stock_code")) for c in plan.tool_calls if c.kwargs.get("stock_code")}
@@ -8534,7 +8592,7 @@ class AceQueryEngine:
                 card[key] = drop_warrant_listing(card[key], results)
                 card[key] = drop_source_mentions(card[key])
                 if key in ("why", "summary"):
-                    card[key] = drop_number_dumps(card[key])   # 10-20：念數據的句子拿掉
+                    card[key] = drop_number_dumps(card[key], total=4 if payload.get("compare_page") else 5)   # 10-20：念數據的句子拿掉
             # 10-20：結論太長時圖卡會把後半句切成標題下一行小字（例「關鍵觀察 2420 元能否站穩。」）→ 後半段移到「為什麼」開頭
             card["answer"], spill = split_answer_head(card.get("answer", ""))
             if spill:
