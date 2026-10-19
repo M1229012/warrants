@@ -2838,12 +2838,19 @@ def watch_plan(payload: Dict[str, Any]) -> Dict[str, Any]:
             by_tool.setdefault(key.split(":", 1)[0], {})[str(data["stock_code"])] = data
     plans: Dict[str, Any] = {}
     for code, tech in (by_tool.get("get_technical_analysis") or {}).items():
-        close = _plan_num(tech.get("close"))
+        card = (by_tool.get("get_pattern_scorecard") or {}).get(code) or {}
+        close = _plan_num(tech.get("close")) or _plan_num(card.get("close"))
         values = {k: _plan_num((v or {}).get("value")) for k, v in (tech.get("moving_averages") or {}).items()}
+        if not any(v is not None for v in values.values()):
+            # 10-20：有評分卡時技術資料只留 ma_recent_3d（均線值在評分卡）→ 取最後一天的均線
+            values = {k: _plan_num((v or [None])[-1]) for k, v in (tech.get("ma_recent_3d") or {}).items()}
         values = {k: v for k, v in values.items() if v is not None}
         if close is None or not values:
             continue
         align = str(tech.get("ma_alignment") or "")
+        if not align and len(values) == 4:
+            ma = [values.get(k) for k in ("MA5", "MA10", "MA20", "MA60")]
+            align = "多頭排列" if ma[0] > ma[1] > ma[2] > ma[3] else "空頭排列" if ma[0] < ma[1] < ma[2] < ma[3] else "均線糾結"
         above = sum(1 for v in values.values() if close > v)
         ma20, ma60 = values.get("MA20"), values.get("MA60")
         if "多頭排列" in align or (ma20 and ma60 and close > ma20 and close > ma60 and above >= 3):
@@ -2853,7 +2860,6 @@ def watch_plan(payload: Dict[str, Any]) -> Dict[str, Any]:
         else:
             direction = "盤整"
         align = ma_alignment_text(values, align)
-        card = (by_tool.get("get_pattern_scorecard") or {}).get(code) or {}
         if card.get("supports_below_close") or card.get("resistances_above_close"):
             supports, resistances = card.get("supports_below_close") or [], card.get("resistances_above_close") or []
         else:
@@ -2862,7 +2868,7 @@ def watch_plan(payload: Dict[str, Any]) -> Dict[str, Any]:
         pick = lambda items: [{"名稱": str(x.get("label")), "價位": x.get("price")} for x in items
                               if _plan_num(x.get("price")) is not None][:3]
         upper, lower = [], []
-        for key, info in (tech.get("ma_deduction") or {}).items():
+        for key, info in (tech.get("ma_deduction") or card.get("ma_deduction") or {}).items():
             value = values.get(key)
             if value is None or not isinstance(info, dict):
                 continue
