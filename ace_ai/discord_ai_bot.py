@@ -7719,7 +7719,7 @@ class AceQueryEngine:
             # 會員型態頁疊上同次判斷的三角；評分與分點回測依本題需求顯示。
             for panel in [p for p in panels if p.get("stock_code") and p.get("bars")]:
                 panel.pop("scorecard", None)
-                panel["hide_bollinger"] = True   # 第二輪：型態圖保留所有均線與大量區，只省略布林顯示
+                # 10-20：使用者要求布林加回型態圖（原「第二輪：只省略布林顯示」取消）；K 線畫布林上下軌虛線，AI 也拿得到布林數值
                 code = panel["stock_code"]
                 technical = next((r.data for r in results if r.ok and r.name == "get_technical_analysis" and r.data.get("stock_code") == code), {})
                 basis = (technical.get("kline_patterns") or {}).get("member_basis")
