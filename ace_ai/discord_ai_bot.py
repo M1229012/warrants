@@ -724,7 +724,9 @@ ADMIN_HELP_GROUPS = (
     ("本週精選", ("本週精選排名", "3006 幫我生成週精選文字", "這版確認，生成圖片")),
     ("草稿", ("直接說修改需求", "還原上一版", "目前草稿")),
     ("資料維護", ("系統狀態", "用量（含費用估算）", "錯誤紀錄", "更新市場底庫", "更新族群名冊", "匯出狀態／匯入狀態")),
-    ("Log 開關（平常關閉，白話可）", ("log狀態（看目前哪些有開）", "開啟三角紀錄／關閉三角紀錄（三角核對）", "全部log關掉")),
+    ("Log 開關（平常關閉，白話可）", ("log狀態（看目前哪些有開）", "開啟三角紀錄／關閉三角紀錄（三角核對）",
+                                  "開啟用量紀錄（每5分鐘用量報表）", "開啟底庫紀錄（底庫更新進度）",
+                                  "開啟休市紀錄（個股缺日提示）", "全部log關掉")),
     ("現股抓取", ("現股測速 2330（70 日）", "現股改成 8 條", "現股恢復自動", "現股抓取狀態")),
     ("族群", ("族群雷達", "族群別名（清單）", "新增族群別名 TGV=玻璃基板", "刪除族群別名 TGV")),
     ("測試員", ("新增測試員 <ID或@人>", "移除測試員 <ID>", "測試員名單")),
@@ -1298,6 +1300,18 @@ def branch_store_window_sections(d: Dict[str, Any]) -> List[Dict[str, Any]]:
     sections.append({"type": "note", "text": f"※ 賣出為市值（含損益）；剩餘以 FIFO 張數計算。資料至 {str(d.get('store_date', '')).replace('-', '/')}，"
                                              "之後以 Sheet 補。"})
     return sections
+
+
+WEEKLY_WARRANT_DETAIL = True      # 週精選 K 線那張圖的權證明細（每分點一張表，列出完整權證名單）
+
+
+def weekly_warrant_row(w: Dict[str, Any]) -> List[str]:
+    """權證名單一列：權證代號名稱、剩餘張數、剩餘天數、價內外、槓桿（天期／價內外／槓桿為現在數值）。"""
+    days_left, money_now, lev_now = w.get("days_left"), w.get("moneyness_now"), w.get("leverage_now")
+    return [f"{w.get('warrant_code', '')} {w.get('warrant_name', '')}".strip(), w.get("remaining_text") or "-",
+            ("已到期" if days_left <= 0 else f"{days_left} 天") if days_left is not None else "-",
+            f"{'價內' if money_now >= 0 else '價外'} {abs(money_now):.0f}%" if money_now is not None else "-",
+            f"{lev_now:.1f} 倍" if lev_now is not None else "-"]
 
 
 def branch_store_warrant_sections(d: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -5112,6 +5126,11 @@ class AceQueryEngine:
         # 有人會把「/ace 族群資金流向」整串貼進輸入框；前綴要拿掉，否則會被當成族群名稱去查。
         question = strip_command_prefix(question)
         compact = re.sub(r"\s+", "", question)
+        # 10-20（測試版移植）：管理員貼上週精選文章最先判斷。文章裡的「10/05 買超」「融資」「型態」「多檔股名」
+        # 會被覆盤、融資、型態驗證、清單排行等判斷誤攔，所以排在所有判斷前面。
+        if admin_mode and image is None and weekly_pick.is_manual_draft_question(question):
+            self.log(f"使用者問題（/ace）：{question[:120]}｜判定為貼上週精選文字")
+            return self._answer_weekly_manual_draft(question, context_key, started)
         access = self._access()
         margin_allowed = bool(access and access.admin_mode and not access.simulation)
         if re.search(r'融資|融券|券資比', question) and not margin_allowed:
@@ -5175,9 +5194,6 @@ class AceQueryEngine:
         admin_reply = self._answer_admin_command(question, started, context_key)
         if admin_reply is not None:
             return admin_reply
-        # 管理員自己貼文字：直接當成目前草稿，不經過 AI，也不做數字核對（文字是人寫的）。
-        if weekly_pick.is_manual_draft_question(question):
-            return self._answer_weekly_manual_draft(question, context_key, started)
         # 週精選草稿是獨立的編輯 session，只有管理員指令會進到這裡。
         if weekly_pick.is_weekly_draft_question(question):
             with self._weekly_lock:
@@ -5299,6 +5315,13 @@ class AceQueryEngine:
                                 elapsed=time.perf_counter() - started)
         if note:
             self.log(f"追問記憶：{note}")
+        emerging = [c for c, _ in parsed.stocks if c in tools.get_emerging_codes()]
+        if emerging and parsed.chip in ("spot", "combined", "warrant"):
+            # 10-16（測試版移植）：興櫃股票沒有公開的券商分點進出：不抓籌碼，改出型態卡，AI 先說明是興櫃、沒有籌碼資料
+            self.log(f"興櫃股票不查籌碼｜{','.join(emerging)}｜改型態分析")
+            parsed.chip = ""
+            parsed.intents = (set(parsed.intents) - {"warrant", "recent_trades", "win_rate"}) | {"analysis"}
+            question = f"{question}（{'、'.join(emerging)} 為興櫃股票，沒有公開的券商分點籌碼；請先簡短說明這點，再分析K線、技術面與型態）"
         if (parsed.chip == "spot" and (_PATTERN_WITH_CHIP_RE.search(question) or _OVERNIGHT_ASK_RE.search(question))
                 and any(c not in tools.INDEX_CODES for c, _ in parsed.stocks)):
             # 同時問型態＋現股籌碼：維持型態分析長圖（K 線＋評分卡），中間加精簡籌碼重點，AI 同時解讀技術面＋籌碼面。
@@ -6085,7 +6108,7 @@ class AceQueryEngine:
                 r"你(?:會|能|可以)(?:做|幫我做)?(?:什麼|哪些)|(?:怎麼|如何)用|說明書?|(?:管理員)?功能(?:表|清單|列表)", compact):
             # 新增管理員指令時，同時加進 ADMIN_HELP_GROUPS（test_admin_help_complete 會檢查有沒有漏）
             return help_result(started, admin=self._show_admin_help(True))
-        log_cmd = __import__("log_switch").parse_command(compact)   # Log 開關（白話可；正式版只開放三角核對）
+        log_cmd = __import__("log_switch").parse_command(compact)   # Log 開關（白話可；10-20 起類別與測試版一致）
         if log_cmd:
             import log_switch
             action, cats = log_cmd
@@ -6279,18 +6302,26 @@ class AceQueryEngine:
         """人工文章的圖片排版：同一版文字只排一次（存在草稿 session）；Gemini 失敗或逐字核對沒過就回 None 用原文排版。
         回傳 (排版, 給管理員的提示, Gemini 次數)。"""
         key = hashlib.sha1((weekly_pick.WEEKLY_LAYOUT_VERSION + "\n" + body).encode("utf-8")).hexdigest()
+        # 文中提到的其他股票：它們的數字不能抽成資料列（會被當成本檔數字，例如瑞昱圖上出現聯詠的累積買超）
+        own, others = str(session.get("stock_code") or ""), []
+        if own:
+            try:
+                others = sorted({str(n) for c, n in tools.get_stock_name_map().items()
+                                 if c != own and len(str(n)) >= 2 and str(n) in body})
+            except Exception as exc:
+                self.log(f"週精選排版：股票名冊讀取失敗，資料列不檢查歸屬｜{type(exc).__name__}: {exc}")
         if session.get("layout") and session.get("layout_for") == key:
             cached = weekly_pick.parse_layout(session["layout"])
             if cached:
                 cached = weekly_pick.tidy_layout(cached)
-                valid, why = weekly_pick.verify_layout(body, cached)
+                valid, why = weekly_pick.verify_layout(body, cached, others)
                 if valid:
                     return cached, "", 0
                 self.log(f"週精選排版快取未通過原文核對：{why}，重新排版")
         reason, calls = "", 0
         for _attempt in range(2):          # 沒通過核對時把原因告訴 Gemini 重排一次
             calls += 1
-            result = self.gateway.generate(weekly_pick.layout_prompt(body, reason), "weekly_layout",
+            result = self.gateway.generate(weekly_pick.layout_prompt(body, reason, others), "weekly_layout",
                                            schema=weekly_pick.LAYOUT_SCHEMA, temperature=0.1)
             if not result.ok:
                 reason = f"Gemini 失敗：{result.error}"
@@ -6301,19 +6332,19 @@ class AceQueryEngine:
             except (TypeError, ValueError):
                 data = tools.core()._extract_json_from_text(result.text) or {}
             layout = weekly_pick.parse_layout(data)
-            ok, reason = weekly_pick.verify_layout(body, layout) if layout else (False, "格式不符")
+            ok, reason = weekly_pick.verify_layout(body, layout, others) if layout else (False, "格式不符")
             if ok:
                 layout = weekly_pick.tidy_layout(layout)
-                ok, reason = weekly_pick.verify_layout(body, layout)
+                ok, reason = weekly_pick.verify_layout(body, layout, others)
                 if ok:
                     return self._keep_layout(context_key, session, key, layout, f"Gemini 第 {calls} 次"), "", calls
             rows = [f"{r['label']}={r['value']}" for s in (layout or {}).get("sections", []) for r in s["rows"]]
             self.log(f"週精選自動排版未通過核對（第 {calls} 次）：{reason}｜資料列：{rows or '-'}")
         # Gemini 沒排好：改用程式規則排版（只刪減與搬動原句，同一套逐句核對）
-        layout = weekly_pick.rule_layout(body)
+        layout = weekly_pick.rule_layout(body, others)
         if layout:
             layout = weekly_pick.tidy_layout(layout)
-        ok, rule_reason = weekly_pick.verify_layout(body, layout) if layout else (False, "無法分段")
+        ok, rule_reason = weekly_pick.verify_layout(body, layout, others) if layout else (False, "無法分段")
         if ok:
             return self._keep_layout(context_key, session, key, weekly_pick.tidy_layout(layout), "程式規則"), "", calls
         self.log(f"週精選程式排版也未通過核對：{rule_reason}")
@@ -6431,10 +6462,42 @@ class AceQueryEngine:
             self._weekly_drafts.pop(context_key, None)
         local_market_cache.delete_state(self._draft_state_key(context_key))
 
+    def _weekly_warrant_sections(self, code: str, branches: Sequence[str]) -> List[Dict[str, Any]]:
+        """週精選圖：文章提到的分點在這檔的權證，每個分點一行平均數據（10-18：不逐檔列權證）。
+        只用權證歷史庫版（有現在的天期、槓桿）；沒有就略過，不影響其他區塊。"""
+        calls = [ToolCall("get_branch_warrant_detail", {"branch_name": b, "days": 70, "stock_code": code}) for b in list(branches)[:3]]
+        if not calls:
+            return []
+        try:
+            results = self._run_tools(calls)
+        except Exception as exc:
+            self.log(f"週精選權證明細略過：{code}｜{type(exc).__name__}: {exc}")
+            return []
+        sections: List[Dict[str, Any]] = []
+        for result in results:
+            d = result.data if result.ok else {}
+            if not d or d.get("source") != "store" or not d.get("groups"):
+                self.log(f"週精選權證明細略過：{code}｜{(d or {}).get('branch', '')}｜{(d or {}).get('reason') or result.error or '沒有歷史庫明細'}")
+                continue
+            group = d["groups"][0]
+            if not group.get("warrants"):
+                continue
+            events = group.get("event_codes") or ""
+            sections.append({"type": "heading", "text": d.get("branch", "") + (f"｜{events} 事件" if events else ""),
+                             "weekly_note": True})
+            # 10-18：一張表列出完整名單（每檔權證一列），不加平均列、不畫數字卡
+            rows = [weekly_warrant_row(w) for w in group["warrants"]]
+            sections.append({"type": "table", "columns": ["權證", "剩餘張數", "剩餘天數", "價內外", "槓桿"],
+                             "widths": (0.40, 0.15, 0.15, 0.15, 0.15), "signed": (), "accent": (), "rows": rows})
+        if sections:
+            sections.insert(0, {"type": "heading", "text": "權證明細", "weekly_note": True})
+        return sections
+
     def _answer_weekly_article_image(self, context_key: str, started: float) -> AnswerResult:
         """管理員確認草稿後，沿用一般個股（3034）版型產生週精選圖片。
 
-        結構固定為：K 線＋精簡權證買賣超標註 → 型態評分（含關鍵價位＋文章提及分點動向） → 已確認週精選文字。
+        10-18 起拆成兩張：第 1 張 K 線（關鍵價位標在圖上）＋權證買賣標註＋權證明細數字卡；第 2 張已確認週精選文字。
+        週精選不畫型態評分卡。
         權證逐日流水只畫在 K 線，不再展開長明細表；分點範圍完全以最終文字實際提到者為準。
         """
         session = self._load_draft_session(context_key, with_candidate=True)
@@ -6458,29 +6521,19 @@ class AceQueryEngine:
         chart_branches = branches or ["__NO_WEEKLY_BRANCH__"]
         panels = self._get_chart_panels([code], {code: chart_branches}, mark_mode="flow", flow_source="sheet")
 
-        # 週精選候選在排名階段已取得同一套技術資料，直接沿用來建 3034 版型的型態評分卡。
-        # 「關鍵價位」照一般 3034 卡保留；「追蹤分點動向」只顯示文章提到的分點。
+        # 10-18：週精選不畫型態評分卡；同一套技術資料只拿來產生關鍵價位（levels_only），
+        # 由 K 線右側價格框＋日期軸下方圖例呈現，不再另畫表格。
         if panels:
             tech = candidate.get("technical") or {}
             vp = candidate.get("volume_profile") or {}
             extras = candidate.get("technical_extras") or {}
-            chips = None
-            try:
-                chip_results = self._run_tools([ToolCall("get_sheet_stock_chips", {"stock_code": code, "days": 20})])
-                if chip_results and chip_results[0].ok:
-                    chips = chip_results[0].data
-            except Exception as exc:
-                self.log(f"週精選圖片分點評分列略過：{code}｜{type(exc).__name__}: {exc}")
             if tech and vp:
                 try:
-                    panels[0]["scorecard"] = weekly_pick.build_pattern_scorecard(
-                        tech, vp, extras, chips, tracked_branch_names=branches
-                    )
-                    # 精選圖精簡：主要得分／失分交給文章解讀、追蹤分點動向和 K 線標註表與文章重複，都不畫
-                    if panels[0]["scorecard"]:
-                        panels[0]["scorecard"].update(hide_reasons=True, show_tracked_branches=False)
+                    card = weekly_pick.build_pattern_scorecard(tech, vp, extras, None, tracked_branch_names=branches)
+                    if card:
+                        panels[0]["key_levels"] = dict(card, levels_only=True)
                 except Exception as exc:
-                    self.log(f"週精選圖片型態評分卡略過：{code}｜{type(exc).__name__}: {exc}")
+                    self.log(f"週精選圖片關鍵價位略過：{code}｜{type(exc).__name__}: {exc}")
 
         title = f"權證分點觀察｜週精選｜{code} {name}"
         image_text = weekly_pick.weekly_image_text(session["draft"], code, name)
@@ -6489,17 +6542,30 @@ class AceQueryEngine:
         layout, layout_note, layout_calls = None, "", 0
         if session.get("manual") and not session.get("layout_off"):
             layout, layout_note, layout_calls = self._weekly_layout(context_key, session, article["body"])
+        # 10-18：拆成兩張圖（長輩用手機看一張太多內容）：第 1 張 K 線＋型態評分＋權證明細，第 2 張精選文字
+        chart_panels = list(panels)
+        warrant_rows = self._weekly_warrant_sections(code, branches) if WEEKLY_WARRANT_DETAIL else []
+        if warrant_rows:
+            chart_panels.append({"branch_card": {"branch": warrant_rows[0]["text"], "tags": [], "label": f"資料日 {data_date}".strip(),
+                                                 "sections": warrant_rows[1:], "weekly_note": True}, "hide_text": True})
         if layout:
-            card = weekly_pick.layout_card(layout, article["title"], f"資料日 {data_date}".strip(), article["disclaimers"], keep_words=branches)
-            panels = list(panels) + [{"branch_card": card, "hide_text": True,
-                                      "footer_text": "股市艾斯  /  日 K 為收盤資料，非盤中即時行情"}]
+            # 10-18 新版文字圖：大標題＋摘要句（管理員寫「摘要：…」才有）＋01／02／03＋技術面價位卡＋操作觀察框
+            header = {"title": f"{code} {name}｜週精選", "subtitle": "權證分點觀察",
+                      "date": f"資料日 {str(data_date).replace('-', '/')}" if data_date else ""}
+            article_panels = [{"weekly_text": weekly_pick.weekly_text_data(layout, article, header, keep_words=branches)}]
         else:
-            panels = list(panels) + [{"article": article}]
+            article_panels = [{"article": article}]
         if layout_note:
             image_text += f"\n\n※ {layout_note}"
+        elapsed = time.perf_counter() - started
+        article_image = AnswerResult(text=image_text, route="weekly_article_image", gemini_calls=0, elapsed=elapsed,
+                                     cacheable=False, panels=article_panels, layout="weekly_article",
+                                     weekly={"image_title": title}, image_title=title)
+        # 第 1 張只有 K 線相關卡片：text 留空，免得文章被當成文字卡再畫一次
         return AnswerResult(
-            text=image_text, route="weekly_article_image", gemini_calls=layout_calls, elapsed=time.perf_counter()-started,
-            cacheable=False, panels=panels, layout="weekly_article", weekly={"image_title": title},
+            text="", route="weekly_article_image", gemini_calls=layout_calls, elapsed=elapsed,
+            cacheable=False, panels=chart_panels, layout="weekly_article", weekly={"image_title": title},
+            followups=[article_image],
         )
 
     def _answer_admin_moneydj_image(self, question: str, started: float) -> AnswerResult:
@@ -8235,9 +8301,11 @@ def _market_maintenance_loop(stop: threading.Event) -> None:
             # 升級後舊底庫沒有上市／上櫃完整性紀錄（含颱風假是否休市）：補查到全部有紀錄為止
             need_status = int(info.get("unchecked_days") or 0) > 0 and not sector_radar.session_open(now)
             if need_history or need_today or need_status:
-                result = market_data.sync(budget_seconds=MARKET_SYNC_BUDGET, log=lambda m: print(f"🗂️ {m}", flush=True))
-                print(f"🗂️ 市場底庫：{result['days']} 個交易日 × {result['stocks']:,} 檔｜最新 {result['last_day']}｜"
-                      f"本輪 {result['requests']} 個請求、{result['elapsed']:.0f} 秒", flush=True)
+                quiet = not __import__("log_switch").enabled("market")   # 10-20：平常不印底庫進度（同測試版）
+                result = market_data.sync(budget_seconds=MARKET_SYNC_BUDGET, log=lambda m: None if quiet else print(f"🗂️ {m}", flush=True))
+                if not quiet:
+                    print(f"🗂️ 市場底庫：{result['days']} 個交易日 × {result['stocks']:,} 檔｜最新 {result['last_day']}｜"
+                          f"本輪 {result['requests']} 個請求、{result['elapsed']:.0f} 秒", flush=True)
                 if need_today and str(result.get("last_day") or "") < today:
                     next_today_try = time.monotonic() + TODAY_SYNC_RETRY_SECONDS
                     print(f"🗂️ 市場底庫：{today} 行情尚未取得，{TODAY_SYNC_RETRY_SECONDS // 60} 分鐘後重試", flush=True)
@@ -8410,7 +8478,8 @@ def _usage_monitor_loop(engine: "AceQueryEngine", stop: threading.Event) -> None
         for provider in ("FinMindData", "CMoney", "MoneyDJFlow", "GoogleSheet", "Gemini"):
             row = usage.get(provider, {})
             lines.append(f"  {provider}｜60s={row.get('last_60s', 0)}｜10m={row.get('last_10m', 0)}｜process={row.get('process_total', 0)}｜errors={row.get('errors', 0)}｜avg={row.get('avg_latency', 0):.2f}s")
-        print("\n".join(lines), flush=True)
+        if __import__("log_switch").enabled("usage"):   # 10-20：用量報表平常不印，需要時開「用量紀錄」（同測試版）
+            print("\n".join(lines), flush=True)
         last_log = time.time()
 
 

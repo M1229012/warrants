@@ -951,6 +951,19 @@ def run_tool(name: str, kwargs: Dict[str, Any], cancel_event: Optional[threading
 # 股票代號／名稱與分點名稱辨識資料
 # ============================================================
 
+def get_emerging_codes() -> set:
+    """10-16：興櫃股票代號（FinMind 股票清單 type=emerging）。興櫃沒有公開的券商分點進出，籌碼題不去抓。"""
+    def build():
+        info = core()._finmind_load_stock_info()
+        if info is None or info.empty or "type" not in info.columns:
+            return set()
+        return set(info.loc[info["type"].astype(str) == "emerging", "stock_id"].astype(str))
+    try:
+        return _cached("emerging_codes", TTL_REFERENCE_SECONDS, build)
+    except Exception:
+        return set()
+
+
 def get_stock_name_map() -> Dict[str, str]:
     """股票代號 → 名稱：TWSE／TPEx 官方基本資料為主，FinMind 股票清單補上 ETF 等其餘代號。"""
     return _cached("stock_name_map", TTL_REFERENCE_SECONDS, _build_stock_name_map)
@@ -2387,6 +2400,11 @@ def _drop_invalid_bars(code: str, frame: pd.DataFrame, source: str) -> pd.DataFr
     拿掉的日子變成缺口，交給 legal_gap_days 用「所屬市場收盤完整、卻沒有這檔」證明確定沒成交。"""
     if frame is None or frame.empty:
         return frame
+    if str(code) in get_emerging_codes():
+        # 10-16：興櫃的 FinMind「開盤」是參考價／均價，常落在當日高低之外（例 3585 10/15 開 68.75、高 66.7），
+        # 不是壞資料：開盤夾回高低區間，其餘照常檢查（價格為 0 的無成交日仍會拿掉）
+        frame = frame.copy()
+        frame["Open"] = frame["Open"].clip(lower=frame["Low"], upper=frame["High"])
     ok = [local_market_cache.valid_bar(r.Open, r.High, r.Low, r.Close, 0.0 if pd.isna(r.Volume) else r.Volume)
           for r in frame[["Open", "High", "Low", "Close", "Volume"]].itertuples(index=False)]
     bad = len(ok) - sum(ok)
@@ -2485,7 +2503,9 @@ def _load_price_bundle(stock_code: str) -> Dict[str, Any]:
         if set(gaps) - known:
             # 已證實合法的缺口（颱風假等全市場休市、確定沒成交）不必補；只有沒證據的缺口才用本地底庫＋FinMind 補。
             # 以前每檔股票的 7/10 颱風假都會各打一次 FinMind，背景型態分數一跑就把每小時額度吃光。
-            legal = set(legal_gap_days(code, gaps))
+            # 10-16：興櫃常常整天沒成交，又不在上市櫃收盤快照裡（無法用快照證明）→ 缺口一律視為無成交
+            emerging_gaps = set(gaps) if str(code) in get_emerging_codes() else set()
+            legal = set(legal_gap_days(code, gaps)) | emerging_gaps
             unproven = [d for d in gaps if d not in legal]
             if unproven:
                 daily_df, daily_source = _repair_daily(code, daily_df, unproven, daily_source,
@@ -2494,7 +2514,7 @@ def _load_price_bundle(stock_code: str) -> Dict[str, Any]:
                 CACHE.set(f"price_daily_{code}", (daily_df, market, daily_source), TTL_PRICE_SECONDS)
                 merged, intraday = _append_intraday_bar(code, daily_df, market)
             gaps = _missing_trading_days(merged)
-            unproven = [d for d in gaps if d not in set(legal_gap_days(code, gaps))]
+            unproven = [d for d in gaps if d not in set(legal_gap_days(code, gaps)) and str(code) not in get_emerging_codes()]
             if unproven:
                 # 補不回來、又沒有休市或停牌證據的缺口：均線／布林會算錯，寧可不答（不假設是停牌或休市）。
                 # 有證據的缺口不限天數：冷門股常常好幾天沒成交、重大訊息暫停交易也可能連續好幾天沒有價格。
@@ -2503,21 +2523,23 @@ def _load_price_bundle(stock_code: str) -> Dict[str, Any]:
                 # 有證據的缺口（全市場確認休市，或所屬市場收盤快照完整卻沒有這檔＝確定沒成交）才照常分析並標註。
                 _ACCEPTED_GAPS[code] = (today, tuple(gaps))
                 shown = "、".join(gaps) if len(gaps) <= 3 else f"{gaps[0]} 等 {len(gaps)} 天"
-                print(f"⚠️ {code} 日K {shown} 已確認為休市、該股無成交或暫停交易，照常分析", flush=True)
+                if __import__("log_switch").enabled("datawarn"):   # 10-20：平常不印，需要時開「休市紀錄」（同測試版）
+                    print(f"⚠️ {code} 日K {shown} 已確認為休市、該股無成交或暫停交易，照常分析", flush=True)
         # 底庫與日K快取保持原始價，只在分析入口還原一次。
         import price_adjustment
         raw_closed = daily_df.copy()
         raw_merged = merged.copy()
         actions = get_corporate_actions(code)
+        jumps = str(code) in get_emerging_codes()   # 10-16：興櫃價格跳動不當成未核實斷層
         try:
-            daily_df = price_adjustment.adjust_shares(daily_df, actions, as_of=merged.index[-1])
-            merged = price_adjustment.adjust_shares(merged, actions)
+            daily_df = price_adjustment.adjust_shares(daily_df, actions, as_of=merged.index[-1], allow_jumps=jumps)
+            merged = price_adjustment.adjust_shares(merged, actions, allow_jumps=jumps)
         except ValueError:
             # FinMind 回應成功但事件漏列，也必須查官方參考價；成功空表不等於沒有事件。
             actions = _recover_corporate_reference(code, actions)
             try:
-                daily_df = price_adjustment.adjust_shares(raw_closed, actions, as_of=raw_merged.index[-1])
-                merged = price_adjustment.adjust_shares(raw_merged, actions)
+                daily_df = price_adjustment.adjust_shares(raw_closed, actions, as_of=raw_merged.index[-1], allow_jumps=jumps)
+                merged = price_adjustment.adjust_shares(raw_merged, actions, allow_jumps=jumps)
             except ValueError as exc:
                 raise ToolDataError(str(exc)) from exc
         closed = kf.calculate_indicators(daily_df)
