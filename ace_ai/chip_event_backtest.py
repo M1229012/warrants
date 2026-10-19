@@ -218,6 +218,10 @@ def branch_study(dates,complete_dates,rows,prices,branch_name='',action_dates=()
             score=lambda b:.65*b['observed_net_20']/top+.35*max(0.,b.get('estimated_return_pct') or 0)/max(best,1e-9)
             selected=sorted(pool,key=lambda b:(-score(b),b['branch']))[:3]
             for i,b in enumerate(selected,1):b['rank_label']=f'主力{i}'
+            # 10-20：主力只看買方會誤導（例：外資大賣時表上全是買盤）→ 補近 20 日淨賣超前 3
+            sells=sorted((b for b in studied if (b['observed_net_20'] or 0)<0),key=lambda b:b['observed_net_20'])[:3]
+            for i,b in enumerate(sells,1):b['rank_label']=f'賣超{i}'
+            selected=selected+sells
         else:
             ranked=[b for b in studied if b.get(key_net)]
             # 買超由多到少，接著賣超由多到少
@@ -412,6 +416,12 @@ def _brief_spot_card(payload):
         groups[-1][1].append(row)
         groups[-1][2].append(_branch_kind(b,habits))
     for name,rows,badges in groups:
+        if view=='key' and name=='賣超前3':
+            # 10-20：主力模式的賣方只放分點＋近 20 日淨賣超（賣方沒有成本意義），表格短、字大
+            sections+=[{'type':'heading','text':'主力賣超｜依近20日淨賣超｜張數'},
+                {'type':'table','columns':['券商分點','近20日（占量）'],'widths':[.5,.5],
+                 'signed':['近20日（占量）'],'accent':[],'rows':[[r[0],r[3]] for r in rows],'row_badges':badges}]
+            continue
         sections+=[{'type':'heading','text':name+(f'｜{basis}' if basis else '')+'｜張數'},
             {'type':'table','columns':['券商分點','當日（占量）','近5日（占量）','近20日（占量）']+(['當日買／賣均價'] if priced else [])+['現價對成本'],
              'widths':[.22,.16,.16,.16,.16,.14] if priced else [.28,.18,.18,.19,.17],
