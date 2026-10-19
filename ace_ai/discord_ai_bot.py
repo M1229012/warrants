@@ -2810,6 +2810,23 @@ def _plan_num(value) -> Optional[float]:
     return v if math.isfinite(v) and v > 0 else None
 
 
+def ma_alignment_text(values: Dict[str, float], align: str = "") -> str:
+    """10-20：均線排列的精確說法。AI 常把「MA5<MA10<MA20、MA60 在下方」寫成「空頭排列」被核對刪掉，
+    這裡直接給它可以照抄的說法（短期均線空頭／多頭排列＋MA60 位置）。"""
+    ma = [values.get(k) for k in ("MA5", "MA10", "MA20", "MA60")]
+    if None in ma:
+        return align or "資料不足"
+    if ma[0] < ma[1] < ma[2] < ma[3]:
+        return "多條均線空頭排列（MA5<MA10<MA20<MA60）"
+    if ma[0] > ma[1] > ma[2] > ma[3]:
+        return "多條均線多頭排列（MA5>MA10>MA20>MA60）"
+    if ma[0] < ma[1] < ma[2]:
+        return f"短期均線空頭排列，季線在月線{'上' if ma[3] > ma[2] else '下'}方"   # 不寫 MA60／否定句：AI 照抄也能通過核對
+    if ma[0] > ma[1] > ma[2]:
+        return f"短期均線多頭排列，季線在月線{'上' if ma[3] > ma[2] else '下'}方"
+    return "均線糾結（未形成多空排列）"
+
+
 def watch_plan(payload: Dict[str, Any]) -> Dict[str, Any]:
     """10-20：每檔的觀察重點（程式算好再交給 AI，不讓 AI 從一堆數字裡自己挑）：
     方向（偏多／偏空／盤整）、下方支撐與上方壓力（由近到遠）、上方均線的扣抵條件（反彈壓力）、下方均線（回測觀察）。
@@ -2835,6 +2852,7 @@ def watch_plan(payload: Dict[str, Any]) -> Dict[str, Any]:
             direction = "偏空"
         else:
             direction = "盤整"
+        align = ma_alignment_text(values, align)
         card = (by_tool.get("get_pattern_scorecard") or {}).get(code) or {}
         if card.get("supports_below_close") or card.get("resistances_above_close"):
             supports, resistances = card.get("supports_below_close") or [], card.get("resistances_above_close") or []
@@ -3022,6 +3040,7 @@ FINAL_WATCH_RULES = ("【觀察重點，必須照做】payload.watch_plan 是程
     "拉回時看哪條均線回測守住（用下方均線_回測觀察的明日條件），跌破代表什麼。scenarios 的 title 用「壓力突破」「回測守住」。\n"
     "- 盤整：講區間上緣（最近壓力）與下緣（最近支撐），向上突破、向下跌破各代表什麼。scenarios 的 title 用「向上突破」「向下跌破」。\n"
     "- 當日大跌依技術面規則以支撐為主。使用者問的不是走勢（只問新聞、成本、籌碼）時先回答所問，觀察重點縮成一句；brief_quote 依該規則。\n"
+    "- 均線排列一律照 watch_plan 的「均線排列」寫：寫「短期均線空頭排列」就不可省略「短期」寫成「空頭排列」；均線糾結不可寫多頭或空頭排列。\n"
     "- 價位只能用 watch_plan 或工具資料裡的數字，不自行計算；不給買賣指令，只寫要觀察的價位與條件。")
 
 
@@ -3672,11 +3691,15 @@ class FactSheet:
             forms = {cleaned, cleaned.lstrip("-")}
             unit = text[match.end():match.end() + 3].lstrip()[:1]   # 10-16：「3.4 萬張」中間有空白也要換算
             if unit in ("萬", "億"):            # 10-16：「1870 萬張」＝18,709,109 張；換算後在 0.5% 內就算對得上
-                scaled = abs(value) * (1e4 if unit == "萬" else 1e8)
+                base = 1e4 if unit == "萬" else 1e8
+                scaled = abs(value) * base
                 nums = getattr(self, "_market_floats", None)
                 if nums is None:
                     nums = self._market_floats = [abs(float(m)) for m in self.market if re.fullmatch(r"-?\d+(?:\.\d+)?", str(m))]
-                if scaled and any(abs(n - scaled) <= scaled * .005 for n in nums):
+                # 10-20：容許誤差依小數位：「1.1 萬張」是四捨五入到千張（±500），10,743 張要算對得上；整數萬至少 0.5%
+                decimals = len(cleaned.split(".", 1)[1]) if "." in cleaned else 0
+                tolerance = max(scaled * .005, 0.5 * base * 10 ** -decimals if decimals else 0.0)
+                if scaled and any(abs(n - scaled) <= tolerance for n in nums):
                     continue
             if forms & self.market:
                 # 句子只講一檔股票時，數字不可以只屬於另一檔股票。
