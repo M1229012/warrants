@@ -6367,17 +6367,8 @@ class AceQueryEngine:
         """本週精選排名：Python 公平計算 Top10，排名階段不呼叫 Gemini。"""
         stats = AnswerStats()
         self.log(f"本週精選問題：{question}")
-        if on_demand.enabled():
-            # 10-19 按需模式（測試版關背景省錢）：排名前先把全市場日K與型態分數補到最新；
-            # 整題期限內做不完就先回覆，背景繼續算，算完再問一次直接出圖。
-            budget = WEEKLY_PICK_DEADLINE_SECONDS - (time.perf_counter() - started) - 60
-            prep = on_demand.market_ready(budget_seconds=max(10.0, budget), log=self.log)
-            if not prep.get("ready"):
-                self.log(f"本週精選按需準備未完成｜已算 {prep.get('scored', 0)} 檔｜尚待 {prep.get('pending', 0)} 檔")
-                return AnswerResult(
-                    text=(f"全市場資料準備中（型態分數已算 {prep.get('scored', 0):,} 檔，尚待約 {prep.get('pending', 0):,} 檔），"
-                          "背景會繼續算完。約 5～10 分鐘後再問一次「本週精選排名」就會直接出圖。"),
-                    route="weekly_pick", gemini_calls=0, elapsed=time.perf_counter() - started, cacheable=False)
+        # 10-20：本週精選候選只來自 Sheet A～E 事件股（近 60 個交易日），每檔當場抓日K算型態分數，
+        # 不需要全市場分數底庫 → 按需模式也不先算全市場（10-19 版誤加，導致每次空等 3 分鐘）
         panels = []
         weekly: Dict[str, Any] = {}
 

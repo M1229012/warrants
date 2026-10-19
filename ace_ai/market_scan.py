@@ -220,10 +220,12 @@ def score_pending(budget_seconds: float = SCORE_BUDGET, log: Callable[[str], Non
         # 10-06：失敗紀錄存本地 DB；重新部署不再整批重算失敗股（每次重啟都燒 FinMind 額度）
         _FAILED_AT.update({k: v for k, v in (local_market_cache.get_state("pattern_score_failed", {}) or {}).items()
                            if k not in _FAILED_AT})
+        # 10-20：本地完全沒有日K的股票（族群名冊約 350 檔：ETF、興櫃、官方日行情沒有的）不列入待算——
+        # 分數只用本地底庫算，這些永遠算不出來，舊寫法每輪都重試、「尚待」永遠降不到 0。
+        universe = [c for c in universe if last_bars.get(c)]
         stamps = {c: tools.source_stamp(c) for c in universe}
         todo = [c for c in universe
-                if (not last_bars.get(c) or scored.get(c) != last_bars[c])
-                and not (last_bars.get(c) and _FAILED_AT.get(c) == stamps[c])]
+                if scored.get(c) != last_bars[c] and _FAILED_AT.get(c) != stamps[c]]
         # 10-08：日期相同但底庫 OHLCV 被更正（指紋不同）也要重算
         same_day = [c for c in universe if last_bars.get(c) and scored.get(c) == last_bars[c] and c not in set(todo)]
         for code, (_, basis) in local_market_cache.latest_pattern_score_basis(same_day).items():
