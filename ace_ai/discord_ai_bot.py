@@ -222,28 +222,34 @@ def _channel_ids(channel) -> Set[int]:
 
 
 def narrow_by_channel(config: BotConfig, access, channel):
-    """權證討論區只當權證會員、一般討論區只當已訂閱（兩種都有的會員在各區只能問該區的籌碼）；管理員不限。"""
+    """10-20：身分照舊（權證籌碼＝權證會員、現股籌碼＝已訂閱），頻道再收窄：
+    權證籌碼只在權證討論區、現股籌碼只在現股頻道（喬巴助理機器人）；其他頻道兩種都不能問。管理員不限。
+    某種頻道沒設定（環境變數空白）就不限那一種，避免漏填時全部擋掉。"""
     e = access.entitlement
     if e.admin or channel is None:
         return access
     ids = _channel_ids(channel)
-    if ids & config.warrant_channel_ids:
+    in_warrant = bool(ids & config.warrant_channel_ids)
+    in_spot = bool(ids & config.spot_channel_ids)
+    if e.warrant and config.warrant_channel_ids and not in_warrant:
+        e = replace(e, warrant=False)
+    if e.spot and (in_warrant or (config.spot_channel_ids and not in_spot)):
         e = replace(e, spot=False)
-    elif config.warrant_channel_ids:
-        e = replace(e, warrant=False)    # 10-16：權證籌碼只在權證頻道（現股頻道與其他頻道都不行）；管理員不限
     return replace(access, entitlement=e) if e is not access.entitlement else access
 
 
 def chip_channel_hint(config: BotConfig, required: str, original, channel) -> str:
-    """被頻道收窄才擋下的籌碼題（本人其實有這個權限）→ 告訴他該去哪一區，不顯示購買訊息。"""
+    """被頻道收窄才擋下的籌碼題（本人其實有這個身分）→ 告訴他該去哪一區，不顯示購買訊息。"""
     guild = getattr(channel, "guild", None)
     ids = _channel_ids(channel) if channel is not None else set()
-    if required == "SPOT" and original.spot and ids & config.warrant_channel_ids:
+    in_warrant = bool(ids & config.warrant_channel_ids)
+    in_spot = bool(ids & config.spot_channel_ids)
+    if required == "SPOT" and original.spot and (in_warrant or (config.spot_channel_ids and not in_spot)):
         target, label = config.spot_channel_ids, "現股籌碼"
-    elif required == "WARRANT" and original.warrant and not ids & config.warrant_channel_ids:
+    elif required == "WARRANT" and original.warrant and config.warrant_channel_ids and not in_warrant:
         target, label = config.warrant_channel_ids, "權證籌碼"
     else:
-        return ""                                   # 不是頻道收窄造成的 → 照舊顯示購買／解鎖訊息
+        return ""                                   # 不是頻道收窄造成的（沒有這個身分）→ 照舊顯示購買／解鎖訊息
     names = [c.name for c in (guild.get_channel(cid) for cid in sorted(target)) if c] if guild else []
     return f"{label}請到 " + ("、".join(f"#{n}" for n in names) or "指定的討論區") + " 詢問。"
 
@@ -2575,11 +2581,11 @@ AI_CARD_SCHEMA = {
 }
 
 FINAL_CARD_FORMAT = """輸出格式（艾斯 AI 解讀）：只輸出符合 schema 的 JSON，不要 Markdown、不要星號或條列符號。你是在「解讀」，不是在整理資料：K 線、均線、評分卡與關鍵價位表已經在圖上，文字要說明這些訊號代表什麼。
-- answer：這段會以粗體呈現，只放1～2句結論，通常30～60字、最多80字，先講使用者現在最需要注意的事；複合問題直接點出各面向的判斷與最重要限制，不把所有依據塞在這裡。數字只有關鍵價位才引用，不逐項報均線、量比或分點名單；詳情放why。從這題最重要的處境或訊號切入，不固定以結構偏強弱開頭，不保證漲跌、不替人決定買賣。
+- answer：這段會以粗體呈現，只放1～2句結論，通常30～60字、最多80字，第一句直接回答使用者問的事；有 watch_plan 時帶出方向判斷（偏多／偏空／盤整）與最關鍵的一個觀察價位；複合問題直接點出各面向的判斷與最重要限制，不把所有依據塞在這裡。數字只有關鍵價位才引用，不逐項報均線、量比或分點名單；詳情放why。不保證漲跌、不替人決定買賣。
 - 支撐／壓力依距離由近到遠寫，最近的先講（含「近價大量區」），不可跳過近的直接講季線。均線扣抵只能引用 turn_text 的明日條件，例如「MA20 明天收至少 955 才續揚」；目前下彎或走平寫「才轉揚」。不可寫「跌停也續揚」「漲停也續彎」「5天後支撐上移」，不列未來3天維持價位、不寫未來方向序列，也不把扣抵條件當成股價必然守住的強支撐。fail_price 是含走平容差的內部門檻，不能當成第一個合法價位；path 是假設收盤不變的內部模擬，不作確定預測。沒有 rise_price_tomorrow 時只說當前方向，不自行補價位。
 - 語氣方向跟著結構走：多頭排列、量增、沿上軌等偏強結構先寫偏強；偏弱先寫偏弱；多空抵銷才寫中性。風險寫成條件（若跌破／若量縮…），不可讓風險蓋過主要判斷，summary 方向和 answer 一致。不寫空泛警語：「風險不容忽視」「需謹慎」「宜保守」「而非追價」「不宜追高」「短期波動風險」這類沒有價位條件的提醒都不要。不可寫「假突破／假跌破」「突破成功／失敗」「型態失效」這類結論。
-- why：重點不要少，說法要精簡：圖上值得講的訊號（均線、型態、量區支撐壓力、扣抵、KD／MACD、布林、法人與分點）挑與本題相關的都可以講，通常 3～4 句、約 120～180 字；用歸納代替列舉（寫「站上所有均線」不寫「站上5日、10日、20日及60日均線」；寫「統一、台新等分點持續買進」不逐家報張數與成本），同方向的證據合併成一句（例「站上所有均線且投信連買 6 日」），不逐項報指標數值。圖上已有的數字（均線值、KD／MACD 數值、分點成本與張數）不要重抄，只在當作關鍵價位時引用 1～2 個。不寫「從技術面來看」「籌碼方面」這類開場詞。若answer已說清楚可留空。型態與趨勢只能引用kline_patterns，不重報評分或所有指標。
-- scenarios：依原問句選擇0～2個有必要的觀察條件，可留空，不強制多空各一個。title用短標直接點出本題要觀察的變化，不套固定情境名稱；text 用「若收盤…／若跌破…，代表…」的條件式，25～45 字，要有具體觀察價位，不重複 why 已講過的理由。只陳述條件與意義，不預測漲跌、不給買賣指令；使用者問操作策略／進出場／停損時也一樣，不寫「建議買進／賣出／停損設在…」，改成要觀察的價位與條件。從K線型態、支撐壓力、量價、均線與布林中選擇能回答本題的證據，不固定順序；why只談真正影響本題答案的面向，不為了湊數羅列指標。K 線型態名稱（箱型、三角收斂、上升／下降趨勢、缺口、紅三兵、吞噬、晨星、十字線、長上／下影線等）只能引用 kline_patterns 有列出的，不可自己判斷；突破狀態照原文的客觀事實描述（價格在上下緣的哪裡、突破後第幾天）；「○○ 起形成」是型態起點、「○○ 收盤向上突破」是突破日，兩個日期不可混用或互換，kline_patterns 有「創近 N 日新高／新低」「越過前高／跌破前低」「脫離近 N 日盤整區」時，與本題相關才在answer或why解釋，用詞照原文（越過、脫離、創高），價位與日期照抄；不可自行下「突破成功／失敗」「假突破／假跌破」「型態失效」這類結論，也不可解讀成偏多或偏空；recent_bars_10（近 10 日 日期 開 高 低 收）與 ma_recent_3d 只用來描述近期走勢與均線方向。answer 第一句要直接回答使用者問的事。均線排列一定照資料寫：MA5<MA10<MA20<MA60 是空頭排列，不可說成多方架構強勢、多方掌控；反之亦然；單日紅K或帶量不等於結構轉多。情境要和目前結構一致：均線空頭排列時，偏多情境寫成「轉強條件」（例「若收盤站穩季線並突破布林上軌，才有機會扭轉空頭排列」），不可寫「多方續攻」「開啟新一波漲勢」這種已經轉多或預測漲勢的說法；均線多頭排列時，偏空情境同理寫成「轉弱條件」。新聞、三大法人或沒有可觀察價位的問題給空陣列。
+- why：回答「為什麼這樣判斷、接下來看哪裡」，2～3 句、約 80～140 字。圖上已經有的數字（各均線值、KD／MACD、量比、法人與分點張數、均價）不要重抄；整段最多引用 2 個價位，而且只能是要觀察的支撐或壓力。用歸納代替列舉（寫「站上所有均線」不寫逐條均線），同方向的證據合併成一句。不寫「從技術面來看」「籌碼方面」這類開場詞。若answer已說清楚可留空。型態與趨勢只能引用kline_patterns，不重報評分或所有指標。寫法範例——不好：「MA5 為 120、MA10 為 118、MA20 為 115，KD 為 75，成交量 3 萬張，股價站上所有均線。」好：「站上所有均線、多頭排列，短線關鍵在 125 前高能否帶量突破；拉回時 MA10 附近守住才算健康整理。」
+- scenarios：有 watch_plan 時給 2 個觀察條件，title 用【觀察重點】指定的短標；沒有 watch_plan 時依原問句選擇0～2個有必要的觀察條件，可留空。text 用「若收盤…／若跌破…，代表…」的條件式，25～45 字，要有具體觀察價位，不重複 why 已講過的理由。只陳述條件與意義，不預測漲跌、不給買賣指令；使用者問操作策略／進出場／停損時也一樣，不寫「建議買進／賣出／停損設在…」，改成要觀察的價位與條件。從K線型態、支撐壓力、量價、均線與布林中選擇能回答本題的證據，不固定順序；why只談真正影響本題答案的面向，不為了湊數羅列指標。K 線型態名稱（箱型、三角收斂、上升／下降趨勢、缺口、紅三兵、吞噬、晨星、十字線、長上／下影線等）只能引用 kline_patterns 有列出的，不可自己判斷；突破狀態照原文的客觀事實描述（價格在上下緣的哪裡、突破後第幾天）；「○○ 起形成」是型態起點、「○○ 收盤向上突破」是突破日，兩個日期不可混用或互換，kline_patterns 有「創近 N 日新高／新低」「越過前高／跌破前低」「脫離近 N 日盤整區」時，與本題相關才在answer或why解釋，用詞照原文（越過、脫離、創高），價位與日期照抄；不可自行下「突破成功／失敗」「假突破／假跌破」「型態失效」這類結論，也不可解讀成偏多或偏空；recent_bars_10（近 10 日 日期 開 高 低 收）與 ma_recent_3d 只用來描述近期走勢與均線方向。answer 第一句要直接回答使用者問的事。均線排列一定照資料寫：MA5<MA10<MA20<MA60 是空頭排列，不可說成多方架構強勢、多方掌控；反之亦然；單日紅K或帶量不等於結構轉多。情境要和目前結構一致：均線空頭排列時，偏多情境寫成「轉強條件」（例「若收盤站穩季線並突破布林上軌，才有機會扭轉空頭排列」），不可寫「多方續攻」「開啟新一波漲勢」這種已經轉多或預測漲勢的說法；均線多頭排列時，偏空情境同理寫成「轉弱條件」。新聞、三大法人或沒有可觀察價位的問題給空陣列。
 - 解讀是在分析，不是把圖表重說一遍：圖卡與表格已列出的分點、張數、價位、比例不要逐項重述（最多引用 1～2 個當作論據），要說明這些資料代表什麼、彼此的關係與對後續的影響。
 - 不要介紹資料來源（不寫「資料來自／取自某網站或資料商」），券商分點名稱照常使用。
 - 只寫和本題答案有關的內容：沒有發生的事、資料顯示「沒有」的項目（例如沒有隔日沖賣出、沒有法人買賣、沒有新聞）不用特別說明；不列和結論無關的數字。分析賣壓或買盤時，從成交量變化、主要賣出／買進券商是誰來說明。
@@ -2789,6 +2795,63 @@ def _spot_price_ai_scope(name, data):
     return scoped
 
 
+def _plan_num(value) -> Optional[float]:
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    return v if math.isfinite(v) and v > 0 else None
+
+
+def watch_plan(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """10-20：每檔的觀察重點（程式算好再交給 AI，不讓 AI 從一堆數字裡自己挑）：
+    方向（偏多／偏空／盤整）、下方支撐與上方壓力（由近到遠）、上方均線的扣抵條件（反彈壓力）、下方均線（回測觀察）。
+    價位只取工具資料裡已有的數字（均線、大量區、布林），不另外計算新數字，事實核對才對得上。"""
+    results = payload.get("tool_results") or {}
+    by_tool: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    for key, data in results.items():
+        if isinstance(data, dict) and data.get("stock_code"):
+            by_tool.setdefault(key.split(":", 1)[0], {})[str(data["stock_code"])] = data
+    plans: Dict[str, Any] = {}
+    for code, tech in (by_tool.get("get_technical_analysis") or {}).items():
+        close = _plan_num(tech.get("close"))
+        values = {k: _plan_num((v or {}).get("value")) for k, v in (tech.get("moving_averages") or {}).items()}
+        values = {k: v for k, v in values.items() if v is not None}
+        if close is None or not values:
+            continue
+        align = str(tech.get("ma_alignment") or "")
+        above = sum(1 for v in values.values() if close > v)
+        ma20, ma60 = values.get("MA20"), values.get("MA60")
+        if "多頭排列" in align or (ma20 and ma60 and close > ma20 and close > ma60 and above >= 3):
+            direction = "偏多"
+        elif "空頭排列" in align or (ma20 and ma60 and close < ma20 and close < ma60 and above <= 1):
+            direction = "偏空"
+        else:
+            direction = "盤整"
+        card = (by_tool.get("get_pattern_scorecard") or {}).get(code) or {}
+        if card.get("supports_below_close") or card.get("resistances_above_close"):
+            supports, resistances = card.get("supports_below_close") or [], card.get("resistances_above_close") or []
+        else:
+            levels = tools.key_price_levels(tech, (by_tool.get("get_volume_profile") or {}).get(code) or {})
+            supports, resistances = levels.get("supports") or [], levels.get("resistances") or []
+        pick = lambda items: [{"名稱": str(x.get("label")), "價位": x.get("price")} for x in items
+                              if _plan_num(x.get("price")) is not None][:3]
+        upper, lower = [], []
+        for key, info in (tech.get("ma_deduction") or {}).items():
+            value = values.get(key)
+            if value is None or not isinstance(info, dict):
+                continue
+            row = {"均線": key, "價位": value, "方向": info.get("direction_now"),
+                   "明日條件": answer_image.public_ma_condition(info)}
+            (upper if value > close else lower).append(row)
+        plans[code] = {"方向": direction, "均線排列": align or "資料不足", "收盤": close,
+                       "下方支撐_由近到遠": pick(sorted(supports, key=lambda x: -(_plan_num(x.get("price")) or 0))),
+                       "上方壓力_由近到遠": pick(sorted(resistances, key=lambda x: _plan_num(x.get("price")) or 1e18)),
+                       "上方均線_扣抵條件": sorted(upper, key=lambda r: r["價位"]),
+                       "下方均線_回測觀察": sorted(lower, key=lambda r: -r["價位"])}
+    return plans
+
+
 def build_final_payload(question: str, results: Sequence[tools.ToolResult]) -> Dict[str, Any]:
     has_scorecard = any(r.ok and r.name == "get_pattern_scorecard" for r in results)
     tool_results: Dict[str, Any] = {}
@@ -2838,7 +2901,7 @@ MEMBER_PATTERN_RULES = """會員型態圖：chart_context.stocks 是圖上實際
 圖線visible=false時，禁止判斷目前位於三角內／外或使用上下緣價位；triangle_history僅為歷史紀錄，不能證明今日位置。改以圖上可核對的均線、量區與價格解讀。
 均線位置依last_bar的收盤與MA5/MA10/MA20/MA60數值及ma_positions逐項核對；不把站上MA60寫成低於全部均線，不把短期空頭排列說成四條均線完整空頭排列。圖上的上下緣是本次主要整理，不用局部支撐失守推論整個三角跌破。
 目前價格位置以chart_context中的current_position與last_bar為準；triangle_structure舊位置只作辨識紀錄，不把候選在線外或盤中越線寫成正式突破事件。
-why用約180～260字解釋型態是否成立、目前位置、關鍵風險。scenarios最多2個，寫具體條件：若收盤有效越線及延續／回測守住會代表什麼，若收回型態內或跌破觀察位置如何重新評估。用條件式觀察，不替用戶下買賣指令、不保證獲利、不設定個人停損比例。沒有量能數據不捏造放量。
+why用2～3句、約100～160字解釋型態是否成立、目前位置、關鍵風險，不重抄圖上數字。scenarios最多2個，寫具體條件：若收盤有效越線及延續／回測守住會代表什麼，若收回型態內或跌破觀察位置如何重新評估。用條件式觀察，不替用戶下買賣指令、不保證獲利、不設定個人停損比例。沒有量能數據不捏造放量。
 不要重複報所有均線／價位；summary留空。"""
 
 
@@ -2933,6 +2996,28 @@ FINAL_SPOT_PRICE_RULES = ("【現股價格歸屬，必須遵守】price_referenc
     "值缺失時不要拿全股參考價代替分點均價，也不要自行填值。保持原問句的客製化回應及自然接梗，不把這些規則或計算說明逐條寫給使用者。")
 
 
+FINAL_SPOT_EVENT_RULES = ("【現股分點動向（10-20 精簡版）】解讀只回答三件事：1. 誰在主導、在做什麼（布局、加碼、調節、出貨、隔日沖、短進短出）；"
+    "2. 和股價的關係（例如在漲停附近買進、逢高調節、低檔承接）；3. 接下來要看什麼（主力是否續買、隔日沖賣壓是否出完、承接是否延續）。"
+    "answer 1 句給明確看法（籌碼偏多／偏空／多空拉鋸）加主因；why 最多 2 句、約 60～110 字；scenarios 最多 1 個；summary 留空。"
+    "整段最多引用 2 個數字，不逐家念分點張數、占量、均價與參考價（表格上都有）；外資券商分點不等於外資法人。"
+    "不可寫任何資料來源名稱。分點有 avg_prices 時是實際成交均價（period＝當日或近N日），可說明成交發生在什麼價位，"
+    "但不代表持股成本、不能推論支撐；沒有 avg_prices 的分點不寫價格。estimated_return_pct 是現價對買超日收盤加權參考價，不是實際損益。"
+    "不要引用任何波段勝率、報酬或筆數；不推定交易者心理、停損或防守意願。只提供現股資料時不杜撰技術結構；"
+    "型態＋籌碼同一題時，籌碼只佔 why 的一句，scenarios 不另給籌碼條件。")
+
+
+FINAL_WATCH_RULES = ("【觀察重點，必須照做】payload.watch_plan 是程式依均線排列與收盤位置算好的每檔方向，以及由近到遠的支撐、壓力、"
+    "上方均線扣抵條件（反彈壓力）與下方均線（回測觀察）。解讀要依方向給客觀的觀察重點，不是把圖上數據再說一次：\n"
+    "- 偏空：先講下方最近的支撐，以及哪一個支撐最有機會止跌反彈、原因（大量區、前低、季線等），止跌要看的訊號（下影線、量縮、站回某價位），"
+    "跌破後的下一個支撐；再用一句說上方均線的扣抵壓力（例「MA20 明天收至少 X 才轉揚，否則續彎、反彈到這裡容易遇壓」）。"
+    "scenarios 的 title 用「支撐觀察」「轉強條件」。\n"
+    "- 偏多：重點放在上方壓力與型態是否突破（triangle_structure 或 kline_patterns 有突破事件才講），突破要不要帶量；"
+    "拉回時看哪條均線回測守住（用下方均線_回測觀察的明日條件），跌破代表什麼。scenarios 的 title 用「壓力突破」「回測守住」。\n"
+    "- 盤整：講區間上緣（最近壓力）與下緣（最近支撐），向上突破、向下跌破各代表什麼。scenarios 的 title 用「向上突破」「向下跌破」。\n"
+    "- 當日大跌依技術面規則以支撐為主。使用者問的不是走勢（只問新聞、成本、籌碼）時先回答所問，觀察重點縮成一句；brief_quote 依該規則。\n"
+    "- 價位只能用 watch_plan 或工具資料裡的數字，不自行計算；不給買賣指令，只寫要觀察的價位與條件。")
+
+
 def build_final_prompt(payload: Dict[str, Any]) -> str:
     """只放這題用得到的規則：技術面、新聞、型態評分卡各自一段，避免每題都送全部規則。"""
     names = {key.split(":", 1)[0] for key in (payload.get("tool_results") or {})}
@@ -2965,12 +3050,12 @@ def build_final_prompt(payload: Dict[str, Any]) -> str:
         sections.append(FINAL_RANK_RULES)
     if names & {"get_spot_chip_summary", "get_spot_branch_flow", "get_spot_event_backtest"}:
         sections.append(FINAL_SPOT_PRICE_RULES)
-    if "get_spot_chip_summary" in names:
-        sections.append(FINAL_SPOT_RULES)
+    if "get_spot_chip_summary" in names and "get_spot_event_backtest" not in names:
+        sections.append(FINAL_SPOT_RULES)        # 10-20：有分點動向表時以表為主，不再送 Top5／集中度規則（解讀會變成念數據）
     if names & {"get_spot_chip_summary", "get_spot_event_backtest"} and _OVERNIGHT_ASK_RE.search(str(payload.get("question") or "")):
         sections.append(FINAL_OVERNIGHT_RULES)      # 10-15：問隔日沖，不論走型態＋籌碼或分點動向，都用白話規則
     if "get_spot_event_backtest" in names:
-        sections.append("現股分點動向（10-15）：解讀中不可寫出任何資料來源名稱（MoneyDJ、富邦、FinMind、證交所等）。分點有 avg_prices 時是實際成交金額算出的均價（buy_avg_day／sell_avg_day＝當日買／賣均價、buy_avg_period＝近20日買進均價），比估成本可靠，可用來說明成交發生在什麼價位（例如是否在漲停價附近買進、隔日以什麼價位賣出），不代表持股成本，也不能推論支撐或賣壓；沒有 avg_prices 的分點不要寫價格。answer 先給一個明確看法（籌碼偏多／偏空／多空拉鋸），再用一句話說主因；why 依序寫：支持這個看法的證據、與看法矛盾的證據、接下來確認或推翻看法的條件（例如賣壓是否集中在少數分點、承接買盤是否延續、轉賣且跌破哪個技術價位代表承接轉弱）；不可推定交易者的持有期限、心理、套牢、停損或防守意願，均價只是期間成交均價，不等於目前剩餘持股成本；最多引用 2～3 個關鍵數字，不逐家列分點張數、比率與均價。表格已列出各分點張數與估成本，解讀要分析買賣結構，例如：近5日與近20日淨買賣超的差異（買賣超是否集中在最近幾天）、是否有隔日沖型買盤、外資與本土券商買賣方向是否相反、買盤集中或分散；不要逐一念各分點的張數與參考價。不要引用任何波段／事件的勝率、平均報酬、筆數或「歷史勝率較高」這類說法；主要看 volume_pct_5＝近5日淨買賣超占成交量、latest_net＝最新一天加碼或調節、retention_pct＝近20日買進量還留著的比例、estimated_return_pct＝現價對估成本（買超日收盤加權，不是實際成本）；成熟波段樣本很少，samples 未達 20 筆時不要引用波段勝率、達標比例或報酬中位數。現股波段統計：使用觀察到的上榜資料，波段累積達規模門檻才成立，次日開盤模擬買進，5/10/20交易日收盤計算。不是實際持股或獲利。主畫面20日，達3%/5%是期末比例，不能把盤中曾達標或漲0.01%算達標。成熟波段少於5笔時使用逐筆紀錄，不拿百分比推論未來。median_return_pct為報酬中位數，median_entry_depth_pct為相對進場價最深跌幅中位數；與worst_drawdown_pct不同，最高漲幅和最深跌幅無先後順序。background為同期間、同進場及排除規則的股價參考，40有效日以下不顯示比例。overnight為本股票本分點的大額買超後隔日反向紀錄：未上榜不是零，不代表同一客戶、真實出場或其他股票也隔日沖；少量配對只陳述事實。estimated_return_pct只是現價相對觀察估均價，非實際損益。沒有margin就省略融資；存在才依實際事件回應，不推論大戶身分。沿用原問句客製回覆與接梗，先回答問題，避免逐行念表；計算方法與例行註解留Log，不在圖片生成免責小字，但資料不足時需用正常文字明確回答。")
+        sections.append(FINAL_SPOT_EVENT_RULES)
     if "get_spot_branch_flow" in names:
         sections.append(FINAL_SPOT_BRANCH_RULES)
     if "get_branch_warrant_detail" in names:
@@ -2981,6 +3066,8 @@ def build_final_prompt(payload: Dict[str, Any]) -> str:
         sections.append(FINAL_INDEX_COMPARE_RULES)
     elif "get_pattern_scorecard" in names:
         sections.append(FINAL_PATTERN_RULES)
+    if payload.get("watch_plan"):
+        sections.append(FINAL_WATCH_RULES)
     sections.append(FINAL_CARD_FORMAT)
     if payload.get("brief_quote"):
         sections.append("本題只問數字（股價、成交量、漲跌）：圖上雖有完整型態資料，解讀要以回答所問為主。answer 先直接回答數字，"
@@ -4785,6 +4872,22 @@ def drop_source_mentions(text: str) -> str:
         return text
     parts = re.split(r"(?<=[。！？；])", str(text))
     return "".join(p for p in parts if not (_SOURCE_NAME_RE.search(p) or _SOURCE_INTRO_RE.search(p))).strip()
+
+
+def drop_number_dumps(text: str, limit: int = 4) -> str:
+    """10-20：一句裡堆 limit 個以上數字＝在念圖上數據（「MA5 為 120、MA10 為 118…」），整句拿掉。
+    MA20、日期、近 20 日這類代號／期間不算數字。"""
+    if not text:
+        return text
+    parts = re.split(r"(?<=[。！？；])", str(text))
+    kept = []
+    for part in parts:
+        plain = part
+        for pattern in _EXEMPT_PATTERNS:
+            plain = pattern.sub(" ", plain)
+        if len(_NUMBER_RE.findall(plain)) < limit:
+            kept.append(part)
+    return "".join(kept).strip()
 
 
 def drop_warrant_listing(text: str, results) -> str:
@@ -8267,6 +8370,14 @@ class AceQueryEngine:
             payload = member_pattern.scoped_payload(payload, context)
         if plan.needs:
             payload["needs"] = plan.needs        # 10-08：需求表真的傳到最後回答
+        try:
+            plans = watch_plan(payload)          # 10-20：依方向的觀察重點（在顯示範圍收窄之後算，價位和圖一致）
+        except Exception as exc:
+            plans = {}
+            self.log(f"觀察重點略過｜{type(exc).__name__}: {exc}")
+        if plans:
+            payload["watch_plan"] = plans
+            self.log("觀察重點｜" + "｜".join(f"{c} {v['方向']}" for c, v in plans.items()))
         prompt = build_final_prompt(payload)
         stats.prompt_chars = len(prompt)
         gemini_started = time.perf_counter()
@@ -8315,6 +8426,8 @@ class AceQueryEngine:
                 card[key] = drop_directives(card.get(key, ""))
                 card[key] = drop_warrant_listing(card[key], results)
                 card[key] = drop_source_mentions(card[key])
+                if key in ("why", "summary"):
+                    card[key] = drop_number_dumps(card[key])   # 10-20：念數據的句子拿掉
             card["scenarios"] = [dict(x, text=drop_source_mentions(drop_directives(x["text"])),
                                       title=drop_source_mentions(drop_directives(fix_scenario_title(x.get("title", "")))))
                                  for x in card.get("scenarios") or []]

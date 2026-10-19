@@ -50,6 +50,9 @@ SYNC_BUDGET = float(os.getenv("DISCORD_AI_SPOT_SYNC_BUDGET", "10") or 10)
 HTTP_READ_TIMEOUT = float(os.getenv("DISCORD_AI_SPOT_HTTP_TIMEOUT", "4") or 4)
 # 第一次查詢同步補一年分點的等待上限（秒）；0＝關閉（只補 70 日、其餘交給背景）
 YEAR_SYNC_BUDGET = float(os.getenv("DISCORD_AI_SPOT_YEAR_SYNC_BUDGET", "60") or 0)
+# 10-20：背景是否把問過的股票補滿一年（1＝補一年；0＝背景只補近 70 日，一年分點等會員查詢時同步補）。
+# 預設 0：一年背景補抓會讓 CPU 長時間空轉（10-19 測試版約 0.38 vCPU 連續數天），有人問才補就夠。
+YEAR_BACKGROUND = os.getenv("DISCORD_AI_SPOT_YEAR_BACKGROUND", "0").strip().lower() in ("1", "true", "yes", "on")
 # 背景補資料排隊上限（排隊中＋執行中的股票數）；滿了這次就不排，下次有人查再試
 MAX_PENDING_BACKFILLS = max(1, int(os.getenv("DISCORD_AI_SPOT_MAX_PENDING_BACKFILLS", "24") or 24))
 # 來源連續失敗幾次就停止本輪，並讓新的抓取暫停 SOURCE_COOLDOWN 秒（已在 DB 的資料照常回答）
@@ -1207,6 +1210,12 @@ def prefetch_history(now=None, fetch_source=open_source, max_submit=1):
             if code in _BACKGROUND:continue
         # Probe the oldest exact date once a day. Existing complete date proves access.
         statuses=local_market_cache.spot_day_status(code,dates)
+        if not YEAR_BACKGROUND:
+            # 10-20：背景只補近 70 日（不探測一年、不抓一年日K）；一年分點由 ensure_year 在會員查詢時補
+            if _unresolved(code,dates[-70:],statuses):
+                submitted+=continue_in_background(code,dates[-70:],dates[-1],(),fetch_source)
+            codes=codes[1:]+codes[:1]
+            break
         probe=local_market_cache.get_state('spot_year_probe:'+code,{}) or {}
         proven=(statuses.get(dates[0]) or {}).get('status')=='complete'
         if not proven and probe.get('day')!=now.strftime('%Y-%m-%d'):
