@@ -2591,7 +2591,7 @@ FINAL_CARD_FORMAT = """輸出格式（艾斯 AI 解讀）：只輸出符合 sche
 - answer：這段會以粗體呈現，只放1～2句結論，通常30～60字、最多80字，只寫一句、60 字內（價位要寫在同一句裡，不可另起一句只寫觀察價位）；第一句直接回答使用者問的事；有 watch_plan 且問的是走勢時帶出方向判斷與最關鍵的一個觀察價位；複合問題直接點出各面向的判斷與最重要限制，不把所有依據塞在這裡。數字只有關鍵價位才引用，不逐項報均線、量比或分點名單；詳情放why。不保證漲跌、不替人決定買賣。
 - 支撐／壓力依距離由近到遠寫，最近的先講（含「近價大量區」），不可跳過近的直接講季線。均線扣抵只能引用 turn_text 的明日條件，例如「MA20 明天收至少 955 才續揚」；目前下彎或走平寫「才轉揚」。不可寫「跌停也續揚」「漲停也續彎」「5天後支撐上移」，不列未來3天維持價位、不寫未來方向序列，也不把扣抵條件當成股價必然守住的強支撐。fail_price 是含走平容差的內部門檻，不能當成第一個合法價位；path 是假設收盤不變的內部模擬，不作確定預測。沒有 rise_price_tomorrow 時只說當前方向，不自行補價位。
 - 語氣方向跟著結構走：多頭排列、量增、沿上軌等偏強結構先寫偏強；偏弱先寫偏弱；多空抵銷才寫中性。風險寫成條件（若跌破／若量縮…），不可讓風險蓋過主要判斷，summary 方向和 answer 一致。不寫空泛警語：「風險不容忽視」「需謹慎」「宜保守」「而非追價」「不宜追高」「短期波動風險」這類沒有價位條件的提醒都不要。不可寫「假突破／假跌破」「突破成功／失敗」「型態失效」這類結論。
-- why：回答「為什麼這樣判斷、接下來看哪裡」，2～3 句、約 80～140 字。圖上已經有的數字（各均線值、KD／MACD、量比、法人與分點張數、均價）不要重抄；整段最多引用 2 個價位，而且只能是要觀察的支撐或壓力。用歸納代替列舉（寫「站上所有均線」不寫逐條均線），同方向的證據合併成一句。不寫「從技術面來看」「籌碼方面」這類開場詞。若answer已說清楚可留空。型態與趨勢只能引用kline_patterns，不重報評分或所有指標。寫法範例——不好：「MA5 為 120、MA10 為 118、MA20 為 115，KD 為 75，成交量 3 萬張，股價站上所有均線。」好：「站上所有均線、多頭排列，短線關鍵在 125 前高能否帶量突破；拉回時 MA10 附近守住才算健康整理。」
+- why：回答「為什麼這樣判斷、接下來看哪裡」，3～5 句、約 150～230 字。重點不要少、說法要精簡：方向的原因、最近支撐與壓力代表什麼、均線扣抵或型態量能的影響，題目有籌碼或法人資料就各用一句說明，能講的重點都講到。圖上已經有的數字（各均線值、KD／MACD、量比、法人與分點張數、均價）不要重抄；整段最多引用 3 個價位，而且只能是要觀察的支撐或壓力。用歸納代替列舉（寫「站上所有均線」不寫逐條均線），同方向的證據合併成一句。不寫「從技術面來看」「籌碼方面」這類開場詞。若answer已說清楚可留空。型態與趨勢只能引用kline_patterns，不重報評分或所有指標。寫法範例——不好：「MA5 為 120、MA10 為 118、MA20 為 115，KD 為 75，成交量 3 萬張，股價站上所有均線。」好：「站上所有均線、多頭排列，短線關鍵在 125 前高能否帶量突破；拉回時 MA10 附近守住才算健康整理。」
 - scenarios：有 watch_plan 時給 2 個觀察條件，title 用【觀察重點】指定的短標；沒有 watch_plan 時依原問句選擇0～2個有必要的觀察條件，可留空。text 用「若收盤…／若跌破…，代表…」的條件式，25～45 字，要有具體觀察價位，不重複 why 已講過的理由。只陳述條件與意義，不預測漲跌、不給買賣指令；使用者問操作策略／進出場／停損時也一樣，不寫「建議買進／賣出／停損設在…」，改成要觀察的價位與條件。從K線型態、支撐壓力、量價、均線與布林中選擇能回答本題的證據，不固定順序；why只談真正影響本題答案的面向，不為了湊數羅列指標。K 線型態名稱（箱型、三角收斂、上升／下降趨勢、缺口、紅三兵、吞噬、晨星、十字線、長上／下影線等）只能引用 kline_patterns 有列出的，不可自己判斷；突破狀態照原文的客觀事實描述（價格在上下緣的哪裡、突破後第幾天）；「○○ 起形成」是型態起點、「○○ 收盤向上突破」是突破日，兩個日期不可混用或互換，kline_patterns 有「創近 N 日新高／新低」「越過前高／跌破前低」「脫離近 N 日盤整區」時，與本題相關才在answer或why解釋，用詞照原文（越過、脫離、創高），價位與日期照抄；不可自行下「突破成功／失敗」「假突破／假跌破」「型態失效」這類結論，也不可解讀成偏多或偏空；recent_bars_10（近 10 日 日期 開 高 低 收）與 ma_recent_3d 只用來描述近期走勢與均線方向。answer 第一句要直接回答使用者問的事。均線排列一定照資料寫：MA5<MA10<MA20<MA60 是空頭排列，不可說成多方架構強勢、多方掌控；反之亦然；單日紅K或帶量不等於結構轉多。情境要和目前結構一致：均線空頭排列時，偏多情境寫成「轉強條件」（例「若收盤站穩季線並突破布林上軌，才有機會扭轉空頭排列」），不可寫「多方續攻」「開啟新一波漲勢」這種已經轉多或預測漲勢的說法；均線多頭排列時，偏空情境同理寫成「轉弱條件」。新聞、三大法人或沒有可觀察價位的問題給空陣列。
 - 解讀是在分析，不是把圖表重說一遍：圖卡與表格已列出的分點、張數、價位、比例不要逐項重述（最多引用 1～2 個當作論據），要說明這些資料代表什麼、彼此的關係與對後續的影響。
 - 不要介紹資料來源（不寫「資料來自／取自某網站或資料商」），券商分點名稱照常使用。
@@ -2942,7 +2942,7 @@ MEMBER_PATTERN_RULES = """會員型態圖：chart_context.stocks 是圖上實際
 圖線visible=false時，禁止判斷目前位於三角內／外或使用上下緣價位；triangle_history僅為歷史紀錄，不能證明今日位置。改以圖上可核對的均線、量區與價格解讀。
 均線位置依last_bar的收盤與MA5/MA10/MA20/MA60數值及ma_positions逐項核對；不把站上MA60寫成低於全部均線，不把短期空頭排列說成四條均線完整空頭排列。圖上的上下緣是本次主要整理，不用局部支撐失守推論整個三角跌破。
 目前價格位置以chart_context中的current_position與last_bar為準；triangle_structure舊位置只作辨識紀錄，不把候選在線外或盤中越線寫成正式突破事件。
-why用2～3句、約100～160字解釋型態是否成立、目前位置、關鍵風險，不重抄圖上數字。scenarios最多2個，寫具體條件：若收盤有效越線及延續／回測守住會代表什麼，若收回型態內或跌破觀察位置如何重新評估。用條件式觀察，不替用戶下買賣指令、不保證獲利、不設定個人停損比例。沒有量能數據不捏造放量。
+why用3～5句、約150～230字解釋型態是否成立、目前位置、關鍵支撐壓力與風險，重點不要少但不重抄圖上數字。scenarios最多2個，寫具體條件：若收盤有效越線及延續／回測守住會代表什麼，若收回型態內或跌破觀察位置如何重新評估。用條件式觀察，不替用戶下買賣指令、不保證獲利、不設定個人停損比例。沒有量能數據不捏造放量。
 不要重複報所有均線／價位；summary留空。"""
 
 
@@ -3039,12 +3039,12 @@ FINAL_SPOT_PRICE_RULES = ("【現股價格歸屬，必須遵守】price_referenc
 
 FINAL_SPOT_EVENT_RULES = ("【現股分點動向（10-20 精簡版）】解讀只回答三件事：1. 誰在主導、在做什麼（布局、加碼、調節、出貨、隔日沖、短進短出）；"
     "2. 和股價的關係（例如在漲停附近買進、逢高調節、低檔承接）；3. 接下來要看什麼（主力是否續買、隔日沖賣壓是否出完、承接是否延續）。"
-    "answer 1 句給明確看法（籌碼偏多／偏空／多空拉鋸）加主因；why 最多 2 句、約 60～110 字；scenarios 最多 1 個；summary 留空。"
-    "整段最多引用 2 個數字，不逐家念分點張數、占量、均價與參考價（表格上都有）；外資券商分點不等於外資法人。"
+    "answer 1 句給明確看法（籌碼偏多／偏空／多空拉鋸）加主因；why 2～4 句、約 100～180 字（三件事都要講到）；scenarios 最多 1 個；summary 留空。"
+    "整段最多引用 3 個數字，不逐家念分點張數、占量、均價與參考價（表格上都有）；外資券商分點不等於外資法人。"
     "不可寫任何資料來源名稱。分點有 avg_prices 時是實際成交均價（period＝當日或近N日），可說明成交發生在什麼價位，"
     "但不代表持股成本、不能推論支撐；沒有 avg_prices 的分點不寫價格。estimated_return_pct 是現價對買超日收盤加權參考價，不是實際損益。"
     "不要引用任何波段勝率、報酬或筆數；不推定交易者心理、停損或防守意願。只提供現股資料時不杜撰技術結構；"
-    "型態＋籌碼同一題時，籌碼只佔 why 的一句，scenarios 不另給籌碼條件。")
+    "型態＋籌碼同一題時，籌碼用 why 的 1～2 句說明（誰在主導、和股價的關係），scenarios 不另給籌碼條件。")
 
 
 FINAL_WATCH_RULES = ("【觀察重點，必須照做】payload.watch_plan 是程式依均線排列與收盤位置算好的每檔方向，以及由近到遠的支撐、壓力、"
@@ -3111,7 +3111,7 @@ def build_final_prompt(payload: Dict[str, Any]) -> str:
     if payload.get("watch_plan"):
         sections.append(FINAL_WATCH_RULES)
     if payload.get("compare_page"):
-        sections.append("【兩檔比較，必須照做】只說重點：answer 一句（60 字內）說哪檔結構相對強或弱與主因；why 2～3 句、約 100～160 字，"
+        sections.append("【兩檔比較，必須照做】只說重點：answer 一句（60 字內）說哪檔結構相對強或弱與主因；why 3～5 句、約 150～230 字，兩檔各自的重點都要講到，"
                         "每檔最多引用 1 個關鍵價位；不報型態分數、評分、五大項，不逐條念均線、量區、布林與法人張數（圖上都有）；"
                         "scenarios 每檔 1 個，title 用股票名稱＋觀察重點（例「台積電｜回測守住」），text 寫該檔要觀察的價位與條件。")
     if payload.get("brief_pattern"):
@@ -4945,6 +4945,21 @@ def soften_candidate_triangle(text: str) -> str:
     return t
 
 
+def soften_alignment(text: str, plans: Optional[Dict[str, Any]]) -> str:
+    """10-20：AI 把「短期均線空頭排列」寫成「均線呈現空頭排列」「MA5、MA10、MA20 與 MA60 皆呈現空頭排列」被刪句。
+    只有一檔時，依 watch_plan 的正確說法改寫那一段（短期均線空頭／多頭排列、均線糾結），再核對一次。"""
+    if not plans or len(plans) != 1:
+        return text
+    label = str(next(iter(plans.values())).get("均線排列") or "")
+    if label.startswith("短期均線空頭排列"):
+        return re.sub(r"(?:短期)?(?:均線|MA\d)[^，。；]{0,30}?空頭(?:排列|架構)", "短期均線空頭排列", text)
+    if label.startswith("短期均線多頭排列"):
+        return re.sub(r"(?:短期)?(?:均線|MA\d)[^，。；]{0,30}?多頭(?:排列|架構)", "短期均線多頭排列", text)
+    if label.startswith("均線糾結"):
+        return re.sub(r"(?:短期)?(?:均線|MA\d)[^，。；]{0,30}?[多空]頭(?:排列|架構)", "均線糾結", text)
+    return text
+
+
 def split_answer_head(text: str, limit: int = 80) -> Tuple[str, str]:
     """10-20：結論只留第一句（≤limit 字）；其餘回傳給呼叫端接到「為什麼」。第一句就超過 limit 時整段保留。"""
     text = str(text or "").strip()
@@ -4956,7 +4971,7 @@ def split_answer_head(text: str, limit: int = 80) -> Tuple[str, str]:
     return text, ""
 
 
-def drop_number_dumps(text: str, limit: int = 4, total: int = 5) -> str:
+def drop_number_dumps(text: str, limit: int = 4, total: int = 7) -> str:
     """10-20：一句裡堆 limit 個以上數字＝在念圖上數據（「MA5 為 120、MA10 為 118…」），整句拿掉；
     整段累計超過 total 個數字後，後面還帶數字的句子也拿掉（解讀說重點，不把數據全部寫一遍）。
     MA20、日期、近 20 日這類代號／期間不算數字。"""
@@ -8523,8 +8538,16 @@ class AceQueryEngine:
             issues = facts.check(text)
             if not issues:
                 return text
-            if any("候選" in reason for _, reasons in issues for reason in reasons):   # check 回傳 [(句子, [原因…])]
+            reasons_all = [reason for _, reasons in issues for reason in reasons]   # check 回傳 [(句子, [原因…])]
+            if any("候選" in reason for reason in reasons_all):
                 fixed = soften_candidate_triangle(text)
+                if fixed != text:
+                    softened.append(text[:40])
+                    text = fixed
+                    if not facts.check(text):
+                        return text
+            if any("排列不符" in reason for reason in reasons_all):
+                fixed = soften_alignment(text, payload.get("watch_plan"))   # 10-20：均線排列照正確說法改寫
                 if fixed != text:
                     softened.append(text[:40])
                     text = fixed
@@ -8554,7 +8577,7 @@ class AceQueryEngine:
             card["answer"] = head.strip()
             card["why"] = card["why"][len(head):].strip()
         if softened:
-            self.log(f"事實核對（解讀卡）：候選三角補上「候選」{len(softened)} 處｜{'；'.join(softened[:4])}")
+            self.log(f"事實核對（解讀卡）：程式改寫 {len(softened)} 處（候選三角／均線排列）｜{'；'.join(softened[:4])}")
         if removed_all:
             self.log(f"事實核對（解讀卡）：刪除 {len(removed_all)} 句｜{'；'.join(r for r in removed_all[:6])}")
         # 10-16：標題句還在就保留解讀（只刪錯的句子）；只有連標題都補不回來才改用規則式回答
@@ -8730,7 +8753,7 @@ class AceQueryEngine:
                 card[key] = drop_warrant_listing(card[key], results)
                 card[key] = drop_source_mentions(card[key])
                 if key in ("why", "summary"):
-                    card[key] = drop_number_dumps(card[key], total=4 if payload.get("compare_page") else 5)   # 10-20：念數據的句子拿掉
+                    card[key] = drop_number_dumps(card[key], total=6 if payload.get("compare_page") else 7)   # 10-20：念數據的句子拿掉
             # 10-20：結論太長時圖卡會把後半句切成標題下一行小字（例「關鍵觀察 2420 元能否站穩。」）→ 後半段移到「為什麼」開頭
             card["answer"], spill = split_answer_head(card.get("answer", ""))
             if spill:
