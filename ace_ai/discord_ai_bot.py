@@ -7764,6 +7764,7 @@ class AceQueryEngine:
                     margin = chip_event_backtest.margin_card(data)
                     if margin:
                         panels.append({"branch_card": margin, "hide_text": True})
+        self._attach_chart_levels(panels, results, parsed.cost_price)
         contribution = next((r.data for r in results if r.name == "get_index_contribution" and r.ok), None)
         markets = list((contribution or {}).get("markets") or [])
         # 問大盤就只給加權、問櫃買就只給櫃買；沒指定才兩個都給，不要拿另一個市場充數。
@@ -8070,6 +8071,16 @@ class AceQueryEngine:
         except Exception as exc:
             self.log(f"測試現股回測略過｜{code}｜{type(exc).__name__}: {exc}")
             return None
+
+    def _attach_chart_levels(self, panels: List[Dict[str, Any]], results: Sequence[tools.ToolResult],
+                             cost_price: Optional[float]) -> None:
+        """10-20：非型態題（「中鋼還有機會嗎」「光寶科壓力大概多少」）沒有型態評分卡 → 關鍵價位仍標在 K 線上
+        （右側價格框＋價位條；只放價位、不畫評分卡）。用本題已抓好的技術面與大量區，不多打 API／AI。"""
+        for panel in [p for p in panels if p.get("stock_code") and p.get("bars")
+                      and not p.get("scorecard") and not p.get("key_levels") and not p.get("compact")]:
+            card = self._pattern_scorecard(panel["stock_code"], results, cost_price)
+            if card:
+                panel["key_levels"] = dict(card, levels_only=True)
 
     def _pattern_scorecard(self, code: str, results: Sequence[tools.ToolResult], cost_price: Optional[float]) -> Dict[str, Any]:
         """型態評分卡：與本週精選同一套 100 分制型態評分（純 Python，0 次 Gemini）；資料不足時回傳空 dict。"""
