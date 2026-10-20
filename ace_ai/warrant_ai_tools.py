@@ -5960,6 +5960,15 @@ def warrant_branch_insights(stock_code: str, chips: Dict[str, Any]) -> Dict[str,
             recent.append(item)
         if recent:
             row["recent_events"] = recent
+        # 10-20：這一波（上次出清後到現在）的規模，金額由程式加總（AI 不能自己加總）
+        wave = c["mine"][c["mine"]["event_date"] > c["last_exit"]] if c["last_exit"] is not None else c["mine"]
+        if len(wave) >= 2:
+            total = float(pd.to_numeric(wave["buy_amount"], errors="coerce").fillna(0).sum())
+            row["wave"] = {"buy_count": int(len(wave)), "buy_total_text": _money_text(total),
+                           "first_date": _day_str(wave["event_date"].min()).replace("-", "/"),
+                           "last_date": _day_str(wave["event_date"].max()).replace("-", "/"),
+                           "all_holding": bool((wave["status"] != "已出清").all()),
+                           "after_exit": c["last_exit"] is not None}
         reasons = [r for r, ok in (("出清後又買回", c["reentry"]), ("有 D／E 大額事件", c["big"]),
                                    ("高勝率且持有中", c["high"] and not holding.empty)) if ok]
         if reasons and not c["selected"]:

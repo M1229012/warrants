@@ -3065,8 +3065,12 @@ FINAL_SPOT_EVENT_RULES = ("【現股分點動向（10-20 精簡版）】解讀�
 FINAL_WARRANT_INSIGHT_RULES = ("【權證分點觀察，優先於【觀察重點】的篇幅要求】get_warrant_branch_insights 是程式挑好的關鍵分點（隔日衝分點已排除）與算好的重點，圖上沒有這些內容。"
     "解讀是在說「現在的狀況」，不是覆盤；不要改念圖上的標註表與「主要分點狀態」（持有筆數、總勝率圖上都有）。"
     "分點一律當一般分點講，不寫「精選」「精選分點」這類標籤。\n"
-    "- answer 第一句一定要寫具體的「誰、哪天、做了什麼」，例如「永豐金內湖 10/19 再買進 217 萬權證，10/05 才剛出清上一波」；"
-    "不可用「近期主力分點」「主力分點目前」「權證分點主要為」「目前權證分點」這類空泛開頭。權證題的 answer 只講分點，不放型態、均線或支撐壓力。\n"
+    "- answer 是新聞標題：直接寫這檔最值得注意的一件事，主角（分點）放最前面，讓人一眼看到重點。"
+    "好的例子：「國票台南兩週連買 4 筆權證合計 1,927 萬，一筆都還沒出場」「永豐金內湖 10/05 出清獲利後，10/16 起又連買兩筆」。"
+    "不好的例子：「威剛（3260）的權證分點籌碼顯示，…」「盟立的權證分點近期操作顯示，…」「近期主力分點…」「目前權證分點主要為…」——不可用這類鋪陳開頭。"
+    "權證題的 answer 只講分點，不放型態、均線或支撐壓力。\n"
+    "- wave 是這一波（上次出清後到現在）的規模：buy_count 筆、合計 buy_total_text、first_date～last_date、all_holding 是否全部還持有；"
+    "有 wave 時標題優先用它（連買幾筆、合計多少、有沒有出場），金額只能用 buy_total_text，不可自己加總。\n"
     "- 權證分點和型態要分開講：分點進場可能是基本面、消息或其他原因，不可推測他們因為技術面（跌破、站回、型態、均線）而進出或會減碼停損，"
     "也不可寫「被動持有」「套牢」「停損」「防守」這類推測心理的說法。型態只在 why 最後另用一句帶過，不和分點寫在同一句。\n"
     "- 先講最近幾天：branches 已依最近事件日排好；recent_events 是近 10 個交易日內的事件。每個數字只能接在它自己那一筆後面："
@@ -3076,7 +3080,8 @@ FINAL_WARRANT_INSIGHT_RULES = ("【權證分點觀察，優先於【觀察重點
     "可以接著說最近那一筆（trading_days_since_buy）相對他平常的持有期是剛進場還是已經偏久。\n"
     "- 之前的操作（覆盤）最多一句帶過：上一波出清（last_exit_*）持有幾個交易日、獲利多少；出清後又買回（rebuy_date）用 rebuy_vs_exit_pct 說是低接還是追價。\n"
     "- small_sample 有值時，勝率要補一句「樣本只有 N 筆，參考就好」；勝率只在當作依據時引用一次。\n"
-    "- why 3～4 句：前 2～3 句講分點（最近動作、到期與習性），最後一句才講型態；每個分點最多引用 2～3 個數字，天數一律寫交易日（到期天數寫「天」）。\n"
+    "- why 4～5 句，依序講到：①這一波的規模與最近一筆（哪天、多少、截至幾日帳面）②到期（expiry_note）與習性（habit_note），最近一筆相對他平常的持有期是剛進場或偏久"
+    "③勝率值得講時一句（small_sample 要提醒樣本少）④有第二個分點就一句帶過 ⑤最後一句才講型態。每個分點最多引用 3～4 個數字，天數一律寫交易日（到期天數寫「天」）。\n"
     "- scenarios 一個用分點條件（持有中的部位出場、出現新的 A～E 事件），一個用 watch_plan 的關鍵價位；兩個都不可寫分點會因價位而進出。")
 
 
@@ -4993,6 +4998,20 @@ def soften_alignment(text: str, plans: Optional[Dict[str, Any]]) -> str:
     if label.startswith("均線糾結"):
         return re.sub(r"(?:短期)?(?:均線|MA\d)[^，。；]{0,30}?[多空]頭(?:排列|架構)", "均線糾結", text)
     return text
+
+
+_FILLER_HEAD_RE = re.compile(
+    r"^\s*(?:[^，。！？]{0,16}?(?:（\d{4}）|\(\d{4}\))?的?)?"
+    r"(?:權證分點|權證籌碼|分點籌碼|現股籌碼|籌碼面|分點)(?:籌碼|近期操作|操作|動向|資料)?"
+    r"(?:顯示|來看|觀察|表現)[，,：:]\s*")
+
+
+def drop_filler_head(text: str) -> str:
+    """10-20：結論是標題，開頭不要「威剛（3260）的權證分點籌碼顯示，」「盟立的權證分點近期操作顯示，」這類鋪陳；
+    刪掉後剩下的內容太短就保留原句。"""
+    text = str(text or "")
+    cut = _FILLER_HEAD_RE.sub("", text, count=1)
+    return cut if cut != text and len(cut) >= 12 else text
 
 
 def split_answer_head(text: str, limit: int = 80) -> Tuple[str, str]:
@@ -8812,7 +8831,7 @@ class AceQueryEngine:
                 if key in ("why", "summary"):
                     card[key] = drop_number_dumps(card[key], total=6 if payload.get("compare_page") else 7)   # 10-20：念數據的句子拿掉
             # 10-20：結論太長時圖卡會把後半句切成標題下一行小字（例「關鍵觀察 2420 元能否站穩。」）→ 後半段移到「為什麼」開頭
-            card["answer"], spill = split_answer_head(card.get("answer", ""))
+            card["answer"], spill = split_answer_head(drop_filler_head(card.get("answer", "")))
             if spill:
                 card["why"] = (spill + card.get("why", "")).strip()
             card["scenarios"] = [dict(x, text=drop_source_mentions(drop_directives(x["text"])),
