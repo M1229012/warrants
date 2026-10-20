@@ -1345,9 +1345,16 @@ def _chart_levels(panel: dict) -> tuple[list[dict], list[dict]]:
     low, high = _price_range(panel['bars'])
     inside = [x for x in items if low <= x['price'] <= high]
     near = sorted(inside, key=lambda x: abs(x['pct']) if x['pct'] is not None else 1e9)
-    tagged = [next(x for x in near if x['kind'] == kind) for kind in ('壓力', '支撐') if any(x['kind'] == kind for x in near)]
-    tagged += [x for x in near if x not in tagged]
-    tagged = tagged[:LEVEL_TAG_MAX]
+    ai = _ai_level_items(panel, low, high)
+    if ai:
+        # 10-20：AI 解讀提到的價位優先標在右側價格框（最多 AI_LEVEL_TAG_MAX 個），其他價位放價位條
+        same = lambda a, b: abs(a['price'] - b['price']) <= max(abs(b['price']) * .0005, .011)
+        items = ai + [x for x in items if not any(same(x, a) for a in ai)]
+        tagged = sorted(ai, key=lambda x: abs(x['pct']) if x['pct'] is not None else 1e9)[:AI_LEVEL_TAG_MAX]
+    else:
+        tagged = [next(x for x in near if x['kind'] == kind) for kind in ('壓力', '支撐') if any(x['kind'] == kind for x in near)]
+        tagged += [x for x in near if x not in tagged]
+        tagged = tagged[:LEVEL_TAG_MAX]
     used = []
     for item in tagged:
         color = next((c for word, c in _TAG_COLORS if word in item['label']), None) \
@@ -1357,6 +1364,24 @@ def _chart_levels(panel: dict) -> tuple[list[dict], list[dict]]:
     tagged.sort(key=lambda x: -x['price'])
     rest = [x for x in items if x not in tagged]
     return tagged, rest
+
+
+AI_LEVEL_TAG_MAX = 4
+
+
+def _ai_level_items(panel: dict, low: float, high: float) -> list[dict]:
+    """panel['ai_levels']（AI 解讀提到、且對得上真實關鍵價位的點位）→ 標框用的價位；圖外的不標。"""
+    close = _finite((panel.get('bars') or [{}])[-1].get('Close'))
+    out = []
+    for lv in panel.get('ai_levels') or []:
+        price = _finite(lv.get('price'))
+        if price is None or not low <= price <= high:
+            continue
+        label = str(lv.get('label') or '')
+        out.append({'label': label, 'name': _level_display_name(label, panel), 'price': price,
+                    'pct': (price / close - 1) * 100 if close else None,
+                    'kind': lv.get('kind') or ('支撐' if close and price <= close else '壓力')})
+    return out
 
 
 def _price_range(bars: list) -> tuple[float, float]:

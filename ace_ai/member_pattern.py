@@ -402,7 +402,8 @@ def scoped_payload(payload, context):
                 del payload["tool_results"][key]; continue
             if tool == "get_technical_analysis":
                 if not stock.get("show_score"):
-                    data = {k: data[k] for k in ("stock_code", "stock_name", "data_date", "signal_status", "freshness", "triangle_structure") if k in data}
+                    data = {k: data[k] for k in ("stock_code", "stock_name", "data_date", "signal_status", "freshness", "triangle_structure",
+                                                 "drawdown") if k in data}   # 10-20：這波跌幅（止穩觀察）
                     payload["tool_results"][key] = data
                 structure = data.get("triangle_structure")
                 if not view.get("visible"):
