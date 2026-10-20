@@ -10641,4 +10641,12 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         print("=" * 60)
         for index, chunk in enumerate(split_discord_message(result.text, config.max_message_chars), 1):
             print(f"--- Discord 訊息 {index} ---")
-            print(
+            print(chunk)
+        print("=" * 60)
+        print(f"route={result.route}｜Gemini 呼叫 {result.gemini_calls} 次｜{result.elapsed:.2f} 秒")
+        return
+    run_discord_bot(config)
+
+
+if __name__ == "__main__":
+    main()
