@@ -5983,6 +5983,9 @@ def warrant_branch_insights(stock_code: str, chips: Dict[str, Any]) -> Dict[str,
                 row["warrants_holding"] = len(warrants)
                 row["days_left_min"] = int(min(w["days_left"] for w in warrants))
                 row["near_expiry_count"] = sum(1 for w in warrants if w["days_left"] <= 30)
+                # 10-20：AI 常只寫「即將到期」不寫天數 → 程式組好句子讓它照抄
+                row["expiry_note"] = (f"最近一檔權證剩 {row['days_left_min']} 天到期"
+                                      + (f"，30 天內到期的有 {row['near_expiry_count']} 檔" if row["near_expiry_count"] > 1 else ""))
                 money = _median([w.get("moneyness_now") for w in warrants])
                 if money is not None:
                     row["moneyness_median_pct"] = round(money, 1)
@@ -6013,6 +6016,10 @@ def warrant_branch_insights(stock_code: str, chips: Dict[str, Any]) -> Dict[str,
                 row["past_median_holding_trading_days"] = round(median_days)
             staged = int(((history["reduce_date"].notna()) & (history["reduce_date"] < history["exit_date"])).sum())
             row["exit_style"] = "多半分批減碼後出清" if staged * 2 >= len(history) else "多半一次出清"
+            row["past_exits"] = int(len(history))
+            if row.get("past_median_holding_trading_days") is not None:
+                row["habit_note"] = (f"過去 {len(history)} 筆出清，平均持有約 {row['past_median_holding_trading_days']} 個交易日，"
+                                     f"{row['exit_style']}")
         out.append(row)
     return {"stock_code": code, "stock_name": chips.get("stock_name", ""), "branches": out,
             "excluded_day_traders": excluded,
