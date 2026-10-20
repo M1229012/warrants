@@ -2539,15 +2539,22 @@ FINAL_PATTERN_RULES = """型態／成本／操作問題（有 get_pattern_scorec
 - 沒有明確訊號或沒有資料的項目直接省略，不要硬湊固定段落。"""
 
 FINAL_CHIPS_RULES = """權證分點問題（有 get_sheet_stock_chips）：
-- 第一句直接回答有沒有追蹤分點的 A～E 事件：有就點名分點、事件別、買進金額、目前部位與勝率；沒有就一句話帶過「近 N 個交易日沒有追蹤分點的大額買進紀錄」，不要解釋系統怎麼定義，也不要寫「我們系統」「缺乏訊號」「先行指標」這類空話。
-- 沒有分點事件時，改用技術面把話講完整，像技術分析者在看盤：先用 volume_trend 說量能（近 5 日均量是前 20 日的幾倍、連續放大幾天、是不是 20 日最大量），再說價格位置（站上哪些均線、相對兩大量區、布林狀態）。
-- volume_trend.level 是「明顯放大」或「溫和放大」時，不可以寫成量能平穩或「市場自然供需」，也不要叫使用者「觀察量能是否放大」——資料已經放大就直接說出來，並說明配合的價格位置代表什麼。
-- 沒有分點資料不等於利多或利空，但也不可以因此省略技術面說明。
+- 10-20：圖上已經有「分點權證買賣標註」表（編號、分點、事件、買進日、金額、後續動作）和「權證事件摘要」（最新事件、事件勝率、主要分點狀態）。
+  解讀是在分析這些資料代表什麼，不是把表格再念一次：不逐筆列分點的日期、事件別、金額、勝率。
+- answer 只寫一句、60 字內：有沒有追蹤分點的 A～E 事件與整體看法（例如「主力分點仍持有」「多數已在高檔出清」）；
+  沒有事件就一句帶過「近 N 個交易日沒有追蹤分點的大額買進紀錄」，不解釋系統怎麼定義，不寫「我們系統」「缺乏訊號」「先行指標」這類空話。
+- why 3～4 句、約 120～200 字，依序回答：
+  1. 主力分點現在的動向：還在、減碼中，還是已出清；持有中的是哪一批（最多點名 1～2 個關鍵分點當論據，每個分點最多 1 個數字）。
+  2. 他們進場的位置和現在股價的關係：例如在突破前布局、在高檔追價、出清後股價轉弱；可用 watch_plan 的支撐壓力說明。
+  3. 接下來要看什麼：持有中的部位會不會出場、有沒有新的事件、股價守不守得住關鍵價位。
+- 高勝率分點（is_high_win_rate）有動作才值得點名；勝率只在當作判斷依據時引用一次，不逐家列。
+- 沒有分點事件時，改用技術面回答：依 watch_plan 的方向說支撐壓力與量能（volume_trend 是「明顯放大」或「溫和放大」就直接說，不寫量能平穩、不叫使用者觀察量能是否放大），
+  同樣不逐項念均線數值；沒有分點資料不等於利多或利空。
 - 權證分點是「事件」資料，不是每天的買賣流量：分點只在觸發 A～E 事件時才有買進紀錄，之後是出清、減碼或仍持有。
-  用「哪個分點、哪天觸發什麼事件、買進多少、後來出清／減碼／仍持有、目前還有幾筆部位在手」來描述；
   不可以用「買盤力道」「買盤轉弱／轉強」「賣壓」「資金流入／流出」「籌碼鬆動」這類每日流量的說法，
   也不可以把「最近幾天沒有新事件」解讀成轉弱——沒有新事件就直接說「最近一次事件是 X 月 X 日」。
-- 只寫 tool_results 裡真的出現的分點名稱，不可自己補其他分點。"""
+- 只寫 tool_results 裡真的出現的分點名稱，不可自己補其他分點。
+- 金額、勝率照 tool_results 原樣引用，不可自行加總、相減或換算（例如不可把 101萬 和 217萬 加成 318萬），要講總額時只能用 event_buy_amount_recent_text。"""
 
 FINAL_RANK_RULES = """權證共識淨買超排行（有 get_top_warrant_buy_stocks）：
 【回答】先寫排行名稱與統計期間（照 source 與 period 寫，不要自己改名，也不要用「共識」「全分點」等字眼），並註明統計範圍是追蹤的分點、不是全市場；接著列出前 3 名（名次、股票、net_buy_cost_text、主要分點，分點是高勝率或精選五分點要點出）。
@@ -2756,17 +2763,23 @@ def _compact_tool_data(name: str, data: Dict[str, Any], has_scorecard: bool) -> 
     elif name == "get_sheet_stock_chips":
         # 分點多的股票這份最大（佔整個 prompt 一半以上）：拿掉和文字版重複的原始金額、和狀態重複的 resolution、
         # 未完成筆數，以及和近期相同的回看金額；圖卡用的是完整資料，不受影響
+        # 10-20：只給重點——每個分點最近 3 筆事件、目前部位、總勝率與事件勝率各一個數字（最多 5 個分點）；
+        # 調整後勝率、加權報酬、樣本數、回看期統計不送（AI 會把一串數字塞進結論）。圖卡照用完整資料。
         branches = []
-        for branch in data.get("branches") or []:
-            branch = dict(branch)
-            branch["events_recent"] = [{k: (int(v) if k == "warrant_count" and v is not None else v)
-                                        for k, v in event.items() if k not in ("buy_amount", "resolution")}
-                                       for event in branch.get("events_recent") or []]
-            if branch.get("event_buy_amount_lookback_text") == branch.get("event_buy_amount_recent_text"):
-                branch.pop("event_buy_amount_lookback_text", None)
-            branch["event_performance"] = {code: {k: v for k, v in (perf or {}).items() if k != "unresolved_count"}
-                                           for code, perf in (branch.get("event_performance") or {}).items()}
-            branches.append(branch)
+        for branch in (data.get("branches") or [])[:5]:
+            events = list(branch.get("events_recent") or [])[-3:]
+            codes = {str(e.get("event")) for e in events if e.get("event")}
+            perf = branch.get("event_performance") or {}
+            row = {"branch": branch.get("branch"), "is_high_win_rate": branch.get("is_high_win_rate"),
+                   "events_recent": [{k: e.get(k) for k in ("event", "event_date", "buy_amount_text", "status", "exit_amount_text")
+                                      if e.get(k) not in (None, "")} for e in events],
+                   "event_buy_amount_recent_text": branch.get("event_buy_amount_recent_text"),
+                   "open_event_count": branch.get("open_event_count"), "position_status": branch.get("position_status"),
+                   "reduce_or_exit_recent": list(branch.get("reduce_or_exit_lookback") or [])[-2:],
+                   "overall_win_rate": branch.get("overall_win_rate_background"),
+                   "event_win_rate": {c: (perf.get(c) or {}).get("raw_win_rate") for c in sorted(codes) if perf.get(c)}}
+            branches.append({k: v for k, v in row.items() if v not in (None, "", [], {})})
+        data = {k: data.get(k) for k in ("stock_code", "stock_name", "available", "reason", "period_recent", "data_latest_event_date")}
         data["branches"] = branches
     elif name in ("get_retail_futures", "get_futures_positions"):
         data["rows"] = (data.get("rows") or [])[-5:]
@@ -4974,6 +4987,11 @@ def split_answer_head(text: str, limit: int = 80) -> Tuple[str, str]:
     first = re.match(r".*?[。！？!?][」』”\"]?", text, re.S)
     if first and len(first.group()) <= limit and text[first.end():].strip():
         return first.group().strip(), text[first.end():].strip()
+    if not first or len(first.group()) > limit:
+        # 第一句就太長：切在 limit 內最後一個逗號，後半段接到「為什麼」
+        cut = max(text.rfind(c, 0, limit) for c in "，；,")
+        if cut >= 15:
+            return text[:cut] + "。", text[cut + 1:].strip()
     return text, ""
 
 
@@ -8115,7 +8133,8 @@ class AceQueryEngine:
                 panel["disable_compare"] = not member_pattern.comparing(plan)
                 # 10-15：籌碼題（現股／權證／兩種一起、型態＋籌碼）不顯示型態評分；海盜型態照舊
                 chip_question = bool(getattr(parsed, "spot_combo", False) or getattr(parsed, "chip", "") in ("spot", "warrant", "combined"))
-                if (TEST_SHOW_SCORECARD and not chip_question and not compare_page
+                # 10-20：問的不是型態（新聞、法人、還有機會嗎…）的型態頁不放評分卡（與正式版一致）
+                if (TEST_SHOW_SCORECARD and not chip_question and not compare_page and code not in plan.brief_pattern
                         and (not view or member_pattern.wants_score(parsed, plan, code))) or _pirate_pattern_request.get():
                     # 10-08：正式版還有評分卡，測試版先照正式版顯示，方便比對評分修正；整飾板拿掉時設 0
                     card = self._pattern_scorecard(code, results, parsed.cost_price)
@@ -9329,8 +9348,9 @@ def _clean_card_text(value: Any, limit: int) -> str:
             break  # Keep leading conditions together; never skip to a later conclusion.
     if complete:
         return "".join(complete)
-    fallback = "內容較長，請縮小問題範圍以取得完整條件。" if limit >= 22 else "請縮小問題範圍。"
-    return fallback if len(fallback) <= limit else ""
+    # 10-20：第一句就超過上限：切在上限內最後一個逗號（不放「內容較長，請縮小問題範圍」這種備用文字，曾整句變成解讀標題）
+    cut = max(result.rfind(c, 0, limit) for c in "，；、,")
+    return result[:cut] + "。" if cut >= min(15, limit // 2) else ""
 
 
 def parse_ai_card(text: str) -> Optional[Dict[str, Any]]:
@@ -9345,7 +9365,7 @@ def parse_ai_card(text: str) -> Optional[Dict[str, Any]]:
             data = None
     if not isinstance(data, dict):
         return None
-    answer = _clean_card_text(data.get("answer"), 120)
+    answer = _clean_card_text(data.get("answer"), 0)      # 10-20：不在這裡截斷；太長由 split_answer_head 移到「為什麼」
     why = _clean_card_text(data.get("why"), 600)
     summary = _clean_card_text(data.get("summary"), 120)
     scenarios = []
