@@ -3125,6 +3125,30 @@ def _kline_patterns(df: pd.DataFrame, code: str = "", provisional_today: bool = 
         return {"triangle_validation": {"status": "unavailable"}, "triangle": None}
 
 
+def _drawdown_facts(df: pd.DataFrame) -> Dict[str, Any]:
+    """10-20：這波跌了多少——近 10 個交易日（約 2 週）高點（價、日）、距高點跌幅、今日漲跌、連跌天數、近 60 日前低（價、日）。
+    使用者：重點是「短短 1～2 週就跌一大段」，所以看 10 日高點，不看 20 日。資料不足回空。"""
+    try:
+        tail20, tail60 = df.tail(10), df.tail(60)
+        close = float(df["Close"].iloc[-1])
+        high_at = tail20["High"].idxmax()
+        low_at = tail60["Low"].idxmin()
+        closes = [float(v) for v in df["Close"].tail(21)]
+        down = 0
+        for a, b in zip(reversed(closes[:-1]), reversed(closes[1:])):
+            if b < a:
+                down += 1
+            else:
+                break
+        return {"high_10d": _num(tail20["High"].max()), "high_10d_date": _fmt_date(high_at),
+                "from_high_pct": _num((close / float(tail20["High"].max()) - 1) * 100, 2),
+                "today_change_pct": _num((closes[-1] / closes[-2] - 1) * 100, 2) if len(closes) >= 2 else None,
+                "down_days": down,
+                "low_60d": _num(tail60["Low"].min()), "low_60d_date": _fmt_date(low_at)}
+    except Exception:
+        return {}
+
+
 def get_technical_analysis(stock_code: str) -> Dict[str, Any]:
     """重用既有指標；若已取得今日即時 K，型態相關數值採當下暫定 K 重新計算。
 
@@ -3194,6 +3218,7 @@ def get_technical_analysis(stock_code: str) -> Dict[str, Any]:
         "ma_kline_signals": safe_signal(kf.get_ma_kline_signals),
         "kline_patterns": _kline_patterns(df, code, bool(use_live and (intraday.get("is_live") or intraday.get("post_close_provisional")))),
         # 給 AI 看近期走勢：近 10 日 K 棒（日期 開 高 低 收）＋均線近 3 日（看均線往上／往下彎）
+        "drawdown": _drawdown_facts(df),
         "recent_bars_10": [[_fmt_date(i)[5:], _num(r.get("Open")), _num(r.get("High")), _num(r.get("Low")), _num(r.get("Close"))]
                            for i, r in df.iloc[-10:].iterrows()],
         "ma_recent_3d": {f"MA{n}": [_num(v) for v in df[f"MA{n}"].iloc[-3:]] for n in (5, 10, 20, 60) if f"MA{n}" in df},

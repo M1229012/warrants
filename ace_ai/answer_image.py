@@ -1632,7 +1632,7 @@ def draw_chart(draw, y: int, panel: dict) -> None:
     if panel.get('institutional'):
         draw_institutional(draw, vbottom + 14, left, right, px, step, bars, panel['institutional'],
                            panel.get('institutional_focus', ''), panel.get('institutional_unit', '張'),
-                           cumulative=not panel.get('institutional_daily_only'),   # 10-20：現股籌碼頁只畫每日
+                           cumulative=False,   # 10-20（測試版移植）：法人副圖一律畫每日三大法人柱，不畫累積線
                            today_label=panel.get('institutional_day', '今日'),
                            extra=panel.get('institutional_extra', ''), dates=last_sub,
                            block_height=290 if panel.get('institutional_daily_only') else INST_BLOCK_H,

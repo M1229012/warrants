@@ -2685,7 +2685,7 @@ def _compact_tool_data(name: str, data: Dict[str, Any], has_scorecard: bool) -> 
         if has_scorecard:
             # 均線值、排列、扣抵都在評分卡；這裡只留評分卡沒有的 KD／MACD 訊號與布林狀態。
             data = {k: data.get(k) for k in ("stock_code", "data_date", "signal_status", "intraday_observation", "kd", "macd", "bollinger",
-                                             "ma20_cross_recent_3_days", "ma_kline_signals", "recent_bars_10", "ma_recent_3d")}
+                                             "ma20_cross_recent_3_days", "ma_kline_signals", "recent_bars_10", "ma_recent_3d", "drawdown")}
             data["kline_patterns"] = ((data_full_patterns or {}).get("summary") or []) + [f"資料旗標：{f}" for f in (data_full_patterns or {}).get("flags") or []]
             data["triangle_validation"] = data_full_patterns["triangle_validation"]
             if triangle_structure:
@@ -2838,6 +2838,11 @@ def watch_plan(payload: Dict[str, Any]) -> Dict[str, Any]:
         else:
             levels = tools.key_price_levels(tech, (by_tool.get("get_volume_profile") or {}).get(code) or {})
             supports, resistances = levels.get("supports") or [], levels.get("resistances") or []
+        drop = tech.get("drawdown") or {}
+        low_60d = _plan_num(drop.get("low_60d"))
+        if low_60d is not None and low_60d < close and not any(abs((_plan_num(x.get("price")) or 0) - low_60d) <= low_60d * .003
+                                                                for x in supports):
+            supports = list(supports) + [{"label": f"前低（{drop.get('low_60d_date')}）", "price": low_60d}]   # 10-20：前低也是止穩候選
         pick = lambda items: [{"名稱": str(x.get("label")), "價位": x.get("price")} for x in items
                               if _plan_num(x.get("price")) is not None][:3]
         upper, lower = [], []
@@ -2853,6 +2858,11 @@ def watch_plan(payload: Dict[str, Any]) -> Dict[str, Any]:
                        "上方壓力_由近到遠": pick(sorted(resistances, key=lambda x: _plan_num(x.get("price")) or 1e18)),
                        "上方均線_扣抵條件": sorted(upper, key=lambda r: r["價位"]),
                        "下方均線_回測觀察": sorted(lower, key=lambda r: -r["價位"])}
+        # 10-20：短短 1～2 週跌一大段（距近 10 個交易日高點跌幅達門檻）或當天大跌 → 止穩觀察
+        is_index = code in tools.INDEX_CODES
+        from_high, today = _plan_num(-(drop.get("from_high_pct") or 0)), _plan_num(-(drop.get("today_change_pct") or 0))
+        if (from_high or 0) >= (5 if is_index else 8) or (today or 0) >= (2 if is_index else 5):
+            plans[code]["止穩觀察"] = {k: drop.get(k) for k in ("high_10d", "high_10d_date", "from_high_pct", "today_change_pct", "down_days")}
     # 10-20：三角股的技術資料在顯示範圍收窄後只剩三角欄位（聯電、華邦電）→ 改用圖上最後一根 K 棒與圖上的關鍵價位補算
     for code, stock in ((payload.get("chart_context") or {}).get("stocks") or {}).items():
         code = str(code)
@@ -2863,8 +2873,11 @@ def watch_plan(payload: Dict[str, Any]) -> Dict[str, Any]:
         values = {k: v for k, v in values.items() if v is not None}
         if code in plans or close is None or len(values) < 4:
             continue
+        stripped = next((d for k, d in results.items() if k.split(":", 1)[0] == "get_technical_analysis"
+                         and isinstance(d, dict) and str(d.get("stock_code")) == code), {})
         tech = {"stock_code": code, "close": close, "moving_averages": {k: {"value": v} for k, v in values.items()},
-                "ma_alignment": ma_alignment_text(values), "ma_deduction": levels.get("ma_deduction") or {}}
+                "ma_alignment": ma_alignment_text(values), "ma_deduction": levels.get("ma_deduction") or {},
+                "drawdown": stripped.get("drawdown") or {}}
         card = {"stock_code": code, "supports_below_close": levels.get("supports_below_close") or [],
                 "resistances_above_close": levels.get("resistances_above_close") or []}
         plans.update(watch_plan({"tool_results": {f"get_technical_analysis:{code}": tech,
@@ -3052,6 +3065,14 @@ FINAL_WATCH_RULES = ("【觀察重點，必須照做】payload.watch_plan 是程
     "拉回時看哪條均線回測守住（用下方均線_回測觀察的明日條件），跌破代表什麼。scenarios 的 title 用「壓力突破」「回測守住」。\n"
     "- 盤整：講區間上緣（最近壓力）與下緣（最近支撐），向上突破、向下跌破各代表什麼。scenarios 的 title 用「向上突破」「向下跌破」。\n"
     "- 當日大跌依技術面規則以支撐為主。使用者問的不是走勢（只問新聞、成本、籌碼）時先回答所問，觀察重點縮成一句；brief_quote 依該規則。\n"
+    "- watch_plan 有「止穩觀察」時（近 1～2 週從 high_10d_date 的高點跌了 from_high_pct%，或當天大跌），讀者最想知道「哪裡有機會止穩」："
+    "answer 寫這波跌了多少、現在要看哪個價位能不能止穩；why 依序寫：下方支撐由近到遠、哪一個最有機會撐住與原因（大量區、季線、前低等）、"
+    "要看到什麼才算止穩（量縮、長下影線、連續幾天不破低、站回某個價位）、跌破後的下一關在哪；scenarios 用「止穩條件」「跌破下一關」。"
+    "這時不寫 KD、MACD、布林帶寬——線就是一路向下，指標只會跟著顯示超賣、過冷，沒有參考意義（背離、鈍化例外）。\n"
+    "- 沒有止穩觀察時可以提 KD、MACD，但要說代表什麼（例如「KD 黃金交叉，短線動能轉強」），不要只報狀態。\n"
+    "- 解讀要給看法，不是報數據：不要只列 KD、MACD、布林帶寬、均線站上跌破這類指標狀態；每提到一個訊號都要說它代表什麼"
+    "（例「跌破月線但守在季線上，屬於多頭結構裡的修正」「量縮回測大量區，賣壓沒有擴大」）。answer 要回答：現在哪一方占上風、"
+    "這次走勢是修正還是轉弱（或是反彈還是轉強）、要看到什麼才會改變看法。\n"
     "- 均線排列一律照 watch_plan 的「均線排列」寫：寫「短期均線空頭排列」就不可省略「短期」寫成「空頭排列」；均線糾結不可寫多頭或空頭排列。\n"
     "- 價位只能用 watch_plan 或工具資料裡的數字，不自行計算；不給買賣指令，只寫要觀察的價位與條件。")
 
@@ -4753,6 +4774,28 @@ def split_answer_head(text: str, limit: int = 80) -> Tuple[str, str]:
         if cut >= 15:
             return text[:cut] + "。", text[cut + 1:].strip()
     return text, ""
+
+
+_OSCILLATOR_RE = re.compile(r"KD|[KDJ]\s*值|MACD|DIF|柱狀體|RSI|布林(?:通道)?(?:帶寬|通道收窄|收窄)|帶寬|超賣|超買|過冷|過熱")
+_OSCILLATOR_KEEP_RE = re.compile(r"背離|鈍化")
+
+
+def drop_oscillator_noise(text: str) -> str:
+    """10-20：止穩觀察（持續下跌）時，「KD 的 J 值過冷」「MACD 柱狀體擴大」沒有意義；整個子句刪掉，背離、鈍化保留。
+    刪完整句沒東西就整句拿掉；新的句首去掉連接詞。"""
+    if not text or not _OSCILLATOR_RE.search(str(text)):
+        return text
+    out = []
+    for sentence in re.split(r"(?<=[。！？；])", str(text)):
+        if not _OSCILLATOR_RE.search(sentence) or _OSCILLATOR_KEEP_RE.search(sentence):
+            out.append(sentence)
+            continue
+        body, end = (sentence[:-1], sentence[-1]) if sentence and sentence[-1] in "。！？；" else (sentence, "")
+        clauses = [c for c in re.split(r"[，,](?!\d)", body) if c.strip() and not _OSCILLATOR_RE.search(c)]
+        if clauses:
+            clauses[0] = _LEADING_CONNECTOR_RE.sub("", re.sub(r"^\s*(?:且|並且|而且|加上)\s*", "", clauses[0]))
+            out.append("，".join(clauses) + (end or "。"))
+    return "".join(out).strip()
 
 
 def drop_number_dumps(text: str, limit: int = 4, total: int = 7) -> str:
@@ -7732,12 +7775,13 @@ class AceQueryEngine:
                     panel["retail"] = dict(retail_data, rows=[r for r in retail_data.get("rows") or [] if r.get("date") in dates])
             if flow and panel.get("bars"):
                 dates = {bar["date"] for bar in panel["bars"]}
-                panel["institutional"] = [row for row in flow.get("rows") or [] if row.get("date") in dates]
+                self._attach_daily_institutional(panel, flow)   # 10-20（測試版移植）：每日三大法人柱、日期對齊
                 # 10-20：副圖固定畫三大法人（大盤、櫃買、個股一致），問「外資」也不只畫單一法人；圖例已有各法人今日數字
         if plan.route in ("rule_pattern", "rule_top_warrant", "rule_index_compare") or plan.pattern:
             for panel in [p for p in panels if p.get("stock_code")]:   # 只有 K 線面板有評分卡（籌碼重點不是）
                 # 10-20：比較圖、問的不是型態（新聞、法人、還有機會嗎…）的型態頁不放評分卡；價位照樣標在 K 線上
-                no_score = compare_page or panel["stock_code"] in plan.brief_pattern
+                # 10-20：大盤／櫃買也不放評分卡（使用者要求）
+                no_score = compare_page or panel["stock_code"] in plan.brief_pattern or panel["stock_code"] in tools.INDEX_CODES
                 card = None if no_score else self._pattern_scorecard(panel["stock_code"], results, parsed.cost_price)
                 with_chips = any(r.name == "get_sheet_stock_chips" and r.ok for r in results)
                 if card and (getattr(parsed, "spot_combo", False) or with_chips or market_flow):
@@ -8307,7 +8351,7 @@ class AceQueryEngine:
             self.log(f"觀察重點略過｜{type(exc).__name__}: {exc}")
         if plans:
             payload["watch_plan"] = plans
-            self.log("觀察重點｜" + "｜".join(f"{c} {v['方向']}" for c, v in plans.items()))
+            self.log("觀察重點｜" + "｜".join(f"{c} {v['方向']}" + ("（止穩觀察）" if v.get("止穩觀察") else "") for c, v in plans.items()))
         prompt = build_final_prompt(payload)
         stats.prompt_chars = len(prompt)
         gemini_started = time.perf_counter()
@@ -8351,17 +8395,21 @@ class AceQueryEngine:
                     card = fixed
             if card is None:
                 return f"（AI 文字中有內容無法對應到原始資料，這次不附 AI 解讀）\n\n{rule_answer}", False
+            # 10-20：止穩觀察（持續下跌）時 KD／MACD 沒有意義，AI 還寫就由程式刪；平常照留
+            drop_mode = any(isinstance(v, dict) and v.get("止穩觀察") for v in (payload.get("watch_plan") or {}).values())
+            osc = drop_oscillator_noise if drop_mode else (lambda t: t)
             for key in ("answer", "why", "summary"):
                 card[key] = drop_directives(card.get(key, ""))
                 card[key] = drop_warrant_listing(card[key], results)
                 card[key] = drop_source_mentions(card[key])
+                card[key] = osc(card[key])
                 if key in ("why", "summary"):
                     card[key] = drop_number_dumps(card[key], total=6 if payload.get("compare_page") else 7)   # 10-20：念數據的句子拿掉
             # 10-20：結論太長時圖卡會把後半句切成標題下一行小字 → 後半段移到「為什麼」開頭
             card["answer"], spill = split_answer_head(drop_filler_head(card.get("answer", "")))
             if spill:
                 card["why"] = (spill + card.get("why", "")).strip()
-            card["scenarios"] = [dict(x, text=drop_source_mentions(drop_directives(x["text"])),
+            card["scenarios"] = [dict(x, text=osc(drop_source_mentions(drop_directives(x["text"]))),
                                       title=drop_source_mentions(drop_directives(fix_scenario_title(x.get("title", "")))))
                                  for x in card.get("scenarios") or []]
             card["scenarios"] = [x for x in card["scenarios"] if x["text"]]
