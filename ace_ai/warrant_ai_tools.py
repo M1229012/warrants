@@ -5806,6 +5806,8 @@ def get_branch_warrant_detail(branch_name: str, days: int = CHIPS_DAYS, stock_co
 INSIGHT_SELECTED_MAX = 2        # 精選五分點最多講幾個
 INSIGHT_OTHER_MAX = 1           # 其他值得關注的分點最多幾個（這檔沒有精選五分點時放寬到 2 個）
 INSIGHT_SMALL_SAMPLE = 20       # 勝率樣本少於這個數要提醒
+INSIGHT_RECENT_DAYS = 10        # 「最近幾天」的事件：近 N 個交易日內
+INSIGHT_RECENT_MAX = 3
 
 
 def _median(values: List[float]) -> Optional[float]:
@@ -5866,11 +5868,16 @@ def _top15_actual_returns(stock_code: str) -> Dict[str, Dict[str, Any]]:
         if remaining <= 0 or cost <= 0 or pnl is None:
             continue
         rec = out.setdefault(kf.normalize_branch_name(row["分點"]), {"cost": 0.0, "pnl": 0.0, "lots": 0,
-                                                                   "price_date": ""})
+                                                                   "price_date": "", "by_event": {}})
         rec["cost"] += cost
         rec["pnl"] += pnl
         rec["lots"] += 1
         rec["price_date"] = max(rec["price_date"], str(_clean_cell(row.get("最新價格日期", ""))))
+        day = _parse_sheet_date(row.get("事件日", "")) if "事件日" in rows.columns else None
+        if day is not None:
+            one = rec["by_event"].setdefault(day.strftime("%Y-%m-%d"), [0.0, 0.0])
+            one[0] += cost
+            one[1] += pnl
     return out
 
 
@@ -5919,17 +5926,36 @@ def warrant_branch_insights(stock_code: str, chips: Dict[str, Any]) -> Dict[str,
         candidates.append({"name": name, "mine": mine, "holding": holding, "exited": exited, "last_exit": last_exit,
                            "reentry": reentry, "big": big, "selected": is_selected, "high": is_high,
                            "latest": mine["event_date"].max()})
-    order = lambda c: (-(not c["holding"].empty), -c["reentry"], -pd.Timestamp(c["latest"]).value)
+    order = lambda c: (-pd.Timestamp(c["latest"]).value, -(not c["holding"].empty), -c["reentry"])   # 10-20：最近有動作的先講
     chosen_selected = sorted([c for c in candidates if c["selected"]], key=order)[:INSIGHT_SELECTED_MAX]
     other_max = INSIGHT_OTHER_MAX if chosen_selected else INSIGHT_SELECTED_MAX
     chosen_other = sorted([c for c in candidates if not c["selected"]],
                           key=lambda c: (-c["reentry"], -c["big"], -(not c["holding"].empty), -pd.Timestamp(c["latest"]).value))[:other_max]
     out = []
-    for c in chosen_selected + chosen_other:
+    # 10-20：輸出依最近事件日排序（精選五分點只影響入選，不標示給 AI）
+    for c in sorted(chosen_selected + chosen_other, key=lambda c: -pd.Timestamp(c["latest"]).value):
         name, holding, exited = c["name"], c["holding"], c["exited"]
         chip = chip_rows.get(name) or {}
-        row: Dict[str, Any] = {"branch": name, "role": "精選五分點" if c["selected"] else "值得關注",
-                               "is_high_win_rate": c["high"], "status": "持有中" if not holding.empty else "已出清"}
+        row: Dict[str, Any] = {"branch": name, "is_high_win_rate": c["high"],
+                               "status": "持有中" if not holding.empty else "已出清",
+                               "latest_event_date": _day_str(c["latest"]).replace("-", "/")}
+        since = trading.between(c["latest"], today)
+        if since is not None:
+            row["trading_days_since_latest_event"] = since
+        rec = actual.get(name) or {}
+        recent = []
+        for _, ev in c["mine"].sort_values("event_date", ascending=False).iterrows():
+            gap = trading.between(ev["event_date"], today)
+            if gap is None or gap > INSIGHT_RECENT_DAYS or len(recent) >= INSIGHT_RECENT_MAX:
+                break
+            item = {"date": _day_str(ev["event_date"]).replace("-", "/"), "event": ev.get("event_code"),
+                    "buy_amount_text": _money_text(ev.get("buy_amount")), "status": ev.get("status")}
+            one = (rec.get("by_event") or {}).get(_day_str(ev["event_date"]))
+            if one and one[0] > 0:
+                item["warrant_return_pct"] = round(one[1] / one[0] * 100, 1)
+            recent.append(item)
+        if recent:
+            row["recent_events"] = recent
         reasons = [r for r, ok in (("出清後又買回", c["reentry"]), ("有 D／E 大額事件", c["big"]),
                                    ("高勝率且持有中", c["high"] and not holding.empty)) if ok]
         if reasons and not c["selected"]:
@@ -5953,10 +5979,10 @@ def warrant_branch_insights(stock_code: str, chips: Dict[str, Any]) -> Dict[str,
                 entry = sum(p * w for p, w in prices) / sum(w for _, w in prices)
                 row["stock_entry_close_avg"] = round(entry, 2)
                 row["stock_vs_entry_pct"] = round((last_close / entry - 1) * 100, 1)
-            rec = actual.get(name)
-            if rec and rec["cost"] > 0:
-                row["warrant_return_pct"] = round(rec["pnl"] / rec["cost"] * 100, 1)
-                row["warrant_return_basis"] = "權證實際價格（近 40 個交易日事件的部位明細" + (f"，價格日 {rec['price_date']}" if rec["price_date"] else "") + "）"
+            if rec and rec.get("cost", 0) > 0:
+                # 所有持有中部位加總（新舊部位混在一起）：只當背景，不當主要數字
+                row["holding_return_all_pct"] = round(rec["pnl"] / rec["cost"] * 100, 1)
+                row["holding_return_all_lots"] = rec["lots"]
             try:
                 detail = get_branch_warrant_detail(name, CHIPS_DAYS, code)
             except Exception as exc:
@@ -6001,7 +6027,8 @@ def warrant_branch_insights(stock_code: str, chips: Dict[str, Any]) -> Dict[str,
         out.append(row)
     return {"stock_code": code, "stock_name": chips.get("stock_name", ""), "branches": out,
             "excluded_day_traders": excluded,
-            "definition_note": ("天數一律是交易日；warrant_return_pct／last_exit_warrant_return_pct 是權證實際價格算的報酬（含槓桿）；"
+            "definition_note": ("天數一律是交易日；recent_events[].warrant_return_pct 是那一筆事件的權證實際報酬、"
+                                "holding_return_all_pct 是所有持有部位加總、last_exit_warrant_return_pct 是上一波出清獲利（都用權證實際價格，含槓桿）；"
                                 "stock_* 是股價位置，不是權證賺賠；價內外正＝價內、負＝價外")}
 
 

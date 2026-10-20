@@ -3062,18 +3062,18 @@ FINAL_SPOT_EVENT_RULES = ("【現股分點動向（10-20 精簡版）】解讀�
     "型態＋籌碼同一題時，籌碼用 why 的 1～2 句說明（誰在主導、和股價的關係），scenarios 不另給籌碼條件。")
 
 
-FINAL_WARRANT_INSIGHT_RULES = ("【權證分點觀察】get_warrant_branch_insights 是程式挑好的關鍵分點（精選五分點優先，隔日衝分點已排除）與算好的重點，"
-    "圖上沒有這些內容；解讀要用它說明分點，不要改念圖上的標註表與「主要分點狀態」（持有筆數、總勝率圖上都有）：\n"
-    "- 篇幅：role＝精選五分點的先講；status＝持有中的完整分析，已出清的一句帶過這次操作；role＝值得關注的分點只用一句，並點出 why_notable（例如出清後又買回）。\n"
-    "- 持有中：held_trading_days 對照 past_median_holding_trading_days（都是交易日），說還在他平常的持有期內，或已超過要留意出場；"
-    "exit_style 是過去出場習慣。有 warrant_return_pct 就用它說權證實際賺賠（含槓桿，寫「權證帳面約 +／−X%」）；"
-    "沒有就不要寫權證賺賠，更不可用股價漲跌推算權證報酬。stock_vs_entry_pct 只能說成「進場時股價在較高／較低的位置」。"
-    "有 days_left_min 一定要寫「最近一檔權證剩 N 天到期」，near_expiry_count 大於 0 要提醒到期前通常會處理部位；價內外是估算。\n"
-    "- 已出清：寫這次持有幾個交易日（last_exit_held_trading_days）、權證出清獲利（last_exit_warrant_return_pct），"
-    "並用 stock_since_exit_pct 評價出場時機（出清後股價下跌＝賣在相對高點；出清後股價續漲＝提早下車）。\n"
-    "- 出清後又買回（rebuy_date）：用 rebuy_vs_exit_pct 說明是等回檔低接（買回時股價比出清時低）還是追價買回（比出清時高）。\n"
+FINAL_WARRANT_INSIGHT_RULES = ("【權證分點觀察】get_warrant_branch_insights 是程式挑好的關鍵分點（隔日衝分點已排除）與算好的重點，圖上沒有這些內容。"
+    "解讀是在說「現在的狀況」，不是覆盤；不要改念圖上的標註表與「主要分點狀態」（持有筆數、總勝率圖上都有）。"
+    "分點一律當一般分點講，不寫「精選」「精選分點」這類標籤。\n"
+    "- 先講最近幾天：branches 已依最近事件日排好；recent_events 是近 10 個交易日內的事件。answer 與 why 第一句先說最近是誰在什麼時候買進或出清、"
+    "金額多少，有 warrant_return_pct 就寫「這筆權證目前帳面約 +／−X%」（一定要講是哪一天的那一筆）。\n"
+    "- 再講現在持有的狀態：最近一檔權證剩幾天到期（days_left_min，一定要寫天數）、near_expiry_count 大於 0 提醒到期前通常會處理部位；"
+    "held_trading_days 對照 past_median_holding_trading_days（交易日）只用一句，說還在平常的持有期內或已超過；exit_style 是過去出場習慣。\n"
+    "- 之前的操作（覆盤）最多一句帶過：上一波出清（last_exit_*）持有幾個交易日、獲利多少；出清後又買回（rebuy_date）用 rebuy_vs_exit_pct 說是低接還是追價。\n"
+    "- holding_return_all_pct 是所有持有部位加總（新舊混在一起），預設不寫；要寫必須說明是「全部持有部位合計」。"
+    "沒有權證實際報酬就不要寫權證賺賠，不可用股價漲跌推算；stock_vs_entry_pct 只能說成進場時股價在較高／較低的位置。\n"
     "- small_sample 有值時，勝率要補一句「樣本只有 N 筆，參考就好」；勝率只在當作依據時引用一次。\n"
-    "- why 用 3～4 句講分點觀察、型態最多一句；每個分點最多引用 2～3 個數字，天數一律寫交易日。")
+    "- why 3～4 句講分點、型態最多一句；每個分點最多引用 2～3 個數字，天數一律寫交易日。")
 
 
 FINAL_WATCH_RULES = ("【觀察重點，必須照做】payload.watch_plan 是程式依均線排列與收盤位置算好的每檔方向，以及由近到遠的支撐、壓力、"
@@ -8021,7 +8021,8 @@ class AceQueryEngine:
             chart_calls.append(ToolCall("get_chart_panel", kwargs))
         # 10-20：比較頁（兩檔以上＋比較）不畫評分卡與三大法人副圖；使用者明問法人才保留
         compare_page = len(codes) >= 2 and (bool(_COMPARE_RE.search(question)) or member_pattern.comparing(plan))
-        if compare_page and "institutional" not in parsed.intents:
+        warrant_page = any(c.name == "get_sheet_stock_chips" for c in plan.tool_calls)   # 10-20：權證題不放三大法人副圖
+        if (compare_page or warrant_page) and "institutional" not in parsed.intents:
             plan.tool_calls = [c for c in plan.tool_calls if c.name != "get_institutional_flow"]
         planned_calls = list(plan.tool_calls)
         run_results = self._run_tools(planned_calls + chart_calls)
