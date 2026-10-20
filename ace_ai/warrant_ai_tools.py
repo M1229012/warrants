@@ -5803,14 +5803,9 @@ def get_branch_warrant_detail(branch_name: str, days: int = CHIPS_DAYS, stock_co
 
 # ---------- 10-20：權證分點觀察（AI 解讀用的關鍵分點重點） ----------
 
-INSIGHT_MAX_BRANCHES = 2
-
-
-def _insight_key_branches(chips: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """關鍵分點：持有中的優先、高勝率優先，最多 INSIGHT_MAX_BRANCHES 個。"""
-    rows = [b for b in chips.get("branches") or [] if b.get("branch")]
-    rows.sort(key=lambda b: (-(int(b.get("open_event_count") or 0) > 0), -bool(b.get("is_high_win_rate"))))
-    return rows[:INSIGHT_MAX_BRANCHES]
+INSIGHT_SELECTED_MAX = 2        # 精選五分點最多講幾個
+INSIGHT_OTHER_MAX = 1           # 其他值得關注的分點最多幾個（這檔沒有精選五分點時放寬到 2 個）
+INSIGHT_SMALL_SAMPLE = 20       # 勝率樣本少於這個數要提醒
 
 
 def _median(values: List[float]) -> Optional[float]:
@@ -5818,66 +5813,196 @@ def _median(values: List[float]) -> Optional[float]:
     return float(pd.Series(values).median()) if values else None
 
 
+def _day_str(value: Any) -> str:
+    return pd.Timestamp(value).strftime("%Y-%m-%d")
+
+
+class _TradingDays:
+    """交易日計數：這檔股票有日K的期間用實際交易日；更早或其他股票用平日扣掉已知休市日（颱風假等）。"""
+
+    def __init__(self, stock_dates: List[str], first: str, last: str):
+        self.stock_dates = stock_dates
+        self.holidays: List[str] = []
+        try:
+            days = [d.strftime("%Y-%m-%d") for d in pd.bdate_range(first, last)]
+            self.holidays = local_market_cache.market_closed_days(days)
+        except Exception:
+            self.holidays = []
+
+    def between(self, start: Any, end: Any) -> Optional[int]:
+        """start（不含）到 end（含）之間的交易日數。"""
+        if start is None or end is None or pd.isna(start) or pd.isna(end):
+            return None
+        a, b = _day_str(start), _day_str(end)
+        if self.stock_dates and self.stock_dates[0] <= a:
+            return sum(1 for d in self.stock_dates if a < d <= b)
+        return int(np.busday_count(pd.Timestamp(a).date() + timedelta(days=1), pd.Timestamp(b).date() + timedelta(days=1),
+                                   holidays=self.holidays))
+
+
+def _close_on(closes: Dict[str, float], dates: List[str], day: Any) -> Optional[float]:
+    key = _day_str(day)
+    before = [d for d in dates if d <= key]
+    return closes[before[-1]] if before else None
+
+
+def _top15_actual_returns(stock_code: str) -> Dict[str, Dict[str, Any]]:
+    """Sheet「快取_TOP15部位明細」：分點 → 持有中部位的權證實際報酬（剩餘成本、未實現損益，用統計日權證價格）。
+    只涵蓋近 40 個交易日內的事件；讀不到回空。"""
+    kf = core()
+    try:
+        df = read_sheet_table("快取_TOP15部位明細")["df"]
+    except Exception as exc:
+        print(f"⚠️ 權證分點觀察｜部位明細略過：{type(exc).__name__}: {exc}", flush=True)
+        return {}
+    need = {"分點", "標的股", "剩餘股數", "剩餘成本", "未實現損益"}
+    if df.empty or not need.issubset(df.columns):
+        return {}
+    rows = df[df["標的股"].map(kf._normalize_stock_name_code_key) == stock_code]
+    out: Dict[str, Dict[str, Any]] = {}
+    for _, row in rows.iterrows():
+        remaining, cost = _count_value(row["剩餘股數"]) or 0.0, _count_value(row["剩餘成本"]) or 0.0
+        pnl = _count_value(row["未實現損益"])
+        if remaining <= 0 or cost <= 0 or pnl is None:
+            continue
+        rec = out.setdefault(kf.normalize_branch_name(row["分點"]), {"cost": 0.0, "pnl": 0.0, "lots": 0,
+                                                                   "price_date": ""})
+        rec["cost"] += cost
+        rec["pnl"] += pnl
+        rec["lots"] += 1
+        rec["price_date"] = max(rec["price_date"], str(_clean_cell(row.get("最新價格日期", ""))))
+    return out
+
+
+def _is_day_trader(rows: pd.DataFrame) -> bool:
+    """這個分點在這檔股票：已出清事件超過一半是隔日衝（DAYTRADE_MAX_HOLD_DAYS 個交易日內出清）。"""
+    exited = rows[rows["status"] == "已出清"]
+    if exited.empty:
+        return False
+    return int(_day_trade_mask(exited).sum()) * 2 > len(exited)
+
+
 def warrant_branch_insights(stock_code: str, chips: Dict[str, Any]) -> Dict[str, Any]:
-    """關鍵分點的進場位置、持有天數與過去習慣、權證剩餘天數／價內外（估算）。
-    只讀本機資料：Sheet 事件表（已預讀）、本地日K、權證歷史庫；不同步、不連網。拿不到的欄位就省略。"""
+    """關鍵分點觀察（給 AI 用）：精選五分點優先，其他分點只有值得關注才列；隔日衝分點排除。
+    只讀本機與已預讀的資料：Sheet 事件表、Sheet 部位明細、本地日K、權證歷史庫；不同步、不連網。拿不到的欄位就省略。"""
     code = core()._normalize_stock_name_code_key(stock_code)
     events = load_abcde_event_rows()["events"]
     closes = _closes(code)
     dates = sorted(closes)
     last_close = closes[dates[-1]] if dates else None
-    out = []
-    for branch in _insight_key_branches(chips):
-        name = branch["branch"]
-        row: Dict[str, Any] = {"branch": name, "is_high_win_rate": bool(branch.get("is_high_win_rate"))}
-        mine = events[(events["branch"] == name) & (events["stock_code"] == code)]
+    today = dates[-1] if dates else taipei_now().strftime("%Y-%m-%d")
+    high, selected = display_branch_set()
+    in_stock = events[events["stock_code"] == code]
+    names = [b["branch"] for b in chips.get("branches") or [] if b.get("branch")]
+    chip_rows = {b["branch"]: b for b in chips.get("branches") or [] if b.get("branch")}
+    first = min([pd.Timestamp(v) for v in events[events["branch"].isin(names)]["event_date"].dropna()] or [pd.Timestamp(today)])
+    trading = _TradingDays(dates, _day_str(first), today)
+    actual = _top15_actual_returns(code)
+    excluded: List[str] = []
+    candidates = []
+    for name in names:
+        mine = in_stock[in_stock["branch"] == name].sort_values("event_date")
+        if mine.empty:
+            continue
+        if _is_day_trader(mine):
+            excluded.append(name)
+            continue
         holding = mine[mine["status"] != "已出清"]
-        if not holding.empty and last_close:
-            weights, prices = [], []
-            for _, ev in holding.iterrows():
-                day = pd.Timestamp(ev["event_date"]).strftime("%Y-%m-%d")
-                before = [d for d in dates if d <= day]
-                if before:
-                    prices.append(closes[before[-1]])
-                    weights.append(float(ev.get("buy_amount") or 0) or 1.0)
-            if prices:
-                entry = sum(p * w for p, w in zip(prices, weights)) / sum(weights)
-                row["holding_events"] = int(len(holding))
-                row["entry_close_avg"] = round(entry, 2)
-                row["close_now"] = round(last_close, 2)
-                row["vs_entry_pct"] = round((last_close / entry - 1) * 100, 1)
-            first = pd.Timestamp(holding["event_date"].min()).strftime("%Y-%m-%d")
-            row["first_holding_date"] = first.replace("-", "/")
-            row["held_trading_days"] = sum(1 for d in dates if d > first)
+        exited = mine[mine["status"] == "已出清"]
+        last_exit = exited["exit_date"].max() if not exited.empty else None
+        reentry = bool(last_exit is not None and not holding.empty and (holding["event_date"] > last_exit).any())
+        big = bool(mine["event_code"].isin(["D", "E"]).any())
+        is_selected, is_high = name in selected, name in high
+        notable = reentry or big or (is_high and not holding.empty)
+        if not (is_selected or notable):
+            continue
+        candidates.append({"name": name, "mine": mine, "holding": holding, "exited": exited, "last_exit": last_exit,
+                           "reentry": reentry, "big": big, "selected": is_selected, "high": is_high,
+                           "latest": mine["event_date"].max()})
+    order = lambda c: (-(not c["holding"].empty), -c["reentry"], -pd.Timestamp(c["latest"]).value)
+    chosen_selected = sorted([c for c in candidates if c["selected"]], key=order)[:INSIGHT_SELECTED_MAX]
+    other_max = INSIGHT_OTHER_MAX if chosen_selected else INSIGHT_SELECTED_MAX
+    chosen_other = sorted([c for c in candidates if not c["selected"]],
+                          key=lambda c: (-c["reentry"], -c["big"], -(not c["holding"].empty), -pd.Timestamp(c["latest"]).value))[:other_max]
+    out = []
+    for c in chosen_selected + chosen_other:
+        name, holding, exited = c["name"], c["holding"], c["exited"]
+        chip = chip_rows.get(name) or {}
+        row: Dict[str, Any] = {"branch": name, "role": "精選五分點" if c["selected"] else "值得關注",
+                               "is_high_win_rate": c["high"], "status": "持有中" if not holding.empty else "已出清"}
+        reasons = [r for r, ok in (("出清後又買回", c["reentry"]), ("有 D／E 大額事件", c["big"]),
+                                   ("高勝率且持有中", c["high"] and not holding.empty)) if ok]
+        if reasons and not c["selected"]:
+            row["why_notable"] = "、".join(reasons)
+        sample = chip.get("overall_sample_included")
+        if chip.get("overall_win_rate_background") is not None:
+            row["overall_win_rate"] = chip.get("overall_win_rate_background")
+            if sample is not None and float(sample) < INSIGHT_SMALL_SAMPLE:
+                row["small_sample"] = int(float(sample))
+        if not holding.empty:
+            row["holding_events"] = int(len(holding))
+            first_hold = holding["event_date"].min()
+            row["first_holding_date"] = _day_str(first_hold).replace("-", "/")
+            held = trading.between(first_hold, today)
+            if held is not None:
+                row["held_trading_days"] = held
+            prices = [(_close_on(closes, dates, ev["event_date"]), float(ev.get("buy_amount") or 0) or 1.0)
+                      for _, ev in holding.iterrows()]
+            prices = [(p, w) for p, w in prices if p]
+            if prices and last_close:
+                entry = sum(p * w for p, w in prices) / sum(w for _, w in prices)
+                row["stock_entry_close_avg"] = round(entry, 2)
+                row["stock_vs_entry_pct"] = round((last_close / entry - 1) * 100, 1)
+            rec = actual.get(name)
+            if rec and rec["cost"] > 0:
+                row["warrant_return_pct"] = round(rec["pnl"] / rec["cost"] * 100, 1)
+                row["warrant_return_basis"] = "權證實際價格（近 40 個交易日事件的部位明細" + (f"，價格日 {rec['price_date']}" if rec["price_date"] else "") + "）"
+            try:
+                detail = get_branch_warrant_detail(name, CHIPS_DAYS, code)
+            except Exception as exc:
+                detail = {}
+                print(f"⚠️ 權證分點觀察｜{name}｜權證明細略過：{type(exc).__name__}: {exc}", flush=True)
+            warrants = [w for g in detail.get("groups") or [] if g.get("stock_code") == code
+                        for w in g.get("warrants") or [] if (w.get("remaining_lots") or 0) > 0 and w.get("days_left") is not None]
+            if warrants:
+                row["warrants_holding"] = len(warrants)
+                row["days_left_min"] = int(min(w["days_left"] for w in warrants))
+                row["near_expiry_count"] = sum(1 for w in warrants if w["days_left"] <= 30)
+                money = _median([w.get("moneyness_now") for w in warrants])
+                if money is not None:
+                    row["moneyness_median_pct"] = round(money, 1)
+        if c["last_exit"] is not None:
+            last = exited[exited["exit_date"] == c["last_exit"]]
+            ev = last.iloc[-1]
+            row["last_exit_date"] = _day_str(ev["exit_date"]).replace("-", "/")
+            held = trading.between(ev["event_date"], ev["exit_date"])
+            if held is not None:
+                row["last_exit_held_trading_days"] = held
+            returns = [r for r in last["exit_return"] if r is not None and r == r]
+            if returns:
+                row["last_exit_warrant_return_pct"] = round(float(sum(returns) / len(returns)), 1)
+            exit_close = _close_on(closes, dates, ev["exit_date"])
+            if exit_close and last_close:
+                row["stock_since_exit_pct"] = round((last_close / exit_close - 1) * 100, 1)
+                if c["reentry"]:
+                    rebuy = holding[holding["event_date"] > c["last_exit"]]["event_date"].min()
+                    rebuy_close = _close_on(closes, dates, rebuy)
+                    if rebuy_close:
+                        row["rebuy_date"] = _day_str(rebuy).replace("-", "/")
+                        row["rebuy_vs_exit_pct"] = round((rebuy_close / exit_close - 1) * 100, 1)
         history = events[(events["branch"] == name) & (events["status"] == "已出清")]
         if not history.empty:
-            days = [float(v) for v in history["holding_days"] if v == v and v is not None]
-            median_days = _median(days)
+            spans = [trading.between(r["event_date"], r["exit_date"]) for _, r in history.iterrows()]
+            median_days = _median(spans)
             if median_days is not None:
-                row["past_median_holding_days"] = round(median_days)
+                row["past_median_holding_trading_days"] = round(median_days)
             staged = int(((history["reduce_date"].notna()) & (history["reduce_date"] < history["exit_date"])).sum())
-            row["past_exits"] = int(len(history))
             row["exit_style"] = "多半分批減碼後出清" if staged * 2 >= len(history) else "多半一次出清"
-        try:
-            detail = get_branch_warrant_detail(name, CHIPS_DAYS, code)
-        except Exception as exc:
-            detail = {}
-            print(f"⚠️ 權證分點觀察｜{name}｜權證明細略過：{type(exc).__name__}: {exc}", flush=True)
-        warrants = [w for g in detail.get("groups") or [] if g.get("stock_code") == code
-                    for w in g.get("warrants") or [] if (w.get("remaining_lots") or 0) > 0 and w.get("days_left") is not None]
-        if warrants:
-            row["warrants_holding"] = len(warrants)
-            row["days_left_min"] = int(min(w["days_left"] for w in warrants))
-            for key, src in (("moneyness_median_pct", "moneyness_now"), ("leverage_median", "leverage_now"),
-                             ("est_return_median_pct", "est_return_pct")):
-                value = _median([w.get(src) for w in warrants])
-                if value is not None:
-                    row[key] = round(value, 1)
-            row["near_expiry_count"] = sum(1 for w in warrants if w["days_left"] <= 30)
         out.append(row)
     return {"stock_code": code, "stock_name": chips.get("stock_name", ""), "branches": out,
-            "definition_note": ("entry_close_avg＝持有中事件的事件日收盤（依買進金額加權），不是分點實際成交價；"
-                                "價內外正＝價內、負＝價外；槓桿與估算報酬用歷史波動率估算，不是實際報價")}
+            "excluded_day_traders": excluded,
+            "definition_note": ("天數一律是交易日；warrant_return_pct／last_exit_warrant_return_pct 是權證實際價格算的報酬（含槓桿）；"
+                                "stock_* 是股價位置，不是權證賺賠；價內外正＝價內、負＝價外")}
 
 
 def chart_marks_for_stock(stock_code: str, dates: List[str], branch_name: str = "") -> Dict[str, Any]:
