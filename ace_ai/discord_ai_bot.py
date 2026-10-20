@@ -3116,8 +3116,8 @@ FINAL_WATCH_RULES = ("【觀察重點，必須照做】payload.watch_plan 是程
     "- watch_plan 有「止穩觀察」時（近 1～2 週從 high_10d_date 的高點跌了 from_high_pct%，或當天大跌），讀者最想知道「哪裡有機會止穩」："
     "answer 寫這波跌了多少、現在要看哪個價位能不能止穩；why 依序寫：下方支撐由近到遠、哪一個最有機會撐住與原因（大量區、季線、前低等）、"
     "要看到什麼才算止穩（量縮、長下影線、連續幾天不破低、站回某個價位）、跌破後的下一關在哪；scenarios 用「止穩條件」「跌破下一關」。"
-    "這時不寫 KD、MACD、布林帶寬的超賣或過冷——讀者看 K 線就知道跌很多。\n"
-    "- 任何時候都不要只寫 KD、MACD、布林帶寬的狀態（過冷、超賣、柱狀體擴大、帶寬收窄）；只有背離、鈍化這類會改變判斷的訊號才寫，而且要說代表什麼。\n"
+    "這時不寫 KD、MACD、布林帶寬——線就是一路向下，指標只會跟著顯示超賣、過冷，沒有參考意義（背離、鈍化例外）。\n"
+    "- 沒有止穩觀察時可以提 KD、MACD，但要說代表什麼（例如「KD 黃金交叉，短線動能轉強」），不要只報狀態。\n"
     "- 解讀要給看法，不是報數據：不要列出 KD、MACD、布林帶寬、均線站上跌破這類指標狀態；每提到一個訊號都要說它代表什麼"
     "（例「跌破月線但守在季線上，屬於多頭結構裡的修正」「量縮回測大量區，賣壓沒有擴大」）。answer 要回答：現在哪一方占上風、"
     "這次走勢是修正還是轉弱（或是反彈還是轉強）、要看到什麼才會改變看法。\n"
@@ -4970,7 +4970,8 @@ def index_inst_wanted(plan: "QueryPlan", parsed: "ParsedQuestion", codes: Sequen
     """10-20：單一指數（加權／櫃買）的型態頁預設附全市場三大法人；說不要法人、比較頁、期貨題（副圖給期貨）不附。"""
     if plan.route != "rule_pattern" or compare_page or len(codes) != 1 or codes[0] not in tools.INDEX_CODES:
         return False
-    if "futures" in parsed.intents or any(c.name in ("get_market_institutional", "get_futures_positions") for c in plan.tool_calls):
+    # 大盤型態頁本來就固定附台指期資料給 AI（不畫副圖）；只有使用者問期貨時副圖才讓給期貨
+    if "futures" in parsed.intents or any(c.name == "get_market_institutional" for c in plan.tool_calls):
         return False
     return "institutional" not in getattr(parsed, "needs_excluded", set()) and not _NO_INST_RE.search(question or "")
 
@@ -5070,6 +5071,28 @@ def split_answer_head(text: str, limit: int = 80) -> Tuple[str, str]:
         if cut >= 15:
             return text[:cut] + "。", text[cut + 1:].strip()
     return text, ""
+
+
+_OSCILLATOR_RE = re.compile(r"KD|[KDJ]\s*值|MACD|DIF|柱狀體|RSI|布林(?:通道)?(?:帶寬|通道收窄|收窄)|帶寬|超賣|超買|過冷|過熱")
+_OSCILLATOR_KEEP_RE = re.compile(r"背離|鈍化")
+
+
+def drop_oscillator_noise(text: str) -> str:
+    """10-20：止穩觀察（持續下跌）時，「KD 的 J 值過冷」「MACD 柱狀體擴大」沒有意義；整個子句刪掉，背離、鈍化保留。
+    刪完整句沒東西就整句拿掉；新的句首去掉連接詞。"""
+    if not text or not _OSCILLATOR_RE.search(str(text)):
+        return text
+    out = []
+    for sentence in re.split(r"(?<=[。！？；])", str(text)):
+        if not _OSCILLATOR_RE.search(sentence) or _OSCILLATOR_KEEP_RE.search(sentence):
+            out.append(sentence)
+            continue
+        body, end = (sentence[:-1], sentence[-1]) if sentence and sentence[-1] in "。！？；" else (sentence, "")
+        clauses = [c for c in re.split(r"[，,](?!\d)", body) if c.strip() and not _OSCILLATOR_RE.search(c)]
+        if clauses:
+            clauses[0] = _LEADING_CONNECTOR_RE.sub("", re.sub(r"^\s*(?:且|並且|而且|加上)\s*", "", clauses[0]))
+            out.append("，".join(clauses) + (end or "。"))
+    return "".join(out).strip()
 
 
 def drop_number_dumps(text: str, limit: int = 4, total: int = 7) -> str:
@@ -8089,6 +8112,12 @@ class AceQueryEngine:
         warrant_page = any(c.name == "get_sheet_stock_chips" for c in plan.tool_calls)   # 10-20：權證題不放三大法人副圖
         if (compare_page or warrant_page) and "institutional" not in parsed.intents:
             plan.tool_calls = [c for c in plan.tool_calls if c.name != "get_institutional_flow"]
+        index_flow = [c for c in plan.tool_calls if c.name == "get_institutional_flow" and c.kwargs.get("stock_code") in tools.INDEX_CODES]
+        if index_flow:
+            # 10-20：「大盤 外資籌碼」需求表排出 get_institutional_flow(TAIEX)，個股法人工具查不到指數 → 換成全市場三大法人
+            plan.tool_calls = [c for c in plan.tool_calls if c not in index_flow]
+            for c in index_flow:
+                plan.add("get_market_institutional", market="tpex" if c.kwargs.get("stock_code") == "TPEX" else "twse")
         if index_inst_wanted(plan, parsed, codes, question, compare_page):
             # 10-20：大盤／櫃買型態頁預設附全市場三大法人（K 線下方副圖＋解讀一句）
             plan.add("get_market_institutional", market="tpex" if codes[0] == "TPEX" else "twse")
@@ -8946,17 +8975,21 @@ class AceQueryEngine:
                     card = fixed
             if card is None:
                 return f"（AI 文字中有內容無法對應到原始資料，這次不附 AI 解讀）\n\n{rule_answer}", False
+            # 10-20：止穩觀察（持續下跌）時 KD／MACD 沒有意義，AI 還寫就由程式刪；平常照留
+            drop_mode = any(isinstance(v, dict) and v.get("止穩觀察") for v in (payload.get("watch_plan") or {}).values())
+            osc = drop_oscillator_noise if drop_mode else (lambda t: t)
             for key in ("answer", "why", "summary"):
                 card[key] = drop_directives(card.get(key, ""))
                 card[key] = drop_warrant_listing(card[key], results)
                 card[key] = drop_source_mentions(card[key])
+                card[key] = osc(card[key])
                 if key in ("why", "summary"):
                     card[key] = drop_number_dumps(card[key], total=6 if payload.get("compare_page") else 7)   # 10-20：念數據的句子拿掉
             # 10-20：結論太長時圖卡會把後半句切成標題下一行小字（例「關鍵觀察 2420 元能否站穩。」）→ 後半段移到「為什麼」開頭
             card["answer"], spill = split_answer_head(drop_filler_head(card.get("answer", "")))
             if spill:
                 card["why"] = (spill + card.get("why", "")).strip()
-            card["scenarios"] = [dict(x, text=drop_source_mentions(drop_directives(x["text"])),
+            card["scenarios"] = [dict(x, text=osc(drop_source_mentions(drop_directives(x["text"]))),
                                       title=drop_source_mentions(drop_directives(fix_scenario_title(x.get("title", "")))))
                                  for x in card.get("scenarios") or []]
             card["scenarios"] = [x for x in card["scenarios"] if x["text"]]
@@ -10608,12 +10641,4 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         print("=" * 60)
         for index, chunk in enumerate(split_discord_message(result.text, config.max_message_chars), 1):
             print(f"--- Discord 訊息 {index} ---")
-            print(chunk)
-        print("=" * 60)
-        print(f"route={result.route}｜Gemini 呼叫 {result.gemini_calls} 次｜{result.elapsed:.2f} 秒")
-        return
-    run_discord_bot(config)
-
-
-if __name__ == "__main__":
-    main()
+            print(
