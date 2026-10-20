@@ -8199,8 +8199,6 @@ class AceQueryEngine:
                 flow = market_flow
                 panel["institutional_unit"] = "億"
                 panel["institutional_day"] = _day_label(flow.get("data_date"))
-                if plan.route != "rule_market_institutional":
-                    panel["institutional_extra"] = market_inst_extra(market_flow, question)
             if (flow is None and futures_data and panel.get("stock_code") == "TAIEX" and panel.get("bars")
                     and (plan.route == "rule_futures" or "futures" in parsed.intents)):
                 focus = futures_focus(question)
@@ -8213,9 +8211,7 @@ class AceQueryEngine:
             if flow and panel.get("bars"):
                 dates = {bar["date"] for bar in panel["bars"]}
                 self._attach_daily_institutional(panel, flow)
-                focus = institutional_focus(question, flow)
-                if focus:
-                    panel["institutional_focus"] = _INVESTOR_KEYS[focus]   # 只問單一法人：副圖只畫該法人
+                # 10-20：副圖固定畫三大法人（大盤、櫃買、個股一致），問「外資」也不只畫單一法人；圖例已有各法人今日數字
         if plan.route in ("rule_pattern", "rule_top_warrant", "rule_index_compare") or plan.pattern:
             # 會員型態頁疊上同次判斷的三角；評分與分點回測依本題需求顯示。
             for panel in [p for p in panels if p.get("stock_code") and p.get("bars")]:
