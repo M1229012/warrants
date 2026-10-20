@@ -2741,8 +2741,8 @@ def _compact_tool_data(name: str, data: Dict[str, Any], has_scorecard: bool) -> 
             branches.append({k: v for k, v in row.items() if v not in (None, "", [], {})})
         data = {k: data.get(k) for k in ("stock_code", "stock_name", "available", "reason", "period_recent", "data_latest_event_date")}
         data["branches"] = branches
-    elif name in ("get_retail_futures", "get_futures_positions"):
-        data["rows"] = (data.get("rows") or [])[-5:]
+    elif name in ("get_retail_futures", "get_futures_positions", "get_market_institutional"):
+        data["rows"] = (data.get("rows") or [])[-5:]   # 10-20：全市場法人逐日也只送 5 天（副圖已畫 70 天）
     elif name == "get_recent_news":
         data["articles"] = [{k: v for k, v in a.items() if k not in ("event_key",) and not (k == "summary" and a.get("content"))}
                             for a in data.get("articles") or []]
@@ -3037,6 +3037,12 @@ FINAL_WARRANT_INSIGHT_RULES = ("【權證分點觀察，優先於【觀察重點
     "- scenarios 一個用分點條件（持有中的部位出場、出現新的 A～E 事件），一個用 watch_plan 的關鍵價位；兩個都不可寫分點會因價位而進出。")
 
 
+FINAL_MARKET_INST_RULES = ("【大盤三大法人，必須照做】圖上 K 線下方已畫全市場三大法人買賣超（億元）。why 用一句帶到法人就好：以外資為主，"
+                           "寫最新一日買或賣、連買／連賣幾天或近 5 日方向，再說跟大盤走勢的關係（例如「外資連 3 天賣超、近 5 日賣超 1,200 億，"
+                           "反彈要先看賣壓是否收斂」「外資轉買，有利守住 46,113 的季線」）；投信、自營商只有方向明顯相反或金額特別大才提。"
+                           "不要逐一念三大法人的數字，也不要只因為法人一天的買賣就改變型態判斷。\n")
+
+
 FINAL_WATCH_RULES = ("【觀察重點，必須照做】payload.watch_plan 是程式依均線排列與收盤位置算好的每檔方向，以及由近到遠的支撐、壓力、"
     "上方均線扣抵條件（反彈壓力）與下方均線（回測觀察）。解讀要依方向給客觀的觀察重點，不是把圖上數據再說一次：\n"
     "- 偏空：先講下方最近的支撐，以及哪一個支撐最有機會止跌反彈、原因（大量區、前低、季線等），止跌要看的訊號（下影線、量縮、站回某價位），"
@@ -3100,6 +3106,8 @@ def build_final_prompt(payload: Dict[str, Any]) -> str:
         sections.append(FINAL_WATCH_RULES)
     if "get_warrant_branch_insights" in names:
         sections.append(FINAL_WARRANT_INSIGHT_RULES)
+    if "get_market_institutional" in names and "get_technical_analysis" in names:
+        sections.append(FINAL_MARKET_INST_RULES)
     if payload.get("compare_page"):
         sections.append("【兩檔比較，必須照做】只說重點：answer 一句（60 字內）說哪檔結構相對強或弱與主因；why 3～5 句、約 150～230 字，兩檔各自的重點都要講到，"
                         "每檔最多引用 1 個關鍵價位；不報型態分數、評分、五大項，不逐條念均線、量區、布林與法人張數（圖上都有）；"
@@ -4635,6 +4643,19 @@ def market_of(parsed: "ParsedQuestion") -> str:
     if codes == ["TPEX"] or (not codes and re.search(r"櫃買|上櫃|OTC", parsed.original or "", re.I)):
         return "tpex"
     return "twse"
+
+
+_NO_INST_RE = re.compile(r"(?:不要|不用|不需要|別|免)(?:看|放|附|畫)?(?:三大)?法人")
+
+
+def index_inst_wanted(plan: "QueryPlan", parsed: "ParsedQuestion", codes: Sequence[str], question: str, compare_page: bool) -> bool:
+    """10-20：單一指數（加權／櫃買）的型態頁預設附全市場三大法人；說不要法人、比較頁、期貨題（副圖給期貨）不附。"""
+    if plan.route != "rule_pattern" or compare_page or len(codes) != 1 or codes[0] not in tools.INDEX_CODES:
+        return False
+    # 大盤型態頁本來就固定附台指期資料給 AI（不畫副圖）；只有使用者問期貨時副圖才讓給期貨
+    if "futures" in parsed.intents or any(c.name == "get_market_institutional" for c in plan.tool_calls):
+        return False
+    return "institutional" not in getattr(parsed, "needs_excluded", set()) and not _NO_INST_RE.search(question or "")
 
 
 def market_institutional_wanted(parsed: "ParsedQuestion") -> bool:
@@ -7610,6 +7631,16 @@ class AceQueryEngine:
         warrant_page = any(c.name == "get_sheet_stock_chips" for c in plan.tool_calls)   # 10-20：權證題不放三大法人副圖
         if (compare_page or warrant_page) and "institutional" not in parsed.intents:
             plan.tool_calls = [c for c in plan.tool_calls if c.name != "get_institutional_flow"]
+        index_flow = [c for c in plan.tool_calls if c.name == "get_institutional_flow" and c.kwargs.get("stock_code") in tools.INDEX_CODES]
+        if index_flow:
+            # 10-20：「大盤 外資籌碼」需求表排出 get_institutional_flow(TAIEX)，個股法人工具查不到指數 → 換成全市場三大法人
+            plan.tool_calls = [c for c in plan.tool_calls if c not in index_flow]
+            for c in index_flow:
+                plan.add("get_market_institutional", market="tpex" if c.kwargs.get("stock_code") == "TPEX" else "twse")
+        if index_inst_wanted(plan, parsed, codes, question, compare_page):
+            # 10-20：大盤／櫃買型態頁預設附全市場三大法人（K 線下方副圖＋解讀一句）
+            plan.add("get_market_institutional", market="tpex" if codes[0] == "TPEX" else "twse")
+            self.log(f"大盤型態頁附三大法人｜{codes[0]}")
         planned_calls = list(plan.tool_calls)
         run_results = self._run_tools(planned_calls + chart_calls)
         combined = pre_results + run_results
@@ -7690,8 +7721,6 @@ class AceQueryEngine:
                 flow = market_flow
                 panel["institutional_unit"] = "億"
                 panel["institutional_day"] = _day_label(flow.get("data_date"))
-                if plan.route != "rule_market_institutional":
-                    panel["institutional_extra"] = market_inst_extra(market_flow, question)
             if (flow is None and futures_data and panel.get("stock_code") == "TAIEX" and panel.get("bars")
                     and (plan.route == "rule_futures" or "futures" in parsed.intents)):
                 focus = futures_focus(question)
@@ -7704,9 +7733,7 @@ class AceQueryEngine:
             if flow and panel.get("bars"):
                 dates = {bar["date"] for bar in panel["bars"]}
                 panel["institutional"] = [row for row in flow.get("rows") or [] if row.get("date") in dates]
-                focus = institutional_focus(question, flow)
-                if focus:
-                    panel["institutional_focus"] = _INVESTOR_KEYS[focus]   # 只問單一法人：副圖只畫該法人
+                # 10-20：副圖固定畫三大法人（大盤、櫃買、個股一致），問「外資」也不只畫單一法人；圖例已有各法人今日數字
         if plan.route in ("rule_pattern", "rule_top_warrant", "rule_index_compare") or plan.pattern:
             for panel in [p for p in panels if p.get("stock_code")]:   # 只有 K 線面板有評分卡（籌碼重點不是）
                 # 10-20：比較圖、問的不是型態（新聞、法人、還有機會嗎…）的型態頁不放評分卡；價位照樣標在 K 線上
