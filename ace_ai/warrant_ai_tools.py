@@ -5875,9 +5875,10 @@ def _top15_actual_returns(stock_code: str) -> Dict[str, Dict[str, Any]]:
         rec["price_date"] = max(rec["price_date"], str(_clean_cell(row.get("最新價格日期", ""))))
         day = _parse_sheet_date(row.get("事件日", "")) if "事件日" in rows.columns else None
         if day is not None:
-            one = rec["by_event"].setdefault(day.strftime("%Y-%m-%d"), [0.0, 0.0])
+            one = rec["by_event"].setdefault(day.strftime("%Y-%m-%d"), [0.0, 0.0, ""])
             one[0] += cost
             one[1] += pnl
+            one[2] = max(one[2], str(_clean_cell(row.get("最新價格日期", ""))))
     return out
 
 
@@ -5949,10 +5950,13 @@ def warrant_branch_insights(stock_code: str, chips: Dict[str, Any]) -> Dict[str,
             if gap is None or gap > INSIGHT_RECENT_DAYS or len(recent) >= INSIGHT_RECENT_MAX:
                 break
             item = {"date": _day_str(ev["event_date"]).replace("-", "/"), "event": ev.get("event_code"),
-                    "buy_amount_text": _money_text(ev.get("buy_amount")), "status": ev.get("status")}
+                    "buy_amount_text": _money_text(ev.get("buy_amount")), "status": ev.get("status"),
+                    "trading_days_since_buy": gap}
             one = (rec.get("by_event") or {}).get(_day_str(ev["event_date"]))
-            if one and one[0] > 0:
+            if one and one[0] > 0 and ev.get("status") != "已出清":
                 item["warrant_return_pct"] = round(one[1] / one[0] * 100, 1)
+                if one[2]:
+                    item["warrant_price_date"] = one[2]
             recent.append(item)
         if recent:
             row["recent_events"] = recent
@@ -5966,23 +5970,8 @@ def warrant_branch_insights(stock_code: str, chips: Dict[str, Any]) -> Dict[str,
             if sample is not None and float(sample) < INSIGHT_SMALL_SAMPLE:
                 row["small_sample"] = int(float(sample))
         if not holding.empty:
+            # 10-20：只給持有筆數；「從最早一筆算的持有天數、股價進場位置、全部部位加總報酬」會被 AI 接到最近那一筆上，不給
             row["holding_events"] = int(len(holding))
-            first_hold = holding["event_date"].min()
-            row["first_holding_date"] = _day_str(first_hold).replace("-", "/")
-            held = trading.between(first_hold, today)
-            if held is not None:
-                row["held_trading_days"] = held
-            prices = [(_close_on(closes, dates, ev["event_date"]), float(ev.get("buy_amount") or 0) or 1.0)
-                      for _, ev in holding.iterrows()]
-            prices = [(p, w) for p, w in prices if p]
-            if prices and last_close:
-                entry = sum(p * w for p, w in prices) / sum(w for _, w in prices)
-                row["stock_entry_close_avg"] = round(entry, 2)
-                row["stock_vs_entry_pct"] = round((last_close / entry - 1) * 100, 1)
-            if rec and rec.get("cost", 0) > 0:
-                # 所有持有中部位加總（新舊部位混在一起）：只當背景，不當主要數字
-                row["holding_return_all_pct"] = round(rec["pnl"] / rec["cost"] * 100, 1)
-                row["holding_return_all_lots"] = rec["lots"]
             try:
                 detail = get_branch_warrant_detail(name, CHIPS_DAYS, code)
             except Exception as exc:
@@ -6027,8 +6016,8 @@ def warrant_branch_insights(stock_code: str, chips: Dict[str, Any]) -> Dict[str,
         out.append(row)
     return {"stock_code": code, "stock_name": chips.get("stock_name", ""), "branches": out,
             "excluded_day_traders": excluded,
-            "definition_note": ("天數一律是交易日；recent_events[].warrant_return_pct 是那一筆事件的權證實際報酬、"
-                                "holding_return_all_pct 是所有持有部位加總、last_exit_warrant_return_pct 是上一波出清獲利（都用權證實際價格，含槓桿）；"
+            "definition_note": ("天數一律是交易日；recent_events[].warrant_return_pct 是那一筆事件的權證實際報酬（截至 warrant_price_date）、"
+                                "last_exit_warrant_return_pct 是上一波出清獲利（都用權證實際價格，含槓桿）；"
                                 "stock_* 是股價位置，不是權證賺賠；價內外正＝價內、負＝價外")}
 
 

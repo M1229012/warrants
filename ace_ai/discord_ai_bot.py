@@ -3065,13 +3065,12 @@ FINAL_SPOT_EVENT_RULES = ("【現股分點動向（10-20 精簡版）】解讀�
 FINAL_WARRANT_INSIGHT_RULES = ("【權證分點觀察】get_warrant_branch_insights 是程式挑好的關鍵分點（隔日衝分點已排除）與算好的重點，圖上沒有這些內容。"
     "解讀是在說「現在的狀況」，不是覆盤；不要改念圖上的標註表與「主要分點狀態」（持有筆數、總勝率圖上都有）。"
     "分點一律當一般分點講，不寫「精選」「精選分點」這類標籤。\n"
-    "- 先講最近幾天：branches 已依最近事件日排好；recent_events 是近 10 個交易日內的事件。answer 與 why 第一句先說最近是誰在什麼時候買進或出清、"
-    "金額多少，有 warrant_return_pct 就寫「這筆權證目前帳面約 +／−X%」（一定要講是哪一天的那一筆）。\n"
-    "- 再講現在持有的狀態：最近一檔權證剩幾天到期（days_left_min，一定要寫天數）、near_expiry_count 大於 0 提醒到期前通常會處理部位；"
-    "held_trading_days 對照 past_median_holding_trading_days（交易日）只用一句，說還在平常的持有期內或已超過；exit_style 是過去出場習慣。\n"
+    "- 先講最近幾天：branches 已依最近事件日排好；recent_events 是近 10 個交易日內的事件。answer 與 why 第一句先說最近是誰、哪天買進或出清、金額多少。"
+    "每個數字只能接在它自己那一筆後面：trading_days_since_buy 是那一筆買進後過了幾個交易日；"
+    "warrant_return_pct 是那一筆權證的帳面報酬，要寫「截至 warrant_price_date 帳面約 +／−X%」，沒有就不寫，不可用股價漲跌推算。\n"
+    "- 再講現在持有的狀態：最近一檔權證剩幾天到期（days_left_min，一定要寫天數），near_expiry_count 大於 0 提醒到期前通常會處理部位；"
+    "past_median_holding_trading_days 是這個分點過去平均持有幾個交易日，只能拿來和最近那一筆的 trading_days_since_buy 比較；exit_style 是過去出場習慣。\n"
     "- 之前的操作（覆盤）最多一句帶過：上一波出清（last_exit_*）持有幾個交易日、獲利多少；出清後又買回（rebuy_date）用 rebuy_vs_exit_pct 說是低接還是追價。\n"
-    "- holding_return_all_pct 是所有持有部位加總（新舊混在一起），預設不寫；要寫必須說明是「全部持有部位合計」。"
-    "沒有權證實際報酬就不要寫權證賺賠，不可用股價漲跌推算；stock_vs_entry_pct 只能說成進場時股價在較高／較低的位置。\n"
     "- small_sample 有值時，勝率要補一句「樣本只有 N 筆，參考就好」；勝率只在當作依據時引用一次。\n"
     "- why 3～4 句講分點、型態最多一句；每個分點最多引用 2～3 個數字，天數一律寫交易日。")
 
