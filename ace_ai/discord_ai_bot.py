@@ -3062,6 +3062,16 @@ FINAL_SPOT_EVENT_RULES = ("【現股分點動向（10-20 精簡版）】解讀�
     "型態＋籌碼同一題時，籌碼用 why 的 1～2 句說明（誰在主導、和股價的關係），scenarios 不另給籌碼條件。")
 
 
+FINAL_WARRANT_INSIGHT_RULES = ("【權證分點觀察】get_warrant_branch_insights 是程式替 1～2 個關鍵分點算好的重點（圖上沒有），解讀要用它說明分點，不要改念圖上的標註表：\n"
+    "- entry_close_avg／vs_entry_pct：持有中事件的進場位置（事件日收盤、依買進金額加權）和現價的差距。現價低於進場位置寫「主力部位目前套在較高位置」，"
+    "高於寫「主力部位仍在獲利區」；這是用收盤估的位置，不可說成分點實際成本或實際損益。\n"
+    "- held_trading_days 與 past_median_holding_days：已持有幾個交易日、這個分點過去出清前通常持有幾天，用來說明「還在他平常的持有期內」或「已超過平常的持有期，要留意出場」；"
+    "exit_style 是過去出場習慣（分批減碼或一次出清），用來說明之後大概會怎麼看到他的動作。只描述歷史，不預測一定會出場。\n"
+    "- warrants：持有中權證的最短剩餘天數（days_left_min）、價內外（正＝價內、負＝價外）、估算槓桿與估算報酬，都要寫「估算」；"
+    "near_expiry_count 大於 0 要提醒到期前通常會處理部位。\n"
+    "- why 用 2～3 句講這些分點觀察、型態最多一句；每個分點最多引用 2 個數字，挑最能說明處境的（通常是進場位置差距與剩餘天數）。")
+
+
 FINAL_WATCH_RULES = ("【觀察重點，必須照做】payload.watch_plan 是程式依均線排列與收盤位置算好的每檔方向，以及由近到遠的支撐、壓力、"
     "上方均線扣抵條件（反彈壓力）與下方均線（回測觀察）。解讀要依方向給客觀的觀察重點，不是把圖上數據再說一次：\n"
     "- 偏空：先講下方最近的支撐，以及哪一個支撐最有機會止跌反彈、原因（大量區、前低、季線等），止跌要看的訊號（下影線、量縮、站回某價位），"
@@ -3125,6 +3135,8 @@ def build_final_prompt(payload: Dict[str, Any]) -> str:
         sections.append(FINAL_PATTERN_RULES)
     if payload.get("watch_plan"):
         sections.append(FINAL_WATCH_RULES)
+    if "get_warrant_branch_insights" in names:
+        sections.append(FINAL_WARRANT_INSIGHT_RULES)
     if payload.get("compare_page"):
         sections.append("【兩檔比較，必須照做】只說重點：answer 一句（60 字內）說哪檔結構相對強或弱與主因；why 3～5 句、約 150～230 字，兩檔各自的重點都要講到，"
                         "每檔最多引用 1 個關鍵價位；不報型態分數、評分、五大項，不逐條念均線、量區、布林與法人張數（圖上都有）；"
@@ -8152,6 +8164,7 @@ class AceQueryEngine:
                     margin = chip_event_backtest.margin_card(data)
                     if margin:
                         panels.append({"branch_card": margin, "hide_text": True})
+        self._attach_warrant_insights(results)
         self._attach_chart_levels(panels, results, parsed.cost_price)
         contribution = next((r.data for r in results if r.name == "get_index_contribution" and r.ok), None)
         markets = list((contribution or {}).get("markets") or [])
@@ -8474,6 +8487,20 @@ class AceQueryEngine:
         except Exception as exc:
             self.log(f"測試現股回測略過｜{code}｜{type(exc).__name__}: {exc}")
             return None
+
+    def _attach_warrant_insights(self, results: List[tools.ToolResult]) -> None:
+        """10-20：有權證分點資料時，替 1～2 個關鍵分點算好進場位置、持有天數與過去習慣、權證剩餘天數／價內外，給 AI 解讀用。"""
+        for chips in [r.data for r in results if r.ok and r.name == "get_sheet_stock_chips" and (r.data or {}).get("available")]:
+            started = time.perf_counter()
+            try:
+                data = tools.warrant_branch_insights(chips.get("stock_code", ""), chips)
+            except Exception as exc:
+                self.log(f"權證分點觀察略過｜{chips.get('stock_code')}｜{type(exc).__name__}: {exc}")
+                continue
+            if data.get("branches"):
+                results.append(tools.ToolResult("get_warrant_branch_insights", True, data))
+                self.log(f"權證分點觀察｜{data['stock_code']}｜" + "、".join(b["branch"] for b in data["branches"])
+                         + f"｜{time.perf_counter() - started:.2f}s")
 
     def _attach_chart_levels(self, panels: List[Dict[str, Any]], results: Sequence[tools.ToolResult],
                              cost_price: Optional[float]) -> None:

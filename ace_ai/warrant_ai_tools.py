@@ -5801,6 +5801,85 @@ def get_branch_warrant_detail(branch_name: str, days: int = CHIPS_DAYS, stock_co
     return result if result is not None else _warrant_detail_from_events(branch_name, days, stock_code)
 
 
+# ---------- 10-20：權證分點觀察（AI 解讀用的關鍵分點重點） ----------
+
+INSIGHT_MAX_BRANCHES = 2
+
+
+def _insight_key_branches(chips: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """關鍵分點：持有中的優先、高勝率優先，最多 INSIGHT_MAX_BRANCHES 個。"""
+    rows = [b for b in chips.get("branches") or [] if b.get("branch")]
+    rows.sort(key=lambda b: (-(int(b.get("open_event_count") or 0) > 0), -bool(b.get("is_high_win_rate"))))
+    return rows[:INSIGHT_MAX_BRANCHES]
+
+
+def _median(values: List[float]) -> Optional[float]:
+    values = [float(v) for v in values if v is not None and v == v]
+    return float(pd.Series(values).median()) if values else None
+
+
+def warrant_branch_insights(stock_code: str, chips: Dict[str, Any]) -> Dict[str, Any]:
+    """關鍵分點的進場位置、持有天數與過去習慣、權證剩餘天數／價內外（估算）。
+    只讀本機資料：Sheet 事件表（已預讀）、本地日K、權證歷史庫；不同步、不連網。拿不到的欄位就省略。"""
+    code = core()._normalize_stock_name_code_key(stock_code)
+    events = load_abcde_event_rows()["events"]
+    closes = _closes(code)
+    dates = sorted(closes)
+    last_close = closes[dates[-1]] if dates else None
+    out = []
+    for branch in _insight_key_branches(chips):
+        name = branch["branch"]
+        row: Dict[str, Any] = {"branch": name, "is_high_win_rate": bool(branch.get("is_high_win_rate"))}
+        mine = events[(events["branch"] == name) & (events["stock_code"] == code)]
+        holding = mine[mine["status"] != "已出清"]
+        if not holding.empty and last_close:
+            weights, prices = [], []
+            for _, ev in holding.iterrows():
+                day = pd.Timestamp(ev["event_date"]).strftime("%Y-%m-%d")
+                before = [d for d in dates if d <= day]
+                if before:
+                    prices.append(closes[before[-1]])
+                    weights.append(float(ev.get("buy_amount") or 0) or 1.0)
+            if prices:
+                entry = sum(p * w for p, w in zip(prices, weights)) / sum(weights)
+                row["holding_events"] = int(len(holding))
+                row["entry_close_avg"] = round(entry, 2)
+                row["close_now"] = round(last_close, 2)
+                row["vs_entry_pct"] = round((last_close / entry - 1) * 100, 1)
+            first = pd.Timestamp(holding["event_date"].min()).strftime("%Y-%m-%d")
+            row["first_holding_date"] = first.replace("-", "/")
+            row["held_trading_days"] = sum(1 for d in dates if d > first)
+        history = events[(events["branch"] == name) & (events["status"] == "已出清")]
+        if not history.empty:
+            days = [float(v) for v in history["holding_days"] if v == v and v is not None]
+            median_days = _median(days)
+            if median_days is not None:
+                row["past_median_holding_days"] = round(median_days)
+            staged = int(((history["reduce_date"].notna()) & (history["reduce_date"] < history["exit_date"])).sum())
+            row["past_exits"] = int(len(history))
+            row["exit_style"] = "多半分批減碼後出清" if staged * 2 >= len(history) else "多半一次出清"
+        try:
+            detail = get_branch_warrant_detail(name, CHIPS_DAYS, code)
+        except Exception as exc:
+            detail = {}
+            print(f"⚠️ 權證分點觀察｜{name}｜權證明細略過：{type(exc).__name__}: {exc}", flush=True)
+        warrants = [w for g in detail.get("groups") or [] if g.get("stock_code") == code
+                    for w in g.get("warrants") or [] if (w.get("remaining_lots") or 0) > 0 and w.get("days_left") is not None]
+        if warrants:
+            row["warrants_holding"] = len(warrants)
+            row["days_left_min"] = int(min(w["days_left"] for w in warrants))
+            for key, src in (("moneyness_median_pct", "moneyness_now"), ("leverage_median", "leverage_now"),
+                             ("est_return_median_pct", "est_return_pct")):
+                value = _median([w.get(src) for w in warrants])
+                if value is not None:
+                    row[key] = round(value, 1)
+            row["near_expiry_count"] = sum(1 for w in warrants if w["days_left"] <= 30)
+        out.append(row)
+    return {"stock_code": code, "stock_name": chips.get("stock_name", ""), "branches": out,
+            "definition_note": ("entry_close_avg＝持有中事件的事件日收盤（依買進金額加權），不是分點實際成交價；"
+                                "價內外正＝價內、負＝價外；槓桿與估算報酬用歷史波動率估算，不是實際報價")}
+
+
 def chart_marks_for_stock(stock_code: str, dates: List[str], branch_name: str = "") -> Dict[str, Any]:
     """K 線標註用的分點買賣點（只讀 Sheet，不含報酬率）。
 
