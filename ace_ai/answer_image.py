@@ -1295,7 +1295,7 @@ def draw_ma_line(draw, x: float, y: float, width: float, last: dict, show_bollin
 
 # ---------- 10-18：關鍵價位改標在 K 線上（右側價格框＋日期軸下方圖例），不再另畫關鍵價位表 ----------
 LEVELS_ON_CHART = True
-LEVEL_TAG_MAX = 2
+LEVEL_TAG_MAX = 3          # 10-20：使用者要多標幾個，最多 3 個
 LEVEL_TAG_H = 32
 LEVEL_TAG_FONT = 20
 _TAG_COLORS = (('三角上緣', '#C76C00'), ('三角下緣', '#1478B5'), ('量區', '#0B7F6B'), ('布林', '#667085'))
@@ -1346,15 +1346,19 @@ def _chart_levels(panel: dict) -> tuple[list[dict], list[dict]]:
     inside = [x for x in items if low <= x['price'] <= high]
     near = sorted(inside, key=lambda x: abs(x['pct']) if x['pct'] is not None else 1e9)
     ai = _ai_level_items(panel, low, high)
+    gap = lambda x: abs(x['pct']) if x['pct'] is not None else 1e9
     if ai:
-        # 10-20：AI 解讀提到的價位優先標在右側價格框（最多 AI_LEVEL_TAG_MAX 個），其他價位放價位條
+        # 10-20：AI 解讀提到的價位併進候選（同價位以 AI 那筆為準），價位條也會出現
         same = lambda a, b: abs(a['price'] - b['price']) <= max(abs(b['price']) * .0005, .011)
         items = ai + [x for x in items if not any(same(x, a) for a in ai)]
-        tagged = sorted(ai, key=lambda x: abs(x['pct']) if x['pct'] is not None else 1e9)[:AI_LEVEL_TAG_MAX]
-    else:
-        tagged = [next(x for x in near if x['kind'] == kind) for kind in ('壓力', '支撐') if any(x['kind'] == kind for x in near)]
-        tagged += [x for x in near if x not in tagged]
-        tagged = tagged[:LEVEL_TAG_MAX]
+        near = sorted([x for x in items if low <= x['price'] <= high], key=gap)
+    # 10-20：AI 解讀提到的價位最優先（近的先）；剩下的名額補最近的壓力、最近的支撐，再補最近的，最多 LEVEL_TAG_MAX 個
+    ai_ids = {id(x) for x in ai}
+    tagged = sorted([x for x in near if id(x) in ai_ids], key=gap)[:LEVEL_TAG_MAX]
+    tagged += [next(x for x in near if x['kind'] == kind and x not in tagged) for kind in ('壓力', '支撐')
+               if any(x['kind'] == kind and x not in tagged for x in near) and not any(t['kind'] == kind for t in tagged)]
+    tagged += [x for x in near if x not in tagged]
+    tagged = tagged[:LEVEL_TAG_MAX]
     used = []
     for item in tagged:
         color = next((c for word, c in _TAG_COLORS if word in item['label']), None) \
@@ -3809,7 +3813,7 @@ def render_answer(question: str, answer: str, panels: list[dict] | None = None,
                   *, title: str = '艾斯助手｜喬巴｜研究筆記', demo: bool = False) -> Image.Image:
     # 測試版所有舊分數卡都只保留技術價位，不輸出分數／分級／評分條。
     # 10-08：正式版拿掉評分卡前，DISCORD_AI_TEST_SHOW_SCORECARD=1（預設）照正式版顯示分數，方便比對評分修正。
-    if os.getenv('DISCORD_AI_TEST_SHOW_SCORECARD', '1').strip().lower() in ('1', 'true', 'yes', 'on'):
+    if os.getenv('DISCORD_AI_TEST_SHOW_SCORECARD', '0').strip().lower() in ('1', 'true', 'yes', 'on'):   # 10-20：預設不顯示評分
         panels = list(panels or [])
     else:
         panels = [dict(p, scorecard=dict(p['scorecard'], hide_score=True, card_title='技術位置', card_note='均線、價量與價位整理'))

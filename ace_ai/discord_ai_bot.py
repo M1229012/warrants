@@ -2781,8 +2781,8 @@ def _compact_tool_data(name: str, data: Dict[str, Any], has_scorecard: bool) -> 
             branches.append({k: v for k, v in row.items() if v not in (None, "", [], {})})
         data = {k: data.get(k) for k in ("stock_code", "stock_name", "available", "reason", "period_recent", "data_latest_event_date")}
         data["branches"] = branches
-    elif name in ("get_retail_futures", "get_futures_positions"):
-        data["rows"] = (data.get("rows") or [])[-5:]
+    elif name in ("get_retail_futures", "get_futures_positions", "get_market_institutional"):
+        data["rows"] = (data.get("rows") or [])[-5:]   # 10-20：全市場法人逐日也只送 5 天（副圖已畫 70 天）
     elif name == "get_recent_news":
         data["articles"] = [{k: v for k, v in a.items() if k not in ("event_key",) and not (k == "summary" and a.get("content"))}
                             for a in data.get("articles") or []]
@@ -3098,6 +3098,12 @@ FINAL_WARRANT_INSIGHT_RULES = ("【權證分點觀察，優先於【觀察重點
     "- scenarios 一個用分點條件（持有中的部位出場、出現新的 A～E 事件），一個用 watch_plan 的關鍵價位；兩個都不可寫分點會因價位而進出。")
 
 
+FINAL_MARKET_INST_RULES = ("【大盤三大法人，必須照做】圖上 K 線下方已畫全市場三大法人買賣超（億元）。why 用一句帶到法人就好：以外資為主，"
+                           "寫最新一日買或賣、連買／連賣幾天或近 5 日方向，再說跟大盤走勢的關係（例如「外資連 3 天賣超、近 5 日賣超 1,200 億，"
+                           "反彈要先看賣壓是否收斂」「外資轉買，有利守住 46,113 的季線」）；投信、自營商只有方向明顯相反或金額特別大才提。"
+                           "不要逐一念三大法人的數字，也不要只因為法人一天的買賣就改變型態判斷。\n")
+
+
 FINAL_WATCH_RULES = ("【觀察重點，必須照做】payload.watch_plan 是程式依均線排列與收盤位置算好的每檔方向，以及由近到遠的支撐、壓力、"
     "上方均線扣抵條件（反彈壓力）與下方均線（回測觀察）。解讀要依方向給客觀的觀察重點，不是把圖上數據再說一次：\n"
     "- 偏空：先講下方最近的支撐，以及哪一個支撐最有機會止跌反彈、原因（大量區、前低、季線等），止跌要看的訊號（下影線、量縮、站回某價位），"
@@ -3115,7 +3121,7 @@ FINAL_WATCH_RULES = ("【觀察重點，必須照做】payload.watch_plan 是程
     "- 解讀要給看法，不是報數據：不要列出 KD、MACD、布林帶寬、均線站上跌破這類指標狀態；每提到一個訊號都要說它代表什麼"
     "（例「跌破月線但守在季線上，屬於多頭結構裡的修正」「量縮回測大量區，賣壓沒有擴大」）。answer 要回答：現在哪一方占上風、"
     "這次走勢是修正還是轉弱（或是反彈還是轉強）、要看到什麼才會改變看法。\n"
-    "- 提到的支撐壓力價位，用 watch_plan 或圖上有標的價位（程式會把你提到的價位標在 K 線上，讓讀者對照）；千元以上的價位寫整數（寫 45,735，不寫 45735.29）。\n"
+    "- 提到的支撐壓力價位，用 watch_plan 或圖上有標的價位（程式會把你提到的價位標在 K 線上，讓讀者對照）；千元以上的價位寫整數（寫 45,735，不寫 45735.29），千元以下照圖上的數字寫、保留小數（寫 364.55，不寫 365）。\n"
     "- 均線排列一律照 watch_plan 的「均線排列」寫：寫「短期均線空頭排列」就不可省略「短期」寫成「空頭排列」；均線糾結不可寫多頭或空頭排列。\n"
     "- 價位只能用 watch_plan 或工具資料裡的數字，不自行計算；不給買賣指令，只寫要觀察的價位與條件。")
 
@@ -3172,6 +3178,8 @@ def build_final_prompt(payload: Dict[str, Any]) -> str:
         sections.append(FINAL_WATCH_RULES)
     if "get_warrant_branch_insights" in names:
         sections.append(FINAL_WARRANT_INSIGHT_RULES)
+    if "get_market_institutional" in names and "get_technical_analysis" in names:
+        sections.append(FINAL_MARKET_INST_RULES)
     if payload.get("compare_page"):
         sections.append("【兩檔比較，必須照做】只說重點：answer 一句（60 字內）說哪檔結構相對強或弱與主因；why 3～5 句、約 150～230 字，兩檔各自的重點都要講到，"
                         "每檔最多引用 1 個關鍵價位；不報型態分數、評分、五大項，不逐條念均線、量區、布林與法人張數（圖上都有）；"
@@ -4833,7 +4841,7 @@ _BREADTH_RE = re.compile(r"盤感|盤面|市場廣度|廣度|權值股|權值|�
 ASK_MARK_MODE = (os.getenv("DISCORD_AI_ASK_MARK_MODE", "event").strip().lower() or "event")
 INTENT_FALLBACK_ENABLE = tools._env_int("DISCORD_AI_INTENT_FALLBACK", 1)
 # 測試版型態頁照正式版顯示型態評分卡（正式版拿掉評分卡前，用來比對評分修正）
-TEST_SHOW_SCORECARD = _env_flag("DISCORD_AI_TEST_SHOW_SCORECARD", "1")
+TEST_SHOW_SCORECARD = _env_flag("DISCORD_AI_TEST_SHOW_SCORECARD", "0")   # 10-20：型態頁預設不放評分卡，明確問分數才放
 MEMORY_RESET_WORDS = ("重新開始", "清除記憶", "換個話題", "忘記上一題")
 MEMORY_RESET_MESSAGE = "🔄 已重新開始：上一題的股票與分點不會再自動延續，請直接輸入想問的股票。"
 _FOLLOWUP_HINT_RE = re.compile(r"^那|它|他|這檔|那檔|這支|那支|該股|這家|那家|呢|同一檔")
@@ -4953,6 +4961,18 @@ def market_of(parsed: "ParsedQuestion") -> str:
     if codes == ["TPEX"] or (not codes and re.search(r"櫃買|上櫃|OTC", parsed.original or "", re.I)):
         return "tpex"
     return "twse"
+
+
+_NO_INST_RE = re.compile(r"(?:不要|不用|不需要|別|免)(?:看|放|附|畫)?(?:三大)?法人")
+
+
+def index_inst_wanted(plan: "QueryPlan", parsed: "ParsedQuestion", codes: Sequence[str], question: str, compare_page: bool) -> bool:
+    """10-20：單一指數（加權／櫃買）的型態頁預設附全市場三大法人；說不要法人、比較頁、期貨題（副圖給期貨）不附。"""
+    if plan.route != "rule_pattern" or compare_page or len(codes) != 1 or codes[0] not in tools.INDEX_CODES:
+        return False
+    if "futures" in parsed.intents or any(c.name in ("get_market_institutional", "get_futures_positions") for c in plan.tool_calls):
+        return False
+    return "institutional" not in getattr(parsed, "needs_excluded", set()) and not _NO_INST_RE.search(question or "")
 
 
 def market_institutional_wanted(parsed: "ParsedQuestion") -> bool:
@@ -8069,6 +8089,10 @@ class AceQueryEngine:
         warrant_page = any(c.name == "get_sheet_stock_chips" for c in plan.tool_calls)   # 10-20：權證題不放三大法人副圖
         if (compare_page or warrant_page) and "institutional" not in parsed.intents:
             plan.tool_calls = [c for c in plan.tool_calls if c.name != "get_institutional_flow"]
+        if index_inst_wanted(plan, parsed, codes, question, compare_page):
+            # 10-20：大盤／櫃買型態頁預設附全市場三大法人（K 線下方副圖＋解讀一句）
+            plan.add("get_market_institutional", market="tpex" if codes[0] == "TPEX" else "twse")
+            self.log(f"大盤型態頁附三大法人｜{codes[0]}")
         planned_calls = list(plan.tool_calls)
         run_results = self._run_tools(planned_calls + chart_calls)
         combined = pre_results + run_results
@@ -8572,7 +8596,11 @@ class AceQueryEngine:
                 if not low <= value <= high or not candidates:
                     continue
                 label, price = min(candidates, key=lambda c: abs(c[1] - value))
-                tolerance = 0.6 if value >= 1000 and float(value).is_integer() else max(abs(price) * .0006, .011)
+                if float(value).is_integer():
+                    # AI 把 349.6 寫成 349、364.55 寫成 365：整數放寬（千元以上 ±0.6；百元以上 ±1；十元以上 ±0.5）
+                    tolerance = 0.6 if value >= 1000 else 1.0 if value >= 100 else 0.5 if value >= 10 else 0.05
+                else:
+                    tolerance = max(abs(price) * .0006, .011)
                 if abs(price - value) <= tolerance and label not in found:
                     found[label] = {"label": label, "price": round(price, 2), "kind": "支撐" if price <= close else "壓力"}
             if found:
@@ -8867,7 +8895,7 @@ class AceQueryEngine:
             self.log(f"觀察重點略過｜{type(exc).__name__}: {exc}")
         if plans:
             payload["watch_plan"] = plans
-            self.log("觀察重點｜" + "｜".join(f"{c} {v['方向']}" for c, v in plans.items()))
+            self.log("觀察重點｜" + "｜".join(f"{c} {v['方向']}" + ("（止穩觀察）" if v.get("止穩觀察") else "") for c, v in plans.items()))
         prompt = build_final_prompt(payload)
         stats.prompt_chars = len(prompt)
         gemini_started = time.perf_counter()
