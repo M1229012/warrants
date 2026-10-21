@@ -9,7 +9,7 @@ from PIL import Image, ImageDraw
 
 from answer_image import (
     ACCENT, BG, CONTENT, INK, LINE, MARGIN, MUTED, WIDTH,
-    add_center_watermarks, encode_image, font, header_brand, text_at,
+    add_center_watermarks, encode_image, font, header_brand, text_at, _brand_logo,
 )
 
 ROW_H = 82
@@ -46,7 +46,8 @@ def render_weekly_pages(question: str, weekly: dict, panels: list | None = None)
     image = Image.new("RGB", (WIDTH, height), BG)
     draw = ImageDraw.Draw(image)
 
-    draw.rectangle((MARGIN, 43, MARGIN + 48, 48), fill=ACCENT)
+    if _brand_logo() is None:   # 10-21：有品牌 Logo 時拿掉左上金色短線
+        draw.rectangle((MARGIN, 43, MARGIN + 48, 48), fill=ACCENT)
     header_brand(draw, "權證分點觀察｜本週精選 Top 10", 30)
     text_at(draw, (MARGIN, top), "近 60 個交易日仍有權證大戶部位的候選股，所有分點採相同規則評分。", 22, MUTED)
     text_at(draw, (MARGIN, top + 34), "技術 50＝一般個股型態評分 100 × 0.5；週精選不使用第二套技術評分。", 20, MUTED)
