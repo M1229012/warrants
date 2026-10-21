@@ -4840,7 +4840,8 @@ def split_answer_head(text: str, limit: int = 80) -> Tuple[str, str]:
         return first.group().strip(), text[first.end():].strip()
     if not first or len(first.group()) > limit:
         # 第一句就太長：切在 limit 內最後一個逗號，後半段接到「為什麼」
-        cut = max(text.rfind(c, 0, limit) for c in "，；,")
+        # 10-21：千分位逗號（4,034.31）不是斷句點，不可從數字中間切開
+        cut = max([m.start() for m in re.finditer(r"[，；]|(?<!\d),|,(?!\d)", text[:limit])] or [-1])
         if cut >= 15:
             return text[:cut] + "。", text[cut + 1:].strip()
     return text, ""
