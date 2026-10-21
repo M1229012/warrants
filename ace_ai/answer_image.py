@@ -1346,17 +1346,13 @@ def _chart_levels(panel: dict) -> tuple[list[dict], list[dict]]:
     inside = [x for x in items if low <= x['price'] <= high]
     near = sorted(inside, key=lambda x: abs(x['pct']) if x['pct'] is not None else 1e9)
     ai = _ai_level_items(panel, low, high)
-    gap = lambda x: abs(x['pct']) if x['pct'] is not None else 1e9
     if ai:
-        # 10-20：AI 解讀提到的價位併進候選（同價位以 AI 那筆為準），價位條也會出現
+        # 10-21：AI 解讀另外提到、程式價位裡沒有的價位只放價位條，不搶右側價格框
         same = lambda a, b: abs(a['price'] - b['price']) <= max(abs(b['price']) * .0005, .011)
-        items = ai + [x for x in items if not any(same(x, a) for a in ai)]
-        near = sorted([x for x in items if low <= x['price'] <= high], key=gap)
-    # 10-20：AI 解讀提到的價位最優先（近的先）；剩下的名額補最近的壓力、最近的支撐，再補最近的，最多 LEVEL_TAG_MAX 個
-    ai_ids = {id(x) for x in ai}
-    tagged = sorted([x for x in near if id(x) in ai_ids], key=gap)[:LEVEL_TAG_MAX]
-    tagged += [next(x for x in near if x['kind'] == kind and x not in tagged) for kind in ('壓力', '支撐')
-               if any(x['kind'] == kind and x not in tagged for x in near) and not any(t['kind'] == kind for t in tagged)]
+        items = items + [a for a in ai if not any(same(a, x) for x in items)]
+    # 10-21（使用者定案）：價格框由程式固定選——最近壓力 1＋最近支撐 1，第三個看下一個支撐或壓力誰離收盤近；
+    # 不跟著 AI 文字變，同一檔不論問型態或籌碼都一樣
+    tagged = [next(x for x in near if x['kind'] == kind) for kind in ('壓力', '支撐') if any(x['kind'] == kind for x in near)]
     tagged += [x for x in near if x not in tagged]
     tagged = tagged[:LEVEL_TAG_MAX]
     used = []

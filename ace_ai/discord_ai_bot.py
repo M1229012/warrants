@@ -2683,6 +2683,16 @@ def _candle_shape(d: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _without_candidate_triangle(facts: Dict[str, Any]) -> Dict[str, Any]:
+    """10-21（使用者定案）：候選三角當作不是三角——AI 拿不到候選三角的線、名稱與文字，只從其他型態說明。"""
+    out = dict(facts)
+    out["triangle"] = None
+    out["triangle_validation"] = dict(facts.get("triangle_validation") or {}, status="none")
+    for key in ("summary", "names", "levels", "flags"):
+        out[key] = [x for x in facts.get(key) or [] if "三角" not in str(x)]
+    return out
+
+
 _SCORE_TAIL_RE = re.compile(r"[（(][^（）()]*\d+(?:\.\d+)?\s*/\s*\d+(?:\.\d+)?[）)]")   # 「（均線趨勢 25/25）」
 
 
@@ -2719,6 +2729,8 @@ def _compact_tool_data(name: str, data: Dict[str, Any], has_scorecard: bool) -> 
         import kline_patterns
         data_full_patterns = kline_patterns.ai_pattern_facts(data.get("kline_patterns") or {},
                                                             data_date=str(data.get("data_date") or ""))
+        if (data_full_patterns.get("triangle") or {}).get("candidate"):
+            data_full_patterns = _without_candidate_triangle(data_full_patterns)
         data.pop("member_view", None)
         data["triangle_validation"] = data_full_patterns["triangle_validation"]
         data["kline_patterns"] = (data_full_patterns.get("summary") or []) + [f"資料旗標：{f}" for f in data_full_patterns.get("flags") or []]   # 白話結論＋旗標（§12）
@@ -2854,7 +2866,19 @@ def ma_alignment_text(values: Dict[str, float], align: str = "") -> str:
     return "均線糾結（未形成多空排列）"
 
 
-def watch_plan(payload: Dict[str, Any]) -> Dict[str, Any]:
+_MA_LABEL_RE = re.compile(r"^MA\d+$")
+
+
+def _plan_side(items: Sequence[Dict[str, Any]], close: float) -> List[Dict[str, Any]]:
+    """10-21：和 K 線價格框同一個選法——均線另列在扣抵／回測欄；某一邊只有均線，才放最近的那條均線。"""
+    others = [x for x in items if not _MA_LABEL_RE.match(str(x.get("label") or ""))]
+    if others:
+        return others
+    mas = [x for x in items if _plan_num(x.get("price")) is not None]
+    return [min(mas, key=lambda x: abs(_plan_num(x.get("price")) - close))] if mas else []
+
+
+def watch_plan(payload: Dict[str, Any], chart_levels: Optional[Dict[str, Dict[str, Any]]] = None) -> Dict[str, Any]:
     """10-20：每檔的觀察重點（程式算好再交給 AI，不讓 AI 從一堆數字裡自己挑）：
     方向（偏多／偏空／盤整）、下方支撐與上方壓力（由近到遠）、上方均線的扣抵條件（反彈壓力）、下方均線（回測觀察）。
     價位只取工具資料裡已有的數字（均線、大量區、布林），不另外計算新數字，事實核對才對得上。"""
@@ -2887,7 +2911,12 @@ def watch_plan(payload: Dict[str, Any]) -> Dict[str, Any]:
         else:
             direction = "盤整"
         align = ma_alignment_text(values, align)
-        if card.get("supports_below_close") or card.get("resistances_above_close"):
+        drawn = (chart_levels or {}).get(code) or {}
+        if drawn.get("supports_below_close") or drawn.get("resistances_above_close"):
+            # 10-21：用圖上那份價位（價格框、價位條同一份），同一檔不論問型態或籌碼都一樣
+            supports = _plan_side(drawn.get("supports_below_close") or [], close)
+            resistances = _plan_side(drawn.get("resistances_above_close") or [], close)
+        elif card.get("supports_below_close") or card.get("resistances_above_close"):
             supports, resistances = card.get("supports_below_close") or [], card.get("resistances_above_close") or []
         else:
             levels = tools.key_price_levels(tech, (by_tool.get("get_volume_profile") or {}).get(code) or {})
@@ -6414,8 +6443,16 @@ class AceQueryEngine:
         for panel in charts:
             self._attach_daily_institutional(panel, inst)
         level_results = [t for t in chart_results if t.ok and t.name in ("get_technical_analysis", "get_volume_profile")]
-        if any(t.name == "get_technical_analysis" and t.data.get("moving_averages") for t in level_results):
-            self._attach_chart_levels(charts, level_results, None)
+        technical = next((t.data for t in level_results if t.name == "get_technical_analysis"), {})
+        if technical.get("moving_averages"):
+            for panel in charts:
+                try:
+                    # 10-21：和型態頁同一套價位（member_pattern.levels_card），價格框、watch_plan、AI 用同一份
+                    panel["key_levels"] = member_pattern.levels_card(panel, technical, tools.key_price_levels, tools.NEAR_ZONE_RATIO)
+                except Exception as exc:
+                    self.log(f"現股籌碼頁價位略過｜{code}｜{type(exc).__name__}: {exc}")
+        if getattr(self, "_request_local", None) is not None:
+            self._request_local.member_chart_context = member_pattern.chart_context(charts)
         # 10-21：整包 K 線圖資料（70 天原始數字）不送 AI；價位改由 watch_plan 提供
         study_results = [tools.ToolResult("get_spot_chip_summary", True, payload)] + [t for t in chart_results
                                                                                        if t.ok and t.name != "get_chart_panel"]
@@ -6431,6 +6468,8 @@ class AceQueryEngine:
         ai_text, llm_ok = self._compose(question, QueryPlan(route="rule_spot_chip", need_final_llm=True),
                                         study_results, stats)
         ai_card = self._take_ai_card()
+        if getattr(self, "_request_local", None) is not None:
+            self._request_local.member_chart_context = None
         self._mark_ai_levels(charts, ai_card, study_results)   # 10-21：AI 提到的價位標在 K 線上（和型態頁一致）
         result = replace(result, text=ai_text if ai_card else text,
                          panels=(charts + extra_panels if backtest else result.panels) + ([{"ai_card": ai_card}] if ai_card else []),
@@ -8270,6 +8309,10 @@ class AceQueryEngine:
                     except Exception as exc:
                         self.log(f"{code} 還原圖表略過｜{type(exc).__name__}: {exc}")
                 view = member_pattern.overlay(panel, (technical.get("kline_patterns") or {}).get("member_view"))
+                if view and view.get("candidate"):
+                    # 10-21（使用者定案）：候選三角當作不是三角——不疊線、不當價位、不給 AI；三角定義之後再調
+                    self.log(f"{code} 候選三角不顯示｜當作沒有三角")
+                    view = None
                 if view:
                     panel["member_triangle"] = view
                     # 10-14：只有管理員入口（/ace，測試版 /testace）畫三角上下緣；/ask 保留型態判斷與價位表，不疊線
@@ -8960,7 +9003,8 @@ class AceQueryEngine:
         if plan.needs:
             payload["needs"] = plan.needs        # 10-08：需求表真的傳到最後回答
         try:
-            plans = watch_plan(payload)          # 10-20：依方向的觀察重點（在顯示範圍收窄之後算，價位和圖一致）
+            drawn = {str(c): s.get("key_levels") or {} for c, s in ((context or {}).get("stocks") or {}).items()}
+            plans = watch_plan(payload, drawn)   # 10-20：依方向的觀察重點；10-21：支撐壓力用圖上那份價位
         except Exception as exc:
             plans = {}
             self.log(f"觀察重點略過｜{type(exc).__name__}: {exc}")
@@ -9054,7 +9098,7 @@ class AceQueryEngine:
                     card['scenarios'][0]['title'] = '情境 A'
                     card['scenarios'][1]['title'] = '情境 B'
             pattern_names = [n for r in results if r.ok and r.name == "get_technical_analysis"
-                             for n in ((r.data.get("kline_patterns") or {}).get("names") or [])]
+                             for n in ((r.data.get("kline_patterns") or {}).get("names") or []) if "候選" not in str(n)]
             card_text = ai_card_text(card)
             if pattern_names and not any(n.split("（")[0][:4] in card_text for n in pattern_names):
                 self.log(f"⚠️ AI 解讀沒有提到 K 線型態｜程式判斷：{'、'.join(pattern_names[:4])}")
