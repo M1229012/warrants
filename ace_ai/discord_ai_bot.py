@@ -2533,7 +2533,7 @@ FINAL_PATTERN_RULES = """型態／成本／操作問題（有 get_pattern_scorec
 - 先直接回答使用者真正問的問題，再挑影響最大的型態、大量區／支撐、均線或權證分點證據。不要把評分卡五大項逐一念完。
 - margin_observation若存在，僅為管理員融資券觀察，完全不計入綜合分。餘額增減不等於買賣超，急跌融資增加不能單憑此判定接貨或散戶套牢；融券增加不直接判定軋空。
 - 問成本／操作：可說成本相對現價與帳面損益，再用「若守住／若跌破／若重新站回」的條件式框架說明，不替使用者下買賣決定。
-- 問型態：可以直接說目前結構偏強、偏弱或中性，並引用型態分數及最關鍵的一個加分、一個壓力。
+- 問型態：直接說目前結構偏強、偏弱或中性，用最關鍵的型態、均線或量區證據說明；不提型態分數、評分、等級、五大項得分（使用者明確問分數才說）。
 - 比較兩檔：描述兩者技術結構差異與各自風險，不提供投資選擇或推薦。
 - 分點資料有價值時，優先說「在哪個型態／大量區附近布局、目前是否仍持有、對應事件歷史表現」；不要只報總勝率。
 - 沒有明確訊號或沒有資料的項目直接省略，不要硬湊固定段落。"""
@@ -2683,6 +2683,9 @@ def _candle_shape(d: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+_SCORE_TAIL_RE = re.compile(r"[（(][^（）()]*\d+(?:\.\d+)?\s*/\s*\d+(?:\.\d+)?[）)]")   # 「（均線趨勢 25/25）」
+
+
 def _compact_tool_data(name: str, data: Dict[str, Any], has_scorecard: bool) -> Optional[Dict[str, Any]]:
     """依問題類型精簡 Tool 資料；回傳 None 表示這份資料已被型態評分卡涵蓋，不必再送。"""
     if has_scorecard and name in ("get_cost_position_context", "get_volume_profile"):
@@ -2739,6 +2742,12 @@ def _compact_tool_data(name: str, data: Dict[str, Any], has_scorecard: bool) -> 
                                     | {"turn_text": answer_image.public_ma_condition(v)}
                                     for k, v in (data.get("ma_deduction") or {}).items() if k in ("MA20", "MA60")}
     elif name == "get_pattern_scorecard":
+        if data.pop("ai_hide_score", False):
+            # 10-21：沒有明確問分數 → 分數、等級、五大項不給 AI（解讀注重型態分析；圖上的評分卡不受影響）
+            for k in ("pattern_score", "grade", "components", "method", "score_basis"):
+                data.pop(k, None)
+            for k in ("plus_reasons", "minus_reasons"):
+                data[k] = [_SCORE_TAIL_RE.sub("", str(x)) for x in data.get(k) or []]
         data["ma_deduction"] = {k: {f: v.get(f) for f in ("direction_now", "fail_price", "rise_price_tomorrow", "next_deduction_price", "path", "outlook")}
                                     | {"turn_text": answer_image.public_ma_condition(v)}
                                 for k, v in (data.get("ma_deduction") or {}).items()}
@@ -2781,8 +2790,13 @@ def _compact_tool_data(name: str, data: Dict[str, Any], has_scorecard: bool) -> 
             branches.append({k: v for k, v in row.items() if v not in (None, "", [], {})})
         data = {k: data.get(k) for k in ("stock_code", "stock_name", "available", "reason", "period_recent", "data_latest_event_date")}
         data["branches"] = branches
-    elif name in ("get_retail_futures", "get_futures_positions", "get_market_institutional"):
-        data["rows"] = (data.get("rows") or [])[-5:]   # 10-20：全市場法人逐日也只送 5 天（副圖已畫 70 天）
+    elif name in ("get_retail_futures", "get_futures_positions", "get_market_institutional", "get_institutional_flow"):
+        data["rows"] = (data.get("rows") or [])[-5:]   # 10-20：法人逐日只送 5 天（副圖已畫 70 天；近 5／20 日合計另有欄位）
+    elif name == "get_spot_chip_summary":
+        for k in ("latest_top_buy", "latest_top_sell"):
+            data[k] = (data.get(k) or [])[:3]         # 10-21：圖上只列買超／賣超前 3
+        if isinstance(data.get("continuity"), list):
+            data["continuity"] = data["continuity"][:6]
     elif name == "get_recent_news":
         data["articles"] = [{k: v for k, v in a.items() if k not in ("event_key",) and not (k == "summary" and a.get("content"))}
                             for a in data.get("articles") or []]
@@ -2923,6 +2937,21 @@ def watch_plan(payload: Dict[str, Any]) -> Dict[str, Any]:
         plans.update(watch_plan({"tool_results": {f"get_technical_analysis:{code}": tech,
                                                   f"get_pattern_scorecard:{code}": card}}))
     return plans
+
+
+_SPOT_TECH_KEEP = ("stock_code", "stock_name", "data_date", "signal_status", "close", "change_pct", "ma_alignment",
+                   "kline_patterns", "triangle_validation", "volume_trend", "drawdown")
+
+
+def slim_spot_payload(payload: Dict[str, Any]) -> None:
+    """10-21：現股籌碼頁（rule_spot_chip）在 watch_plan 算完之後才精簡：技術面只留結論欄位，大量區原始資料不送。"""
+    results = payload.get("tool_results") or {}
+    for key in list(results):
+        name, data = key.split(":", 1)[0], results[key]
+        if name == "get_volume_profile":
+            results.pop(key)
+        elif name == "get_technical_analysis" and isinstance(data, dict):
+            results[key] = {k: data[k] for k in _SPOT_TECH_KEEP if data.get(k) not in (None, "", [], {})}
 
 
 def build_final_payload(question: str, results: Sequence[tools.ToolResult]) -> Dict[str, Any]:
@@ -3118,10 +3147,12 @@ FINAL_WATCH_RULES = ("【觀察重點，必須照做】payload.watch_plan 是程
     "要看到什麼才算止穩（量縮、長下影線、連續幾天不破低、站回某個價位）、跌破後的下一關在哪；scenarios 用「止穩條件」「跌破下一關」。"
     "這時不寫 KD、MACD、布林帶寬——線就是一路向下，指標只會跟著顯示超賣、過冷，沒有參考意義（背離、鈍化例外）。\n"
     "- 沒有止穩觀察時可以提 KD、MACD，但要說代表什麼（例如「KD 黃金交叉，短線動能轉強」），不要只報狀態。\n"
-    "- 解讀要給看法，不是報數據：不要列出 KD、MACD、布林帶寬、均線站上跌破這類指標狀態；每提到一個訊號都要說它代表什麼"
+    "- 解讀要給看法，不是報數據：不要只列 KD、MACD、布林帶寬、均線站上跌破這類指標狀態；每提到一個訊號都要說它代表什麼"
     "（例「跌破月線但守在季線上，屬於多頭結構裡的修正」「量縮回測大量區，賣壓沒有擴大」）。answer 要回答：現在哪一方占上風、"
     "這次走勢是修正還是轉弱（或是反彈還是轉強）、要看到什麼才會改變看法。\n"
     "- 提到的支撐壓力價位，用 watch_plan 或圖上有標的價位（程式會把你提到的價位標在 K 線上，讓讀者對照）；千元以上的價位寫整數（寫 45,735，不寫 45735.29），千元以下照圖上的數字寫、保留小數（寫 364.55，不寫 365）。\n"
+    "- 關鍵價位固定用 watch_plan：支撐先寫「下方支撐_由近到遠」第一個、壓力先寫「上方壓力_由近到遠」第一個，需要第二個才往下一個；"
+    "收盤價本身不是關鍵價位。同一檔股票不論問型態或籌碼，用的都是同一組價位。\n"
     "- 均線排列一律照 watch_plan 的「均線排列」寫：寫「短期均線空頭排列」就不可省略「短期」寫成「空頭排列」；均線糾結不可寫多頭或空頭排列。\n"
     "- 價位只能用 watch_plan 或工具資料裡的數字，不自行計算；不給買賣指令，只寫要觀察的價位與條件。")
 
@@ -6373,13 +6404,21 @@ class AceQueryEngine:
                        continuity=report.get("continuity") or [])
         backtest = self._prepare_event_backtest(code, name, report=report, question=question)
         extra_panels = []
+        # 10-21：補抓技術面與大量區（多半是快取）→ 和型態頁同一套關鍵價位（watch_plan、右側價格框、AI 點位標示）
         chart_results = self._run_tools([ToolCall("get_chart_panel", {"stock_code": code, "with_marks": False}),
-                                        ToolCall("get_institutional_flow", {"stock_code": code, "days": 70})]) if backtest else []
+                                        ToolCall("get_institutional_flow", {"stock_code": code, "days": 70}),
+                                        ToolCall("get_technical_analysis", {"stock_code": code}),
+                                        ToolCall("get_volume_profile", {"stock_code": code})]) if backtest else []
         charts = [dict(t.data) for t in chart_results if t.name == 'get_chart_panel' and t.ok]
         inst = next((t.data for t in chart_results if t.name == 'get_institutional_flow' and t.ok), {})
         for panel in charts:
             self._attach_daily_institutional(panel, inst)
-        study_results = [tools.ToolResult("get_spot_chip_summary", True, payload)] + [t for t in chart_results if t.ok]
+        level_results = [t for t in chart_results if t.ok and t.name in ("get_technical_analysis", "get_volume_profile")]
+        if any(t.name == "get_technical_analysis" and t.data.get("moving_averages") for t in level_results):
+            self._attach_chart_levels(charts, level_results, None)
+        # 10-21：整包 K 線圖資料（70 天原始數字）不送 AI；價位改由 watch_plan 提供
+        study_results = [tools.ToolResult("get_spot_chip_summary", True, payload)] + [t for t in chart_results
+                                                                                       if t.ok and t.name != "get_chart_panel"]
         if backtest:
             study_results.append(tools.ToolResult("get_spot_event_backtest", True, backtest))
             for panel in charts:
@@ -6392,6 +6431,7 @@ class AceQueryEngine:
         ai_text, llm_ok = self._compose(question, QueryPlan(route="rule_spot_chip", need_final_llm=True),
                                         study_results, stats)
         ai_card = self._take_ai_card()
+        self._mark_ai_levels(charts, ai_card, study_results)   # 10-21：AI 提到的價位標在 K 線上（和型態頁一致）
         result = replace(result, text=ai_text if ai_card else text,
                          panels=(charts + extra_panels if backtest else result.panels) + ([{"ai_card": ai_card}] if ai_card else []),
                          gemini_calls=stats.gemini_calls, elapsed=time.perf_counter() - started,
@@ -7566,6 +7606,10 @@ class AceQueryEngine:
         for code, _ in parsed.stocks:
             per_stock[code] = (per_stock.get(code, set()) | untargeted) - drop
         per_stock = {c: v for c, v in per_stock.items() if c in {x for x, _ in parsed.stocks}}
+        if per_stock and not any(per_stock.values()) and not drop & {"analysis", "technical"} and not parsed.branches:
+            # 10-21：看不懂要問什麼（需求只有「其他」）但有明確抓到股票 → 預設型態頁，不反問
+            per_stock = {c: {"analysis"} for c in per_stock}
+            self.log("需求看不懂但有股票｜預設型態頁｜" + ",".join(per_stock))
         parsed.intents = set().union(*per_stock.values()) if per_stock else set()
         if parsed.sector_context is None:
             for target in list(needs.get("compare_with") or []) + [t for n in items if n.get("type") == "compare" for t in n.get("targets") or []]:
@@ -8250,7 +8294,9 @@ class AceQueryEngine:
                         card = dict(card, compact=True, **({"hide_reasons": True} if market_flow and not with_chips else {}))
                     if card:
                         panel["scorecard"] = card
-                        results.append(tools.ToolResult("get_pattern_scorecard", True, card))
+                        # 10-21：沒有明確問分數，送給 AI 的評分卡拿掉分數（圖上照舊）
+                        results.append(tools.ToolResult("get_pattern_scorecard", True, card if member_pattern.wants_score(parsed, plan, code)
+                                                        else dict(card, ai_hide_score=True)))
                 if not member_pattern.wants_spot(parsed, plan, code):
                     continue
                 scoped = getattr(parsed, "spot_branch", "") if getattr(parsed, "chip", "") != "warrant" else ""
@@ -8921,6 +8967,13 @@ class AceQueryEngine:
         if plans:
             payload["watch_plan"] = plans
             self.log("觀察重點｜" + "｜".join(f"{c} {v['方向']}" + ("（止穩觀察）" if v.get("止穩觀察") else "") for c, v in plans.items()))
+        if plan.route == "rule_spot_chip":
+            # 10-21：現股籌碼頁以籌碼為主，技術面只留結論欄位；支撐壓力看 watch_plan（大量區原始資料不送）
+            slim_spot_payload(payload)
+        sizes = sorted(((k, len(json.dumps(v, ensure_ascii=False, default=str))) for k, v in (payload.get("tool_results") or {}).items()),
+                       key=lambda x: -x[1])
+        self.log("AI 資料量｜" + "｜".join(f"{k} {n:,}字" for k, n in sizes[:6])
+                 + (f"｜watch_plan {len(json.dumps(plans, ensure_ascii=False, default=str)):,}字" if plans else ""))
         prompt = build_final_prompt(payload)
         stats.prompt_chars = len(prompt)
         gemini_started = time.perf_counter()
