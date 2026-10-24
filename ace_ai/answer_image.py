@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageEnhance, ImageFont
 
 BG = '#F5F5F7'
 INK = '#101828'
@@ -3694,6 +3694,7 @@ def _is_sector_panel(panel: dict) -> bool:
 
 BRAND_LOGO_ASSET = Path(__file__).with_name('assets') / 'brand_logo.png'
 BRAND_LOGO_H = 112          # 10-21：右上角品牌 Logo 高度（WIDTH 1440 下）
+BRAND_LOGO_SATURATION = 1.5    # 10-24：Logo 飽和度微調（1＝原圖）
 BRAND_NAME, BRAND_SUB = '股市艾斯', 'STOCK ACE'
 BRAND_SUB_INK = '#8A93A0'
 
@@ -3706,6 +3707,11 @@ def _brand_logo() -> Image.Image | None:
     except Exception:
         print(f'⚠️ 品牌 Logo 讀取失敗：{BRAND_LOGO_ASSET}（請補上傳 assets/brand_logo.png；頁首先用文字品牌）', flush=True)
         return None
+    if BRAND_LOGO_SATURATION != 1:
+        # 只調 RGB 再放回原 alpha：直接對 RGBA 調飽和度會連透明邊緣一起變硬
+        rgb = ImageEnhance.Color(logo.convert('RGB')).enhance(BRAND_LOGO_SATURATION)
+        rgb.putalpha(logo.getchannel('A'))
+        logo = rgb
     return logo.resize((round(logo.width * BRAND_LOGO_H / logo.height), BRAND_LOGO_H), Image.LANCZOS)
 
 
