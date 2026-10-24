@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageEnhance, ImageFont
 
 BG = '#F5F5F7'
 INK = '#101828'
@@ -3566,10 +3566,66 @@ def _is_sector_panel(panel: dict) -> bool:
     return bool((panel or {}).get('sector') or (panel or {}).get('sector_members') or (panel or {}).get('sector_catalog'))
 
 
+BRAND_LOGO_ASSET = Path(__file__).with_name('assets') / 'brand_logo.png'
+BRAND_LOGO_H = 112          # 10-21：右上角品牌 Logo 高度（WIDTH 1440 下）
+BRAND_LOGO_SATURATION = 1.5    # 10-24：Logo 飽和度微調（1＝原圖）
+BRAND_NAME, BRAND_SUB = '股市艾斯', 'STOCK ACE'
+BRAND_SUB_INK = '#8A93A0'
+
+
+@lru_cache(maxsize=1)
+def _brand_logo() -> Image.Image | None:
+    """右上角品牌 Logo（透明 PNG）；部署漏傳時回 None，頁首改回文字品牌，不讓整張圖失敗。"""
+    try:
+        logo = Image.open(BRAND_LOGO_ASSET).convert('RGBA')
+    except Exception:
+        print(f'⚠️ 品牌 Logo 讀取失敗：{BRAND_LOGO_ASSET}（請補上傳 assets/brand_logo.png；頁首先用文字品牌）', flush=True)
+        return None
+    if BRAND_LOGO_SATURATION != 1:
+        # 只調 RGB 再放回原 alpha：直接對 RGBA 調飽和度會連透明邊緣一起變硬
+        rgb = ImageEnhance.Color(logo.convert('RGB')).enhance(BRAND_LOGO_SATURATION)
+        rgb.putalpha(logo.getchannel('A'))
+        logo = rgb
+    return logo.resize((round(logo.width * BRAND_LOGO_H / logo.height), BRAND_LOGO_H), Image.LANCZOS)
+
+
+def _spaced_width(text: str, f, gap: float) -> float:
+    return sum(f.getlength(ch) for ch in text) + gap * max(0, len(text) - 1)
+
+
+def brand_mark_width() -> float:
+    """右上角品牌標誌的總寬度（Logo＋間距＋文字），題目換行要讓開。"""
+    logo = _brand_logo()
+    if logo is None:
+        return 0.0
+    return logo.width + 14 + max(font(40, True).getlength(BRAND_NAME), _spaced_width(BRAND_SUB, font(20), 4))
+
+
+def brand_mark(draw, right: float, center_y: float) -> bool:
+    """10-21：右上角品牌標誌＝火焰 Logo＋「股市艾斯」＋字距拉開的「STOCK ACE」，右緣對齊卡片。"""
+    image = getattr(draw, '_image', None)
+    logo = _brand_logo()
+    if image is None or logo is None:
+        return False
+    name_f, sub_f, gap = font(40, True), font(20), 4
+    name_w, sub_w = name_f.getlength(BRAND_NAME), _spaced_width(BRAND_SUB, sub_f, gap)
+    block_w = max(name_w, sub_w)
+    draw.text((right, center_y - 4), BRAND_NAME, font=name_f, fill=INK, anchor='rs')
+    x = right - sub_w
+    for ch in BRAND_SUB:
+        draw.text((x, center_y + 32), ch, font=sub_f, fill=BRAND_SUB_INK, anchor='ls')
+        x += sub_f.getlength(ch) + gap
+    image.paste(logo, (round(right - block_w - 14 - logo.width), round(center_y - logo.height / 2)), logo)
+    return True
+
+
 def header_brand(draw, title: str, size: int, brand: str = 'ACE / RESEARCH') -> None:
-    """頁首：左邊標題、右邊品牌字，右緣對齊下方卡片（WIDTH - MARGIN），兩者同一條文字基線。"""
+    """頁首：左邊標題、右邊品牌，右緣對齊下方卡片（WIDTH - MARGIN）。
+    10-21：預設品牌改成火焰 Logo＋股市艾斯＋STOCK ACE；示範圖等特別字樣照舊用文字。"""
     baseline = 66 + font(size, True).getmetrics()[0]
     draw.text((MARGIN, baseline), title, font=font(size, True), fill=INK, anchor='ls')
+    if brand == 'ACE / RESEARCH' and brand_mark(draw, WIDTH - MARGIN, 107):
+        return
     draw.text((WIDTH - MARGIN, baseline), brand, font=font(20), fill=ACCENT, anchor='rs')
 
 
@@ -3721,7 +3777,9 @@ def render_answer(question: str, answer: str, panels: list[dict] | None = None,
         # 兩檔比較：K 線縮短、不畫分點標註，兩張評分卡合併成一張並排比較表，圖片長度約減半。
         panels = [{**p, 'compact': True} for p in panels]
     weekly_head = next((p['weekly_text'].get('header') for p in weekly_text_panels if p['weekly_text'].get('header')), None)
-    question_lines = [] if weekly_head else wrap(clean(question), 31, CONTENT - 12, True)
+    # 10-21：右上角有品牌 Logo 時，題目換行寬度扣掉品牌區，長題目不會壓到 Logo
+    reserve = brand_mark_width() + 32 if not demo and _brand_logo() is not None else 0
+    question_lines = [] if weekly_head else wrap(clean(question), 31, CONTENT - 12 - reserve, True)
     header_height = WEEKLY_HEADER_H if weekly_head else 155 + len(question_lines) * 47
     # 交易覆盤：文字改由覆盤卡呈現（有行數上限），不再另外排整段文字，圖片才不會一直變長
     # AI 解讀卡已包含回答全文（含延續上一題與資料時間），不再另外排文字區塊。
@@ -3748,7 +3806,8 @@ def render_answer(question: str, answer: str, panels: list[dict] | None = None,
         print(f"📝 交易覆盤圖片｜render height={height}px", flush=True)
     image = Image.new('RGB', (WIDTH, height), BG)
     draw = ImageDraw.Draw(image)
-    draw.rectangle((MARGIN, 43, MARGIN + 48, 48), fill=ACCENT)
+    if demo or _brand_logo() is None:   # 10-21：有品牌 Logo 時拿掉左上金色短線，Logo 是唯一亮點
+        draw.rectangle((MARGIN, 43, MARGIN + 48, 48), fill=ACCENT)
     header_brand(draw, title, 28, '示範資料・非真實行情' if demo else 'ACE / RESEARCH')
     if weekly_head:
         draw_weekly_header(draw, weekly_head)
