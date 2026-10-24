@@ -554,6 +554,28 @@ def liquidity_map(days: int = 20) -> Dict[str, Dict[str, float]]:
             for code, lots, value, count in rows}
 
 
+def liquidity_before(day: str, days: int = 20) -> Dict[str, Dict[str, float]]:
+    """只用 day 之前的 N 個交易日：平均成交金額（元）與前一交易日成交金額（元）。
+    10-24 今日族群排行用：盤前就能決定的名單，盤中、收盤後重算都一樣（不吃到當天的 K 棒）。"""
+    dates = [d for d in known_dates(limit=max(1, int(days)) + 5) if d < str(day)][:max(1, int(days))]
+    if not dates:
+        return {}
+    marks = ",".join("?" * len(dates))
+    try:
+        with _LOCK:
+            with _db() as conn:
+                rows = conn.execute(
+                    f"""SELECT stock_code, AVG(volume*close), COUNT(*),
+                               SUM(CASE WHEN date=? THEN volume*close ELSE 0 END)
+                        FROM daily_bars WHERE date IN ({marks}) GROUP BY stock_code""",
+                    [dates[0], *dates]).fetchall()
+    except Exception:
+        return {}
+    return {str(code): {"avg_value": float(avg or 0), "days": int(count or 0), "last_value": float(last or 0),
+                        "last_date": dates[0]}
+            for code, avg, count, last in rows}
+
+
 def get_state(key: str, default: Any = None) -> Any:
     try:
         with _db() as conn:

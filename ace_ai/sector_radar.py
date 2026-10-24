@@ -38,30 +38,95 @@ MIS_BENCHMARKS = {"t00.tw": "加權指數", "o00.tw": "櫃買指數"}
 MIS_TIMEOUT = max(3.0, tools._env_float("DISCORD_AI_RADAR_TIMEOUT", 8.0))
 _STATE_PREFIX = "radar_snap:"
 
+# 10-24：MIS 常回 HTML／空資料的對策——所有 MIS 請求走 mis_get() 單一出口：
+# 同一時間只送一個、兩次間隔 MIS_GAP 秒；每條連線先開 index.jsp 取得 cookie；
+# 參數帶毫秒時間戳；失敗分成 blocked／html／timeout／conn／http 五類寫 Log；被擋（403/429/HTML）就冷卻 MIS_COOLDOWN 秒。
+MIS_INDEX_URL = "https://mis.twse.com.tw/stock/index.jsp"
+MIS_GAP = max(0.0, tools._env_float("DISCORD_AI_MIS_GAP", 0.5))
+MIS_COOLDOWN = max(10.0, tools._env_float("DISCORD_AI_MIS_COOLDOWN", 90.0))
+MIS_WARM_TTL = 600.0
+_MIS_GATE = threading.Lock()
+_MIS_NEXT = [0.0]
+_MIS_COOL_UNTIL = [0.0]
+_MIS_WARMED: Dict[int, float] = {}
+
+
+class MisError(RuntimeError):
+    """MIS 請求失敗；kind＝cooldown／blocked／html／timeout／conn／http。"""
+
+    def __init__(self, kind: str, detail: str = ""):
+        super().__init__(f"MIS {kind}" + (f"：{detail}" if detail else ""))
+        self.kind = kind
+
+
+def mis_cooling() -> bool:
+    return time.monotonic() < _MIS_COOL_UNTIL[0]
+
+
+def _mis_cool(reason: str) -> None:
+    _MIS_COOL_UNTIL[0] = time.monotonic() + MIS_COOLDOWN
+    print(f"⚠️ MIS 疑似被擋（{reason}），暫停 {MIS_COOLDOWN:.0f} 秒", flush=True)
+
+
+def mis_get(session, params: Dict[str, Any]) -> Dict[str, Any]:
+    """MIS getStockInfo 的單一出口；成功回 JSON dict，失敗丟 MisError。"""
+    if mis_cooling():
+        raise MisError("cooldown")
+    import requests
+    with _MIS_GATE:
+        wait = _MIS_NEXT[0] - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
+        try:
+            if (isinstance(session, requests.Session)        # 只對真正的連線取 cookie（測試替身不動）
+                    and time.monotonic() - _MIS_WARMED.get(id(session), -1e9) > MIS_WARM_TTL):
+                try:
+                    session.get(MIS_INDEX_URL, headers={"User-Agent": MIS_HEADERS["User-Agent"]}, timeout=(4, MIS_TIMEOUT))
+                    _MIS_WARMED[id(session)] = time.monotonic()
+                except Exception as exc:          # 取 cookie 失敗不擋正式請求，只記一筆
+                    print(f"⚠️ MIS 取 cookie 失敗｜{tools.err_text(exc)}", flush=True)
+            started, status = time.perf_counter(), 0
+            try:
+                response = session.get(MIS_URL, params={**params, "json": "1", "delay": "0", "_": int(time.time() * 1000)},
+                                       headers=MIS_HEADERS, timeout=(4, MIS_TIMEOUT))
+                status = int(response.status_code)
+            except requests.exceptions.Timeout as exc:
+                raise MisError("timeout", tools.err_text(exc, 80)) from exc
+            except Exception as exc:
+                raise MisError("conn", tools.err_text(exc, 80)) from exc
+            finally:
+                try:
+                    tools.record_api_event("TWSE-MIS", status=status, latency=time.perf_counter() - started)
+                except Exception:
+                    pass
+            if status in (403, 429):
+                _mis_cool(f"HTTP {status}")
+                raise MisError("blocked", f"HTTP {status}")
+            if status >= 400:
+                raise MisError("http", f"HTTP {status}")
+            try:
+                payload = response.json()
+            except ValueError as exc:
+                _mis_cool("回傳不是 JSON")
+                raise MisError("html", str(getattr(response, "text", "") or "")[:60].replace("\n", " ")) from exc
+            if not isinstance(payload, dict):
+                raise MisError("html", "JSON 格式不符")
+            return payload
+        finally:
+            _MIS_NEXT[0] = time.monotonic() + MIS_GAP
+
 
 def fetch_sector_quotes() -> Dict[str, Any]:
     """證交所 MIS 即時類股指數：一次請求拿完，回傳 {rows, benchmarks, time}。"""
     if tools.closed_quotes_only():
         return {"rows": [], "benchmarks": {}, "time": ""}
     channels = "|".join(MIS_CHANNELS + ["tse_t00.tw", "otc_o00.tw"])
-    started = time.perf_counter()
-    status = 0
     try:
-        try:
-            session = tools.core().get_thread_session()
-        except Exception:   # 主程式還沒載入時（離線測試）就用一般連線
-            import requests
-            session = requests
-        response = session.get(MIS_URL, params={"ex_ch": channels, "json": "1", "delay": "0"},
-                               headers=MIS_HEADERS, timeout=(4, MIS_TIMEOUT))
-        status = int(response.status_code)
-        response.raise_for_status()
-        payload = response.json() or {}
-    finally:
-        try:
-            tools.record_api_event("TWSE-MIS", status=status, latency=time.perf_counter() - started)
-        except Exception:
-            pass
+        session = tools.core().get_thread_session()
+    except Exception:   # 主程式還沒載入時（離線測試）就用一般連線
+        import requests
+        session = requests
+    payload = mis_get(session, {"ex_ch": channels})
     rows, benchmarks, stamp = [], {}, ""
     market_turnover: Optional[float] = None
     for item in payload.get("msgArray") or []:
@@ -418,10 +483,11 @@ def detect_intent(text: str) -> Optional[Dict[str, str]]:
 # ============================================================
 
 LEADER_TOP = 5                      # v1.4：每族群領漲／領跌 TOP5（不硬湊反方向）
-MEMBER_WORKERS = 4                  # MIS 批次並行數（循序打 13 批要 10 秒以上）
+# 10-24：MIS 並行容易被擋，改為依序送出（mis_get 本身也有全域閘門），時限放寬到 20 秒
+MEMBER_WORKERS = max(1, tools._env_int("DISCORD_AI_MIS_WORKERS", 1))
 MEMBER_BATCH = 50                   # 每個 MIS 請求帶幾檔
 MEMBER_RETRY_BATCH = 10             # 缺漏代號的重試批量
-MEMBER_DEADLINE = 12.0              # 整次成員報價的時間上限（秒），不能拖住 Discord 回覆
+MEMBER_DEADLINE = max(5.0, tools._env_float("DISCORD_AI_MIS_DEADLINE", 20.0))   # 整次成員報價的時間上限（秒）
 MIN_COVERAGE = 0.80                 # 報價完整率低於此值不下判讀
 SMALL_SECTOR = 10                   # 成分股少於此數，卡片註明檔數
 BROAD_MIN, SPLIT_MIN, GAP_MIN = 0.60, 0.50, 0.80
@@ -489,7 +555,8 @@ def _thread_session():
 
 _HTTP_LOCK = threading.Lock()
 _HTTP_SENT = [0]                     # 成員報價實際送出的 HTTP 次數（全域、thread-safe）
-_BATCH_STATS: Dict[str, set] = {"unknown": set(), "today": set(), "no_trade": set(), "conn_error": set()}   # 本輪彙總（用代號去重，重試不重算）
+# 本輪彙總（用代號去重，重試不重算）；conn_error 收 MisError.kind，empty 收「回了 JSON 但沒有任何報價」的批次
+_BATCH_STATS: Dict[str, set] = {"unknown": set(), "today": set(), "no_trade": set(), "conn_error": set(), "empty": set()}
 
 
 def _fetch_batch_scoped(request_id: str, codes: List[str]) -> Dict[str, Dict[str, Any]]:
@@ -517,25 +584,20 @@ def _fetch_batch(session, codes: List[str]) -> Dict[str, Dict[str, Any]]:
         _BATCH_STATS["unknown"].update(c for c in codes if c not in channels)
     if not channels:
         return {}  # 市場別未知時不猜上市；交給覆蓋率檢查處理
-    with _HTTP_LOCK:
-        _HTTP_SENT[0] += 1
-    began, status, items = time.perf_counter(), 0, []
-    try:
-        response = session.get(MIS_URL, params={"ex_ch": "|".join(channels.values()),
-                                                "json": "1", "delay": "0"},
-                               headers=MIS_HEADERS, timeout=(4, MIS_TIMEOUT))
-        status = int(response.status_code)
-        response.raise_for_status()
-        items = (response.json() or {}).get("msgArray") or []
-    except Exception as exc:
-        print(f"⚠️ MIS 成員報價批次失敗｜{len(codes)} 檔｜{tools.err_text(exc)}", flush=True)
+    if not mis_cooling():
         with _HTTP_LOCK:
-            _BATCH_STATS["conn_error"].add(type(exc).__name__)
-    finally:
-        try:
-            tools.record_api_event("TWSE-MIS", status=status, latency=time.perf_counter() - began)
-        except Exception:
-            pass
+            _HTTP_SENT[0] += 1
+    items = []
+    try:
+        items = mis_get(session, {"ex_ch": "|".join(channels.values())}).get("msgArray") or []
+        if not items:
+            with _HTTP_LOCK:
+                _BATCH_STATS["empty"].add(codes[0])           # 以批次第一檔代表該批
+    except MisError as exc:
+        if exc.kind != "cooldown":
+            print(f"⚠️ MIS 成員報價批次失敗｜{len(codes)} 檔｜{exc}", flush=True)
+        with _HTTP_LOCK:
+            _BATCH_STATS["conn_error"].add(exc.kind)
     out: Dict[str, Dict[str, Any]] = {}
     today, no_trade = set(), set()
     for item in items:
@@ -607,9 +669,11 @@ def _fetch_stock_quotes(codes: List[str]) -> Dict[str, Dict[str, Any]]:
         sent = _HTTP_SENT[0] - sent_before     # 同時有其他查詢在抓時會一起算進來，屬上限值
         unknown, today = len(_BATCH_STATS["unknown"]), len(_BATCH_STATS["today"])
         no_trade = len(_BATCH_STATS["no_trade"])
+        errors, empty = sorted(_BATCH_STATS["conn_error"]), len(_BATCH_STATS["empty"])
     print(f"📡 MIS 成員報價｜requested={len(codes)}｜returned={len(out)}｜missing={len(missing)}"
           f"｜市場別不明={unknown}｜中價估算={no_trade}/{today}（MIS 無成交價）"
-          f"｜http_calls={sent}（{len(batches)} 批＋重試）｜{time.perf_counter() - began:.1f}s"
+          + (f"｜錯誤類型={'/'.join(errors)}" if errors else "") + (f"｜空回應批次={empty}" if empty else "")
+          + f"｜http_calls={sent}（{len(batches)} 批＋重試）｜{time.perf_counter() - began:.1f}s"
           + (f"｜{','.join(missing[:15])}" if missing else ""), flush=True)
     return out
 

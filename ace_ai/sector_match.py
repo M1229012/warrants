@@ -19,6 +19,10 @@ import warrant_ai_tools as tools
 
 ALIAS_PATH = Path(__file__).with_name("sector_aliases.json")
 CUSTOM_PATH = Path(__file__).with_name("custom_sectors.json")
+# 10-24：會員族群唯一來源。開啟時（預設）族群名稱只認這份 JSON，沒寫進去的族群一律查不到；
+# 設 DISCORD_AI_MEMBER_SECTORS_ONLY=0 退回舊流程（CMoney 名冊＋同義詞表＋官方類股）。
+MEMBER_PATH = Path(__file__).with_name("member_sectors.json")
+MEMBER_ONLY = str(__import__("os").getenv("DISCORD_AI_MEMBER_SECTORS_ONLY", "1")).strip().lower() not in ("0", "false", "no", "off")
 FUZZY_MIN = 0.85          # 編輯距離門檻；低於這個就當作查不到
 FUZZY_MARGIN = 0.10       # 第一名與第二名的差距，避免兩個族群都像
 _LOCK = threading.RLock()
@@ -76,6 +80,12 @@ def _data() -> Dict[str, Any]:
             custom_raw = payload
     aliases = dict(alias_raw.get("aliases") or {})
     aliases.update(_extra_aliases())             # 管理員用 /ace 新增的別名（存資料庫，不用重新部署）
+    member_raw: Dict[str, Any] = {}
+    if MEMBER_ONLY:
+        try:
+            member_raw = json.loads(MEMBER_PATH.read_text(encoding="utf-8"))
+        except Exception as exc:
+            print(f"⚠️ 會員族群 JSON 讀取失敗：{MEMBER_PATH.name}｜{tools.err_text(exc)}", flush=True)
     with _LOCK:
         _CACHE.update({
             "ready": True,
@@ -83,8 +93,40 @@ def _data() -> Dict[str, Any]:
             "typos": dict(alias_raw.get("typos") or {}),
             "exclude": {str(x) for x in (alias_raw.get("exclude_groups") or [])},
             "custom": dict(custom_raw.get("groups") or {}),
+            "member": dict(member_raw.get("groups") or {}),
+            "member_version": str(member_raw.get("version") or ""),
         })
     return _CACHE
+
+
+def member_groups() -> Dict[str, Dict[str, Any]]:
+    """會員族群 JSON 的 groups（{顯示名稱: {aliases, stocks:[[代號,名稱]], family, trial, status...}}）。"""
+    return _data().get("member") or {}
+
+
+def member_version() -> str:
+    return str(_data().get("member_version") or "")
+
+
+def member_state(group: Dict[str, Any], code: str) -> str:
+    """試行族群的成分股狀態：confirmed／pending／excluded；非試行族群一律視為 confirmed。"""
+    if not group.get("trial"):
+        return "confirmed"
+    return str(((group.get("status") or {}).get(str(code)) or {}).get("state") or "pending")
+
+
+def member_codes(name: str, confirmed_only: bool = False) -> List[str]:
+    """族群成分代號（去掉 excluded；confirmed_only 時只留已查證的）。"""
+    group = member_groups().get(name) or {}
+    out = []
+    for item in group.get("stocks") or []:
+        code = str(item[0] if isinstance(item, (list, tuple)) else item)
+        state = member_state(group, code)
+        if state == "excluded" or (confirmed_only and state != "confirmed"):
+            continue
+        if code not in out:
+            out.append(code)
+    return out
 
 
 EXTRA_ALIAS_KEY = "sector_alias_extra"          # {別名: [名冊族群名稱]}
@@ -102,7 +144,11 @@ def _extra_aliases() -> Dict[str, List[str]]:
 def add_alias(alias: str, names: List[str]) -> Tuple[bool, str]:
     """管理員新增別名：名稱必須是名冊裡的族群；成功後立刻生效。"""
     alias = str(alias or "").strip()
-    codes, hit = _codes_for_names([str(n).strip() for n in names if str(n).strip()])
+    if MEMBER_ONLY:
+        hit = [n for n in (str(x).strip() for x in names) if n in member_groups()][:1]
+        codes = hit
+    else:
+        codes, hit = _codes_for_names([str(n).strip() for n in names if str(n).strip()])
     if not alias or not codes:
         return False, "找不到這些族群名稱（要和名冊完全相同），例：新增族群別名 TGV=玻璃基板"
     import local_market_cache
@@ -267,8 +313,54 @@ def _alias_in(key: str, value: str) -> bool:
     return key in value
 
 
+def _member_keys() -> List[Tuple[str, str]]:
+    """(正規化別名, 會員族群名稱)；包含族群名稱本身、JSON 別名與管理員新增的別名。"""
+    with _LOCK:
+        cached = _CACHE.get("member_keys")
+    if cached is not None:
+        return cached
+    groups = member_groups()
+    keys: List[Tuple[str, str]] = []
+    for name, info in groups.items():
+        for raw in [name] + list(info.get("aliases") or []):
+            key = normalize(raw)
+            if key:
+                keys.append((key, name))
+    for alias, names in _extra_aliases().items():
+        target = next((n for n in names or [] if n in groups), "")
+        if target and normalize(alias):
+            keys.append((normalize(alias), target))
+    with _LOCK:
+        _CACHE["member_keys"] = keys
+    return keys
+
+
+def _member_match(text: str) -> Optional[Dict[str, Any]]:
+    """會員族群比對：先比完整名稱／別名，再找問句裡最長的別名；對不到就回 None，不做模糊猜測。"""
+    value = normalize(text)
+    if not value:
+        return None
+    core = core_topic(text) or value
+    keys = _member_keys()
+    hit = next(((key, name, "exact") for key, name in keys if key == core or key == value), None)
+    if hit is None:
+        contains = sorted(((len(key), key, name) for key, name in keys if len(key) >= 2 and _alias_in(key, value)),
+                          reverse=True)
+        if contains:
+            hit = (contains[0][1], contains[0][2], "alias")
+    if hit is None:
+        return None
+    key, name, confidence = hit
+    result = _custom(name, confidence)
+    if key != normalize(name):
+        result["alias_used"] = key          # 會員講的是別名（例：GB200）→ 回答時註明對應到哪個族群
+    return result
+
+
 def match(text: str) -> Optional[Dict[str, Any]]:
     """從問句找族群；對不到回 None（上層要誠實說查不到）。"""
+    if MEMBER_ONLY:
+        return _member_match(text)
     value = normalize(text)
     if not value:
         return None
@@ -347,13 +439,44 @@ def suggest(text: str, limit: int = 3) -> List[str]:
     core = core_topic(text)
     if len(core) < 2:
         return []
+    if MEMBER_ONLY:
+        best: Dict[str, float] = {}
+        for key, name in _member_keys():
+            ratio = difflib.SequenceMatcher(None, core, key).ratio()
+            best[name] = max(best.get(name, 0.0), ratio)
+        scored = sorted(((r, n) for n, r in best.items()), reverse=True)
+        return [name for ratio, name in scored[:limit] if ratio >= 0.4]
     scored = sorted(((difflib.SequenceMatcher(None, core, key).ratio(), name)
                      for key, _, name, _, _ in _index()), reverse=True)
     return [name for ratio, name in scored[:limit] if ratio >= 0.4]
 
 
+def _member_members(name: str) -> Dict[str, Any]:
+    """會員族群成分股（去掉 excluded）；格式與 sector_roster.get_members 相同，另附試行／查證狀態。"""
+    group = member_groups().get(name)
+    if not group:
+        raise KeyError(name)
+    listed = {str(item[0]): str(item[1]) for item in group.get("stocks") or [] if isinstance(item, (list, tuple))}
+    codes = member_codes(name)
+    names = sector_roster._name_map()
+    markets = sector_roster._market_map()
+    stocks = [{"stock_code": c, "stock_name": names.get(c) or listed.get(c, ""), "market": markets.get(c, ""),
+               "member_state": member_state(group, c)} for c in codes]
+    counts = {state: sum(s["member_state"] == state for s in stocks) for state in ("confirmed", "pending")}
+    return {
+        "industry": "custom:" + name, "name": name, "stocks": stocks,
+        "source": "member_sectors", "updated_at": member_version(), "complete": True, "missing_markets": [],
+        "scope": str(group.get("scope") or ""), "trial": bool(group.get("trial")), "state_counts": counts,
+        "family": str(group.get("family") or name),
+        "market_counts": {"twse": sum(s["market"] == "twse" for s in stocks),
+                          "tpex": sum(s["market"] == "tpex" for s in stocks)},
+    }
+
+
 def custom_members(name: str) -> Dict[str, Any]:
     """自訂族群的成分股（格式與 sector_roster.get_members 相同）。"""
+    if MEMBER_ONLY:
+        return _member_members(name)
     info = (_data().get("custom") or {}).get(name)
     if not info:
         raise KeyError(name)
@@ -372,6 +495,8 @@ def custom_members(name: str) -> Dict[str, Any]:
 def groups_of(stock_code: str) -> List[str]:
     """反查：這一檔屬於哪些族群（含自訂族群）。"""
     code = str(stock_code).strip()
+    if MEMBER_ONLY:
+        return sorted(name for name in member_groups() if code in member_codes(name))
     exclude = _data().get("exclude") or set()
     found = [str(info.get("name") or "") for info in (sector_roster._load().get("groups") or {}).values()
              if code in (info.get("stocks") or [])]

@@ -66,7 +66,18 @@ def _liquid_codes() -> set:
             if (row.get("avg_value") or 0) >= MIN_AVG_VALUE and (row.get("avg_lots") or 0) >= MIN_AVG_LOTS}
 
 
+def _catalog() -> Dict[str, Dict[str, Any]]:
+    """{族群代碼: {name, kind}}；會員族群模式（10-24 預設）改用 member_sectors.json。"""
+    import sector_match
+    if sector_match.MEMBER_ONLY:
+        return {"custom:" + name: {"name": name, "kind": "member"} for name in sector_match.member_groups()}
+    return sector_roster.catalog()
+
+
 def _member_codes() -> Dict[str, List[str]]:
+    import sector_match
+    if sector_match.MEMBER_ONLY:
+        return {"custom:" + name: sector_match.member_codes(name) for name in sector_match.member_groups()}
     groups = sector_roster.catalog()
     out: Dict[str, List[str]] = {}
     for code in groups:
@@ -114,7 +125,7 @@ def _dedupe_overlap(rows: List[Dict[str, Any]], members: Optional[Dict[str, List
 
 def rank_groups(mode: str, limit: int = 10) -> Dict[str, Any]:
     """mode＝market_momentum（中位漲幅）或 market_technical（中位型態分數）。"""
-    catalog = sector_roster.catalog()
+    catalog = _catalog()
     if not catalog:
         return {"mode": mode, "rows": [], "reason": "roster_missing", "groups_total": 0, "groups_ranked": 0}
     members = _member_codes()

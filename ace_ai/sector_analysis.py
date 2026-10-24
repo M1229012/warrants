@@ -618,6 +618,14 @@ def members_panel(data: Dict[str, Any]) -> Dict[str, Any]:
 
 def catalog_panel() -> Dict[str, Any]:
     """會員圖片只列細產業，避免概念題材/大產業全部塞進一張超長圖。"""
+    if sector_match.MEMBER_ONLY:
+        groups = sector_match.member_groups()
+        themes = [n for n, g in groups.items() if g.get("source") == "own"]
+        others = [n for n, g in groups.items() if g.get("source") != "own"]
+        sections = [{"title": "主題族群", "items": themes}]
+        if others:
+            sections.append({"title": "產業／概念", "items": others})
+        return {"sector_catalog": {"title": "可查詢的族群", "sections": sections}}
     industries = sector_roster.group_names("industry") if sector_roster.available() else []
     concepts = sector_roster.group_names("concept") if sector_roster.available() else []
     groups = []
@@ -707,8 +715,11 @@ LIVE_MIN_COVERAGE = 0.8      # 有效成分股報價覆蓋率門檻（全市場�
 
 def _belongs_panel(code: str, label: str, names: List[str], max_groups: int = 5, per_group: int = 5) -> Dict[str, Any]:
     """「3055 是什麼族群」：每個族群列成交額前 5 大（問的那檔放最前）＋最新漲跌；純本地資料（09-30）。"""
-    groups = {str(v.get("name")): list(v.get("stocks") or []) for v in (sector_roster._load().get("groups") or {}).values()}
-    groups.update({n: [str(c) for c in (v.get("stocks") or [])] for n, v in (sector_match._data().get("custom") or {}).items()})
+    if sector_match.MEMBER_ONLY:
+        groups = {n: sector_match.member_codes(n) for n in sector_match.member_groups()}
+    else:
+        groups = {str(v.get("name")): list(v.get("stocks") or []) for v in (sector_roster._load().get("groups") or {}).values()}
+        groups.update({n: [str(c) for c in (v.get("stocks") or [])] for n, v in (sector_match._data().get("custom") or {}).items()})
     members = {n: list(dict.fromkeys(groups.get(n) or [])) for n in names}
     liquid = local_market_cache.liquidity_map(20)
     ranked = sorted(names, key=lambda n: -len(members[n]))
@@ -792,6 +803,10 @@ def live_group_ranking() -> Optional[Dict[str, Any]]:
     報價走 sector_radar 5 分鐘共用快取；背景 tick 會先暖好，會員查詢通常直接讀快取。"""
     if tools.closed_quotes_only():
         return None
+    if sector_match.MEMBER_ONLY:
+        # 10-24：會員族群模式下由 member_sector_rank 抓同一批 MIS 報價（背景暖快取也走這裡）
+        import member_sector_rank
+        return member_sector_rank.rank() if member_sector_rank._live_allowed() else None
     import sector_radar
     catalog = sector_roster.catalog()
     if not catalog:
@@ -857,6 +872,17 @@ def _intraday_radar_answer() -> Optional[Dict[str, Any]]:
 
 def _market_radar_answer(mode: str) -> Dict[str, Any]:
     """全市場族群排行：盤中漲幅先用即時雷達，其餘一律用本地底庫，不為單一問題掃市場。"""
+    if mode == "market_momentum" and sector_match.MEMBER_ONLY:
+        # 10-24：今日族群排行只用會員族群 JSON（等權平均＋中位數＋上漲比例＋相對基準＋標籤）
+        import member_sector_rank
+        try:
+            result = member_sector_rank.answer()
+        except Exception as exc:
+            print(f"⚠️ 今日族群排行失敗｜{tools.err_text(exc)}", flush=True)
+            result = None
+        if result:
+            return result
+        return {"text": "今日族群排行的行情或名單資料暫時不足，請稍後再試。", "calls": 0, "cacheable": False}
     if mode == "market_momentum":
         live = _intraday_radar_answer()
         if live:
