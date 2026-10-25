@@ -5388,8 +5388,11 @@ def _branch_positions(canonical: str) -> Optional[Dict[str, Any]]:
         meta_info = metas.get(code) or {}
         # 名稱表是這個代號「最後一次」的權證；標的對不上時代表代號已被重用，改用基本資料或留空
         same = not info.get("stock") or info.get("stock") == p["stock"]
-        p["name"] = (info.get("name") if same else "") or meta_info.get("name", "") or info.get("name", "")
         p["stock_name"] = stock_name_map.get(p["stock"], "") or (info.get("stock_name", "") if same else "")
+        # 10-25：權證名稱以「目前掛牌的基本資料」為準（例：089177 歷史庫名稱是舊的「元債2X元富4A購02」，
+        # 現在其實是「永擎元大63購03」）；基本資料標的對不上或沒有這檔，才用歷史庫名稱
+        # 名稱不含標的股名＝很可能是代號回收前的舊名稱：寧可只顯示代號，也不顯示錯的名稱
+        p["name"] = warrant_display_name(p["stock"], p["stock_name"], meta_info, info if same else {})             or ("" if p["stock_name"] else (info.get("name", "") if same else ""))
         p["meta"] = meta_info if (not meta_info.get("stock_name") or meta_info.get("stock_name") == p["stock_name"]) else {}
         p["remaining_cost"] = sum(lot[1] for lot in p["lots"])
         last_trade = p["meta"].get("last_trade") or ""
@@ -5728,9 +5731,11 @@ def _warrant_detail_from_store(canonical: str, requested: int, days: int, stock_
             if (stock, wcode) in sheet_left and info["state"] == "持有":
                 lots = sheet_left[(stock, wcode)]                    # Sheet 部位明細有逐檔剩餘股數
             store_missing.append(wcode)
-            p = {"warrant": wcode, "name": info["name"], "stock": stock, "stock_name": stock_name_map.get(stock, ""),
-                 "remaining": lots, "cycle_bought": lots, "expired": False, "event_only": True,
-                 "meta": warrant_store.meta([wcode]).get(wcode, {})}
+            meta_one = warrant_store.meta([wcode]).get(wcode, {})
+            p = {"warrant": wcode, "stock": stock, "stock_name": stock_name_map.get(stock, ""),
+                 "name": warrant_display_name(stock, stock_name_map.get(stock, ""), meta_one, {"name": info["name"]})
+                         or ("" if stock_name_map.get(stock, "") else info["name"]),
+                 "remaining": lots, "cycle_bought": lots, "expired": False, "event_only": True, "meta": meta_one}
         bought[stock].append({"p": p, "buy_sh": buy_sh, "buy_amt": info["amount"] or buy_amt, "last": info["last"],
                               "event_state": info["state"]})
     others: Dict[str, int] = defaultdict(int)                  # 視窗內有買、但不在任何事件清單的零星權證
@@ -5815,6 +5820,20 @@ def _warrant_detail_from_store(canonical: str, requested: int, days: int, stock_
         "definition_note": ("天期＝距到期日天數；價內外＝標的價相對履約價；估算槓桿用標的近 60 日歷史波動率套 Black-Scholes，"
                             "不是市場實際隱含波動率；習慣統計用買進當下（最近一次買進日）的數值"),
     }
+
+
+def warrant_display_name(stock: str, stock_name: str, meta_info: Dict[str, Any], history: Dict[str, Any]) -> str:
+    """權證顯示名稱：目前掛牌的基本資料（標的相同）優先；否則用歷史庫／事件表名稱，但名稱要含標的股名才採用，
+    避免代號回收後顯示成上一檔權證的名稱。都不符合回空字串（呼叫端自行決定備援）。"""
+    meta_stock = str((meta_info or {}).get("stock") or "").strip()
+    meta_stock_name = str((meta_info or {}).get("stock_name") or "").strip()
+    if (meta_info or {}).get("name") and ((meta_stock and meta_stock == str(stock)) or
+                                         (not meta_stock and meta_stock_name and meta_stock_name == stock_name)):
+        return str(meta_info["name"])
+    name = str((history or {}).get("name") or "")
+    if name and (not stock_name or stock_name in name):
+        return name
+    return ""
 
 
 def store_position_for(candidates: List[Dict[str, Any]], stock: str, stock_name: str = "") -> Optional[Dict[str, Any]]:
