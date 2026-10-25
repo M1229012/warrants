@@ -951,15 +951,28 @@ def run_tool(name: str, kwargs: Dict[str, Any], cancel_event: Optional[threading
 # 股票代號／名稱與分點名稱辨識資料
 # ============================================================
 
+def emerging_codes_from_info(info) -> set:
+    """10-25：FinMind 股票清單同一檔會有多列（轉板前後各一列，例：7711 永擎 2025-11-19 由興櫃轉上市）。
+    每檔只看最新一列；沒有日期欄時，只要有上市／上櫃紀錄就不算興櫃。"""
+    if info is None or info.empty or "type" not in info.columns or "stock_id" not in info.columns:
+        return set()
+    frame = info.copy()
+    frame["stock_id"] = frame["stock_id"].astype(str).str.strip()
+    frame["type"] = frame["type"].astype(str).str.strip()
+    if "date" in frame.columns:
+        frame["_d"] = pd.to_datetime(frame["date"], errors="coerce")
+        frame = frame.sort_values("_d", na_position="first").drop_duplicates("stock_id", keep="last")
+        return set(frame.loc[frame["type"] == "emerging", "stock_id"])
+    listed = set(frame.loc[frame["type"].isin(["twse", "tpex"]), "stock_id"])
+    return set(frame.loc[frame["type"] == "emerging", "stock_id"]) - listed
+
+
 def get_emerging_codes() -> set:
     """10-16：興櫃股票代號（FinMind 股票清單 type=emerging）。興櫃沒有公開的券商分點進出，籌碼題不去抓。"""
     def build():
-        info = core()._finmind_load_stock_info()
-        if info is None or info.empty or "type" not in info.columns:
-            return set()
-        return set(info.loc[info["type"].astype(str) == "emerging", "stock_id"].astype(str))
+        return emerging_codes_from_info(core()._finmind_load_stock_info())
     try:
-        return _cached("emerging_codes", TTL_REFERENCE_SECONDS, build)
+        return _cached("emerging_codes_v2", TTL_REFERENCE_SECONDS, build)   # 10-25：v2＝每檔只看最新一列
     except Exception:
         return set()
 
@@ -5695,10 +5708,9 @@ def _warrant_detail_from_store(canonical: str, requested: int, days: int, stock_
     store_missing: List[str] = []
     bought: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     for (stock, wcode), info in event_warrants.items():
-        candidates = by_code.get(wcode, [])
-        p = (next((x for x in candidates if x["stock"] == stock), None)
-             or next((x for x in candidates if not x["stock"]), None)
-             or (candidates[0] if len(candidates) == 1 else None))
+        # 10-25：權證代號會回收重用（例：7711 事件的權證被配到同代號的「元債2X」權證）。
+        # 只接受標的相同的歷史庫部位；歷史庫沒寫標的時，名稱要含標的股名才算。都不符就改用事件表資料。
+        p = store_position_for(by_code.get(wcode, []), stock, stock_name_map.get(stock, ""))
         last_store = max((str(d[0])[:10].replace("/", "-") for d in p["days"]), default="") if p is not None else ""
         if p is not None and p["remaining"] <= 0 and info["last"] > last_store:
             # 事件表比歷史庫新（例：10/02 事件買進、歷史庫還沒收到）：歷史庫看到的是舊一輪已賣完，
@@ -5803,6 +5815,17 @@ def _warrant_detail_from_store(canonical: str, requested: int, days: int, stock_
         "definition_note": ("天期＝距到期日天數；價內外＝標的價相對履約價；估算槓桿用標的近 60 日歷史波動率套 Black-Scholes，"
                             "不是市場實際隱含波動率；習慣統計用買進當下（最近一次買進日）的數值"),
     }
+
+
+def store_position_for(candidates: List[Dict[str, Any]], stock: str, stock_name: str = "") -> Optional[Dict[str, Any]]:
+    """歷史庫裡同一個權證代號可能屬於不同標的（代號回收）：先找標的相同的部位；
+    標的欄空白時，權證名稱要含標的股名才採用；其餘一律不配對（不可「只有一筆就拿來用」）。"""
+    same = next((x for x in candidates if str(x.get("stock") or "") == str(stock)), None)
+    if same is not None:
+        return same
+    if stock_name:
+        return next((x for x in candidates if not x.get("stock") and stock_name in str(x.get("name") or "")), None)
+    return None
 
 
 def get_branch_warrant_detail(branch_name: str, days: int = CHIPS_DAYS, stock_code: str = "") -> Dict[str, Any]:
