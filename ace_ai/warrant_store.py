@@ -157,6 +157,15 @@ def _download(url: str, timeout: float = 180.0) -> Path:
     return Path(name)
 
 
+def keep_latest_name(names: Dict[str, Any], warrant: str, day: str, record: tuple) -> None:
+    """10-25：權證代號會回收重用，同一代號在歷史庫裡可能是前後兩檔不同的權證
+    （例：089177 2024 年是「元債2X元富4A購02」，2026/10 起是「永擎元大63購03」）。
+    名稱表每個代號只存一筆，所以要存「日期最新」那一列，不能存檔案裡排在最後的那一列。"""
+    old = names.get(warrant)
+    if old is None or str(day) >= str(old[0]):
+        names[warrant] = (str(day), record)
+
+
 def load_history(path: Path, allow_shrink: bool = False) -> int:
     """逐批（10 萬列）寫進 bw_daily／bw_names；整份在同一個 transaction 內替換，失敗全部回滾。
     新檔明顯縮水（筆數 < 舊資料 7 成，或最新日期倒退）丟 StoreShrunk 並回滾，除非 allow_shrink。"""
@@ -177,8 +186,9 @@ def load_history(path: Path, allow_shrink: bool = False) -> int:
                     if not warrant or not branch:
                         continue
                     stock = _text(data["標的股"][i])
-                    names[warrant] = (warrant, _text(data["權證名稱"][i]), stock, _text(data["標的名稱"][i]))
                     day = _iso(data["日期"][i])
+                    keep_latest_name(names, warrant, day,
+                                     (warrant, _text(data["權證名稱"][i]), stock, _text(data["標的名稱"][i])))
                     if day < cutoff:
                         continue
                     rows.append((branch, warrant, stock, day,
@@ -190,7 +200,7 @@ def load_history(path: Path, allow_shrink: bool = False) -> int:
                 after_max = conn.execute("SELECT COALESCE(MAX(date),'') FROM bw_daily").fetchone()[0]
                 _guard_shrink("權證分點歷史", int(before or 0), count, str(before_max or ""), str(after_max or ""))
             conn.execute("DELETE FROM bw_names")
-            conn.executemany("INSERT OR REPLACE INTO bw_names VALUES(?,?,?,?)", list(names.values()))
+            conn.executemany("INSERT OR REPLACE INTO bw_names VALUES(?,?,?,?)", [r for _, r in names.values()])
     return count
 
 
