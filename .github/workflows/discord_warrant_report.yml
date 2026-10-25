@@ -87,13 +87,19 @@ jobs:
           set -euo pipefail
           export DEBIAN_FRONTEND=noninteractive
 
+          FONT_FILE="/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"
+
+          # 這個函式放在 if 條件裡呼叫時 set -e 不會生效，
+          # 所以每一步都要自己 return，最後用字型檔是否存在當作成功與否。
           install_fonts() {
-            sudo timeout 120s apt-get update -qq
-            sudo timeout 120s apt-get install -y --no-install-recommends fonts-noto-cjk
-            fc-cache -f
+            sudo timeout 300s apt-get update -qq || return 1
+            sudo timeout 600s apt-get install -y --no-install-recommends \
+              -o Acquire::Retries=3 fonts-noto-cjk || return 1
+            fc-cache -f || return 1
+            test -f "${FONT_FILE}"
           }
 
-          if fc-list | grep -qi "Noto Sans CJK"; then
+          if [ -f "${FONT_FILE}" ]; then
             echo "✅ Noto Sans CJK 已存在，略過安裝"
           else
             echo "開始安裝 Noto Sans CJK 字型"
@@ -101,10 +107,13 @@ jobs:
             if ! install_fonts; then
               echo "⚠️ 第一次安裝字型失敗或逾時，等待 10 秒後重試"
               sleep 10
-              install_fonts
+              if ! install_fonts; then
+                echo "❌ Noto Sans CJK 字型安裝失敗，停止執行以免產出亂碼圖片"
+                exit 1
+              fi
             fi
 
-            echo "✅ Noto Sans CJK 字型安裝完成"
+            echo "✅ Noto Sans CJK 字型安裝完成：${FONT_FILE}"
           fi
 
       - name: Set up Python
