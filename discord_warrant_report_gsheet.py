@@ -3643,15 +3643,19 @@ def read_actual_daily_net_from_history(target: date) -> dict:
 # ══════════════════════════════════════════════════════════════════════
 
 def get_font_path(bold=False):
+    # 只接受中文字型；找不到就直接報錯，不再退回 DejaVu（DejaVu 沒有中文字，圖會變成方塊亂碼）
+    weight = "Bold" if bold else "Regular"
     candidates = [
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc" if bold else "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/truetype/noto/NotoSansCJK-Bold.ttc" if bold else "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        f"/usr/share/fonts/opentype/noto/NotoSansCJK-{weight}.ttc",
+        f"/usr/share/fonts/truetype/noto/NotoSansCJK-{weight}.ttc",
     ]
     for p in candidates:
         if os.path.exists(p):
             return p
-    return candidates[-1]
+    raise RuntimeError(
+        "找不到 Noto Sans CJK 字型，停止產圖以免出現亂碼。"
+        "GitHub Actions 請確認 Install system fonts 步驟有成功安裝 fonts-noto-cjk。"
+    )
 
 
 def make_font(size, bold=False):
