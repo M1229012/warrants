@@ -2068,7 +2068,7 @@ def weekly_article_parts(draft: str, stock_code: str, stock_name: str = "") -> D
 # 人工文章自動排版：Gemini 只重新分段、加固定小標、把數字整理成資料列；程式逐字核對，不通過就用原文排版
 # ============================================================
 
-WEEKLY_LAYOUT_VERSION = "weekly-note-v6-levels"
+WEEKLY_LAYOUT_VERSION = "weekly-note-v7-verbatim"     # 10-26：逐字核對（只准刪固定開頭語）、價位卡要寫明支撐／壓力
 LAYOUT_HEADINGS = ("技術面", "籌碼面", "操作觀察")
 LAYOUT_SCHEMA = {
     "type": "object",
@@ -2109,14 +2109,17 @@ def layout_prompt(body: str, retry_reason: str = "", others: Sequence[str] = ())
         "大盤盤勢、個股走勢強弱、型態與價位放技術面；籌碼面只放分點、權證、法人買賣的內容，"
         "一句同時講盤勢和法人時，依整句主旨決定。\n"
         "2. 段落內的句子必須逐字照抄原文，不可改寫、增減字詞、換同義詞或改數字；只能重新分段（太長拆開、零碎的合併）。\n"
-        "3. 句首和小標意思重複的開頭語要刪掉，例如「技術面來看，」「權證籌碼方面，」「操作上，」。\n"
+        "3. 只能刪掉句首和小標重複的開頭語：「技術面來看，」「技術面上，」「權證籌碼方面，」「籌碼面上，」「操作上，」這一類；"
+        "其他任何字都不能刪，包括「另外」「目前」「所以」「不過」「而且」這類連接詞或時間詞，一個字都不能少。\n"
         + (f"4. 籌碼面裡的金額、勝率、持有天數這類數字，最多 {LAYOUT_MAX_ROWS} 個可以整理成 rows：label 是簡短名稱，"
            "value 只放數字和單位，例如 {\"label\":\"近70日4筆事件買進\",\"value\":\"約2,120萬元\"}、"
            "{\"label\":\"調整後勝率\",\"value\":\"約67%\"}；整理進 rows 的那一句要從段落刪掉，不要重複。"
            "後面還接著補充說明的數字句（例如「近70日買進約2,120萬元，目前仍持有」）不要抽成 rows，留在段落，避免意思跑掉。\n"
            if LAYOUT_ROWS else "4. rows 一律輸出空陣列；金額、勝率等數字都留在原句裡，不要抽出來。\n") +
         "5. 去掉 **、emoji 等格式符號；不要加任何原文沒有的內容。\n" + other +
-        f"7. levels：從技術面文字中，挑最多 {LAYOUT_MAX_LEVELS} 個原文明確寫出的價位做成價位卡；"
+        f"7. levels：從技術面文字中，挑最多 {LAYOUT_MAX_LEVELS} 個原文明確寫成支撐或壓力的價位做成價位卡"
+        "（同一句要有支撐、防守、守住、跌破、壓力、賣壓、突破、前高、大量區、均線、趨勢線這類字）；"
+        "成本、進場價、目標價、分批價位不是支撐壓力，不要做成價位卡；"
         "kind 是壓力（現價上方、賣壓）或支撐（現價下方、防守），price 照抄原文的數字加單位（例「794 元」），"
         f"note 是 {LAYOUT_LEVEL_NOTE} 字以內、用原文用詞的簡短說明（例「9/23 避雷針」「5 月起上升趨勢線」）。"
         "原文沒有寫出具體價位就輸出空陣列；levels 只是摘要，段落文字照樣保留完整原句。\n\n"
@@ -2187,6 +2190,12 @@ def verify_layout(body: str, layout: Dict[str, Any], others: Sequence[str] = ())
         note = level.get("note", "")
         if len(note) > LAYOUT_LEVEL_NOTE or not set(_layout_numbers([note])) <= body_numbers:
             return False, f"價位卡說明太長或有原文沒有的數字：{note}"
+    # 10-26：價位所在的那個子句要寫明是支撐／壓力（例：「盡量把成本控制在 1,350 元附近」是成本，不是支撐）→ 拿掉那張卡，排版照用
+    kept_levels = [lv for lv in levels if _level_in_context(body, lv)]
+    if len(kept_levels) != len(levels):
+        print(f"ℹ️ 週精選價位卡略過（原文同一句沒寫明支撐／壓力）：{[lv.get('price') for lv in levels if lv not in kept_levels]}",
+              flush=True)
+        layout["levels"] = kept_levels
     if len(rows) > LAYOUT_MAX_ROWS:
         return False, f"資料列 {len(rows)} 列，最多 {LAYOUT_MAX_ROWS} 列"
     long_label = next((r["label"] for r in rows if len(r["label"]) > LAYOUT_MAX_LABEL), "")
@@ -2218,7 +2227,52 @@ def verify_layout(body: str, layout: Dict[str, Any], others: Sequence[str] = ())
                 leftover = leftover.replace(piece, "", 1)
     if len(leftover) > max(30, len(original) * LAYOUT_LEFTOVER_RATIO):
         return False, f"有 {len(leftover)} 字原文沒有出現在排版結果：{leftover[:20]}"
+    if not rows:
+        # 10-26：沒有資料列（預設）時逐字核對——只准刪和小標重複的固定開頭語與 emoji，其他字一個都不能少
+        missing = _strict_leftover(original, paragraphs)
+        if missing:
+            return False, f"原文有字被刪掉：「{missing[:20]}」"
     return True, ""
+
+
+_LEAD_IN_WORDS = (r"(?:權證籌碼方面|權證籌碼上|權證籌碼|權證方面|籌碼方面|籌碼面|籌碼上|技術面上|技術面|技術上|"
+                  r"型態上|型態面|操作建議|操作方面|操作面|操作上)(?:來看|而言|方面|部分|上)?")
+_LEAD_IN_CORE_RE = re.compile(_LEAD_IN_WORDS)
+_EMOJI_RE = re.compile("[\U0001F000-\U0001FFFF☀-➿️‍]")
+
+
+def _strict_leftover(original: str, paragraphs: List[str]) -> str:
+    """依原文順序對位每個子句，回傳沒被任何子句涵蓋、也不是固定開頭語／emoji 的字。"""
+    covered = [False] * len(original)
+    cursor = 0
+    for paragraph in paragraphs:
+        for clause in _CLAUSE_RE.findall(paragraph):
+            piece = _layout_norm(clause)
+            if not piece:
+                continue
+            idx = original.find(piece, cursor)
+            if idx < 0:                       # 順序被調動：找第一個還沒被用過的位置
+                idx = next((i for i in range(len(original)) if original.startswith(piece, i)
+                            and not any(covered[i:i + len(piece)])), -1)
+            if idx < 0:
+                continue
+            covered[idx:idx + len(piece)] = [True] * len(piece)
+            cursor = idx + len(piece)
+    rest = "".join(ch if not hit else "\n" for ch, hit in zip(original, covered))
+    rest = _EMOJI_RE.sub("", _LEAD_IN_CORE_RE.sub("", rest))
+    return "".join(rest.split())
+
+
+_LEVEL_WORDS = ("支撐", "防守", "守住", "撐住", "跌破", "停損", "下緣", "頸線", "低點", "壓力", "賣壓", "套牢", "反壓",
+                "突破", "站上", "前高", "高點", "上緣", "關卡", "大量區", "均線", "日線", "週線", "月線", "季線", "年線",
+                "趨勢線", "缺口", "布林", "避雷針")
+
+
+def _level_in_context(body: str, level: Dict[str, Any]) -> bool:
+    """價位卡的價格要出現在原文某個子句，且那個子句寫明是支撐／壓力類的價位。"""
+    numbers = set(_layout_numbers([level.get("price", "")]))
+    clauses = [c for c in _CLAUSE_RE.findall(str(body or "")) if numbers and numbers <= set(_layout_numbers([c]))]
+    return any(any(w in c for w in _LEVEL_WORDS) for c in clauses)
 
 
 # 子句：以，；。或逗號分隔，但「2,120」這種數字中間的逗號不切
@@ -2272,8 +2326,7 @@ def tidy_layout(layout: Dict[str, Any]) -> Dict[str, Any]:
     return {"sections": [s for s in sections if s["paragraphs"] or s["rows"]], "levels": list(layout.get("levels") or [])}
 
 
-_LEAD_IN_RE = re.compile(r"^(?:權證籌碼方面|權證籌碼上|權證籌碼|權證方面|籌碼方面|籌碼面|籌碼上|技術面上|技術面|技術上|"
-                         r"型態上|型態面|操作建議|操作方面|操作面|操作上)(?:來看|而言|方面|部分|上)?[，,：:、\s]*")
+_LEAD_IN_RE = re.compile(r"^" + _LEAD_IN_WORDS + r"[，,：:、\s]*")
 # 小標關鍵字與權重：「突破」「整理」「操作」這類各段都會出現的通用詞權重低
 _HEADING_WORDS = {
     "技術面": {"均線": 1, "型態": 1, "布林": 1, "季線": 1, "月線": 1, "年線": 1, "K線": 1, "扣抵": 1, "趨勢": 1,
