@@ -616,7 +616,12 @@ def _fetch_batch(session, codes: List[str]) -> Dict[str, Dict[str, Any]]:
             lots = _num_field(item, "v")                  # MIS 累計成交量（張）
             out[code] = {"name": str(item.get("n") or code), "price": price, "prev": previous,
                          "change_pct": round((price / previous - 1) * 100, 2),
-                         "value": lots * 1000 * price}     # 成交金額近似值（MIS 沒有逐檔成交金額）
+                         "value": lots * 1000 * price,     # 成交金額近似值（MIS 沒有逐檔成交金額）
+                         # 10-24：今日族群排行用（漲停鎖住／打開、離今日高點）；MIS 給「-」時為 0
+                         "high": _num_field(item, "h"), "low": _num_field(item, "l"), "open": _num_field(item, "o"),
+                         "limit_up": _num_field(item, "u"), "limit_down": _num_field(item, "w"),
+                         "traded": _num_field(item, "z") > 0,
+                         "lots": lots}                     # 10-25：族群排行 v2 算近 5 分量（累計張數相減）
     with _HTTP_LOCK:
         _BATCH_STATS["today"].update(today)
         _BATCH_STATS["no_trade"].update(no_trade)

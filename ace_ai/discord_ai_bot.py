@@ -9829,6 +9829,12 @@ def _intraday_sampling_loop_admin(stop: threading.Event) -> None:
                     sector_radar.tick()
                 except Exception as exc:
                     print(f"⚠️ 族群雷達快照略過｜{tools.err_text(exc)}", flush=True)
+                # 10-25 族群排行 v2：每 60 秒拍一張流動性名單報價（近 5 分、近段量增、跟漲觀察）
+                try:
+                    import member_sector_tape
+                    member_sector_tape.sample()
+                except Exception as exc:
+                    print(f"⚠️ 族群排行快照略過｜{tools.err_text(exc)}", flush=True)
                 if time.monotonic() - last_basket >= INTRADAY_SAMPLE_SECONDS:
                     last_basket = time.monotonic()
                     try:
