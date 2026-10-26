@@ -464,7 +464,7 @@ def mark_legend(draw, panel: dict, top: float, dry: bool) -> int:
     if mode == 'flow':
         # 週精選／明確詢問買賣超點位：K 線上的編號對應下方明細表。
         # 10-18：說明文字依寬度換行（不截字）；各分點的編號／筆數摘要不畫（下方明細表已有分點與編號）
-        note = '編號＝買進事件；同編號賣出＝出清；減碼對應下表買進，未對應＝待對帳'
+        note = '編號＝買進事件；同編號賣出＝出清；減碼寫在對應買進的後續動作'
         note_lines = wrap(note, 18, int(width - 232), False)
         if not dry:
             sy = top + h + 7

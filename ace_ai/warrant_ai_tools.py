@@ -6414,6 +6414,8 @@ def sheet_flow_marks_for_stock(stock_code: str, dates: List[str], branch_name: s
                       "action_date": group["day"], "net_amount": _num(-amount, 0),
                       "net_amount_text": _money_text(-amount)})
 
+    # 10-26：對應不到任何事件的賣出（賣的是沒進事件表的部位，例如分次小額買進）不畫、不列表，只寫 Log，
+    # 圖表專注在 A～E 事件部位。
     known_branches = {str(b) for b in rows["branch"].unique()} if not rows.empty else set()
     for (branch, day), amount in sorted(sell_amounts.items(), key=lambda item: -item[1]):
         amount = max(0.0, amount - claimed_amounts.get((branch, day), 0.0))
@@ -6426,9 +6428,8 @@ def sheet_flow_marks_for_stock(stock_code: str, dates: List[str], branch_name: s
         day_text = in_chart(day)
         if not day_text:
             continue
-        marks.append({"no": "", "branch": branch, "event_codes": "", "kind": "reduce",
-                      "action": "sell", "action_text": "賣出待對帳", "action_date": day_text,
-                      "net_amount": _num(-amount, 0), "net_amount_text": _money_text(-amount)})
+        print(f"ℹ️ {code} 權證標註｜{branch} {day_text} 賣出 {_money_text(-amount)} 對應不到事件（非事件部位），圖表不顯示",
+              flush=True)
 
     if not marks:
         print(f"ℹ️ {code} Google Sheet 權證標註：指定分點/期間無事件", flush=True)

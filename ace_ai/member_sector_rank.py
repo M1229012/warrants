@@ -120,6 +120,11 @@ def quotes(codes: List[str]) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]
                    "high": float(q.get("high") or 0), "low": float(q.get("low") or 0),
                    "limit_up": float(q.get("limit_up") or 0), "limit_down": float(q.get("limit_down") or 0)}
                for c, q in raw.items() if float(q.get("value") or 0) > 0 and float(q.get("prev") or 0) > 0}
+        if len(out) < len(codes) * LIVE_MIN_SHARE:
+            # 10-26：颱風假、臨時休市等平日沒有今天的盤中報價 → 改用本地日 K 最新一個交易日，不要回空
+            print(f"📊 今日族群排行｜盤中報價只有 {len(out)}/{len(codes)} 檔（今天可能休市），改用最新交易日收盤資料", flush=True)
+            out, info = _closed_quotes(codes)
+            return out, dict(info, fallback=True)
         _verify_reference(out)
         now = tools.taipei_now()
         closed = now.hour * 60 + now.minute >= 13 * 60 + 30
@@ -127,6 +132,20 @@ def quotes(codes: List[str]) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]
         return out, {"live": not closed, "basis": "收盤" if closed else "盤中",
                      "time": tape_status["time"] or now.strftime("%H:%M:%S"), "date": now.strftime("%Y-%m-%d"),
                      "tape": tape_status}
+    return _closed_quotes(codes)
+
+
+LIVE_MIN_SHARE = 0.5          # 盤中有效報價不到名單一半＝今天沒開盤（颱風假等），改用最新交易日
+
+
+def latest_trade_day() -> str:
+    """本地日 K 最新的交易日（假日、連假、颱風假都會停在最後一個有開盤的日子）。"""
+    dates = local_market_cache.known_dates(limit=1)
+    return dates[0] if dates else ""
+
+
+def _closed_quotes(codes: List[str]) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
+    """最新交易日收盤（純本地日 K）；除權息的上市股改用公告參考價重算漲跌。"""
     changes = local_market_cache.latest_changes(codes)
     latest = max((str(v.get("date") or "") for v in changes.values()), default="")
     out = {c: {"change_pct": float(v["change_pct"]), "price": float(v["close"]),
@@ -154,8 +173,9 @@ def _reference_prices(day: str) -> Dict[str, float]:
         try:
             _REF_CACHE[day] = _twse_reference_prices(day)
         except Exception as exc:
+            # 10-26：失敗也記住（當天不再重打），避免每次查詢都卡 10 秒逾時
             print(f"⚠️ 除權息參考價讀取失敗，{day} 漲跌幅未調整｜{tools.err_text(exc)}", flush=True)
-            return {}
+            _REF_CACHE[day] = {}
     return _REF_CACHE[day]
 
 
@@ -325,11 +345,20 @@ def rank(day: Optional[str] = None, direction: str = "strong") -> Optional[Dict[
     groups = sector_match.member_groups()
     if not groups:
         return None
+    began = time.perf_counter()
+    if day is None and not _live_allowed():
+        day = latest_trade_day() or None        # 假日／收盤後：名單用「最新交易日以前」的成交額，和顯示的那天對齊
     pool = liquid_pool(day)
     if not pool:
         return None
-    began = time.perf_counter()
+    t_pool = time.perf_counter() - began
     quote, info = quotes(sorted(pool))
+    if info.get("fallback") and info.get("date") and info["date"] != day:
+        pool = liquid_pool(info["date"])        # 颱風假改用收盤資料：名單也換成那一天的
+        quote, info = _closed_quotes(sorted(pool))
+        info["fallback"] = True
+    print(f"⏱️ 今日族群排行｜名單 {t_pool:.1f}s｜報價 {time.perf_counter() - began - t_pool:.1f}s"
+          f"｜{info.get('basis', '')} {info.get('date', '')}", flush=True)
     if not quote:
         return None
     valid_pool = [c for c in pool if c in quote]
@@ -592,7 +621,9 @@ def reason_card(data: Dict[str, Any], question: str, gateway, validate, names: D
 
 def answer(question: str = "", gateway=None, validate=None) -> Optional[Dict[str, Any]]:
     """「哪個族群最強／最弱（為什麼）」：TOP5 排行卡；問原因時再加新聞解讀卡。資料不足回 None。"""
+    began = time.perf_counter()
     intent = read_intent(question, gateway)
+    t_intent = time.perf_counter() - began
     weak = intent["direction"] == "weak"
     if _live_allowed():
         try:
@@ -605,7 +636,7 @@ def answer(question: str = "", gateway=None, validate=None) -> Optional[Dict[str
         return None
     names = _names()
     info = data["info"]
-    when = f"盤中 {info['time']}" if info["live"] else f"{info['date']} 收盤"
+    when = f"盤中 {info['time']}" if info["live"] else f"{info['date']} 收盤" + _latest_hint(info)
     title = "今日最弱族群" if weak else "今日族群排行"
     # 10-25：定義、門檻、有效檔數等說明只寫 Log（rank() 已印），使用者看到的只留重點與一行免責
     lines = [f"**{title} TOP{len(data['rows'])}｜{when}**"]
@@ -639,7 +670,8 @@ def answer(question: str = "", gateway=None, validate=None) -> Optional[Dict[str
             lines += ["", card["answer"], card["why"]] + ([card["summary"]] if card["summary"] else [])
         else:
             lines.append("原因解讀暫時無法使用，以上為程式計算的排行。")
-    print(f"📊 族群排行題意｜{intent['direction']}｜原因={'要' if intent['wants_reason'] else '不要'}｜判斷={intent['by']}", flush=True)
+    print(f"📊 族群排行題意｜{intent['direction']}｜原因={'要' if intent['wants_reason'] else '不要'}｜判斷={intent['by']}"
+          f"｜⏱️ 題意 {t_intent:.1f}s／全部 {time.perf_counter() - began:.1f}s", flush=True)
     return {"text": "\n".join(lines), "calls": calls, "cacheable": False, "panels": panels, **usage,
             "token_source": "official" if usage.get("total_tokens") else "none"}
 
@@ -680,7 +712,7 @@ def panel(data: Dict[str, Any], names: Optional[Dict[str, str]] = None) -> Dict[
         banner = "剛開始取樣，近5分資料累積中，先顯示今日累計排行。"
     return {"sector_groups": {
         "title": f"{'今日最弱族群' if weak else '今日族群排行'} TOP{len(rows)}",
-        "stamp": f"截至 {info['time']}" if info["live"] else f"{_md(info['date'])} 收盤",
+        "stamp": f"截至 {info['time']}" if info["live"] else f"{_md(info['date'])} 收盤" + _latest_hint(info),
         "subtitle": "", "note": "", "banner": banner, "style": "v3",
         "leader_label": "領跌" if weak else "領漲", "limit_label": "跌停" if weak else "漲停",
         "lag_label": "抗跌" if weak else "落後", "extreme_label": "離低點" if weak else "離高點",
@@ -712,6 +744,11 @@ def follow_card_panel(data: Dict[str, Any], names: Optional[Dict[str, str]] = No
         print(f"👀 跟漲觀察｜{mode}｜{banner}", flush=True)
     return {"sector_follow": {"title": "強勢族群・跟漲觀察", "stamp": f"截至 {info['time']}",
                               "banner": banner, "mode": mode, "items": items, "live": True}}
+
+
+def _latest_hint(info: Dict[str, Any]) -> str:
+    """假日、連假、颱風假顯示的是之前的交易日：標「最新交易日」，避免被當成今天。"""
+    return "・最新交易日" if info.get("date") and info["date"] != _today() else ""
 
 
 def _md(day: str) -> str:
