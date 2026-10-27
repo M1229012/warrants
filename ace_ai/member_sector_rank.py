@@ -43,10 +43,11 @@ MOVERS = 3
 FLAT_EPS = 1e-9
 LIMIT_PCT = 9.5            # 收盤模式沒有漲跌停價：漲跌幅 ≥9.5% 視為漲（跌）停（近似值，圖上註明）
 STOCK_LIST = max(3, tools._env_int("DISCORD_AI_MEMBER_RANK_STOCK_LIST", 12))   # 圖卡每個族群最多列幾檔同族群股
+FOLLOW_UP_RATIO = UP_RATIO          # 跟漲觀察的族群資格：上漲比例 ≥ 60%（和「強勢」標籤同一個門檻）
 
 _POOL_LOCK = threading.Lock()
 _POOL_CACHE: Dict[str, Any] = {}
-_VERIFY_DONE: Dict[str, bool] = {}
+_VERIFY_DONE: Dict[str, set] = {}        # 10-27：{日期: 參考價不符的代號}，公告抓取成功才記
 
 
 # ============================================================
@@ -65,27 +66,75 @@ def universe() -> List[str]:
     return sorted(codes)
 
 
+POOL_STATE_KEY = "member_rank_pool_v1"
+POOL_STALE_RETRY = 600.0          # 日 K 底庫還沒到最新交易日時，名單 10 分鐘後重算（不寫入持久化）
+
+
+def _expected_sessions(day: str) -> Optional[List[str]]:
+    """官方交易日曆中 day 之前的交易日（新到舊，最多 LIQUIDITY_DAYS 個）；日曆沒涵蓋到前一天就回 None。"""
+    try:
+        import pandas as pd
+        saved = local_market_cache.get_state(local_market_cache.MARKET_SESSIONS_KEY, {}) or {}
+        prev_day = (pd.Timestamp(day) - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+        if not saved or str(saved.get("last") or "") < prev_day:
+            return None
+        first = max(str(saved.get("first") or ""), (pd.Timestamp(day) - pd.Timedelta(days=60)).strftime("%Y-%m-%d"))
+        sessions = local_market_cache.market_sessions_between(first, prev_day)
+    except Exception as exc:
+        print(f"⚠️ 族群排行名單：交易日曆讀取失敗，改用底庫既有日期｜{tools.err_text(exc)}", flush=True)
+        return None
+    return sorted(sessions or [], reverse=True)[:LIQUIDITY_DAYS] or None
+
+
 def liquid_pool(day: Optional[str] = None) -> Dict[str, Dict[str, float]]:
-    """當日固定的流動性名單：{代號: {avg_value, last_value}}；同一天、同一版 JSON 只算一次。"""
+    """當日固定的流動性名單：{代號: {avg_value, last_value}}；同一天、同一版 JSON 只算一次。
+    10-27 審核修正：
+    - 只用已確認（confirmed）的日 K
+    - 有官方交易日曆時，「前 20 個交易日」「前一交易日」照日曆，不用底庫剛好有的日期（底庫停在 10/22 不能當 10/26）
+    - 名單存進本地 DB，盤中重啟或日 K 被更正，同一天名單都不變（底庫不完整時不存，10 分鐘後重算）"""
     day = day or _today()
-    key = f"{day}|{sector_match.member_version()}|{MIN_VALUE:.0f}"
+    key = f"{day}|{sector_match.member_version()}|{MIN_VALUE:.0f}|{LIQUIDITY_DAYS}"
     with _POOL_LOCK:
-        if _POOL_CACHE.get("key") == key:
+        if _POOL_CACHE.get("key") == key and time.monotonic() < float(_POOL_CACHE.get("expires") or float("inf")):
             return _POOL_CACHE["pool"]
-    stats = local_market_cache.liquidity_before(day, LIQUIDITY_DAYS)
+    saved = local_market_cache.get_state(POOL_STATE_KEY, {}) or {}
+    if saved.get("key") == key and isinstance(saved.get("pool"), dict):
+        with _POOL_LOCK:
+            _POOL_CACHE.update(key=key, pool=saved["pool"], meta=saved.get("meta") or {}, expires=None)
+        return saved["pool"]
+    sessions = _expected_sessions(day)
+    stats = local_market_cache.liquidity_before(day, LIQUIDITY_DAYS, sessions=sessions)
     pool = {}
-    for code in universe():
+    codes = universe()
+    for code in codes:
         row = stats.get(code) or {}
         full = int(row.get("days") or 0) >= LIQUIDITY_DAYS
         avg_ok = full and float(row.get("avg_value") or 0) >= MIN_VALUE
         last_ok = float(row.get("last_value") or 0) >= MIN_VALUE
         if avg_ok or last_ok:
             pool[code] = {"avg_value": float(row.get("avg_value") or 0), "last_value": float(row.get("last_value") or 0)}
+    prev_day = sessions[0] if sessions else ""
+    have_prev = any(float((stats.get(c) or {}).get("last_value") or 0) > 0 for c in codes)
+    meta = {"calendar": bool(sessions), "prev_day": prev_day,
+            "base_stale": bool(sessions) and not have_prev}
     with _POOL_LOCK:
-        _POOL_CACHE.update(key=key, pool=pool)
-    print(f"📋 今日族群排行名單｜{day}｜成分股 {len(universe())} 檔｜通過流動性 {len(pool)} 檔"
-          f"｜門檻 {MIN_VALUE / 1e4:,.0f} 萬（{LIQUIDITY_DAYS} 日均或前一日）｜JSON {sector_match.member_version()}", flush=True)
+        _POOL_CACHE.update(key=key, pool=pool, meta=meta,
+                           expires=(time.monotonic() + POOL_STALE_RETRY) if meta["base_stale"] else None)
+    if not meta["base_stale"]:
+        try:
+            local_market_cache.set_state(POOL_STATE_KEY, {"key": key, "pool": pool, "meta": meta})
+        except Exception as exc:
+            print(f"⚠️ 族群排行名單存檔失敗（只影響重啟後是否沿用）｜{tools.err_text(exc)}", flush=True)
+    print(f"📋 今日族群排行名單｜{day}｜成分股 {len(codes)} 檔｜通過流動性 {len(pool)} 檔"
+          f"｜門檻 {MIN_VALUE / 1e4:,.0f} 萬（{LIQUIDITY_DAYS} 日均或前一日，收盤價×成交股數估計）｜JSON {sector_match.member_version()}"
+          + (f"｜前一交易日 {prev_day}（官方日曆）" if sessions else "｜⚠️ 官方日曆未涵蓋，改用底庫已確認日期")
+          + ("｜⚠️ 日 K 底庫還沒有前一交易日資料，名單不完整、10 分鐘後重算" if meta["base_stale"] else ""), flush=True)
     return pool
+
+
+def pool_meta() -> Dict[str, Any]:
+    with _POOL_LOCK:
+        return dict(_POOL_CACHE.get("meta") or {})
 
 
 # ============================================================
@@ -93,8 +142,9 @@ def liquid_pool(day: Optional[str] = None) -> Dict[str, Dict[str, float]]:
 # ============================================================
 
 # 10-24：族群排行開放會員看即時（只限這個功能；個股查詢仍照 closed_quotes_only 規則）。
-# 報價走 sector_radar 5 分鐘共用快取，多人同時問只抓一次。設 0 退回「會員只看收盤」。
+# 報價走 member_sector_tape 每 60 秒一張的快照。設 0 退回「會員只看收盤」。
 MEMBER_LIVE = str(__import__("os").getenv("DISCORD_AI_MEMBER_RANK_LIVE", "1")).strip().lower() not in ("0", "false", "no", "off")
+CLOSE_MINUTE = 13 * 60 + 30
 
 
 def _live_scope():
@@ -107,29 +157,65 @@ def _live_allowed() -> bool:
 
 
 def quotes(codes: List[str]) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
-    """回傳 ({代號: {change_pct, price, est_value, high, limit_up...}}, 資訊)。只收有成交、有參考價的報價。"""
+    """回傳 ({代號: {change_pct, price, est_value, high, limit_up...}}, 資訊)。只收有實際成交價、有參考價的報價。
+    10-27 審核修正：
+    - 只用實際成交價（MIS z／pz，或今天稍早觀測到的最近一筆成交）；五檔中價不算（買 108／賣 110 不能變成成交 109）
+    - 報價新鮮度逐檔用現在時間判斷（member_sector_tape.merged）
+    - 13:30 後要有 13:30 以後的快照才算「收盤」；只有更早的快照就標「盤後暫定｜最後快照」並保留過期提醒
+    - 參考價和證交所公告不符的股票不納入"""
     if _live_allowed():
-        # 10-25 v2：改用每 60 秒一張的快照（member_sector_tape），不再走 sector_radar 的 5 分鐘共用快取
         import member_sector_tape as tape
+        clock = tools.taipei_now()
+        late = clock.hour * 60 + clock.minute >= CLOSE_MINUTE
         with _live_scope():
-            snap = tape.current(codes)
-        raw = {c: q for c, q in (snap[1] if snap else {}).items() if c in set(codes)}
-        # 漲跌幅用價格重算（sector_radar 的 change_pct 已四捨五入到 2 位，上漲判斷要用未四捨五入值）
-        out = {c: {"change_pct": (float(q["price"]) / float(q["prev"]) - 1) * 100, "price": float(q["price"]),
-                   "est_value": float(q.get("value") or 0), "prev": float(q["prev"]), "name": q.get("name", ""),
-                   "high": float(q.get("high") or 0), "low": float(q.get("low") or 0),
-                   "limit_up": float(q.get("limit_up") or 0), "limit_down": float(q.get("limit_down") or 0)}
-               for c, q in raw.items() if float(q.get("value") or 0) > 0 and float(q.get("prev") or 0) > 0}
+            # 收盤後：補拍失敗時仍可用今天最後一張快照，但會標「盤後暫定｜最後快照」並保留過期提醒
+            snap = tape.current(codes, tape.KEEP_SECONDS if late else tape.STALE_SECONDS)
+        wanted = set(codes)
+        raw = {c: q for c, q in (snap[1] if snap else {}).items() if c in wanted}
+        out: Dict[str, Dict[str, Any]] = {}
+        carried = no_trade = 0
+        for c, q in raw.items():
+            prev = float(q.get("prev") or 0)
+            price = tape.trade_price(q)
+            if not price:
+                last = tape.last_trade(c)
+                if last:
+                    price, carried = last[0], carried + 1
+            if not price or prev <= 0:
+                no_trade += 1
+                continue
+            lots = float(q.get("lots") or 0)
+            value = lots * 1000 * price if lots else float(q.get("value") or 0)
+            if value <= 0:
+                continue
+            # 漲跌幅用價格重算（sector_radar 的 change_pct 已四捨五入到 2 位，上漲判斷要用未四捨五入值）
+            out[c] = {"change_pct": (price / prev - 1) * 100, "price": price, "est_value": value, "prev": prev,
+                      "name": q.get("name", ""), "high": float(q.get("high") or 0), "low": float(q.get("low") or 0),
+                      "limit_up": float(q.get("limit_up") or 0), "limit_down": float(q.get("limit_down") or 0)}
+        print(f"🎞️ 族群排行報價｜可用 {len(out)}/{len(codes)}｜沿用稍早成交價 {carried}｜沒有成交價 {no_trade}", flush=True)
         if len(out) < len(codes) * LIVE_MIN_SHARE:
             # 10-26：颱風假、臨時休市等平日沒有今天的盤中報價 → 改用本地日 K 最新一個交易日，不要回空
             print(f"📊 今日族群排行｜盤中報價只有 {len(out)}/{len(codes)} 檔（今天可能休市），改用最新交易日收盤資料", flush=True)
             out, info = _closed_quotes(codes)
             return out, dict(info, fallback=True)
-        _verify_reference(out)
+        bad = _verify_reference(out)
+        for c in bad:
+            out.pop(c, None)
         now = tools.taipei_now()
-        closed = now.hour * 60 + now.minute >= 13 * 60 + 30
         tape_status = tape.status()
-        return out, {"live": not closed, "basis": "收盤" if closed else "盤中",
+        snap_minute = None
+        if snap:
+            from datetime import datetime
+            moment = datetime.fromtimestamp(snap[0], now.tzinfo)
+            snap_minute = moment.hour * 60 + moment.minute
+        after_close = now.hour * 60 + now.minute >= CLOSE_MINUTE
+        if after_close and snap_minute is not None and snap_minute >= CLOSE_MINUTE:
+            basis, live = "收盤", False
+        elif after_close:
+            basis, live = "最後盤中快照", False
+        else:
+            basis, live = "盤中", True
+        return out, {"live": live, "basis": basis,
                      "time": tape_status["time"] or now.strftime("%H:%M:%S"), "date": now.strftime("%Y-%m-%d"),
                      "tape": tape_status}
     return _closed_quotes(codes)
@@ -138,6 +224,8 @@ def quotes(codes: List[str]) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]
 # 盤中有效報價不到名單 2 成＝今天沒開盤（颱風假等），改用最新交易日。
 # 10-27：原本 5 成，MIS 一次只回一半時盤中會被誤判成休市、顯示 10/22 的舊排行；快照也改成合併最近 3 分鐘。
 LIVE_MIN_SHARE = 0.2
+# 台股一般股票單日漲跌幅上限 10%：日 K 漲跌超過這個幅度又沒有公告參考價可核對，多半是除權息／減資的未調整價格
+PRICE_LIMIT_GUARD = 10.5
 
 
 def latest_trade_day() -> str:
@@ -147,7 +235,8 @@ def latest_trade_day() -> str:
 
 
 def _closed_quotes(codes: List[str]) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
-    """最新交易日收盤（純本地日 K）；除權息的上市股改用公告參考價重算漲跌。"""
+    """最新交易日收盤（純本地日 K）；除權息的上市股改用公告參考價重算漲跌。
+    10-27 審核：參考價來源失敗時不靜默照用未調整漲跌；超過單日漲跌幅上限、又沒有公告參考價的股票不納入。"""
     changes = local_market_cache.latest_changes(codes)
     latest = max((str(v.get("date") or "") for v in changes.values()), default="")
     out = {c: {"change_pct": float(v["change_pct"]), "price": float(v["close"]),
@@ -156,29 +245,44 @@ def _closed_quotes(codes: List[str]) -> Tuple[Dict[str, Dict[str, Any]], Dict[st
            if str(v.get("date") or "") == latest and float(v.get("volume") or 0) > 0}
     # 日 K 的漲跌幅是對「未調整昨收」；當天除權息的上市股改用證交所公告的參考價（上櫃尚未涵蓋）
     refs = _reference_prices(latest)
-    fixed = [c for c in out if refs.get(c)]
+    fixed = [c for c in out if refs and refs.get(c)]
     for c in fixed:
         out[c]["change_pct"] = (out[c]["price"] / refs[c] - 1) * 100
     if fixed:
         print(f"🔎 今日族群排行｜{latest} 除權息 {len(fixed)} 檔改用公告參考價計算漲跌", flush=True)
-    return out, {"live": False, "basis": "收盤", "time": "", "date": latest}
+    odd = [c for c in out if c not in fixed and abs(out[c]["change_pct"]) > PRICE_LIMIT_GUARD]
+    for c in odd:
+        out.pop(c)
+    if odd:
+        print(f"⚠️ 今日族群排行｜{latest} 有 {len(odd)} 檔漲跌超過 ±{PRICE_LIMIT_GUARD:g}% 且沒有公告參考價可核對"
+              f"（可能是除權息、減資或新上市），不納入｜{'、'.join(odd[:10])}", flush=True)
+    return out, {"live": False, "basis": "收盤", "time": "", "date": latest,
+                 "reference_checked": refs is not None}
 
 
 _REF_CACHE: Dict[str, Dict[str, float]] = {}
+_REF_FAILED: Dict[str, float] = {}
+REF_RETRY_SECONDS = 1800.0
 
 
-def _reference_prices(day: str) -> Dict[str, float]:
-    """同一天只讀一次 TWT49U；讀不到就回空（照原本未調整漲跌，並寫 Log）。"""
+def _reference_prices(day: str) -> Optional[Dict[str, float]]:
+    """當天 TWT49U 除權息參考價。成功（含當天沒有事件）整天快取；失敗回 None，30 分鐘後可以再試。
+    10-27 審核：原本失敗也記成空結果、整天不再重試，來源恢復了也用不到。"""
     if not day:
         return {}
-    if day not in _REF_CACHE:
-        try:
-            _REF_CACHE[day] = _twse_reference_prices(day)
-        except Exception as exc:
-            # 10-26：失敗也記住（當天不再重打），避免每次查詢都卡 10 秒逾時
-            print(f"⚠️ 除權息參考價讀取失敗，{day} 漲跌幅未調整｜{tools.err_text(exc)}", flush=True)
-            _REF_CACHE[day] = {}
-    return _REF_CACHE[day]
+    if day in _REF_CACHE:
+        return _REF_CACHE[day]
+    failed = _REF_FAILED.get(day)
+    if failed is not None and time.monotonic() - failed < REF_RETRY_SECONDS:
+        return None
+    try:
+        _REF_CACHE[day] = _twse_reference_prices(day)
+        _REF_FAILED.pop(day, None)
+        return _REF_CACHE[day]
+    except Exception as exc:
+        _REF_FAILED[day] = time.monotonic()
+        print(f"⚠️ 除權息參考價讀取失敗，{day} 先不核對（{REF_RETRY_SECONDS / 60:.0f} 分鐘後重試）｜{tools.err_text(exc)}", flush=True)
+        return None
 
 
 def _twse_reference_prices(day: str) -> Dict[str, float]:
@@ -201,18 +305,21 @@ def _twse_reference_prices(day: str) -> Dict[str, float]:
     return out
 
 
-def _verify_reference(live: Dict[str, Dict[str, Any]]) -> None:
-    """每天一次：當天除權息的上市股，核對 MIS 參考價（y）和證交所公告的除權息參考價是否一致，結果寫 Log。
-    上櫃除權息與減資恢復交易的參考價另有來源，v1 尚未核對（已知限制）。"""
+def _verify_reference(live: Dict[str, Dict[str, Any]]) -> set:
+    """當天除權息的上市股：核對 MIS 參考價（y）和證交所公告的除權息參考價，不一致的代號回傳（呼叫端排除）。
+    公告抓取成功才記成「今天核對過」；失敗下次再試。上櫃除權息與減資恢復交易的參考價尚未核對（已知限制）。"""
     day = _today()
-    if _VERIFY_DONE.get(day):
-        return
-    _VERIFY_DONE[day] = True
+    if day in _VERIFY_DONE:
+        return _VERIFY_DONE[day]
     official = _reference_prices(day)
+    if official is None:
+        return set()
     checked = [(c, live[c]["prev"], ref) for c, ref in official.items() if c in live and live[c].get("prev")]
-    bad = [f"{c}:MIS {p:g}／公告 {r:g}" for c, p, r in checked if abs(p - r) > 0.011]
-    print(f"🔎 除權息參考價核對｜{day}｜公告 {len(official)} 檔｜可比對 {len(checked)} 檔｜不符 {len(bad)} 檔"
-          + (f"｜{'、'.join(bad[:10])}" if bad else ""), flush=True)
+    bad = {c for c, p, r in checked if abs(p - r) > 0.011}
+    _VERIFY_DONE[day] = bad
+    print(f"🔎 除權息參考價核對｜{day}｜公告 {len(official)} 檔｜可比對 {len(checked)} 檔｜不符 {len(bad)} 檔（不納入）"
+          + (f"｜{'、'.join(sorted(bad)[:10])}" if bad else ""), flush=True)
+    return bad
 
 
 # ============================================================
@@ -381,6 +488,9 @@ def rank(day: Optional[str] = None, direction: str = "strong") -> Optional[Dict[
                               + (f"｜只算已查證 {confirmed['avg']:+.2f}%（{confirmed['valid']} 檔）"
                                  if confirmed["status"] == "ok" else f"｜只算已查證：{confirmed['status']}（{confirmed['valid']} 檔）"))
         rows.append(stat)
+    # 單一榜、依等權平均排序（和 XQ 細產業指數、CMoney 主力動向公開的算法一致）。
+    # 10-27 試過「10 檔分榜＋中位數主排序」後撤回：沒有依據，不為了讓大族群排前面另加規則；
+    # 中位數、上漲比例只當「整群是否同步」的資訊顯示。
     rows.sort(key=lambda r: ((r["avg"] if weak else -r["avg"]), r["name"]))
     for index, row in enumerate(rows, 1):
         row["raw_rank"] = index
@@ -400,7 +510,8 @@ def rank(day: Optional[str] = None, direction: str = "strong") -> Optional[Dict[
         row["rank"] = index
         _enrich(row, quote, info)
         row["m5"] = _group_m5(row, stock_moves)
-        print(f"📊 今日族群排行明細｜{index}.{row['name']}｜平均 {row['avg']:+.2f}%｜中位 {row['median']:+.2f}%"
+        print(f"📊 今日族群排行明細｜{index}.{row['name']}"
+              f"｜平均 {row['avg']:+.2f}%｜中位 {row['median']:+.2f}%｜上漲 {row['up_ratio'] * 100:.0f}%"
               f"｜有效 {row['valid']}／通過流動性 {row['liquid']}／成分 {row['members']} 檔｜標籤 {row['label']}"
               + (f"｜漲停 鎖 {row.get('locked_up', 0)}・開 {row.get('opened_up', 0)}"
                  f"｜跌停 鎖 {row.get('locked_down', 0)}・開 {row.get('opened_down', 0)}" if row.get("live_fields") else "")
@@ -408,15 +519,16 @@ def rank(day: Optional[str] = None, direction: str = "strong") -> Optional[Dict[
     print(f"📊 今日族群排行（{'最弱' if weak else '最強'}）｜{info['basis']} {info['date']} {info['time']}｜可排名 {len(rows)}／{len(groups)} 族群"
           f"｜基準 {('%+.2f%%' % bench) if bench is not None else '不足'}（有效 {len(valid_pool)}/{len(pool)}）"
           f"｜{time.perf_counter() - began:.1f}s", flush=True)
-    print("📊 今日族群排行前十（含同家族）｜" + "｜".join(
-        f"{r['raw_rank']}.{r['name']} {r['avg']:+.2f}% {r['label']}" for r in rows[:10]), flush=True)
+    print("📊 今日族群排行前十（含同家族，依平均）｜" + "｜".join(
+        f"{r['raw_rank']}.{r['name']} 中位{r['median']:+.2f}% 平均{r['avg']:+.2f}% {r['valid']}檔 {r['label']}"
+        for r in rows[:10]), flush=True)
     if skipped:
         print(f"📊 今日族群排行未排名 {len(skipped)} 族群（有效/通過流動性/成分）｜" + "、".join(skipped[:40]), flush=True)
     for line in trial_logs:
         print("🧪 試行族群比較｜" + line, flush=True)
     return {"rows": shown, "all_rows": rows, "info": info, "bench": bench, "bench_valid": len(valid_pool),
             "pool": len(pool), "groups": len(groups), "skipped": len(skipped), "direction": "weak" if weak else "strong",
-            "quote": quote, "moves": stock_moves}
+            "quote": quote, "moves": stock_moves, "pool_meta": pool_meta()}
 
 
 def _group_m5(row: Dict[str, Any], stock_moves: Dict[str, Dict[str, Any]]) -> Optional[float]:
@@ -436,17 +548,24 @@ FOLLOW_RATIO = max(0.0, tools._env_float("DISCORD_AI_FOLLOW_RATIO", 1.5))       
 FOLLOW_MIN_VALUE5 = max(0.0, tools._env_float("DISCORD_AI_FOLLOW_MIN_VALUE5", 10_000_000.0))     # 近 5 分成交額 ≥ 1,000 萬
 FOLLOW_MIN_DAY_VALUE = max(0.0, tools._env_float("DISCORD_AI_FOLLOW_MIN_DAY_VALUE", 100_000_000.0))  # 今日累計成交額 ≥ 1 億
 FOLLOW_MAX = max(1, tools._env_int("DISCORD_AI_FOLLOW_MAX", 5))
-FOLLOW_FILL = 4                    # 跟漲觀察不到這麼多檔時，用「相對落後」補到這個數（最多 2 檔）
 
 
 def follow(data: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """回傳 [{code, group, price, day, lag, m5, beat, vol5, value5, ratio, bars, state}]；state＝跟漲觀察／相對落後。
-    先過量能門檻（近 5 分成交額、今日累計成交額），沒量的不論價格怎麼動都不列；
-    相對落後只在已有跟漲觀察股時當補位，避免把「漲幅最低」誤當成候選。"""
+    """回傳 [{code, group, price, day, lag, m5, beat, vol5, value5, ratio, bars, state}]，只有 state＝跟漲觀察。
+    搜尋範圍＝圖上顯示的強勢族群（TOP5 中通過族群資格的），不是全部族群。
+    先過量能門檻（近 5 分成交額、今日累計成交額），沒量的不論價格怎麼動都不列。
+    10-27 審核：拿掉「相對落後」補位（會補進近 5 分下跌、縮量的股票）；沒有符合的就照實說沒有。
+    當沖資格尚未核對，卡片不寫「可當沖」。"""
     quote, stock_moves = data.get("quote") or {}, data.get("moves") or {}
     watch, lagging, seen, thin = [], [], set(), 0
+    bench = data.get("bench")
     for row in data.get("rows") or []:
         if row.get("label") != "強勢" or row.get("m5") is None:
+            continue
+        # 10-27 族群資格（和排名分開）：中位數 > 0、中位數跑贏股票池基準、上漲比例 ≥ 60%，
+        # 避免只有少數領漲股拉高平均的族群被當成強勢
+        if row.get("median", 0) <= 0 or row.get("up_ratio", 0) < FOLLOW_UP_RATIO \
+                or (bench is not None and row.get("median", 0) <= bench):
             continue
         for code in row.get("codes") or []:
             q, mv = quote.get(code) or {}, stock_moves.get(code)
@@ -460,19 +579,20 @@ def follow(data: Dict[str, Any]) -> List[Dict[str, Any]]:
             if value5 < FOLLOW_MIN_VALUE5 or float(q.get("est_value") or 0) < FOLLOW_MIN_DAY_VALUE:
                 thin += 1
                 continue
+            if mv.get("m5") is None:
+                continue                  # 近 5 分區間不完整（不是 4～7 分鐘）就不判斷
             beat = mv["m5"] - row["m5"]
             good = mv["m5"] > 0 and beat > 0 and mv["ratio"] is not None and mv["ratio"] >= FOLLOW_RATIO
-            item = {"code": code, "group": row["name"], "price": q["price"], "day": q["change_pct"], "lag": lag,
-                    "m5": mv["m5"], "beat": beat, "vol5": mv["vol5"], "value5": value5, "ratio": mv["ratio"],
-                    "bars": mv["bars"], "state": "跟漲觀察" if good else "相對落後"}
-            (watch if good else lagging).append(item)
+            if not good:
+                lagging.append(code)
+                continue
+            watch.append({"code": code, "group": row["name"], "price": q["price"], "day": q["change_pct"], "lag": lag,
+                          "m5": mv["m5"], "beat": beat, "vol5": mv["vol5"], "value5": value5, "ratio": mv["ratio"],
+                          "bars": mv["bars"], "state": "跟漲觀察"})
     watch.sort(key=lambda s: (-s["beat"], s["code"]))
-    lagging.sort(key=lambda s: (-s["beat"], s["code"]))
     picks = watch[:FOLLOW_MAX]
-    if picks:
-        picks += lagging[:max(0, min(2, FOLLOW_FILL - len(picks)))]
     print(f"👀 跟漲觀察｜強勢族群 {sum(1 for r in data.get('rows') or [] if r.get('label') == '強勢')}"
-          f"｜符合 {len(watch)} 檔｜相對落後 {len(lagging)} 檔｜量不足略過 {thin} 檔"
+          f"｜符合 {len(watch)} 檔｜落後但價量沒改善 {len(lagging)} 檔（不列）｜量不足略過 {thin} 檔"
           f"｜條件：落後族群中位 ≥{FOLLOW_LAG:g} 個百分點、近5分上漲且跑贏族群、近段量增 ≥{FOLLOW_RATIO:g} 倍"
           f"（最近 5 分量 ÷ 前三段平均）、近5分成交額 ≥{FOLLOW_MIN_VALUE5 / 1e4:,.0f} 萬、今日成交額 ≥{FOLLOW_MIN_DAY_VALUE / 1e8:g} 億"
           + ("｜" + "、".join(f"{s['code']}{s['state']}" for s in picks) if picks else ""), flush=True)
@@ -651,12 +771,15 @@ def answer(question: str = "", gateway=None, validate=None) -> Optional[Dict[str
         return None
     names = _names()
     info = data["info"]
-    when = f"盤中 {info['time']}" if info["live"] else f"{info['date']} 收盤" + _latest_hint(info)
+    when = (f"盤中 {info['time']}" if info["live"] else
+            f"盤後暫定（最後快照 {info['time']}）" if info.get("basis") == "最後盤中快照" else
+            f"{info['date']} 收盤" + _latest_hint(info))
     title = "今日最弱族群" if weak else "今日族群排行"
-    # 10-25：定義、門檻、有效檔數等說明只寫 Log（rank() 已印），使用者看到的只留重點與一行免責
+    # 10-25：定義、門檻等說明只寫 Log（rank() 已印），使用者看到的只留重點與一行免責
+    # 10-27：主數字＝等權平均；中位數、上漲比例表示整群是否同步；比大盤＝平均 − 股票池基準（同一口徑）
     lines = [f"**{title} TOP{len(data['rows'])}｜{when}**"]
     for row in data["rows"]:
-        rel = f"｜比大盤 {row['rel']:+.2f}%" if row.get("rel") is not None else ""
+        rel = f"｜比股票池 {row['rel']:+.2f}%" if row.get("rel") is not None else ""
         m5 = f"｜近5分 {row['m5']:+.2f}%" if row.get("m5") is not None else ""
         stocks = list(reversed(row.get("stocks") or [])) if weak else list(row.get("stocks") or [])
         lag = ""
@@ -664,8 +787,8 @@ def answer(question: str = "", gateway=None, validate=None) -> Optional[Dict[str
             lag = f"｜{'抗跌' if weak else '落後'} " + "・".join(
                 f"{names.get(s['code'], s['code'])} {s['change_pct']:+.2f}%" for s in stocks[-2:])
         tag = _label_text(row)
-        lines.append(f"{row['rank']}. {row['name']}{f'【{tag}】' if tag else ''} {row['avg']:+.2f}%"
-                     f"｜上漲 {row['up_count']}/{row['valid']}{rel}{m5}"
+        lines.append(f"{row['rank']}. {row['name']}{f'【{tag}】' if tag else ''} 平均 {row['avg']:+.2f}%"
+                     f"｜中位數 {row['median']:+.2f}%｜上漲 {row['up_count']}/{row['valid']}{rel}{m5}"
                      f"｜{'領跌' if weak else '領漲'} {_movers_text(row, names, weak)}{lag}")
     lines.append("盤中快照・僅供研究參考，非買賣建議。" if info["live"] else "收盤資料・僅供研究參考，非買賣建議。")
     panels = [panel(data, names)]
@@ -700,7 +823,46 @@ def panel(data: Dict[str, Any], names: Optional[Dict[str, str]] = None) -> Dict[
     names = names if names is not None else _names()
     info = data["info"]
     weak = data.get("direction") == "weak"
-    rows = [{
+    rows = _panel_rows(data.get("rows") or [], names, weak)
+    tape = info.get("tape") or {}
+    # 10-25 v3：說明與門檻只寫 Log；圖上只剩標題、時間、必要狀態（近 5 分累積中／資料過期）
+    banner = ""
+    # 10-27 審核：過期提醒不因為「已過 13:30」就消失；底庫缺前一交易日也要講
+    if tape.get("state") == "stale" and info.get("basis") != "收盤":
+        banner = f"行情 {int((tape.get('age') or 0) // 60)} 分鐘未更新，以下是 {tape.get('time', '')} 的資料。"
+    elif info["live"] and tape.get("state") in ("warming", "none"):
+        banner = "剛開始取樣，近5分資料累積中，先顯示今日累計排行。"
+    if (data.get("pool_meta") or {}).get("base_stale"):
+        banner = "．".join(x for x in (banner, "日K底庫還沒更新到前一交易日，流動性名單可能不完整。") if x)
+    if info["live"]:
+        stamp = f"截至 {info['time']}"
+    elif info.get("basis") == "最後盤中快照":
+        stamp = f"盤後暫定｜最後快照 {info['time']}"
+    else:
+        stamp = f"{_md(info['date'])} 收盤" + _latest_hint(info)
+    return {"sector_groups": {
+        "title": f"{'今日最弱族群' if weak else '今日族群排行'} TOP{len(rows)}",
+        "stamp": stamp,
+        "subtitle": "", "note": "", "banner": banner, "style": "v3",
+        "leader_label": "領跌" if weak else "領漲", "limit_label": "跌停" if weak else "漲停",
+        "lag_label": "抗跌" if weak else "落後", "extreme_label": "平均距低點" if weak else "平均距高點",
+        "heat_label": "估計成交額" if info["live"] else "成交額", "live": bool(info["live"]),
+        "m5_ready": bool(info["live"] and tape.get("state") in ("ok", "stale")),
+        "time": info.get("time", ""), "direction": "weak" if weak else "strong",
+        # 10-27：主數字＝等權平均；摘要行顯示上漲比例＋中位數（同步程度），灰字顯示比大盤、有效／成分檔數
+        "rows": rows, "sync_info": True,
+    }}
+
+
+def _head_tail(stocks: List[Any], tail: int = 2) -> List[Any]:
+    """太長時保留前 STOCK_LIST − tail 檔與最後 tail 檔（圖卡的領漲取頭、落後取尾）。"""
+    if len(stocks) <= STOCK_LIST:
+        return stocks
+    return stocks[:STOCK_LIST - tail] + stocks[-tail:]
+
+
+def _panel_rows(board: List[Dict[str, Any]], names: Dict[str, str], weak: bool) -> List[Dict[str, Any]]:
+    return [{
         "rank": row["rank"], "name": row["name"], "avg": round(row["avg"], 2), "median": round(row["median"], 2),
         "up": row.get("up_count", 0), "valid": row["valid"], "liquid": row["liquid"], "members": row["members"],
         "rel": round(row["rel"], 2) if row.get("rel") is not None else None,
@@ -717,28 +879,14 @@ def panel(data: Dict[str, Any], names: Optional[Dict[str, str]] = None) -> Dict[
         "from_extreme": (round(row[("from_low" if weak else "from_high")], 2)
                          if row.get("from_low" if weak else "from_high") is not None else None),
         # 同族群全部有效股（強榜由強到弱、弱榜由弱到強），給「落後補漲」參考；10-25 第 5 欄加代號
-        "stocks": [(names.get(s["code"], s["code"]), round(s["change_pct"], 2), s["state"],
-                    round(s["heat"], 1) if s.get("heat") is not None else None, s["code"])
-                   for s in (list(reversed(row.get("stocks") or [])) if weak else (row.get("stocks") or []))][:STOCK_LIST],
+        # 10-27 修：原本先截前 12 檔，圖卡再取最後 2 檔當「落後」→ 拿到的是第 11、12 強（機器人落後 +4.32% 的錯）。
+        # 改成保留頭尾：最強的幾檔＋真正最後 2 檔
+        "stocks": _head_tail([(names.get(s["code"], s["code"]), round(s["change_pct"], 2), s["state"],
+                               round(s["heat"], 1) if s.get("heat") is not None else None, s["code"])
+                              for s in (list(reversed(row.get("stocks") or [])) if weak else (row.get("stocks") or []))]),
         "m5": round(row["m5"], 2) if row.get("m5") is not None else None,
-    } for row in data["rows"]]
-    tape = info.get("tape") or {}
-    # 10-25 v3：說明與門檻只寫 Log；圖上只剩標題、時間、必要狀態（近 5 分累積中／資料過期）
-    banner = ""
-    if info["live"] and tape.get("state") == "stale":
-        banner = f"行情 {int((tape.get('age') or 0) // 60)} 分鐘未更新，以下是 {tape.get('time', '')} 的資料。"
-    elif info["live"] and tape.get("state") in ("warming", "none"):
-        banner = "剛開始取樣，近5分資料累積中，先顯示今日累計排行。"
-    return {"sector_groups": {
-        "title": f"{'今日最弱族群' if weak else '今日族群排行'} TOP{len(rows)}",
-        "stamp": f"截至 {info['time']}" if info["live"] else f"{_md(info['date'])} 收盤" + _latest_hint(info),
-        "subtitle": "", "note": "", "banner": banner, "style": "v3",
-        "leader_label": "領跌" if weak else "領漲", "limit_label": "跌停" if weak else "漲停",
-        "lag_label": "抗跌" if weak else "落後", "extreme_label": "離低點" if weak else "離高點",
-        "heat_label": "估計成交額" if info["live"] else "成交額", "live": bool(info["live"]),
-        "m5_ready": bool(info["live"] and tape.get("state") in ("ok", "stale")),
-        "time": info.get("time", ""), "direction": "weak" if weak else "strong", "rows": rows,
-    }}
+        "up_ratio": round(row.get("up_ratio", 0), 3),
+    } for row in board]
 
 
 def follow_card_panel(data: Dict[str, Any], names: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
@@ -755,7 +903,7 @@ def follow_card_panel(data: Dict[str, Any], names: Optional[Dict[str, str]] = No
         items = [dict(p, name=names.get(p["code"], p["code"]),
                       **{k: round(p[k], 2) for k in ("price", "day", "lag", "m5", "beat")},
                       ratio=round(p["ratio"], 1) if p.get("ratio") is not None else None,
-                      vol5=int(round(p["vol5"] or 0)), bars=[int(round(b)) for b in p["bars"]],
+                      vol5=int(round(p["vol5"] or 0)), bars=[int(round(b)) if b is not None else None for b in p["bars"]],
                       value5_text=_value_text(p.get("value5")))
                  for p in follow(data)]
         if not items:

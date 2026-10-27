@@ -3016,10 +3016,17 @@ def _gr3_stock_units(label: str, stocks: list) -> list:
 def _gr3_lines(row: dict, data: dict, inner: float) -> tuple:
     """回傳 (摘要行, 領漲行, 落後行, 灰字)。"""
     weak = data.get('direction') == 'weak'
-    stats = [[('上漲 ', MUTED, False), (f"{row.get('up', 0)}/{row.get('valid', 0)}", INK, True), ('　', INK, False)]]
+    sync = bool(data.get('sync_info'))
+    up, valid = int(row.get('up', 0) or 0), int(row.get('valid', 0) or 0)
+    ratio = f"（{up / valid * 100:.0f}%）" if sync and valid else ''
+    stats = [[('上漲 ', MUTED, False), (f"{up}/{valid}{ratio}", INK, True), ('　', INK, False)]]
     rel = _finite(row.get('rel'))
-    if rel is not None:
-        stats.append([('比大盤 ', MUTED, False), (f'{rel:+.2f}%', _signed_ink(rel), True), ('　', INK, False)])
+    med = _finite(row.get('median'))
+    if sync and med is not None:
+        # 10-27：主數字是等權平均；這一行放上漲比例＋中位數，看整群是否同步（平均高、中位數低＝漲勢集中在少數幾檔）
+        stats.append([('中位數 ', MUTED, False), (f'{med:+.2f}%', _signed_ink(med), True), ('　', INK, False)])
+    elif rel is not None:
+        stats.append([('比股票池 ', MUTED, False), (f'{rel:+.2f}%', _signed_ink(rel), True), ('　', INK, False)])
     if data.get('live'):
         m5 = _finite(row.get('m5'))
         stats.append([('近5分 ', MUTED, False), (f'{m5:+.2f}%', _signed_ink(m5), True) if m5 is not None
@@ -3029,15 +3036,20 @@ def _gr3_lines(row: dict, data: dict, inner: float) -> tuple:
     tail = [s for s in stocks[-GR_TAIL:] if s not in head] if len(stocks) > GR_HEAD else []
     lead = _gr_flow(_gr3_stock_units(str(data.get('leader_label') or '領漲'), head), inner, GR_BODY) if head else []
     lag = _gr_flow(_gr3_stock_units(str(data.get('lag_label') or '落後'), tail), inner, GR_BODY) if tail else []
-    med = _finite(row.get('median'))
-    meta = [f'中位數 {med:+.2f}%' if med is not None else '']
+    if sync:
+        # 10-27 審核正名：比較對象是追蹤股票池（不是加權指數）→「比股票池」；平均 − 股票池平均，和主數字同一口徑。
+        # 有效／成分＝有實際成交價、通過流動性的檔數／名單候選檔數（已扣 excluded）
+        meta = [f'比股票池 {rel:+.2f}%' if rel is not None else '',
+                f"有效 {valid}／成分 {int(row.get('members') or valid)} 檔"]
+    else:
+        meta = [f'中位數 {med:+.2f}%' if med is not None else '']
     heat = _finite(row.get('heat'))
     if data.get('live'):
         extreme = _finite(row.get('from_extreme'))
         if extreme is not None and row.get('live_fields'):
             meta.append(f"{data.get('extreme_label') or ('離低點' if weak else '離高點')} {extreme:+.2f}%")
         if heat is not None:
-            meta.append(f'量能達日均 {heat * 100:.0f}%')
+            meta.append(f'估計成交額達日均 {heat * 100:.0f}%')
     else:
         if heat is not None:
             meta.append(f'量能 {heat:.1f} 倍')
@@ -4519,6 +4531,14 @@ def render_answer(question: str, answer: str, panels: list[dict] | None = None,
     if debug_panel is not None:
         from kline_debug import render
         return render(debug_panel)
+    fib_panel = next((p.get("fib_debug") for p in panels if p.get("fib_debug")), None)
+    if fib_panel is not None:   # 10-27 測試版：費波驗證圖
+        from fib_debug import render as fib_render
+        return fib_render(fib_panel)
+    cdp_panel = next((p.get("cdp_debug") for p in panels if p.get("cdp_debug")), None)
+    if cdp_panel is not None:   # 10-27 測試版：CDP 驗證圖
+        from cdp_debug import render as cdp_render
+        return cdp_render(cdp_panel)
     # 族群排行／成分股：整張用卡片呈現，不再另外排文字區塊（文字版只留給 Log）。
     sector_panels = [p for p in panels if _is_sector_panel(p)]
     article_panels = [p for p in panels if _is_article_panel(p)]

@@ -554,10 +554,22 @@ def liquidity_map(days: int = 20) -> Dict[str, Dict[str, float]]:
             for code, lots, value, count in rows}
 
 
-def liquidity_before(day: str, days: int = 20) -> Dict[str, Dict[str, float]]:
+def liquidity_before(day: str, days: int = 20, sessions: Optional[List[str]] = None) -> Dict[str, Dict[str, float]]:
     """只用 day 之前的 N 個交易日：平均成交金額（元）與前一交易日成交金額（元）。
-    10-24 今日族群排行用：盤前就能決定的名單，盤中、收盤後重算都一樣（不吃到當天的 K 棒）。"""
-    dates = [d for d in known_dates(limit=max(1, int(days)) + 5) if d < str(day)][:max(1, int(days))]
+    10-24 今日族群排行用：盤前就能決定的名單，盤中、收盤後重算都一樣（不吃到當天的 K 棒）。
+    10-27 審核：只讀已確認（confirmed=1）的日 K；sessions（官方交易日，新到舊）有給就照它算，
+    不用底庫剛好存在的日期（底庫缺 10/26 時不能把 10/22 當成前一交易日）。
+    成交金額是「收盤價 × 成交股數」估計值，不是官方成交金額。"""
+    if sessions:
+        dates = sorted((d for d in sessions if d < str(day)), reverse=True)[:max(1, int(days))]
+    else:
+        try:
+            with _db() as conn:
+                dates = [str(r[0]) for r in conn.execute(
+                    "SELECT date FROM daily_bars WHERE confirmed=1 AND date<? GROUP BY date ORDER BY date DESC LIMIT ?",
+                    (str(day), max(1, int(days)))).fetchall()]
+        except Exception:
+            return {}
     if not dates:
         return {}
     marks = ",".join("?" * len(dates))
@@ -567,7 +579,7 @@ def liquidity_before(day: str, days: int = 20) -> Dict[str, Dict[str, float]]:
                 rows = conn.execute(
                     f"""SELECT stock_code, AVG(volume*close), COUNT(*),
                                SUM(CASE WHEN date=? THEN volume*close ELSE 0 END)
-                        FROM daily_bars WHERE date IN ({marks}) GROUP BY stock_code""",
+                        FROM daily_bars WHERE confirmed=1 AND date IN ({marks}) GROUP BY stock_code""",
                     [dates[0], *dates]).fetchall()
     except Exception:
         return {}

@@ -109,10 +109,14 @@ def member_version() -> str:
 
 
 def member_state(group: Dict[str, Any], code: str) -> str:
-    """試行族群的成分股狀態：confirmed／pending／excluded；非試行族群一律視為 confirmed。"""
+    """試行族群的成分股狀態：confirmed／pending／excluded；非試行族群沒寫狀態的視為 confirmed。
+    10-27 審核：明確標 excluded 的一律排除（試行結束、trial 改成 false 時，之前排除的股票不能自動回來）。"""
+    state = str(((group.get("status") or {}).get(str(code)) or {}).get("state") or "")
+    if state == "excluded":
+        return "excluded"
     if not group.get("trial"):
         return "confirmed"
-    return str(((group.get("status") or {}).get(str(code)) or {}).get("state") or "pending")
+    return state or "pending"
 
 
 def member_codes(name: str, confirmed_only: bool = False) -> List[str]:

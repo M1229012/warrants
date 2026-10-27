@@ -55,6 +55,8 @@ import numpy as np
 
 import sector_match
 import kline_debug
+import fib_debug
+import cdp_debug
 import sector_radar
 import trade_review
 import review_language
@@ -740,6 +742,8 @@ ADMIN_HELP_GROUPS = (
                   "熱門股票今日／近7天", "大家都問什麼類型的問題", "統計診斷")),
     ("額度（/額度 指令）", ("贈送 AI 次數", "設定身分組每日 AI 次數", "清除身分組每日設定", "查詢某人／身分組額度")),
     ("型態驗證", ("型態驗證 2330（趨勢線、錨點、轉折確認日）", "型態驗證 2344 1608 2421（一次最多 10 檔，公開）", "圖片型態驗證（attachment 附股票清單截圖，最多 10 檔）")),
+    ("費波驗證（測試版）", ("費波驗證 2330（大波段錨點、回撤／延伸價位、共振）", "費波驗證 2344 1608（一次最多 10 檔，公開）")),
+    ("CDP 驗證（測試版）", ("CDP驗證 2330（逐日五價、觸及與收回統計）", "CDP驗證 2344 1608（一次最多 10 檔，公開）")),
     ("本週精選", ("本週精選排名", "3006 幫我生成週精選文字", "這版確認，生成圖片")),
     ("草稿", ("直接說修改需求", "還原上一版", "目前草稿")),
     ("資料維護", ("系統狀態", "記憶體明細（常駐記憶體花在哪）", "用量（含費用估算）", "錯誤紀錄", "更新市場底庫", "更新族群名冊", "匯出狀態／匯入狀態")),
@@ -5971,6 +5975,11 @@ class AceQueryEngine:
                 speed_text = str(exc)
             return AnswerResult(speed_text, 'admin_spot_speed', 0, time.perf_counter()-started,
                                 as_text=True, cacheable=False)
+        # 10-27 測試版：費波／CDP 驗證排在型態驗證前（「費波型態驗證」不能被型態驗證吃掉）
+        for module, label, route in ((fib_debug, "費波驗證", "admin_fib"), (cdp_debug, "CDP 驗證", "admin_cdp")):
+            if module.is_request(question):
+                return self._answer_level_debug(question, started, module=module, label=label, route=route,
+                                                is_admin=is_admin, admin_mode=admin_mode)
         if kline_debug.is_request(question) and (admin_mode or kline_debug._COMMAND.search(question) or re.search(r"驗證|核對|錨點|轉折確認", question)):
             return self._answer_kline_debug(question, started, is_admin=is_admin, admin_mode=admin_mode, image=image)
         if admin_mode:
@@ -6995,6 +7004,34 @@ class AceQueryEngine:
         first = results[0]
         first.gemini_calls = ocr_calls
         first.private_notice = notice
+        first.followups = list(first.followups) + results[1:]
+        return first
+
+    def _answer_level_debug(self, question: str, started: float, *, module, label: str, route: str,
+                            is_admin: bool, admin_mode: bool) -> AnswerResult:
+        """10-27 測試版：費波／CDP 驗證圖，權限與可見性比照型態驗證；價位全部來自程式同次計算，不用 AI。"""
+        access = self._access()
+        if not (is_admin and admin_mode and access is not None and access.admin_mode and not access.simulation):
+            return AnswerResult(text=f"{label}僅限管理員透過 /ace 使用。", route=route + "_denied",
+                                gemini_calls=0, elapsed=time.perf_counter()-started, as_text=True)
+        try:
+            codes = module.parse_codes(question)
+        except Exception as exc:
+            return AnswerResult(text=f"{label}未完成：" + tools.err_text(exc), route=route + "_error",
+                                gemini_calls=0, elapsed=time.perf_counter()-started, cacheable=False, as_text=True)
+        results = []
+        for code in codes:
+            try:
+                __import__("request_runtime").check_budget(IMAGE_RESERVE_SECONDS)
+                panel = module.load_panel(code)
+                results.append(AnswerResult(text=f"管理員{label}：沿用程式計算的價位；未使用 AI。",
+                                            route=route + "_debug", gemini_calls=0, elapsed=time.perf_counter()-started,
+                                            panels=[panel], cacheable=False, image_title=f"{code}｜{label}"))
+            except Exception as exc:
+                self.log(f"{label}未完成｜{code}｜{tools.err_text(exc)}")
+                results.append(AnswerResult(text=f"{code} {label}未完成：" + tools.err_text(exc), route=route + "_error",
+                                            gemini_calls=0, elapsed=time.perf_counter()-started, cacheable=False, as_text=True))
+        first = results[0]
         first.followups = list(first.followups) + results[1:]
         return first
 
@@ -9318,7 +9355,7 @@ def schedule_late_ai_image(engine, original, target, make_files, no_mentions):
 
 
 PUBLIC_ANSWER_ROUTES = frozenset(("planner", "answer_cache"))
-PUBLIC_ADMIN_ROUTES = frozenset(("admin_kline_debug",))
+PUBLIC_ADMIN_ROUTES = frozenset(("admin_kline_debug", "admin_fib_debug", "admin_cdp_debug"))
 # /ace 管理指令字眼：含內部狀態、路徑、快取、筆數、log 的回覆一開始就 ephemeral defer。
 _ADMIN_PRIVATE_RE = re.compile(r"錯誤|ERROR|狀態|用量|使用量|USAGE|底庫|名冊|維護|DEBUG|LOG|日誌|快取|CACHE|草稿|說明|HELP|指令|記憶體", re.IGNORECASE)
 
@@ -9340,7 +9377,9 @@ def is_public_answer(result) -> bool:
 
 def followup_ephemeral(result, *, ephemeral=False) -> bool:
     """型態驗證逐張決定可見性；其他後續回覆保留原設定。"""
-    if result.route in PUBLIC_ADMIN_ROUTES or result.route in ("admin_kline_error", "admin_kline_denied"):
+    if result.route in PUBLIC_ADMIN_ROUTES or result.route in ("admin_kline_error", "admin_kline_denied",
+                                                               "admin_fib_error", "admin_fib_denied",
+                                                               "admin_cdp_error", "admin_cdp_denied"):
         return bool(ephemeral or not is_public_answer(result))
     return bool(ephemeral)
 
@@ -9836,9 +9875,18 @@ INTRADAY_SAMPLE_SECONDS = 300             # 盤中量能基準籃子取樣間隔
 
 
 def _sector_tape_gate() -> bool:
-    """族群排行快照要不要拍：盤中＋取樣開著（按需模式＝被問到後 2 小時）。背景執行緒用管理員報價權限判斷。"""
+    """族群排行快照要不要拍：盤中一律拍（10-27 使用者要求開盤就自動抓，不等有人問；測試版省錢開關也不影響）。
+    背景執行緒用管理員報價權限判斷。"""
     with tools.quote_policy(admin_live=True):
-        return sector_radar.session_open(tools.taipei_now()) and on_demand.radar_awake()
+        now = tools.taipei_now()
+        if not sector_radar.session_open(now):
+            return False
+    # 10-27 審核：官方交易日曆確認今天休市（元旦、颱風假已公告等）就不取樣；日曆沒涵蓋今天時照平日判斷
+    try:
+        day = now.strftime("%Y-%m-%d")
+        return local_market_cache.market_sessions_between(day, day) != []
+    except Exception:
+        return True
 
 
 def _intraday_sampling_loop(stop: threading.Event) -> None:

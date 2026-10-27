@@ -1,6 +1,6 @@
 {
  "_note": "會員族群唯一來源（10-24）。source=own 為使用者自訂（concept_ui.py），source=cmoney 為 CMoney 名冊 2026-09-20 快照。family 相同的族群在「哪個族群最強」排行只取最強一個（只在顯示時去重）。建議每季檢查一次。trial=true 的族群成分股查證未完成：status.state＝confirmed（有公開證據顯示產業關聯，不代表營收占比高）／pending（待查，仍納入計算）／excluded（查證後排除，需寫 reason 與適用範圍，不納入計算）。",
- "version": "2026-10-27.2",
+ "version": "2026-10-27.3",
  "groups": {
   "AI伺服器ODM": {
    "key": "AI_ODM",
@@ -2735,7 +2735,11 @@
    "aliases": [
     "資訊服務",
     "IT_SERVICE",
-    "系統整合"
+    "系統整合",
+    "軟體",
+    "軟體股",
+    "軟體服務",
+    "資訊軟體"
    ],
    "stocks": [
     [

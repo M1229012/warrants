@@ -109,8 +109,9 @@ def latest() -> Optional[Tuple[float, str, Dict[str, Dict[str, Any]]]]:
         return _SNAPS[-1] if _SNAPS else None
 
 
-def current(codes: List[str]) -> Optional[Tuple[float, Dict[str, Dict[str, Any]]]]:
-    """查詢用：最新快照不夠新（超過一個取樣間隔）就當場補拍；拍不到就回最後一張（由呼叫端判斷過期）。"""
+def current(codes: List[str], max_age: float = STALE_SECONDS) -> Optional[Tuple[float, Dict[str, Dict[str, Any]]]]:
+    """查詢用：最新快照不夠新（超過一個取樣間隔）就當場補拍；拍不到就回最後一張（由呼叫端判斷過期）。
+    max_age：每檔報價最多可以多舊（盤中 180 秒；收盤後找最後一張快照時放寬，並由呼叫端標「最後快照」）。"""
     last = latest()
     if not last or last[1] != _day() or _now_ts() - last[0] > TAPE_SECONDS * 1.5:
         try:
@@ -120,21 +121,21 @@ def current(codes: List[str]) -> Optional[Tuple[float, Dict[str, Dict[str, Any]]
         last = latest()
     if not last or last[1] != _day():
         return None
-    return last[0], merged()[1]
+    return last[0], merged(max_age)[1]
 
 
-def merged(max_age: float = STALE_SECONDS) -> Tuple[Dict[str, float], Dict[str, Dict[str, Any]]]:
-    """10-27：每檔取最近 max_age 秒內最新的一筆（某張快照漏抓的股票用前幾張補上，不會整檔消失）。
-    回傳 ({代號: 該筆時間戳}, {代號: 報價})。"""
+def merged(max_age: float = STALE_SECONDS, now_ts: Optional[float] = None) -> Tuple[Dict[str, float], Dict[str, Dict[str, Any]]]:
+    """每檔取最新一筆，某張快照漏抓的股票用前幾張補上，不會整檔消失。回傳 ({代號: 該筆時間戳}, {代號: 報價})。
+    10-27 審核：新鮮度以「現在時間」逐檔判斷（原本相對最新快照再疊加整批容忍，A 已 350 秒沒更新仍算有效）。"""
     with _LOCK:
         snaps = list(_SNAPS)
     if not snaps:
         return {}, {}
-    newest = snaps[-1][0]
+    cutoff = (now_ts if now_ts is not None else _now_ts()) - max_age
     stamps: Dict[str, float] = {}
     out: Dict[str, Dict[str, Any]] = {}
     for ts, day, quotes in reversed(snaps):
-        if day != snaps[-1][1] or newest - ts > max_age:
+        if day != snaps[-1][1] or ts < cutoff:
             break
         for code, q in quotes.items():
             if code not in out:
@@ -142,8 +143,34 @@ def merged(max_age: float = STALE_SECONDS) -> Tuple[Dict[str, float], Dict[str, 
     return stamps, out
 
 
-def _quote_before(code: str, target: float) -> Optional[Dict[str, Any]]:
-    """這一檔在時間 ≤ target 的最後一筆，且不早於 target − TOLERANCE（中間漏抓的快照會往前找）。"""
+def trade_price(q: Optional[Dict[str, Any]]) -> Optional[float]:
+    """實際成交價：MIS 的 z／pz（trade_price）；舊格式只有 price 時，traded=True 才代表 price 是成交價。
+    五檔中價、單邊掛單價一律不算（10-27 審核：買 108／賣 110 的中價 109 曾被算成 +9%）。"""
+    if not q:
+        return None
+    value = float(q.get("trade_price") or 0)
+    if value > 0:
+        return value
+    if "trade_price" not in q and q.get("traded") and float(q.get("price") or 0) > 0:
+        return float(q["price"])
+    return None
+
+
+def last_trade(code: str, max_age: float = KEEP_SECONDS) -> Optional[Tuple[float, float]]:
+    """這一檔今天最近一次的實際成交價（價格, 觀測時間）；超過 max_age 秒或今天沒有就回 None。"""
+    cutoff, day = _now_ts() - max_age, _day()
+    with _LOCK:
+        for ts, snap_day, quotes in reversed(_SNAPS):
+            if snap_day != day or ts < cutoff:
+                return None
+            price = trade_price(quotes.get(code))
+            if price:
+                return price, ts
+    return None
+
+
+def _quote_before(code: str, target: float) -> Optional[Tuple[float, Dict[str, Any]]]:
+    """這一檔在時間 ≤ target 的最後一筆（觀測時間, 報價），且不早於 target − TOLERANCE。"""
     with _LOCK:
         for ts, _, quotes in reversed(_SNAPS):
             if ts > target + 1:
@@ -151,7 +178,7 @@ def _quote_before(code: str, target: float) -> Optional[Dict[str, Any]]:
             if ts < target - TOLERANCE:
                 return None
             if code in quotes:
-                return quotes[code]
+                return ts, quotes[code]
     return None
 
 
@@ -174,35 +201,67 @@ def status(now_ts: Optional[float] = None) -> Dict[str, Any]:
             "follow_ready": span >= follow_need, "follow_at": clock(first + follow_need)}
 
 
+M5_MIN, M5_MAX = 240.0, 420.0          # 「近 5 分」實際區間要落在 4～7 分鐘，否則不算
+MIN_SEGMENT = 120.0                    # 量的每一段至少 2 分鐘（太短的一段量速雜訊太大）
+
+
 def moves(codes: List[str]) -> Dict[str, Dict[str, Any]]:
-    """每檔：m5＝近 5 分漲跌%；vol5＝近 5 分成交張數；ratio＝近段量增（前三段平均為 0 或資料不足＝None）；
-    bars＝最近三段 5 分鐘量（舊→新）。沒有 5 分鐘前快照的股票不列入。"""
-    stamps, now = merged()
+    """每檔：m5＝近 5 分漲跌%（實際成交價、實際區間 4～7 分鐘，否則 None）；
+    vol5＝近 5 分成交張數（換算成 300 秒）；ratio＝近段量增；bars＝最近三段 5 分鐘量（舊→新，缺資料＝None）。
+    10-27 審核修正：
+    - 所有股票用同一組目標時點（以整體最新快照往回 5／10／15／20 分），不再各自從自己的最新時間往回算
+    - 量增改用「每秒成交量」比較，區間不等長（例如 7 分鐘對 3 分鐘）也不會算出假放量
+    - 累積量變少（負差）＝資料異常 → 量增 None；缺段留 None，不當成 0 張
+    沒有 5 分鐘前快照的股票不列入。"""
+    last = latest()
+    if not last:
+        return {}
+    anchor = last[0]
+    stamps, now = merged(now_ts=anchor)          # 價量形狀以最新快照為準；報價本身新不新鮮由排行的 quotes() 把關
     out: Dict[str, Dict[str, Any]] = {}
     for code in codes:
         q = now.get(code)
         if not q:
             continue
-        # 以這一檔自己最新那筆的時間往回推（每檔抓到的時間可能差一兩張快照）
-        marks = [_quote_before(code, stamps[code] - WINDOW * i) for i in range(1, SEGMENTS + 2)]   # −5、−10、−15、−20 分
-        before = marks[0]
-        if not before or not float(before.get("price") or 0):
+        marks = [_quote_before(code, anchor - WINDOW * i) for i in range(1, SEGMENTS + 2)]   # −5、−10、−15、−20 分
+        if not marks[0]:
             continue
-        m5 = (float(q["price"]) / float(before["price"]) - 1) * 100
-        lots = [float(q.get("lots") or 0)] + [float(m.get("lots") or 0) if m else None for m in marks]
-        segs = [lots[i] - lots[i + 1] if lots[i] is not None and lots[i + 1] is not None else None
-                for i in range(len(lots) - 1)]                                    # [近5分, 前一段, 前二段, 前三段]
-        vol5 = max(0.0, segs[0]) if segs[0] is not None else None
-        prev = [max(0.0, s) for s in segs[1:] if s is not None]
-        ratio = (vol5 / (sum(prev) / len(prev))) if vol5 is not None and len(prev) == SEGMENTS and sum(prev) > 0 else None
-        bars = [max(0.0, s) if s is not None else 0.0 for s in reversed(segs[:3])]
-        out[code] = {"m5": m5, "vol5": vol5, "ratio": ratio, "bars": bars}
+        points = [(stamps[code], q)] + [m for m in marks]
+        price_now, (t1, before) = trade_price(q), marks[0]
+        price_before = trade_price(before)
+        span = stamps[code] - t1
+        m5 = ((price_now / price_before - 1) * 100
+              if price_now and price_before and M5_MIN <= span <= M5_MAX else None)
+        rates: List[Optional[float]] = []
+        segs: List[Optional[float]] = []
+        anomaly = False
+        for i in range(SEGMENTS + 1):
+            a, b = points[i], points[i + 1]
+            if not a or not b:
+                rates.append(None)
+                segs.append(None)
+                continue
+            seconds = a[0] - b[0]
+            diff = float(a[1].get("lots") or 0) - float(b[1].get("lots") or 0)
+            if diff < 0:
+                anomaly = True
+            if seconds < MIN_SEGMENT or diff < 0:
+                rates.append(None)
+                segs.append(None)
+                continue
+            rates.append(diff / seconds)
+            segs.append(diff * WINDOW / seconds)                 # 換算成 5 分鐘的張數，三根量柱才可比較
+        prev = [r for r in rates[1:] if r is not None]
+        ratio = (rates[0] / (sum(prev) / len(prev))
+                 if not anomaly and rates[0] is not None and len(prev) == SEGMENTS and sum(prev) > 0 else None)
+        bars = list(reversed(segs[:3]))
+        out[code] = {"m5": m5, "vol5": segs[0], "ratio": ratio, "bars": bars, "anomaly": anomaly}
     return out
 
 
 def group_m5(codes: List[str], stock_moves: Dict[str, Dict[str, Any]]) -> Optional[float]:
     """族群近 5 分＝成分股近 5 分的等權平均；有資料的不到 80% 就不算。"""
-    values = [stock_moves[c]["m5"] for c in codes if c in stock_moves]
+    values = [stock_moves[c]["m5"] for c in codes if c in stock_moves and stock_moves[c].get("m5") is not None]
     if not codes or len(values) < len(codes) * MIN_COVERAGE:
         return None
     return sum(values) / len(values)

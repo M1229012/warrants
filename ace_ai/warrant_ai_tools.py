@@ -2062,10 +2062,11 @@ def fetch_index_quote(code: str) -> Dict[str, Any]:
 
 
 def mis_item_is_today(item: Dict[str, Any], now: Optional[datetime] = None) -> bool:
-    """MIS 每筆報價的 d（YYYYMMDD）要是今天；帶了日期但不是今天＝前一交易日資料。沒帶日期時無法判斷，不擋。"""
+    """MIS 每筆報價的 d（YYYYMMDD）要是今天；帶了日期但不是今天＝前一交易日資料。
+    10-27 審核：沒帶日期＝無法證明是今天的資料，不當成今天（原本直接放行）。"""
     day = str((item or {}).get("d") or "").strip()
     if not day:
-        return True
+        return False
     return day == (now or taipei_now()).strftime("%Y%m%d")
 
 

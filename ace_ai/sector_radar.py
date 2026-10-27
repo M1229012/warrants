@@ -614,6 +614,10 @@ def _fetch_batch(session, codes: List[str]) -> Dict[str, Dict[str, Any]]:
                 no_trade.add(code)
         if code and price > 0 and previous > 0 and is_today:
             lots = _num_field(item, "v")                  # MIS 累計成交量（張）
+            # 10-27 審核：price 在沒有成交價時是五檔中價（族群雷達沿用）；族群排行只能用實際成交價 → 另存 trade_price。
+            # z＝本次成交價；pz＝前一筆成交價（MIS 有時 z 是「-」但 pz 有值）；兩者都沒有＝今天還沒有可用的成交價
+            z_price, pz_price = _num_field(item, "z"), _num_field(item, "pz")
+            trade_price = z_price if z_price > 0 else pz_price if pz_price > 0 else 0.0
             out[code] = {"name": str(item.get("n") or code), "price": price, "prev": previous,
                          "change_pct": round((price / previous - 1) * 100, 2),
                          "value": lots * 1000 * price,     # 成交金額近似值（MIS 沒有逐檔成交金額）
@@ -621,7 +625,9 @@ def _fetch_batch(session, codes: List[str]) -> Dict[str, Dict[str, Any]]:
                          "high": _num_field(item, "h"), "low": _num_field(item, "l"), "open": _num_field(item, "o"),
                          "limit_up": _num_field(item, "u"), "limit_down": _num_field(item, "w"),
                          "traded": _num_field(item, "z") > 0,
-                         "lots": lots}                     # 10-25：族群排行 v2 算近 5 分量（累計張數相減）
+                         "lots": lots,                     # 10-25：族群排行 v2 算近 5 分量（累計張數相減）
+                         "trade_price": trade_price,       # 10-27：實際成交價（0＝未知）
+                         "trade_time": str(item.get("t") or ""), "exchange_date": str(item.get("d") or "")}
     with _HTTP_LOCK:
         _BATCH_STATS["today"].update(today)
         _BATCH_STATS["no_trade"].update(no_trade)
