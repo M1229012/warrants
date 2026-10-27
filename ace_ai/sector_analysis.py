@@ -100,13 +100,15 @@ def detect_request(question: str) -> Optional[Dict[str, str]]:
         return request
 
     # 全市場族群排行：問的是「所有族群」，句子裡不能還留著某個特定族群名稱。
-    market_residual = _residual(question, r"整體|全部|所有|市場|台股|現在|目前|今天|最大|最多|最高|比較|的|所|些|個|強|弱|好|差|誰")
+    # 10-24：最弱／跌最多與「為什麼漲（跌）」也算全市場族群排行；方向與要不要原因交給 AI 讀整句（member_sector_rank.read_intent）
+    market_residual = _residual(question, r"整體|全部|所有|市場|台股|現在|目前|今天|最大|最多|最高|最低|比較|的|所|些|個|強|弱|好|差|慘|誰"
+                                          r"|跌|漲|為什麼|為何|原因|因為|是|在|了|呢|嗎")
     if (re.search(r"族群|類股|產業", text) and not market_residual
-            and re.search(r"最強|最好|最弱|排行|排名|轉強|轉弱|結構|強勢|較強|強的|弱的|漲幅|漲最|最大", text)):
+            and re.search(r"最強|最好|最弱|最差|最慘|排行|排名|轉強|轉弱|結構|強勢|較強|強的|弱的|漲幅|漲最|跌幅|跌最|最大", text)):
         # 預設＝漲跌幅排行（盤中即時、收盤後用最新日）；明講型態／結構／技術才走型態排行
         if re.search(r"型態|結構|技術|線型|趨勢", text):
             return {"mode": "market_technical", "industry": "", "name": "全市場族群"}
-        return {"mode": "market_momentum", "industry": "", "name": "全市場族群"}
+        return {"mode": "market_momentum", "industry": "", "name": "全市場族群", "question": question}
 
     # 族群清單放到最後判斷：句子裡不能有排行字眼，也不能還留著一個沒對到的族群名稱
     # （「火箭燃料族群有哪些股票」要回查不到，不是丟出整份清單）。
@@ -121,9 +123,27 @@ def detect_request(question: str) -> Optional[Dict[str, str]]:
         topic = sector_match.core_topic(question) or question
         near = sector_match.suggest(question)
         tail = ("相近的有：" + "、".join(near)) if near else "可以輸入「族群清單」看看目前有哪些族群。"
-        return {"mode": "unsupported", "industry": "", "name": topic,
+        # 10-27：規則讀不懂（例如「族群現在誰比較猛」）不直接回查不到；ai_retry＝先讓 AI 讀整句，
+        # AI 判斷是在問全市場族群排行就改走排行，真的是沒收錄的族群才用這段訊息
+        return {"mode": "unsupported", "industry": "", "name": topic, "ai_retry": True,
                 "message": f"查不到「{topic}」這個族群。{tail}"}
     return None
+
+
+# AI 分類回來的 target 只是泛稱（族群、類股、題材…）＝沒有指定哪個族群，是在問全市場
+_GENERIC_TARGET_RE = re.compile(r"^(?:全部|所有|整體|全市場|市場|台股|盤面|今天|今日|現在|目前)*(?:的)?"
+                                r"(?:族群|類股|產業|題材|概念股|板塊|類別|資金)?$")
+
+
+def market_request_from_ai(question: str, action: str, target: str) -> Optional[Dict[str, str]]:
+    """AI 分類為 subject=sector、但沒指定特定族群時，依 action 對到全市場族群功能；有指定具體族群名稱回 None。"""
+    if not _GENERIC_TARGET_RE.match(sector_match.normalize(str(target or "")).strip()):
+        return None
+    if action == "members":
+        return {"mode": "catalog", "industry": "", "name": "產業分類"}
+    if action == "pattern":
+        return {"mode": "market_technical", "industry": "", "name": "全市場族群"}
+    return {"mode": "market_momentum", "industry": "", "name": "全市場族群", "question": question}
 
 
 def mode_from_text(text: str, default: str = "technical") -> str:
@@ -870,13 +890,13 @@ def _intraday_radar_answer() -> Optional[Dict[str, Any]]:
     return {"text": "\n".join(lines), "calls": 0, "cacheable": False, "panels": [panel]}
 
 
-def _market_radar_answer(mode: str) -> Dict[str, Any]:
+def _market_radar_answer(mode: str, request: Optional[Dict[str, Any]] = None, gateway=None, validate=None) -> Dict[str, Any]:
     """全市場族群排行：盤中漲幅先用即時雷達，其餘一律用本地底庫，不為單一問題掃市場。"""
     if mode == "market_momentum" and sector_match.MEMBER_ONLY:
-        # 10-24：今日族群排行只用會員族群 JSON（等權平均＋中位數＋上漲比例＋相對基準＋標籤）
+        # 10-24：今日族群排行只用會員族群 JSON（TOP5、最強／最弱、問原因時附新聞解讀）
         import member_sector_rank
         try:
-            result = member_sector_rank.answer()
+            result = member_sector_rank.answer(str((request or {}).get("question") or ""), gateway, validate)
         except Exception as exc:
             print(f"⚠️ 今日族群排行失敗｜{tools.err_text(exc)}", flush=True)
             result = None
@@ -1197,7 +1217,7 @@ def answer(request: Dict[str, str], gateway, validate) -> Dict[str, Any]:
     if mode == "overview":
         return _overview_answer(request, gateway, validate)
     if mode in ("market_momentum", "market_technical"):
-        return _market_radar_answer(mode)
+        return _market_radar_answer(mode, request, gateway, validate)
     if mode == "catalog":
         return {"text": "", "calls": 0, "cacheable": True, "panels": [catalog_panel()]}
     if mode == "belongs":

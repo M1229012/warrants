@@ -628,8 +628,9 @@ def _fetch_batch(session, codes: List[str]) -> Dict[str, Dict[str, Any]]:
     return out
 
 
-def _fetch_stock_quotes(codes: List[str]) -> Dict[str, Dict[str, Any]]:
-    """批次報價＋完整率驗證：缺的用小批重試一次，仍缺就記下來（不猜、不補）。"""
+def _fetch_stock_quotes(codes: List[str], deadline_seconds: Optional[float] = None) -> Dict[str, Dict[str, Any]]:
+    """批次報價＋完整率驗證：缺的用小批重試一次，仍缺就記下來（不猜、不補）。
+    deadline_seconds：整次時限（預設 MEMBER_DEADLINE）；背景取樣不趕時間，可以給長一點，一次抓齊。"""
     if tools.closed_quotes_only():
         return {}
     try:
@@ -639,7 +640,7 @@ def _fetch_stock_quotes(codes: List[str]) -> Dict[str, Dict[str, Any]]:
         session = requests
     out: Dict[str, Dict[str, Any]] = {}
     began = time.perf_counter()
-    deadline = began + MEMBER_DEADLINE
+    deadline = began + (deadline_seconds or MEMBER_DEADLINE)
     with _HTTP_LOCK:
         sent_before = _HTTP_SENT[0]
         for bucket in _BATCH_STATS.values():

@@ -52,29 +52,56 @@ def record(quotes: Dict[str, Dict[str, Any]], ts: Optional[float] = None, day: O
         _SNAPS.append((ts, day, dict(quotes)))
 
 
-def _fetch(codes: List[str]) -> Dict[str, Dict[str, Any]]:
+# 10-27：MIS 常常 20 秒內只回一半（Log：766 檔只拿到 198～600 檔），背景取樣給長一點時限一次抓齊；
+# 查詢時補拍仍用 sector_radar 的 20 秒，避免整題逾時。
+BACKGROUND_DEADLINE = max(20.0, tools._env_float("DISCORD_AI_MEMBER_TAPE_DEADLINE", 50.0))
+
+
+def _fetch(codes: List[str], deadline: Optional[float] = None) -> Dict[str, Dict[str, Any]]:
     import sector_radar
-    return sector_radar._fetch_stock_quotes(list(codes))
+    return sector_radar._fetch_stock_quotes(list(codes), deadline)
 
 
 def sample(codes: Optional[List[str]] = None, force: bool = False) -> bool:
-    """拍一張快照（同一時間只有一個執行緒在抓；距離上一張不到 TAPE_SECONDS 就跳過）。回傳是否有新快照。"""
+    """拍一張快照（同一時間只有一個執行緒在抓；距離上一張不到 TAPE_SECONDS 就跳過）。回傳是否有新快照。
+    force＝查詢當下補拍（用短時限）；背景取樣用 BACKGROUND_DEADLINE。"""
     import member_sector_rank as rank
     if not rank._live_allowed():
         return False
-    with _FETCH_LOCK:
+    # 查詢補拍不排隊：背景正在抓（最多 50 秒）就直接用現有快照，避免整題逾時
+    if not _FETCH_LOCK.acquire(blocking=not force):
+        return False
+    try:
         last = latest()
-        if not force and last and _now_ts() - last[0] < TAPE_SECONDS - 5:
-            return False
+        if not force and last and _now_ts() - last[0] < 10:
+            return False                  # 剛被查詢補拍過；間隔由 run_loop 控制
+        if force and last and last[1] == _day() and _now_ts() - last[0] <= TAPE_SECONDS * 1.5:
+            return False                  # 背景剛拍好一張，直接用
         codes = sorted(codes if codes is not None else rank.liquid_pool())
         if not codes:
             return False
         began = time.perf_counter()
         with rank._live_scope():
-            quotes = _fetch(codes)
+            quotes = _fetch(codes, None if force else BACKGROUND_DEADLINE)
         record(quotes)
-        print(f"🎞️ 族群排行快照｜{len(quotes)}/{len(codes)} 檔｜{time.perf_counter() - began:.1f}s｜累積 {len(_SNAPS)} 張", flush=True)
+        print(f"🎞️ 族群排行快照｜{len(quotes)}/{len(codes)} 檔｜{time.perf_counter() - began:.1f}s｜累積 {len(_SNAPS)} 張"
+              f"｜{'查詢補拍' if force else '背景'}", flush=True)
         return bool(quotes)
+    finally:
+        _FETCH_LOCK.release()
+
+
+def run_loop(stop: threading.Event, gate) -> None:
+    """獨立執行緒：gate() 為真（盤中、取樣開著）時每 TAPE_SECONDS 秒拍一張；抓取時間算在間隔裡。"""
+    while not stop.is_set():
+        began = time.monotonic()
+        try:
+            if gate():
+                sample()
+        except Exception as exc:
+            print(f"⚠️ 族群排行快照略過｜{tools.err_text(exc)}", flush=True)
+        if stop.wait(max(5.0, TAPE_SECONDS - (time.monotonic() - began))):
+            break
 
 
 def latest() -> Optional[Tuple[float, str, Dict[str, Dict[str, Any]]]]:
@@ -93,15 +120,38 @@ def current(codes: List[str]) -> Optional[Tuple[float, Dict[str, Dict[str, Any]]
         last = latest()
     if not last or last[1] != _day():
         return None
-    return last[0], last[2]
+    return last[0], merged()[1]
 
 
-def _snap_before(target: float) -> Optional[Dict[str, Dict[str, Any]]]:
-    """時間 ≤ target 的最後一張，且不早於 target − TOLERANCE。"""
+def merged(max_age: float = STALE_SECONDS) -> Tuple[Dict[str, float], Dict[str, Dict[str, Any]]]:
+    """10-27：每檔取最近 max_age 秒內最新的一筆（某張快照漏抓的股票用前幾張補上，不會整檔消失）。
+    回傳 ({代號: 該筆時間戳}, {代號: 報價})。"""
+    with _LOCK:
+        snaps = list(_SNAPS)
+    if not snaps:
+        return {}, {}
+    newest = snaps[-1][0]
+    stamps: Dict[str, float] = {}
+    out: Dict[str, Dict[str, Any]] = {}
+    for ts, day, quotes in reversed(snaps):
+        if day != snaps[-1][1] or newest - ts > max_age:
+            break
+        for code, q in quotes.items():
+            if code not in out:
+                out[code], stamps[code] = q, ts
+    return stamps, out
+
+
+def _quote_before(code: str, target: float) -> Optional[Dict[str, Any]]:
+    """這一檔在時間 ≤ target 的最後一筆，且不早於 target − TOLERANCE（中間漏抓的快照會往前找）。"""
     with _LOCK:
         for ts, _, quotes in reversed(_SNAPS):
-            if ts <= target + 1:
-                return quotes if ts >= target - TOLERANCE else None
+            if ts > target + 1:
+                continue
+            if ts < target - TOLERANCE:
+                return None
+            if code in quotes:
+                return quotes[code]
     return None
 
 
@@ -127,19 +177,19 @@ def status(now_ts: Optional[float] = None) -> Dict[str, Any]:
 def moves(codes: List[str]) -> Dict[str, Dict[str, Any]]:
     """每檔：m5＝近 5 分漲跌%；vol5＝近 5 分成交張數；ratio＝近段量增（前三段平均為 0 或資料不足＝None）；
     bars＝最近三段 5 分鐘量（舊→新）。沒有 5 分鐘前快照的股票不列入。"""
-    last = latest()
-    if not last:
-        return {}
-    now_ts, _, now = last
-    marks = [_snap_before(now_ts - WINDOW * i) for i in range(1, SEGMENTS + 2)]      # −5、−10、−15、−20 分
+    stamps, now = merged()
     out: Dict[str, Dict[str, Any]] = {}
     for code in codes:
-        q, before = now.get(code), marks[0]
-        if not q or not before or code not in before or not float(before[code].get("price") or 0):
+        q = now.get(code)
+        if not q:
             continue
-        m5 = (float(q["price"]) / float(before[code]["price"]) - 1) * 100
-        lots = [float(q.get("lots") or 0)] + [float((m or {}).get(code, {}).get("lots") or 0) if m and code in m else None
-                                              for m in marks]
+        # 以這一檔自己最新那筆的時間往回推（每檔抓到的時間可能差一兩張快照）
+        marks = [_quote_before(code, stamps[code] - WINDOW * i) for i in range(1, SEGMENTS + 2)]   # −5、−10、−15、−20 分
+        before = marks[0]
+        if not before or not float(before.get("price") or 0):
+            continue
+        m5 = (float(q["price"]) / float(before["price"]) - 1) * 100
+        lots = [float(q.get("lots") or 0)] + [float(m.get("lots") or 0) if m else None for m in marks]
         segs = [lots[i] - lots[i + 1] if lots[i] is not None and lots[i + 1] is not None else None
                 for i in range(len(lots) - 1)]                                    # [近5分, 前一段, 前二段, 前三段]
         vol5 = max(0.0, segs[0]) if segs[0] is not None else None

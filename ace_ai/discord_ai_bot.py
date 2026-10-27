@@ -7953,6 +7953,8 @@ class AceQueryEngine:
                   "（pattern＝走勢／型態／技術面／能不能追／會不會跌、institutional＝外資投信自營商法人、futures＝台指期未平倉、"
                   "cost＝使用者講自己的成本、套牢、賠錢、還值得持有嗎、要不要賣、回本或進場理由；沒有成本數字也可選cost。股票諧音、玩笑、火箭、帶我飛、豁達等投資口語，若是在問這檔的好壞或走勢，選pattern，不能因為是玩笑就選none。無關股市的聊天仍選none。news＝消息題材新聞、price＝只問價格漲跌、chips＝分點籌碼主力、"
                   "compare＝比較兩檔、members＝族群成分股、rank＝排行、warrant_list＝問某分點（券商）買了哪些權證／權證代號）；"
+                  "問整個市場哪些族群／題材／產業／類股最強、最弱、在漲、在跌、資金跑去哪、誰在噴、為什麼漲跌，"
+                  "選 subject=sector、action=rank、target 空字串（沒有指定某個族群）；問特定族群就把族群名稱寫在 target；"
                   "target 寫問題裡提到的股票名稱或代號、或族群名稱，沒有就填空字串；"
                   "branch 寫問題裡提到的券商分點名稱（可能是簡稱，例如美好、元大南屯），沒有就填空字串。\n問題：" + question)
         result = self.gateway.generate(prompt, purpose="intent", schema=schema, temperature=0.0)
@@ -7984,6 +7986,13 @@ class AceQueryEngine:
             parsed.stocks = [("TAIEX", tools.INDEX_CODES["TAIEX"])]
             parsed.intents = set(parsed.intents) | {"index"}
             return self.router.plan(parsed, stats)
+        if subject == "sector":
+            # 10-27：沒指定族群（或只寫「族群」「題材」這種泛稱）＝全市場族群排行／清單，不靠固定問法
+            market = sector_analysis.market_request_from_ai(question, action, target)
+            if market:
+                parsed.sector = market
+                parsed.intents = set(parsed.intents) | {"sector"}
+                return QueryPlan(route="rule_sector")
         if subject == "sector" and target:
             hit = sector_match.match(target)
             if hit:
@@ -8141,7 +8150,16 @@ class AceQueryEngine:
 
         if plan.route == "rule_sector":
             access_policy.require_sector(self._access())
-            return self._answer_sector(parsed.sector, started)
+            if (parsed.sector or {}).get("mode") == "unsupported" and parsed.sector.get("ai_retry"):
+                # 10-27：規則看出在問族群但讀不懂 → 先讓 AI 讀整句（白話問法），AI 也判斷不了才回「查不到」
+                fallback = dict(parsed.sector)
+                retry = self._classify_fallback(question, parsed, stats)
+                if retry is None or retry.route != "rule_sector" or (parsed.sector or {}).get("mode") == "unsupported":
+                    parsed.sector = fallback
+                else:
+                    self.log(f"🧭 族群問句改由 AI 判斷｜{parsed.sector.get('mode')}｜{parsed.sector.get('name')}")
+            # 10-27：族群排行要靠原句判斷最強／最弱（之前沒帶問句，「族群最弱」被當成最強）
+            return self._answer_sector(dict(parsed.sector, question=parsed.sector.get("question") or question), started)
 
         pre_results: List[tools.ToolResult] = []
         if plan.route == "rule_top_warrant":
@@ -8518,7 +8536,12 @@ class AceQueryEngine:
         if request.get("mode") == "technical":
             request = dict(request, mode="overview")
         if on_demand.enabled():
-            on_demand.market_ready(budget_seconds=40.0, log=self.log)   # 按需模式：族群排行用的底庫補到最新
+            if request.get("mode") == "market_momentum" and sector_analysis.sector_match.MEMBER_ONLY:
+                # 10-27：今日族群排行只用盤中快照／最近收盤，不必等日 K 補齊；補資料丟背景，不再卡 40 秒（曾讓整題逾時）
+                threading.Thread(target=on_demand.market_ready, kwargs={"budget_seconds": 120.0, "log": self.log},
+                                 name="ace-market-ready", daemon=True).start()
+            else:
+                on_demand.market_ready(budget_seconds=40.0, log=self.log)   # 按需模式：族群排行用的底庫補到最新
             on_demand.wake_radar()
         result = sector_analysis.answer(request, self.gateway, validate)
         if request.get("matched_by"):
@@ -9812,6 +9835,12 @@ TODAY_SYNC_LAST_MINUTE = 21 * 60          # 21:00 後當天不再重試（休市
 INTRADAY_SAMPLE_SECONDS = 300             # 盤中量能基準籃子取樣間隔
 
 
+def _sector_tape_gate() -> bool:
+    """族群排行快照要不要拍：盤中＋取樣開著（按需模式＝被問到後 2 小時）。背景執行緒用管理員報價權限判斷。"""
+    with tools.quote_policy(admin_live=True):
+        return sector_radar.session_open(tools.taipei_now()) and on_demand.radar_awake()
+
+
 def _intraday_sampling_loop(stop: threading.Event) -> None:
     # 管理員雷達需要背景快照；/ask 在入口與資料工具仍禁止即時行情。
     with tools.quote_policy(admin_live=True):
@@ -9829,12 +9858,6 @@ def _intraday_sampling_loop_admin(stop: threading.Event) -> None:
                     sector_radar.tick()
                 except Exception as exc:
                     print(f"⚠️ 族群雷達快照略過｜{tools.err_text(exc)}", flush=True)
-                # 10-25 族群排行 v2：每 60 秒拍一張流動性名單報價（近 5 分、近段量增、跟漲觀察）
-                try:
-                    import member_sector_tape
-                    member_sector_tape.sample()
-                except Exception as exc:
-                    print(f"⚠️ 族群排行快照略過｜{tools.err_text(exc)}", flush=True)
                 if time.monotonic() - last_basket >= INTRADAY_SAMPLE_SECONDS:
                     last_basket = time.monotonic()
                     try:
@@ -10222,6 +10245,10 @@ def run_discord_bot(config: BotConfig) -> None:
                 threading.Thread(target=_tpex_institutional_loop, args=(usage_stop,), name="ace-tpex-inst", daemon=True).start()
             # 盤中取樣：背景開著一律跑；按需模式只在族群雷達被問到後的 2 小時內取樣（on_demand.radar_awake）
             threading.Thread(target=_intraday_sampling_loop, args=(usage_stop,), name="ace-intraday-sample", daemon=True).start()
+            # 10-27 族群排行快照獨立一條執行緒：每 60 秒一張（抓取 30～50 秒，不能和族群雷達 tick 擠同一條）
+            import member_sector_tape
+            threading.Thread(target=member_sector_tape.run_loop, args=(usage_stop, _sector_tape_gate),
+                             name="ace-sector-tape", daemon=True).start()
         print(
             f"✅ 艾斯 AI 已上線：{client.user}｜指令 /{config.slash_command_name}（一般）＋/{config.admin_command_name}（管理員）" + (f" 與 {config.command_prefix}" if config.prefix_command_enabled else "") + "｜"
             f"允許使用者 {'不限' if config.allow_all_users else str(len(config.allowed_user_ids)) + ' 人'}｜限制頻道 {len(config.allowed_channel_ids) or '不限'}｜"

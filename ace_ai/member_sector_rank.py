@@ -135,7 +135,9 @@ def quotes(codes: List[str]) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]
     return _closed_quotes(codes)
 
 
-LIVE_MIN_SHARE = 0.5          # 盤中有效報價不到名單一半＝今天沒開盤（颱風假等），改用最新交易日
+# 盤中有效報價不到名單 2 成＝今天沒開盤（颱風假等），改用最新交易日。
+# 10-27：原本 5 成，MIS 一次只回一半時盤中會被誤判成休市、顯示 10/22 的舊排行；快照也改成合併最近 3 分鐘。
+LIVE_MIN_SHARE = 0.2
 
 
 def latest_trade_day() -> str:
