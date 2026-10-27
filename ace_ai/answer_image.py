@@ -3141,7 +3141,9 @@ def _follow_block(draw, x: float, y: float, width: float, item: dict, first: boo
                                           ('　跑贏族群 ', MUTED, False), pct('beat')]], 10_000, 23)[0], 23)
     ly += 40
     ratio = _finite(item.get('ratio'))
+    value5 = str(item.get('value5_text') or '')
     vol_line = _gr_flow([[('近5分量 ', MUTED, False), (f"{int(item.get('vol5') or 0):,} 張", INK, True),
+                          *([(f'（{value5}）', MUTED, False)] if value5 else []),
                           ('　量增 ', MUTED, False), (f'{ratio:.1f} 倍' if ratio is not None else '不足',
                                                      INK if ratio is not None else MUTED, True), ('　', INK, False)]], 10_000, 23)[0]
     _gr_draw_line(draw, x, ly + 6, vol_line, 23)
