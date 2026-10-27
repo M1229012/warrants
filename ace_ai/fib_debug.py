@@ -13,7 +13,7 @@ import kline_debug
 
 _COMMAND = re.compile(r"(?:費波|斐波|費氏|費布|fibo?)\s*\w{0,4}?\s*驗證|驗證\s*\w{0,3}?(?:費波|斐波|費氏|費布)", re.IGNORECASE)
 _CODE_RE = re.compile(r"(?<![0-9A-Za-z])(?:[0-9]{4,6}[A-Za-z]?|TAIEX|TPEX)(?![0-9A-Za-z])", re.IGNORECASE)
-KIND_COLOR = {"retrace": "#1478B5", "prior": "#C76C00", "extend": "#8044B8"}
+KIND_COLOR = {"retrace": "#1478B5", "prior": "#C76C00", "extend": "#8044B8", "box": "#2F855A"}
 
 
 def is_request(question: str) -> bool:
@@ -93,16 +93,19 @@ def render(data: dict) -> Image.Image:
     text(margin, 120, f"大轉折門檻 {params['major_atr']:g} ATR｜合格波段 ≥ {params['leg_atr']:g} ATR｜回看 {params['lookback']} 根"
                       f"｜確認日當天的轉折不使用", 22, muted)
     x = margin
-    for label, color in (("回撤／反彈", KIND_COLOR["retrace"]), ("前波高點", KIND_COLOR["prior"]), ("延伸", KIND_COLOR["extend"])):
+    for label, color in (("回撤／反彈", KIND_COLOR["retrace"]), ("前波高點", KIND_COLOR["prior"]), ("延伸", KIND_COLOR["extend"]),
+                         ("整理區等幅", KIND_COLOR["box"])):
         draw.line((x, 180, x + 50, 180), fill=color, width=4)
         text(x + 60, 166, label, 21, color)
         x += 60 + tw(label, 21) + 34
     draw.rectangle((x, 170, x + 44, 190), fill="#FFEFC7")
     text(x + 54, 166, "共振區", 21, muted)
     x += 54 + tw("共振區", 21) + 34
-    text(x, 166, "實線＝交給 AI｜虛線＝不交給 AI｜灰點小轉折、黑圈大轉折", 21, muted)
+    draw.rectangle((x, 170, x + 44, 190), outline=KIND_COLOR["box"], width=2)
+    text(x + 54, 166, "整理區", 21, muted)
+    text(margin, 202, "實線＝交給 AI｜虛線＝不交給 AI｜灰點小轉折、黑圈大轉折", 21, muted)
 
-    left, right, top, bottom = 115, 1215, 225, 755
+    left, right, top, bottom = 115, 1215, 255, 755
     step = (right - left) / max(1, len(visible))
     px = lambda i: left + (i - start + 0.5) * step
     prices = [b[k] for b in visible for k in ("Low", "High")] + [lv["price"] for lv in levels]
@@ -120,6 +123,15 @@ def render(data: dict) -> Image.Image:
     for lv in levels:   # 共振區先畫，K 棒蓋在上面
         if lv["confluence"]:
             draw.rectangle((left, py(lv["price"]) - 5, right, py(lv["price"]) + 5), fill="#FFEFC7")
+    box = (sel or {}).get("box")
+    if box and box["end"] >= start:   # 整理區：收盤高低框（虛線上下緣），不加文字以免壓到 K 棒
+        bx0, bx1 = px(max(start, box["start"])) - step / 2, px(box["end"]) + step / 2
+        by0, by1 = py(box["top"]), py(box["bottom"])
+        for xx in range(int(bx0), int(bx1), 10):
+            for yy in (by0, by1):
+                draw.line((xx, yy, min(xx + 6, bx1), yy), fill=KIND_COLOR["box"], width=2)
+        for xx in (bx0, bx1):
+            draw.line((xx, by0, xx, by1), fill=KIND_COLOR["box"], width=2)
 
     for i in range(start, end + 1):
         bar = bars[i]

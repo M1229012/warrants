@@ -4,11 +4,12 @@
 錨點規則（寫死，同一檔同一天一定抓同一組點）：
   1. 大級別轉折＝ZigZag 門檻放大 MAJOR_MULT 倍；確認日當天不用（與型態驗證一致）。
   2. 回看 LOOKBACK 根內、幅度 ≥ LEG_ATR 倍 ATR 的最近一段＝選用波段 A→B；後續同向小段創更高（低）時併入，B 往後移。
-  3. 上漲段：B 回撤 0.382／0.5／0.618 為下方支撐；B 之後已確認的回檔低點 C 存在時，C＋(B−A)×1.0／1.618 為延伸目標；
+  3. 上漲段：B 回撤 0.382／0.5／0.618 為下方支撐；B 之後已確認的回檔低點 C 存在時，C＋(B−A)×1.0／1.382／1.618 為延伸目標；
      沒有 C 就創新高時，A＋(B−A)×1.382／1.618／2／2.618。
      下跌段：B＋(A−B)×0.382／0.5／0.618 為反彈參考，A 為前波高點；收盤已站上 A 時改看 B＋(A−B)×1.382／1.618／2／2.618。
   4. 價位落在其他結構 CONF_ATR 倍 ATR 內＝共振；只有「在收盤之上且有共振」的費波價位（及前波高點）才交給 AI。
      創新高（延伸模式）上方沒有結構可共振，收盤之上最近 EXTEND_AI 個延伸價位直接交給 AI。
+  5. 最近結束的整理區（≥ BOX_MIN 根、收盤高低差 ≤ BOX_ATR 倍 ATR）：上緣＋整理高度＝等幅測量，畫成價位並當共振對象。
 """
 from __future__ import annotations
 
@@ -33,7 +34,10 @@ VOL_BIN_ATR = _env("VOL_BIN_ATR", 0.5)    # 大量區價格格寬（ATR 倍數�
 VOL_TOP = int(_env("VOL_TOP", 3))         # 最多取幾個大量區
 VOL_MIN_RATIO = _env("VOL_MIN_RATIO", 1.5)   # 大量區成交量 ≥ 平均格的倍數
 RETRACE = (0.382, 0.5, 0.618)
-EXTEND = (1.0, 1.618)
+EXTEND = (1.0, 1.382, 1.618)
+BOX_MIN = int(_env("BOX_MIN", 20))        # 整理區至少幾根
+BOX_ATR = _env("BOX_ATR", 4.5)            # 整理區收盤高低差 ≤ 此倍數 ATR（整理區最後一天的前一日 ATR）
+BOX_RECENT = int(_env("BOX_RECENT", 10))  # 整理區要在最近幾根內結束（離太久的整理不算這次突破）
 BREAKOUT = (1.382, 1.618, 2.0, 2.618)   # 越過波段端點、沒有 C 可用時，從低點起算的延伸倍數
 EXTEND_AI = int(_env("EXTEND_AI", 2))   # 創新高時收盤之上最近幾個延伸價位直接交給 AI（上方沒有結構可共振）
 
@@ -67,6 +71,22 @@ def _volume_zones(h, l, c, v, begin: int, last: int, ref: float) -> List[Dict[st
             break
         zones.append({"low": low + k * width, "high": low + (k + 1) * width, "price": low + (k + 0.5) * width})
     return zones
+
+
+def find_box(c, atr, last: int) -> Optional[Dict[str, Any]]:
+    """最近結束的整理區：終點在最近 BOX_RECENT 根內，往回延伸到收盤高低差超過 BOX_ATR 倍 ATR 為止，取最長的一段。"""
+    floor = max(0, last - LOOKBACK + 1)
+    best = None
+    for e in range(last - 1, max(floor + BOX_MIN - 1, last - BOX_RECENT) - 1, -1):
+        if np.isnan(atr[e]):
+            continue
+        hi = lo = c[e]
+        s = e
+        while s - 1 >= floor and max(hi, c[s - 1]) - min(lo, c[s - 1]) <= BOX_ATR * atr[e]:
+            hi, lo, s = max(hi, c[s - 1]), min(lo, c[s - 1]), s - 1
+        if e - s + 1 >= BOX_MIN and (best is None or e - s > best["end"] - best["start"]):
+            best = {"start": s, "end": e, "top": float(hi), "bottom": float(lo)}
+    return best
 
 
 def compute(frame: pd.DataFrame, events: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -176,9 +196,22 @@ def compute(frame: pd.DataFrame, events: Optional[Dict[str, Any]] = None) -> Dic
             for r in RETRACE:
                 refs.append({"price": g_lo + (g_hi - g_lo) * r,
                              "text": f"另一段 {r:g}（{dates[g['a']['idx']][5:]}～{dates[g['b']['idx']][5:]}）"})
+        box = find_box(c, atr, last)
+        if box:   # 10-27（3034 案例）：整理區等幅測量＝上緣＋整理高度；畫成價位，也當費波的共振對象
+            box.update(height=box["top"] - box["bottom"], target=2 * box["top"] - box["bottom"], broke=close > box["top"],
+                       start_date=dates[box["start"]], end_date=dates[box["end"]])
+            item = {"label": "整理區等幅" if box["broke"] else "整理區等幅（突破後）", "kind": "box", "ratio": 1.0,
+                    "price": box["target"]}
+            levels.append(item)
+            refs.append({"price": box["target"], "text": f"整理區等幅 {box['target']:.2f}", "level": item})
+            refs.append({"price": box["top"], "text": f"整理區上緣 {box['top']:.2f}"})
+            box["line"] = (f"整理區：{box['start_date'][5:]}～{box['end_date'][5:]} 收盤 {box['bottom']:.2f}～{box['top']:.2f}"
+                           f"（{box['end'] - box['start'] + 1} 根），{'已向上突破' if box['broke'] else '尚未向上突破'}；"
+                           f"等幅測量 {box['top']:.2f}＋{box['height']:.2f}＝{box['target']:.2f}")
+        selected["box"] = box
         for item in levels:
             price = item["price"]
-            hits = [x["text"] for x in refs if abs(x["price"] - price) <= tol]
+            hits = [x["text"] for x in refs if abs(x["price"] - price) <= tol and x.get("level") is not item]
             hits += [f"大量區 {z['low']:.2f}～{z['high']:.2f}" for z in zones
                      if abs(z["price"] - price) <= tol + (z["high"] - z["low"]) / 2]
             step = round_step(price)
@@ -186,7 +219,7 @@ def compute(frame: pd.DataFrame, events: Optional[Dict[str, Any]] = None) -> Dic
             if nearest > 0 and abs(nearest - price) <= tol:
                 hits.append(f"整數關卡 {nearest:g}")
             item.update(price=float(price), above=price > close, confluence=hits,
-                        ai=bool(price > close and (hits or item["kind"] == "prior")))
+                        ai=bool(price > close and (hits or item["kind"] in ("prior", "box"))))
         selected["zones"] = zones
         levels.sort(key=lambda x: x["price"])
         if mode == "extend":
@@ -196,6 +229,8 @@ def compute(frame: pd.DataFrame, events: Optional[Dict[str, Any]] = None) -> Dic
         summary.append(f"選用波段：A {a['price']:.2f}（{dates[a['idx']]}）→ B {b['price']:.2f}（{dates[b['idx']]}），"
                        f"{word} {amp:.2f}（約 {selected['amp_atr']:.1f} ATR）" + ("；後續同向小段已併入" if merged else "")
                        + (f"；C {cpt['price']:.2f}（{dates[cpt['idx']]}）" if cpt else ""))
+        if box:
+            summary.append(box["line"])
         picks = [x for x in levels if x["ai"]]
         summary.append("交給 AI 的上方參考：" + ("、".join(f"{x['label']} {x['price']:.2f}" for x in picks) if picks
                                                  else "沒有在收盤之上且有共振的價位，AI 不提費波參考價"))
