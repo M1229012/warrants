@@ -4,9 +4,11 @@
 錨點規則（寫死，同一檔同一天一定抓同一組點）：
   1. 大級別轉折＝ZigZag 門檻放大 MAJOR_MULT 倍；確認日當天不用（與型態驗證一致）。
   2. 回看 LOOKBACK 根內、幅度 ≥ LEG_ATR 倍 ATR 的最近一段＝選用波段 A→B；後續同向小段創更高（低）時併入，B 往後移。
-  3. 上漲段：B 回撤 0.382／0.5／0.618 為下方支撐；B 之後已確認的回檔低點 C 存在時，C＋(B−A)×1.0／1.618 為延伸目標。
-     下跌段：B＋(A−B)×0.382／0.5／0.618 為反彈參考，A 為前波高點。
+  3. 上漲段：B 回撤 0.382／0.5／0.618 為下方支撐；B 之後已確認的回檔低點 C 存在時，C＋(B−A)×1.0／1.618 為延伸目標；
+     沒有 C 就創新高時，A＋(B−A)×1.382／1.618／2／2.618。
+     下跌段：B＋(A−B)×0.382／0.5／0.618 為反彈參考，A 為前波高點；收盤已站上 A 時改看 B＋(A−B)×1.382／1.618／2／2.618。
   4. 價位落在其他結構 CONF_ATR 倍 ATR 內＝共振；只有「在收盤之上且有共振」的費波價位（及前波高點）才交給 AI。
+     創新高（延伸模式）上方沒有結構可共振，收盤之上最近 EXTEND_AI 個延伸價位直接交給 AI。
 """
 from __future__ import annotations
 
@@ -32,6 +34,8 @@ VOL_TOP = int(_env("VOL_TOP", 3))         # 最多取幾個大量區
 VOL_MIN_RATIO = _env("VOL_MIN_RATIO", 1.5)   # 大量區成交量 ≥ 平均格的倍數
 RETRACE = (0.382, 0.5, 0.618)
 EXTEND = (1.0, 1.618)
+BREAKOUT = (1.382, 1.618, 2.0, 2.618)   # 越過波段端點、沒有 C 可用時，從低點起算的延伸倍數
+EXTEND_AI = int(_env("EXTEND_AI", 2))   # 創新高時收盤之上最近幾個延伸價位直接交給 AI（上方沒有結構可共振）
 
 
 def round_step(price: float) -> float:
@@ -138,17 +142,26 @@ def compute(frame: pd.DataFrame, events: Optional[Dict[str, Any]] = None) -> Dic
             if cpt:
                 for r in EXTEND:
                     levels.append({"label": f"延伸 {r:g}", "kind": "extend", "ratio": r, "price": cpt["price"] + amp * r})
+            elif close > hi and not broken:   # 10-27：沒有 C 就創新高，延伸從 A 起算
+                for r in BREAKOUT:
+                    levels.append({"label": f"延伸 {r:g}", "kind": "extend", "ratio": r, "price": lo + amp * r})
             if close > hi:
                 mode, mode_text = "extend", "收盤高於波段高點 B（創波段新高），上方看延伸價位"
             else:
                 mode, mode_text = "pullback", "上漲波段後拉回，上方先看前波高點 B，站上後看延伸價位"
             if not cpt and not broken:
-                mode_text += "；B 之後的回檔低點 C 尚未確認，延伸價位暫不計算"
+                mode_text += ("；B 之後沒有已確認的回檔低點 C，延伸價位以 A 起算" if close > hi
+                              else "；B 之後的回檔低點 C 尚未確認，延伸價位暫不計算")
         else:
             for r in RETRACE:
                 levels.append({"label": f"反彈 {r:g}", "kind": "retrace", "ratio": r, "price": lo + amp * r})
             levels.append({"label": "前波高點 A", "kind": "prior", "ratio": 1.0, "price": hi})
-            mode, mode_text = "rebound", "下跌波段後反彈，上方看下跌段的回撤反彈價位與前波高點 A"
+            if close > hi and not broken:   # 10-27：已站上 A＝反彈超過 100%，改看 B 起算的延伸（4566 案例）
+                for r in BREAKOUT:
+                    levels.append({"label": f"延伸 {r:g}", "kind": "extend", "ratio": r, "price": lo + amp * r})
+                mode, mode_text = "extend", "收盤已站上下跌段起點 A（反彈超過 100%），上方看 B＋(A−B) 的延伸價位"
+            else:
+                mode, mode_text = "rebound", "下跌波段後反彈，上方看下跌段的回撤反彈價位與前波高點 A"
         if broken:
             mode_text += "；後續已反向越過波段起點 A，此段僅供參考"
 
@@ -176,6 +189,9 @@ def compute(frame: pd.DataFrame, events: Optional[Dict[str, Any]] = None) -> Dic
                         ai=bool(price > close and (hits or item["kind"] == "prior")))
         selected["zones"] = zones
         levels.sort(key=lambda x: x["price"])
+        if mode == "extend":
+            for item in [x for x in levels if x["kind"] == "extend" and x["above"]][:EXTEND_AI]:
+                item["ai"] = True
         word = "上漲" if d > 0 else "下跌"
         summary.append(f"選用波段：A {a['price']:.2f}（{dates[a['idx']]}）→ B {b['price']:.2f}（{dates[b['idx']]}），"
                        f"{word} {amp:.2f}（約 {selected['amp_atr']:.1f} ATR）" + ("；後續同向小段已併入" if merged else "")
