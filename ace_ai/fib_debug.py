@@ -88,9 +88,9 @@ def render(data: dict) -> Image.Image:
         return draw.textlength(str(value), font=font(size, bold))
 
     text(margin, 25, f"{data['stock_code']} {data.get('stock_name', '')}｜管理員費波驗證", 37, bold=True)
-    text(margin, 86, f"正式收盤截至 {bars[end]['date']}｜顯示 {len(visible)} 根（還原價）｜前一日 ATR20：{data['atr']:.2f}"
+    text(margin, 86, f"正式收盤截至 {bars[end]['date']}｜顯示 {len(visible)} 根／計算 {len(bars)} 根（還原價）｜前一日 ATR20：{data['atr']:.2f}"
                      f"｜共振距離 {data['tolerance']:.2f}", 22, muted)
-    text(margin, 120, f"大轉折門檻 {params['major_atr']:g} ATR｜合格波段 ≥ {params['leg_atr']:g} ATR｜回看 {params['lookback']} 根"
+    text(margin, 120, f"大轉折門檻 {params['major_atr']:g} ATR｜合格波段 ≥ {params['leg_atr']:g} ATR｜終點在最近 {params['lookback']} 根"
                       f"｜確認日當天的轉折不使用", 22, muted)
     x = margin
     for label, color in (("回撤／反彈", KIND_COLOR["retrace"]), ("前波高點", KIND_COLOR["prior"]), ("延伸", KIND_COLOR["extend"]),
@@ -228,7 +228,8 @@ def render(data: dict) -> Image.Image:
     leg_rows = []
     for g in (data.get("legs") or [])[-10:]:
         if g["selected"]:
-            note = "選用" + (f"（後續併入，B 移到 {sel['b']['date'][5:]}）" if sel and sel.get("merged") else "")
+            note = "選用" + (f"（後續併入，B 移到 {sel['b']['date'][5:]}）" if sel and sel.get("merged") else "") \
+                + ("（備援：回看區間最低／最高點，不是大轉折）" if g.get("fallback") else "")
         else:
             note = g["status"] or "合格（較舊，未選用）"
         leg_rows.append(([lw(g["a"]), lw(g["b"]), "上漲" if g["dir"] > 0 else "下跌", f"{g['amp_atr']:.1f}", note],

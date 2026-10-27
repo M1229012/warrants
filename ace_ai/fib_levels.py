@@ -26,7 +26,8 @@ def _env(name: str, default: float) -> float:
 
 
 MAJOR_MULT = _env("MAJOR_MULT", 2.5)      # 大級別轉折門檻＝ZIGZAG_ATR × 此倍數
-LOOKBACK = int(_env("LOOKBACK", 120))     # 只在最近 N 根內找波段
+LOOKBACK = int(_env("LOOKBACK", 120))     # 波段終點要在最近 N 根內（起點可以更早）
+HISTORY = int(_env("HISTORY", 260))       # 計算只用最後 N 根（含 ATR 暖機），結果不隨載入的歷史長短改變
 LEG_ATR = _env("LEG_ATR", 6.0)            # 合格波段幅度 ≥ 此倍數 ATR（波段終點當日的前一日 ATR）
 CONF_ATR = _env("CONF_ATR", 1.0)          # 共振距離：目前 ATR 的倍數
 OTHER_LEGS = int(_env("OTHER_LEGS", 2))   # 另外拿最近幾段合格波段的回撤價做群聚比對
@@ -93,7 +94,8 @@ def compute(frame: pd.DataFrame, events: Optional[Dict[str, Any]] = None) -> Dic
     need = ["Open", "High", "Low", "Close"]
     if frame is None or not set(need) <= set(frame.columns):
         raise ValueError("日 K 欄位不足，無法計算費波")
-    df = frame.dropna(subset=need).sort_index()
+    # 10-27：固定只用最後 HISTORY 根，ZigZag 起算點不隨載入的歷史長短改變（3034 兩次抓到不同 A）
+    df = frame.dropna(subset=need).sort_index().iloc[-HISTORY:]
     if len(df) < kp.WARMUP_MIN + kp.MIN_BARS + 2:
         raise ValueError(f"日 K 只有 {len(df)} 根，無法計算費波")
     adj, adjust_flags = kp.adjust(df, events)
@@ -113,18 +115,29 @@ def compute(frame: pd.DataFrame, events: Optional[Dict[str, Any]] = None) -> Dic
 
     legs = []
     for a, b in zip(major, major[1:]):
-        if b["idx"] < begin:
+        if b["idx"] < begin:   # 終點在回看範圍內就算；起點可以在範圍外（3034：04-23 起漲）
             continue
         unit = atr[b["idx"]] if not np.isnan(atr[b["idx"]]) else ref
         amp = abs(b["price"] - a["price"])
-        status = (f"起點早於回看 {LOOKBACK} 根" if a["idx"] < begin else
-                  f"幅度 {amp / unit:.1f} ATR，未達 {LEG_ATR:g} ATR" if amp / unit < LEG_ATR else "")
+        status = f"幅度 {amp / unit:.1f} ATR，未達 {LEG_ATR:g} ATR" if amp / unit < LEG_ATR else ""
         legs.append({"a": a, "b": b, "dir": 1 if b["type"] == "H" else -1, "amp": amp,
                      "amp_atr": amp / unit, "status": status})
     qualified = [g for g in legs if not g["status"]]
+    fallback = False
+    if not qualified:   # 備援：沒有合格大波段時，用回看區間的最低點與最高點（依時間先後）當 A→B，每檔都畫得出來
+        lo_i = begin + int(np.argmin(l[begin:last + 1]))
+        hi_i = begin + int(np.argmax(h[begin:last + 1]))
+        if lo_i != hi_i and h[hi_i] > l[lo_i]:
+            ends = sorted(((lo_i, "L", l[lo_i]), (hi_i, "H", h[hi_i])))
+            a, b = ({"type": t, "idx": i, "price": float(p), "confirm": i} for i, t, p in ends)
+            unit = atr[b["idx"]] if not np.isnan(atr[b["idx"]]) else ref
+            amp = b["price"] - a["price"] if b["type"] == "H" else a["price"] - b["price"]
+            legs.append({"a": a, "b": b, "dir": 1 if b["type"] == "H" else -1, "amp": amp,
+                         "amp_atr": amp / unit, "status": "", "fallback": True})
+            qualified, fallback = legs[-1:], True
 
     selected, levels, summary = None, [], []
-    mode, mode_text = "none", f"最近 {LOOKBACK} 根沒有 ≥{LEG_ATR:g} ATR 的大級別波段，不給費波價位"
+    mode, mode_text = "none", f"最近 {LOOKBACK} 根價格沒有波動，不給費波價位"
     if qualified:
         leg = qualified[-1]
         used = [leg]
@@ -143,14 +156,15 @@ def compute(frame: pd.DataFrame, events: Optional[Dict[str, Any]] = None) -> Dic
                 break
             if p["type"] == b["type"] and (p["price"] - b["price"]) * d > 0:
                 b, merged = p, True
-        after = [p for p in major if p["idx"] > b["idx"] and p["type"] == a["type"]]
+        after = [p for p in (minor if fallback else major) if p["idx"] > b["idx"] and p["type"] == a["type"]]
         cpt = (min(after, key=lambda p: p["price"]) if d > 0 else max(after, key=lambda p: p["price"])) if after and not broken else None
         amp = abs(b["price"] - a["price"])
         lo, hi = min(a["price"], b["price"]), max(a["price"], b["price"])
         leg["selected"] = True
         unit = atr[b["idx"]] if not np.isnan(atr[b["idx"]]) else ref
         selected = {"a": a, "b": b, "c": cpt, "dir": d, "amp": amp, "amp_atr": amp / unit,
-                    "merged": merged, "broken": broken}
+                    "merged": merged, "broken": broken, "fallback": fallback}
+        at_high = close > hi or (fallback and d > 0 and b["idx"] >= last - 5)   # 備援的 B 就是近日新高＝還在創高
         if d > 0:
             for r in RETRACE:
                 levels.append({"label": f"回撤 {r:g}", "kind": "retrace", "ratio": r, "price": hi - amp * r})
@@ -162,16 +176,15 @@ def compute(frame: pd.DataFrame, events: Optional[Dict[str, Any]] = None) -> Dic
             if cpt:
                 for r in EXTEND:
                     levels.append({"label": f"延伸 {r:g}", "kind": "extend", "ratio": r, "price": cpt["price"] + amp * r})
-            elif close > hi and not broken:   # 10-27：沒有 C 就創新高，延伸從 A 起算
+            elif not broken:   # 10-27：沒有 C 時延伸從 A 起算（創新高時才是主要目標，否則是站上 B 後的參考）
                 for r in BREAKOUT:
                     levels.append({"label": f"延伸 {r:g}", "kind": "extend", "ratio": r, "price": lo + amp * r})
-            if close > hi:
+            if at_high:
                 mode, mode_text = "extend", "收盤高於波段高點 B（創波段新高），上方看延伸價位"
             else:
                 mode, mode_text = "pullback", "上漲波段後拉回，上方先看前波高點 B，站上後看延伸價位"
             if not cpt and not broken:
-                mode_text += ("；B 之後沒有已確認的回檔低點 C，延伸價位以 A 起算" if close > hi
-                              else "；B 之後的回檔低點 C 尚未確認，延伸價位暫不計算")
+                mode_text += "；B 之後沒有已確認的回檔低點 C，延伸價位以 A 起算"
         else:
             for r in RETRACE:
                 levels.append({"label": f"反彈 {r:g}", "kind": "retrace", "ratio": r, "price": lo + amp * r})
@@ -184,6 +197,8 @@ def compute(frame: pd.DataFrame, events: Optional[Dict[str, Any]] = None) -> Dic
                 mode, mode_text = "rebound", "下跌波段後反彈，上方看下跌段的回撤反彈價位與前波高點 A"
         if broken:
             mode_text += "；後續已反向越過波段起點 A，此段僅供參考"
+        if fallback:
+            mode_text = f"（備援）回看 {LOOKBACK} 根沒有 ≥{LEG_ATR:g} ATR 的大級別波段，改用區間最低／最高點；" + mode_text
 
         refs = []
         anchor_idx = {a["idx"], b["idx"]} | ({cpt["idx"]} if cpt else set())
@@ -241,11 +256,13 @@ def compute(frame: pd.DataFrame, events: Optional[Dict[str, Any]] = None) -> Dic
     bars = [{"date": dates[i], "Open": float(o[i]), "High": float(h[i]), "Low": float(l[i]), "Close": float(c[i]),
              "Volume": float(v[i]) if not np.isnan(v[i]) else 0.0} for i in range(len(c))]
     flags = list(adjust_flags.get("F2") or [])
-    return {"bars": bars, "display_start": begin, "last": last, "atr": ref, "close": close, "tolerance": tol,
-            "minor": [_pivot(p, dates) for p in minor if p["idx"] >= begin],
-            "major": [_pivot(p, dates) for p in major if p["idx"] >= begin],
+    show = max(0, min(begin, selected["a"]["idx"] - 5)) if selected else begin   # 起點在回看範圍外時圖往前延伸，看得到 A
+    return {"bars": bars, "display_start": show, "last": last, "atr": ref, "close": close, "tolerance": tol,
+            "minor": [_pivot(p, dates) for p in minor if p["idx"] >= show],
+            "major": [_pivot(p, dates) for p in major if p["idx"] >= show],
             "legs": [{"a": _pivot(g["a"], dates), "b": _pivot(g["b"], dates), "dir": g["dir"], "amp": float(g["amp"]),
-                      "amp_atr": float(g["amp_atr"]), "status": g["status"], "selected": g["selected"]} for g in legs],
+                      "amp_atr": float(g["amp_atr"]), "status": g["status"], "selected": g["selected"],
+                      "fallback": bool(g.get("fallback"))} for g in legs],
             "selected": None if selected is None else dict(
                 selected, a=_pivot(selected["a"], dates), b=_pivot(selected["b"], dates),
                 c=_pivot(selected["c"], dates) if selected["c"] else None, amp=float(selected["amp"]),
