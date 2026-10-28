@@ -558,14 +558,30 @@ def _enrich(row: Dict[str, Any], quote: Dict[str, Dict[str, Any]], info: Dict[st
 CONCEPT_EXCESS = max(0.0, tools._env_float("DISCORD_AI_CONCEPT_EXCESS", 1.0))   # 概念族群要比所屬產業多 ≥ 1 個百分點
 
 
-def _concept_check(rows: List[Dict[str, Any]], groups: Dict[str, Dict[str, Any]], weak: bool) -> Dict[str, str]:
+def _industry_reference(groups: Dict[str, Dict[str, Any]], pool: Dict[str, Any],
+                        quote: Dict[str, Dict[str, Any]]) -> Dict[str, float]:
+    """各產業族群「有拿到價格的成分股」平均漲跌幅，不管這群能不能排名（覆蓋不足、樣本不足也照算）。
+    10-28：ASIC 收盤覆蓋不足沒有名次時，TPU 的創意、世芯仍要拿 ASIC 的實際漲幅比，不能跳過。"""
+    out = {}
+    for name, info in groups.items():
+        if info.get("kind") == "concept":
+            continue
+        changes = [quote[c]["change_pct"] for c in sector_match.member_codes(name) if c in pool and c in quote]
+        if changes:
+            out[name] = sum(changes) / len(changes)
+    return out
+
+
+def _concept_check(rows: List[Dict[str, Any]], groups: Dict[str, Dict[str, Any]], weak: bool,
+                   reference: Optional[Dict[str, float]] = None) -> Dict[str, str]:
     """10-28 產業族群優先：概念族群（kind=concept）要比「成分股所屬產業族群」的平均更強，才代表概念本身在動。
     超額＝概念平均 − 各有效成分股所屬產業族群平均的平均（按檔數）。強勢要 ≥ CONCEPT_EXCESS、弱勢要 ≤ −CONCEPT_EXCESS；
     不到就是產業連動（例：TPU 的創意、世芯其實是 ASIC 在漲），不上榜。回 {不上榜的概念族群: 原因}。
     成分股所屬產業有一半以上排不出名次（無法比較）時照常上榜。"""
     industry_of = {code: name for name, info in groups.items() if info.get("kind") != "concept"
                    for code, _ in info.get("stocks") or []}
-    industry_avg = {r["name"]: r["avg"] for r in rows if (groups.get(r["name"]) or {}).get("kind") != "concept"}
+    industry_avg = dict(reference) if reference is not None else \
+        {r["name"]: r["avg"] for r in rows if (groups.get(r["name"]) or {}).get("kind") != "concept"}
     out: Dict[str, str] = {}
     for row in rows:
         if (groups.get(row["name"]) or {}).get("kind") != "concept":
@@ -632,7 +648,7 @@ def rank(day: Optional[str] = None, direction: str = "strong") -> Optional[Dict[
     rows.sort(key=lambda r: ((r["avg"] if weak else -r["avg"]), r["name"]))
     for index, row in enumerate(rows, 1):
         row["raw_rank"] = index
-    subsumed = _concept_check(rows, groups, weak)
+    subsumed = _concept_check(rows, groups, weak, _industry_reference(groups, pool, quote))
     shown, families = [], set()
     for row in rows:                      # 同家族只在顯示時取一個，向後遞補
         if row["family"] in families or row["name"] in subsumed:

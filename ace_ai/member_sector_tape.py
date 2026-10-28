@@ -62,6 +62,15 @@ def _fetch(codes: List[str], deadline: Optional[float] = None) -> Dict[str, Dict
     return sector_radar._fetch_stock_quotes(list(codes), deadline)
 
 
+def _fetch_order(codes) -> List[str]:
+    """10-28：今天最近幾張快照都沒抓到的股票排最前面，其餘照代號。
+    查詢補拍只有 20 秒，原本永遠照代號順序抓，最後幾批（6695～67xx）每次逾時，收盤後同一批永遠缺，
+    ASIC 等族群一直「資料不足」；改成缺的先抓，下一次查詢就補齊（merged 會把前後快照合併）。"""
+    have = merged(KEEP_SECONDS)[1] if latest() and latest()[1] == _day() else {}
+    ordered = sorted(codes)
+    return [c for c in ordered if c not in have] + [c for c in ordered if c in have]
+
+
 def sample(codes: Optional[List[str]] = None, force: bool = False) -> bool:
     """拍一張快照（同一時間只有一個執行緒在抓；距離上一張不到 TAPE_SECONDS 就跳過）。回傳是否有新快照。
     force＝查詢當下補拍（用短時限）；背景取樣用 BACKGROUND_DEADLINE。"""
@@ -77,7 +86,7 @@ def sample(codes: Optional[List[str]] = None, force: bool = False) -> bool:
             return False                  # 剛被查詢補拍過；間隔由 run_loop 控制
         if force and last and last[1] == _day() and _now_ts() - last[0] <= TAPE_SECONDS * 1.5:
             return False                  # 背景剛拍好一張，直接用
-        codes = sorted(codes if codes is not None else rank.liquid_pool())
+        codes = _fetch_order(codes if codes is not None else rank.liquid_pool())
         if not codes:
             return False
         began = time.perf_counter()
