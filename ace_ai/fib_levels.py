@@ -12,6 +12,8 @@
   5. 最近結束的整理區（≥ BOX_MIN 根、收盤高低差 ≤ BOX_ATR 倍 ATR）：上緣＋整理高度＝等幅測量，畫成價位並當共振對象。
   6. 還在下跌（最後一段 ≥ LEG_ATR、低點在最近 5 根內）：另算下方參考——收盤所在大波段的 0.618／0.786／1.0 回撤、
      前波低點、上一段大跌從這次高點往下量 0.618／1.0；收盤之下最近 SUPPORT_AI 個交給 AI。
+     反彈價位是用還沒確認的低點算的＝暫定（tentative），仍交給 AI 但要註明低點確認後才成立。
+  7. 離收盤 ≤ TEST_ATR 倍 ATR 的價位＝正在測試（testing），不是目標價，不交給 AI，順延到下一個。
 """
 from __future__ import annotations
 
@@ -42,10 +44,11 @@ BOX_MIN = int(_env("BOX_MIN", 20))        # 整理區至少幾根
 BOX_ATR = _env("BOX_ATR", 4.5)            # 整理區收盤高低差 ≤ 此倍數 ATR（整理區最後一天的前一日 ATR）
 BOX_RECENT = int(_env("BOX_RECENT", 10))  # 整理區要在最近幾根內結束（離太久的整理不算這次突破）
 BREAKOUT = (1.382, 1.618, 2.0, 2.618)   # 越過波段端點、沒有 C 可用時，從低點起算的延伸倍數
-EXTEND_AI = int(_env("EXTEND_AI", 2))
+EXTEND_AI = int(_env("EXTEND_AI", 2))     # 創新高時收盤之上最近幾個延伸價位直接交給 AI（上方沒有結構可共振）
 SUPPORT_RETRACE = (0.618, 0.786, 1.0)   # 還在下跌時：大波段回撤（只取收盤之下的）
 DROP_PROJECT = (0.618, 1.0)             # 還在下跌時：上一段大跌幅度從這次高點往下量
-SUPPORT_AI = int(_env("SUPPORT_AI", 2))   # 還在下跌時，收盤之下最近幾個價位交給 AI   # 創新高時收盤之上最近幾個延伸價位直接交給 AI（上方沒有結構可共振）
+SUPPORT_AI = int(_env("SUPPORT_AI", 2))   # 還在下跌時，收盤上下各最近幾個價位交給 AI
+TEST_ATR = _env("TEST_ATR", 0.5)          # 離收盤在此倍數 ATR 內＝正在測試，不當目標價（2308：1504 貼著收盤 1510）
 
 
 def round_step(price: float) -> float:
@@ -327,6 +330,8 @@ def compute(frame: pd.DataFrame, events: Optional[Dict[str, Any]] = None) -> Dic
                 f"還在下跌：{dates[pa['idx']][5:]} 高點 {pa['price']:.2f} 跌到 {pb['price']:.2f}（約 {provisional['amp_atr']:.1f} ATR，"
                 f"低點還沒確認）；下方看支撐，反彈先看最近的壓力")
             levels += support_levels(pa)
+        tentative = falling and selected["provisional"]   # 反彈價位用還沒確認的低點算，低點再破就會往下移
+        test_tol = TEST_ATR * ref
         for item in levels:
             price = item["price"]
             hits = [x["text"] for x in refs if 1e-6 < abs(x["price"] - price) <= tol and x.get("level") is not item]   # 同價＝自己（前波低點就是那個轉折）
@@ -336,15 +341,17 @@ def compute(frame: pd.DataFrame, events: Optional[Dict[str, Any]] = None) -> Dic
             nearest = round(price / step) * step
             if nearest > 0 and abs(nearest - price) <= tol:
                 hits.append(f"整數關卡 {nearest:g}")
-            item.update(price=float(price), above=price > close, confluence=hits,
-                        ai=bool(price > close and (hits or item["kind"] in ("prior", "box"))))
+            testing = abs(price - close) <= test_tol   # 10-28：貼著收盤＝股價已經在這條線上，不是目標價
+            item.update(price=float(price), above=price > close, confluence=hits, testing=testing,
+                        tentative=bool(tentative and item["kind"] == "retrace"),
+                        ai=bool(price > close and not testing and (hits or item["kind"] in ("prior", "box"))))
         selected["zones"] = zones
         levels.sort(key=lambda x: x["price"])
         if mode == "extend":
-            for item in [x for x in levels if x["kind"] == "extend" and x["above"]][:EXTEND_AI]:
+            for item in [x for x in levels if x["kind"] == "extend" and x["above"] and not x["testing"]][:EXTEND_AI]:
                 item["ai"] = True
-        if falling:   # 收盤之下最近幾個價位直接交給 AI；上方只留最近幾個反彈壓力，數字不要太多
-            for item in sorted([x for x in levels if not x["above"]], key=lambda x: -x["price"])[:SUPPORT_AI]:
+        if falling:   # 收盤之下最近幾個價位直接交給 AI（跳過正在測試的）；上方只留最近幾個反彈壓力，數字不要太多
+            for item in sorted([x for x in levels if not x["above"] and not x["testing"]], key=lambda x: -x["price"])[:SUPPORT_AI]:
                 item["ai"] = True
             for item in sorted([x for x in levels if x["above"] and x["ai"]], key=lambda x: x["price"])[SUPPORT_AI:]:
                 item["ai"] = False
@@ -355,11 +362,17 @@ def compute(frame: pd.DataFrame, events: Optional[Dict[str, Any]] = None) -> Dic
         if box:
             summary.append(box["line"])
         picks = [x for x in levels if x["ai"] and x["above"]]
-        summary.append(("交給 AI 的反彈壓力：" if falling else "交給 AI 的上方參考：") + ("、".join(f"{x['label']} {x['price']:.2f}" for x in picks) if picks
-                                                 else "沒有在收盤之上且有共振的價位，AI 不提費波參考價"))
+        head = ("交給 AI 的反彈壓力（暫定：用還沒確認的低點算，低點確認後才成立）：" if tentative
+                else "交給 AI 的反彈壓力：" if falling else "交給 AI 的上方參考：")
+        summary.append(head + ("、".join(f"{x['label']} {x['price']:.2f}" for x in picks) if picks
+                               else "沒有在收盤之上且有共振的價位，AI 不提費波參考價"))
         if falling:
             downs = sorted([x for x in levels if x["ai"] and not x["above"]], key=lambda x: -x["price"])
             summary.append("交給 AI 的下方參考：" + ("、".join(f"{x['label']} {x['price']:.2f}" for x in downs) or "收盤之下沒有參考價位"))
+        near = [x for x in levels if x["testing"]]
+        if near:
+            summary.append(f"正在測試（離收盤 ≤ {TEST_ATR:g} ATR，不當目標價、不交給 AI）："
+                           + "、".join(f"{x['label']} {x['price']:.2f}" for x in near))
     summary.insert(0, f"最新收盤 {close:.2f}｜{mode_text}")
     for g in legs:
         g.setdefault("selected", False)

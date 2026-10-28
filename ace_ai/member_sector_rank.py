@@ -208,16 +208,21 @@ def quotes(codes: List[str]) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]
         import member_sector_tape as tape
         clock = tools.taipei_now()
         late = clock.hour * 60 + clock.minute >= CLOSE_MINUTE
+        official_close = _official_close_quotes(codes, clock)
+        if official_close is not None:
+            return official_close
         with _live_scope():
             # 收盤後：補拍失敗時仍可用今天最後一張快照，但會標「盤後暫定｜最後快照」並保留過期提醒
             snap = tape.current(codes, tape.KEEP_SECONDS if late else tape.STALE_SECONDS)
         wanted = set(codes)
         raw = {c: q for c, q in (snap[1] if snap else {}).items() if c in wanted}
         out: Dict[str, Dict[str, Any]] = {}
-        carried = moved = no_trade = 0
+        carried = moved = no_trade = estimated = 0
+        snap_ts = float(snap[0]) if snap else 0.0
         for c, q in raw.items():
             prev = float(q.get("prev") or 0)
             price = tape.trade_price(q)
+            is_estimate = False
             if not price:
                 # 10-28 審核：只有「最新累計量等於那筆已核實價格當時的累計量」才沿用；
                 # 量已增加＝之後有新成交、最新價未知，不能拿舊價當最新價
@@ -226,6 +231,11 @@ def quotes(codes: List[str]) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]
                     price, carried = last[0], carried + 1
                 elif last:
                     moved += 1
+            if not price and not late:
+                # 10-28：MIS 盤中多數沒有成交價（台積電成交量一直增加，z 仍是「-」）→ 委託盤估值，圖卡標「盤中估值，非成交價」
+                mid = _book_estimate(q, tape, c, snap_ts)
+                if mid:
+                    price, is_estimate, estimated = mid, True, estimated + 1
             if not price or prev <= 0:
                 no_trade += 1
                 continue
@@ -236,9 +246,10 @@ def quotes(codes: List[str]) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]
             # 漲跌幅用價格重算（sector_radar 的 change_pct 已四捨五入到 2 位，上漲判斷要用未四捨五入值）
             out[c] = {"change_pct": (price / prev - 1) * 100, "price": price, "est_value": value, "prev": prev,
                       "name": q.get("name", ""), "high": float(q.get("high") or 0), "low": float(q.get("low") or 0),
-                      "limit_up": float(q.get("limit_up") or 0), "limit_down": float(q.get("limit_down") or 0)}
-        print(f"🎞️ 族群排行報價｜已核實成交價 {len(out)}/{len(codes)}｜同日行情 {len(raw)}"
-              f"｜沿用（量未增加）{carried}｜量已增加、最新價未知 {moved}｜沒有成交價 {no_trade}", flush=True)
+                      "limit_up": float(q.get("limit_up") or 0), "limit_down": float(q.get("limit_down") or 0),
+                      "estimated": is_estimate}
+        print(f"🎞️ 族群排行報價｜可用 {len(out)}/{len(codes)}（已核實成交價 {len(out) - estimated}＋委託盤估值 {estimated}）"
+              f"｜同日行情 {len(raw)}｜沿用（量未增加）{carried}｜量已增加、最新價未知 {moved}｜沒有價格 {no_trade}", flush=True)
         official = _official_session_today()
         short = len(out) < len(codes) * LIVE_MIN_SHARE
         if short and official is not True:
@@ -267,8 +278,42 @@ def quotes(codes: List[str]) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]
             basis, live = "盤中", True
         return out, {"live": live, "basis": basis,
                      "time": tape_status["time"] or now.strftime("%H:%M:%S"), "date": now.strftime("%Y-%m-%d"),
-                     "tape": tape_status, "data_short": short, "verified": len(out), "requested": len(codes)}
+                     "tape": tape_status, "data_short": short, "verified": len(out), "requested": len(codes),
+                     "estimated": sum(1 for q in out.values() if q.get("estimated"))}
     return _closed_quotes(codes)
+
+
+OFFICIAL_CLOSE_MINUTE = 14 * 60 + 35     # 證交所／櫃買當日收盤表大約 14:30 前後公布
+_CLOSE_TRY: Dict[str, float] = {}
+
+
+def _book_estimate(q: Dict[str, Any], tape: Any, code: str, snap_ts: float) -> Optional[float]:
+    """委託盤估值：最佳買一、賣一都有、只差一個合法價位，而且最近約 1 分鐘累計量有增加 → 回中間價；否則 None。
+    價差大（買 108／賣 110）、單邊掛單（漲跌停）、很久沒成交的股票都不估，避免「最後成交 100、掛單 109」被算成 +9%。"""
+    bid, ask = float(q.get("bid") or 0), float(q.get("ask") or 0)
+    if bid <= 0 or ask <= bid or abs(ask - tools.tick_above(bid)) > 1e-6:
+        return None
+    if not tape.volume_rose(code, snap_ts, float(q.get("lots") or 0)):
+        return None
+    return round((bid + ask) / 2, 4)
+
+
+def _official_close_quotes(codes: List[str], clock) -> Optional[Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]]:
+    """10-28：收盤後（14:35 起）改用證交所＋櫃買當日正式收盤價；當日收盤表還沒完整就回 None（照舊用盤後快照）。"""
+    if clock.hour * 60 + clock.minute < OFFICIAL_CLOSE_MINUTE or _official_session_today() is not True:
+        return None
+    day = clock.strftime("%Y-%m-%d")
+    if not _prev_day_complete(day):
+        last = _CLOSE_TRY.get(day, 0.0)
+        if time.monotonic() - last < POOL_STALE_RETRY and last:
+            return None                     # 收盤表抓失敗：10 分鐘內不重抓，先用盤後快照
+        _CLOSE_TRY[day] = time.monotonic()
+        if not _ensure_prev_day(day):
+            return None
+    out, info = _closed_quotes(codes)
+    if str(info.get("date") or "") != day:
+        return None
+    return out, dict(info, basis="收盤", official_close=True)
 
 
 def _official_session_today() -> Optional[bool]:
@@ -633,6 +678,9 @@ def follow(data: Dict[str, Any]) -> List[Dict[str, Any]]:
             q, mv = quote.get(code) or {}, stock_moves.get(code)
             if code in seen or not mv or _limit_state(q) in ("locked_up", "locked_down"):
                 continue
+            if q.get("estimated"):
+                continue                    # 10-28：委託盤估值不是成交價，不拿來判斷跟漲
+
             lag = q["change_pct"] - row["median"]
             if lag > -FOLLOW_LAG:
                 continue
@@ -894,9 +942,13 @@ def panel(data: Dict[str, Any], names: Optional[Dict[str, str]] = None) -> Dict[
         banner = f"行情 {int((tape.get('age') or 0) // 60)} 分鐘未更新，以下是 {tape.get('time', '')} 的資料。"
     elif info["live"] and tape.get("state") in ("warming", "none"):
         banner = "剛開始取樣，近5分資料累積中，先顯示今日累計排行。"
+    if info.get("live") and info.get("estimated"):
+        # 10-28：盤中委託盤估值要講清楚，不冒充成交價
+        banner = "．".join(x for x in (banner, f"盤中估值，非成交價：{info['estimated']} 檔用最佳買賣中間價估算"
+                                                 "（買賣只差一檔、近 1 分鐘有成交）。") if x)
     if info.get("data_short"):
         # 10-28 審核：開市日盤中缺價＝資料不足，不是休市
-        banner = "．".join(x for x in (banner, f"盤中已核實成交價只有 {info.get('verified', 0)}／{info.get('requested', 0)} 檔，"
+        banner = "．".join(x for x in (banner, f"盤中可用價格只有 {info.get('verified', 0)}／{info.get('requested', 0)} 檔，"
                                                  "資料不足，排行可能不完整。") if x)
     if (data.get("pool_meta") or {}).get("base_stale"):
         banner = "．".join(x for x in (banner, "日K底庫還沒更新到前一交易日，流動性名單可能不完整。") if x)

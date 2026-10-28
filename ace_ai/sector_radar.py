@@ -657,6 +657,8 @@ def _fetch_batch(session, codes: List[str]) -> Dict[str, Dict[str, Any]]:
                          "lots": lots,                     # 10-25：族群排行 v2 算近 5 分量（累計張數相減）
                          "trade_price": trade_price,       # 10-28：只有 z（已核實成交價）；0＝未知
                          "pz_price": pz_price,             # 10-28：候選價格，語義待核實，排行不直接用
+                         # 10-28：最佳買一／賣一（族群排行盤中估值用；只有一檔價差且近 1 分鐘有成交才用中間價）
+                         "bid": _first_level(item.get("b")), "ask": _first_level(item.get("a")),
                          "price_source": source,
                          "trade_time": str(item.get("t") or ""), "exchange_date": str(item.get("d") or "")}
     with _HTTP_LOCK:

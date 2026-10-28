@@ -171,6 +171,16 @@ def last_trade(code: str, max_age: float = KEEP_SECONDS) -> Optional[Tuple[float
     return None
 
 
+def volume_rose(code: str, now_ts: float, lots_now: float) -> bool:
+    """最近約 1 分鐘有新成交：比當前早至少 30 秒、最多 TOLERANCE＋30 秒的那張快照，累計張數比現在少。
+    沒有更早的快照（剛開始取樣）或量沒增加都回 False。"""
+    before = _quote_before(code, now_ts - 30)
+    if not before or lots_now <= 0:
+        return False
+    lots_then = float((before[1] or {}).get("lots") or 0)
+    return 0 < lots_then < lots_now
+
+
 def carry_allowed(base_lots: float, lots_now: float) -> bool:
     """舊成交價可以沿用＝最新累計量「等於」那筆已核實價格對應的累計量（同一天，last_trade 已限定）。
     量增加（之後有新成交、價格未知）、倒退或重置、任一邊缺值，都不能沿用。"""
