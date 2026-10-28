@@ -94,6 +94,7 @@ def _data() -> Dict[str, Any]:
             "exclude": {str(x) for x in (alias_raw.get("exclude_groups") or [])},
             "custom": dict(custom_raw.get("groups") or {}),
             "member": dict(member_raw.get("groups") or {}),
+            "member_parents": dict(member_raw.get("parents") or {}),
             "member_version": str(member_raw.get("version") or ""),
         })
     return _CACHE
@@ -106,6 +107,37 @@ def member_groups() -> Dict[str, Dict[str, Any]]:
 
 def member_version() -> str:
     return str(_data().get("member_version") or "")
+
+
+def parent_children(parent: str) -> List[str]:
+    """上層類別（例：被動元件）底下的會員族群，依 JSON 順序。"""
+    return [name for name, info in member_groups().items() if str(info.get("parent") or "") == parent]
+
+
+def match_parent(text: str) -> Optional[Dict[str, Any]]:
+    """10-28：問句講的是上層類別（被動元件、IC設計、PCB、連接器、網通、生技…）→ {name, children, alias_used}。
+    句子裡有更長的族群名稱／別名時（「PCB硬板」「MLCC」）以族群為準，回 None。"""
+    value = normalize(text)
+    if not value:
+        return None
+    parents = _data().get("member_parents") or {}
+    best = None
+    for parent, info in parents.items():
+        if not parent_children(parent):
+            continue
+        for raw in [parent] + list((info or {}).get("aliases") or []):
+            key = normalize(raw)
+            if len(key) >= 2 and _alias_in(key, value) and (best is None or len(key) > len(best[0])):
+                best = (key, parent)
+    if best is None:
+        return None
+    longer = [k for k, _ in _member_keys() if len(k) > len(best[0]) and _alias_in(k, value)]
+    if longer:
+        return None
+    out = {"name": best[1], "children": parent_children(best[1])}
+    if best[0] != normalize(best[1]):
+        out["alias_used"] = best[0]
+    return out
 
 
 def member_state(group: Dict[str, Any], code: str) -> str:

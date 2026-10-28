@@ -601,13 +601,17 @@ def _concept_check(rows: List[Dict[str, Any]], groups: Dict[str, Dict[str, Any]]
     return out
 
 
-def rank(day: Optional[str] = None, direction: str = "strong") -> Optional[Dict[str, Any]]:
+def rank(day: Optional[str] = None, direction: str = "strong",
+         only: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
     """所有會員族群的今日排行（完整結果）；direction＝strong（平均漲幅高到低）或 weak（低到高）。
+    only：10-28 問上層類別（例：被動元件）時，只排這幾個子族群、全部列出、不做概念族群檢查。
     名單或報價都拿不到時回 None。"""
     weak = direction == "weak"
-    groups = sector_match.member_groups()
+    all_groups = sector_match.member_groups()
+    groups = {k: v for k, v in all_groups.items() if k in set(only)} if only else all_groups
     if not groups:
         return None
+    top_n = len(groups) if only else TOP_N
     began = time.perf_counter()
     if day is None and not _live_allowed():
         day = latest_trade_day() or None        # 假日／收盤後：名單用「最新交易日以前」的成交額，和顯示的那天對齊
@@ -648,14 +652,14 @@ def rank(day: Optional[str] = None, direction: str = "strong") -> Optional[Dict[
     rows.sort(key=lambda r: ((r["avg"] if weak else -r["avg"]), r["name"]))
     for index, row in enumerate(rows, 1):
         row["raw_rank"] = index
-    subsumed = _concept_check(rows, groups, weak, _industry_reference(groups, pool, quote))
+    subsumed = {} if only else _concept_check(rows, groups, weak, _industry_reference(groups, pool, quote))
     shown, families = [], set()
     for row in rows:                      # 同家族只在顯示時取一個，向後遞補
         if row["family"] in families or row["name"] in subsumed:
             continue
         families.add(row["family"])
         shown.append(row)
-        if len(shown) >= TOP_N:
+        if len(shown) >= top_n:
             break
     stock_moves: Dict[str, Dict[str, Any]] = {}
     if info.get("live") and info.get("tape"):
@@ -683,7 +687,8 @@ def rank(day: Optional[str] = None, direction: str = "strong") -> Optional[Dict[
         print("🧪 試行族群比較｜" + line, flush=True)
     return {"rows": shown, "all_rows": rows, "info": info, "bench": bench, "bench_valid": len(valid_pool),
             "pool": len(pool), "groups": len(groups), "skipped": len(skipped), "direction": "weak" if weak else "strong",
-            "quote": quote, "moves": stock_moves, "pool_meta": pool_meta()}
+            "quote": quote, "moves": stock_moves, "pool_meta": pool_meta(),
+            "unranked": [s.split(":", 1)[0] for s in skipped]}
 
 
 def _group_m5(row: Dict[str, Any], stock_moves: Dict[str, Dict[str, Any]]) -> Optional[float]:
@@ -912,8 +917,10 @@ def reason_card(data: Dict[str, Any], question: str, gateway, validate, names: D
     return card, usage
 
 
-def answer(question: str = "", gateway=None, validate=None) -> Optional[Dict[str, Any]]:
-    """「哪個族群最強／最弱（為什麼）」：TOP5 排行卡；問原因時再加新聞解讀卡。資料不足回 None。"""
+def answer(question: str = "", gateway=None, validate=None, only: Optional[List[str]] = None,
+           title: str = "") -> Optional[Dict[str, Any]]:
+    """「哪個族群最強／最弱（為什麼）」：TOP5 排行卡；問原因時再加新聞解讀卡。資料不足回 None。
+    only／title：10-28 問上層類別（例：被動元件）時，只排它底下的子族群，標題寫「被動元件 子族群排行」。"""
     began = time.perf_counter()
     intent = read_intent(question, gateway)
     t_intent = time.perf_counter() - began
@@ -924,18 +931,22 @@ def answer(question: str = "", gateway=None, validate=None) -> Optional[Dict[str
             on_demand.wake_radar()          # 背景關閉時：被問到才開始每 60 秒取樣（近 5 分、跟漲觀察要靠累積）
         except Exception:
             pass
-    data = rank(direction=intent["direction"])
+    data = rank(direction=intent["direction"], only=only)
     if not data or not data["rows"]:
         return None
+    if title:
+        data["title"] = f"{title} 子族群排行"
     names = _names()
     info = data["info"]
     when = (f"盤中 {info['time']}" if info["live"] else
             f"盤後暫定（最後快照 {info['time']}）" if info.get("basis") == "最後盤中快照" else
             f"{info['date']} 收盤" + _latest_hint(info))
-    title = "今日最弱族群" if weak else "今日族群排行"
+    heading = data.get("title") or ("今日最弱族群" if weak else "今日族群排行")
     # 10-25：定義、門檻等說明只寫 Log（rank() 已印），使用者看到的只留重點與一行免責
     # 10-27：主數字＝等權平均；中位數、上漲比例表示整群是否同步；比大盤＝平均 − 股票池基準（同一口徑）
-    lines = [f"**{title} TOP{len(data['rows'])}｜{when}**"]
+    lines = [f"**{heading}{'' if data.get('title') else ' TOP' + str(len(data['rows']))}｜{when}**"]
+    if data.get("unranked") and only:
+        lines.append("資料不足、暫不排名：" + "、".join(data["unranked"]))
     for row in data["rows"]:
         rel = f"｜比股票池 {row['rel']:+.2f}%" if row.get("rel") is not None else ""
         m5 = f"｜近5分 {row['m5']:+.2f}%" if row.get("m5") is not None else ""
@@ -1007,7 +1018,7 @@ def panel(data: Dict[str, Any], names: Optional[Dict[str, str]] = None) -> Dict[
     else:
         stamp = f"{_md(info['date'])} 收盤" + _latest_hint(info)
     return {"sector_groups": {
-        "title": f"{'今日最弱族群' if weak else '今日族群排行'} TOP{len(rows)}",
+        "title": data.get("title") or f"{'今日最弱族群' if weak else '今日族群排行'} TOP{len(rows)}",
         "stamp": stamp,
         "subtitle": "", "note": "", "banner": banner, "style": "v3",
         "leader_label": "領跌" if weak else "領漲", "limit_label": "跌停" if weak else "漲停",

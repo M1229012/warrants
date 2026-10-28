@@ -8573,7 +8573,8 @@ class AceQueryEngine:
         if request.get("mode") == "technical":
             request = dict(request, mode="overview")
         if on_demand.enabled():
-            if request.get("mode") == "market_momentum" and sector_analysis.sector_match.MEMBER_ONLY:
+            if request.get("mode") in ("market_momentum", "parent_rank", "parent_members") \
+                    and sector_analysis.sector_match.MEMBER_ONLY:
                 # 10-28：今日族群排行的股票池只抓前一交易日收盤表（member_sector_rank._ensure_prev_day），
                 # 不再觸發全市場日K補齊與型態分數重算（測試版關背景就是為了省這段）
                 pass

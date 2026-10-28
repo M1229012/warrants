@@ -76,6 +76,16 @@ def detect_request(question: str) -> Optional[Dict[str, str]]:
             return {"mode": "belongs", "industry": "", "name": code, "stock_code": code}
         return None
 
+    parent = sector_match.match_parent(question) if sector_match.MEMBER_ONLY else None
+    if parent and action != "blocked":
+        # 10-28：問上層類別（被動元件、IC設計、PCB…）→ 底下所有子族群一起排名；問成分股就列出子族群
+        mode = "parent_members" if action == "members" else "parent_rank"
+        request = {"mode": mode, "industry": "", "name": parent["name"], "children": parent["children"],
+                   "question": question}
+        if parent.get("alias_used"):
+            request["matched_by"] = f"「{parent['alias_used']}」對應類別：{parent['name']}"
+        return request
+
     hit = sector_match.match(question)
     if hit:
         if action == "blocked":
@@ -1210,6 +1220,17 @@ def _overview_answer(request: Dict[str, Any], gateway, validate) -> Dict[str, An
     return {"text": "\n".join(text), "calls": 1, "cacheable": ai_ok, "panels": panels, **usage}
 
 
+def _parent_members_answer(request: Dict[str, Any]) -> Dict[str, Any]:
+    """10-28：問上層類別有哪些股票 → 列出子族群與各自成分股。"""
+    groups = sector_match.member_groups()
+    lines = [f"**{request['name']}｜共 {len(request.get('children') or [])} 個子族群**"]
+    for child in request.get("children") or []:
+        stocks = (groups.get(child) or {}).get("stocks") or []
+        lines.append(f"・{child}（{len(stocks)} 檔）：" + "、".join(str(s[1]) for s in stocks))
+    lines.append("※ 族群分類僅供研究參考，不代表買賣建議。")
+    return {"text": "\n".join(lines), "calls": 0, "cacheable": True}
+
+
 def answer(request: Dict[str, str], gateway, validate) -> Dict[str, Any]:
     mode = request["mode"]
     if mode == "unsupported":
@@ -1220,6 +1241,20 @@ def answer(request: Dict[str, str], gateway, validate) -> Dict[str, Any]:
         return _market_radar_answer(mode, request, gateway, validate)
     if mode == "catalog":
         return {"text": "", "calls": 0, "cacheable": True, "panels": [catalog_panel()]}
+    if mode == "parent_members":
+        return _parent_members_answer(request)
+    if mode == "parent_rank":
+        import member_sector_rank
+        try:
+            result = member_sector_rank.answer(str(request.get("question") or ""), gateway, validate,
+                                               only=list(request.get("children") or []), title=request["name"])
+        except Exception as exc:
+            print(f"⚠️ {request['name']} 子族群排行失敗｜{tools.err_text(exc)}", flush=True)
+            result = None
+        if result:
+            return result
+        return {"text": f"{request['name']}底下的族群今天行情資料不足，暫時排不出來，請稍後再試。"
+                        f"\n包含：{'、'.join(request.get('children') or [])}", "calls": 0, "cacheable": False}
     if mode == "belongs":
         code = str(request.get("stock_code") or request.get("name") or "")
         names = sector_match.groups_of(code)
