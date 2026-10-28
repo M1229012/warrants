@@ -160,7 +160,7 @@ def replay_code(code: str, df: pd.DataFrame, step: int = STEP, horizon: int = HO
             area = res["areas"][lv["area"]] if lv.get("area") is not None else None
             base = {"code": code, "date": day, "mode": res["mode"], "widened": res["widened"],
                     "label": lv["label"], "kind": lv["kind"], "side": side, "ai": lv["ai"],
-                    "tentative": lv["tentative"], "watch": lv["watch"], "tight": bool(lv.get("tight")),
+                    "tentative": lv["tentative"], "conditional": lv["conditional"], "watch": lv["watch"], "tight": bool(lv.get("tight")),
                     "confluence": bool(lv["confluence"]), "area_size": len(area["labels"]) if area else 1,
                     "atr": atr, "close": close}
             rows.append(dict(base, control=False, price=lv["price"], dist_atr=dist,
@@ -231,6 +231,9 @@ GROUPS = [
     ("下跌支撐（大段／前低／等幅）", lambda r: r["kind"] == "support" and not r["watch"]),
     ("暫定（未確認錨點）", lambda r: r["tentative"] and not r["watch"]),
     ("錨點已確認", lambda r: not r["tentative"] and not r["watch"]),
+    ("突破後條件目標", lambda r: r["conditional"] and not r["watch"]),
+    ("交給 AI｜上方", lambda r: r["ai"] and r["side"] > 0),
+    ("交給 AI｜下方", lambda r: r["ai"] and r["side"] < 0),
     ("有緊密共振", lambda r: r["tight"] and not r["watch"]),
     ("只有附近共振", lambda r: r["confluence"] and not r["tight"] and not r["watch"]),
     ("沒有共振", lambda r: not r["confluence"] and not r["watch"]),

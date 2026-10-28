@@ -143,7 +143,7 @@ def render(data: dict) -> Image.Image:
     x += 54 + tw("AI 價位區", 21) + 34
     draw.rectangle((x, 170, x + 44, 190), outline=KIND_COLOR["box"], width=2)
     text(x + 54, 166, "整理區", 21, muted)
-    text(margin, 202, "實線＝交給 AI｜點線＝交給 AI，依未確認錨點試算｜虛線＝不交給 AI｜灰點小轉折、黑圈大轉折", 21, muted)
+    text(margin, 202, "實線＝交給 AI｜點線＝錨點未確認｜長短線＝突破後條件目標｜虛線＝不交給 AI｜灰點小轉折、黑圈大轉折", 21, muted)
 
     left, right, top, bottom = 115, 1215, 255, 755
     step = (right - left) / max(1, len(visible))
@@ -164,7 +164,7 @@ def render(data: dict) -> Image.Image:
         text(left - 10 - tw(label, 18), yy - 12, label, 18, muted)
 
     for area in data.get("areas") or []:   # 交給 AI 的價位區先畫，K 棒蓋在上面；其餘共振寫在下方表格
-        if area["ai"] and low <= area["low"] and area["high"] <= high:
+        if area["ai"] and not area.get("conditional") and low <= area["low"] and area["high"] <= high:   # 條件目標不畫黃帶
             draw.rectangle((left, py(area["high"]) - 5, right, py(area["low"]) + 5), fill="#FFEFC7")
     box = (sel or {}).get("box")
     if box and box["end"] >= start:   # 整理區：收盤高低框（虛線上下緣），不加文字以免壓到 K 棒
@@ -188,7 +188,13 @@ def render(data: dict) -> Image.Image:
     for lv in levels:
         yy, color = py(lv["price"]), KIND_COLOR[lv["kind"]]
         x1 = left if lv["kind"] == "support" else x0   # 下跌支撐來自更早的結構，整條畫滿才看得到
-        if lv["ai"] and lv.get("tentative"):   # 暫定：點線
+        if lv["ai"] and lv.get("conditional"):   # 突破後才成立：長短線
+            xx = x1
+            while xx < right:
+                draw.line((xx, yy, min(xx + 16, right), yy), fill=color, width=3)
+                draw.line((min(xx + 22, right), yy, min(xx + 25, right), yy), fill=color, width=3)
+                xx += 31
+        elif lv["ai"] and lv.get("tentative"):   # 暫定：點線
             xx = x1
             while xx < right:
                 draw.line((xx, yy, min(xx + 4, right), yy), fill=color, width=3)
@@ -212,7 +218,12 @@ def render(data: dict) -> Image.Image:
     if sel:
         points = [(k, sel[k]) for k in ("a", "b", "c") if sel.get(k)]
         for (_, p), (_, q) in zip(points, points[1:]):
-            draw.line((px(p["idx"]), py(p["price"]), px(q["idx"]), py(q["price"])), fill="#8A94A6", width=2)
+            x1, y1, x2, y2 = px(p["idx"]), py(p["price"]), px(q["idx"]), py(q["price"])
+            if x1 < left < x2:   # 起點在圖外：連線從圖左緣開始，不畫到 Y 軸刻度上
+                y1 += (y2 - y1) * (left - x1) / (x2 - x1)
+                x1 = left
+            if x1 >= left:
+                draw.line((x1, y1, x2, y2), fill="#8A94A6", width=2)
         for key, p in points:
             if not start <= p["idx"] <= end:
                 continue
@@ -225,7 +236,8 @@ def render(data: dict) -> Image.Image:
             text(cx - tw(label, 21, True) / 2, ly + 1, label, 21, "#C2410C", True)
 
     tags = [{"y": py(lv["price"]), "text": f"{lv.get('tag') or lv['label'].replace('前波高點', '前高').replace(' ', '')}｜{lv['price']:.2f}"
-                                           + (" 現價附近" if lv.get("watch") else " 暫定" if lv["ai"] and lv.get("tentative") else ""),
+                                           + (" 現價附近" if lv.get("watch") else " 條件" if lv["ai"] and lv.get("conditional")
+                                              else " 暫定" if lv["ai"] and lv.get("tentative") else ""),
              "color": KIND_COLOR[lv["kind"]],
              "bold": lv["ai"]} for lv in levels]
     tags.append({"y": py(data["close"]), "text": f"收盤｜{data['close']:.2f}", "color": ink, "bold": True})
@@ -297,7 +309,8 @@ def render(data: dict) -> Image.Image:
     level_rows = [([lv["label"], f"{lv['price']:.2f}",
                     "現價附近" if lv.get("watch") else "收盤之上" if lv["above"] else "收盤之下",
                     conf_text(lv),
-                    ("是（暫定）" if lv.get("tentative") else "是") if lv["ai"] else "否"], ink if lv["ai"] else muted)
+                    ("是（條件）" if lv.get("conditional") else "是（暫定）" if lv.get("tentative") else "是") if lv["ai"] else "否"],
+                   ink if lv["ai"] else muted)
                   for lv in sorted(data.get("levels") or [], key=lambda x: -x["price"])]   # 表格列全部價位（含圖外的）
     table(f"費波價位｜緊密＝{params['tight_atr']:g} ATR 內、附近＝{params['conf_atr']:g} ATR 內｜相距 {params['zone_atr']:g} ATR 內併成一區",
           [(margin + 12, "價位", 330), (410, "價格", 130), (550, "位置", 130), (690, "共振對象", 620), (1330, "交給 AI", 110)], level_rows)
