@@ -3038,9 +3038,12 @@ def _gr3_lines(row: dict, data: dict, inner: float) -> tuple:
     lag = _gr_flow(_gr3_stock_units(str(data.get('lag_label') or '落後'), tail), inner, GR_BODY) if tail else []
     if sync:
         # 10-27 審核正名：比較對象是追蹤股票池（不是加權指數）→「比股票池」；平均 − 股票池平均，和主數字同一口徑。
-        # 有效／成分＝有實際成交價、通過流動性的檔數／名單候選檔數（已扣 excluded）
-        meta = [f'比股票池 {rel:+.2f}%' if rel is not None else '',
-                f"有效 {valid}／成分 {int(row.get('members') or valid)} 檔"]
+        # 10-28：有效／有量／成分＝有已核實成交價／通過流動性股票池／名單候選檔數（已扣 excluded）。
+        # 「有效 4／有量 4」是報價完整、只是有量股少；「有效 4／有量 12」才是報價不足，兩種要看得出差別。
+        liquid = row.get("liquid")
+        counts = f"有效 {valid}／" + (f"有量 {int(liquid)}／" if liquid is not None else "") \
+            + f"成分 {int(row.get('members') or valid)} 檔"
+        meta = [f'比股票池 {rel:+.2f}%' if rel is not None else '', counts]
     else:
         meta = [f'中位數 {med:+.2f}%' if med is not None else '']
     heat = _finite(row.get('heat'))

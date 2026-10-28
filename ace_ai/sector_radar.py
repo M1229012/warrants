@@ -556,7 +556,29 @@ def _thread_session():
 _HTTP_LOCK = threading.Lock()
 _HTTP_SENT = [0]                     # 成員報價實際送出的 HTTP 次數（全域、thread-safe）
 # 本輪彙總（用代號去重，重試不重算）；conn_error 收 MisError.kind，empty 收「回了 JSON 但沒有任何報價」的批次
-_BATCH_STATS: Dict[str, set] = {"unknown": set(), "today": set(), "no_trade": set(), "conn_error": set(), "empty": set()}
+_BATCH_STATS: Dict[str, set] = {"unknown": set(), "today": set(), "no_trade": set(), "conn_error": set(), "empty": set(),
+                                "z_ok": set(), "pz_only": set(), "quote_only": set(), "no_price": set()}
+# 10-28 蒐證：少數代表股保存連續幾次 MIS 原始欄位（不增加請求，只從既有回應挑出來印 Log）
+SAMPLE_CODES = {c.strip() for c in str(os.getenv("DISCORD_AI_MIS_SAMPLE_CODES",
+                "2330,2317,2454,2382,3017,2603,2881,1301,6669,3231")).split(",") if c.strip()}
+SAMPLE_PER_DAY = max(0, tools._env_int("DISCORD_AI_MIS_SAMPLE_PER_DAY", 5))
+SAMPLE_FIELDS = ("c", "ch", "ex", "n", "d", "t", "tlong", "z", "pz", "y", "o", "h", "l", "v", "tv", "a", "b", "f", "g", "u", "w")
+_SAMPLE_COUNT: Dict[Tuple[str, str], int] = {}
+
+
+def _log_raw_sample(item: Dict[str, Any], source: str, sent_at: float) -> None:
+    code = str(item.get("c") or "")
+    if code not in SAMPLE_CODES or SAMPLE_PER_DAY <= 0:
+        return
+    key = (tools.taipei_now().strftime("%Y-%m-%d"), code)
+    with _HTTP_LOCK:
+        count = _SAMPLE_COUNT.get(key, 0)
+        if count >= SAMPLE_PER_DAY:
+            return
+        _SAMPLE_COUNT[key] = count + 1
+    raw = {k: item.get(k) for k in SAMPLE_FIELDS if k in item}
+    print(f"🧾 MIS 原始樣本｜{code}｜第 {count + 1} 次｜請求 {time.strftime('%H:%M:%S', time.localtime(sent_at))}"
+          f"｜price_source={source}｜{json.dumps(raw, ensure_ascii=False)}", flush=True)
 
 
 def _fetch_batch_scoped(request_id: str, codes: List[str]) -> Dict[str, Dict[str, Any]]:
@@ -588,6 +610,7 @@ def _fetch_batch(session, codes: List[str]) -> Dict[str, Dict[str, Any]]:
         with _HTTP_LOCK:
             _HTTP_SENT[0] += 1
     items = []
+    sent_at = time.time()
     try:
         items = mis_get(session, {"ex_ch": "|".join(channels.values())}).get("msgArray") or []
         if not items:
@@ -600,24 +623,30 @@ def _fetch_batch(session, codes: List[str]) -> Dict[str, Dict[str, Any]]:
             _BATCH_STATS["conn_error"].add(exc.kind)
     out: Dict[str, Dict[str, Any]] = {}
     today, no_trade = set(), set()
+    kinds: Dict[str, set] = {"z_ok": set(), "pz_only": set(), "quote_only": set(), "no_price": set()}
     for item in items:
         code = str(item.get("c") or "")
         channel = channels.get(code)
         if not channel or (item.get("ch") and item["ch"] != f"{code}.tw") \
                 or (item.get("ex") and item["ex"] != channel.split("_", 1)[0]):
             continue
-        price, previous = _mis_price(item), _num_field(item, "y")
+        # 10-28 審核：先讀 z／pz，再看五檔。以前先要求「z 或五檔」有價才往下，只有 pz 的報價整檔被丟掉。
+        z_price, pz_price = _num_field(item, "z"), _num_field(item, "pz")
+        quote_mid, previous = _mis_price(item), _num_field(item, "y")
+        source = "z" if z_price > 0 else "pz_only" if pz_price > 0 else "quote_only" if quote_mid > 0 else "no_price"
+        _log_raw_sample(item, source, sent_at)
         is_today = tools.mis_item_is_today(item)
         if is_today:
             today.add(code)
-            if price > 0 and _num_field(item, "z") <= 0:     # 沒有成交價、用五檔中價估算
+            kinds["z_ok" if source == "z" else source].add(code)
+            if source != "z" and quote_mid > 0:          # 族群雷達沿用：沒有 z 時用五檔中價估算
                 no_trade.add(code)
+        # 族群雷達的 price：z → 五檔中價 → pz（估算用，不代表成交）
+        price = quote_mid or pz_price
         if code and price > 0 and previous > 0 and is_today:
             lots = _num_field(item, "v")                  # MIS 累計成交量（張）
-            # 10-27 審核：price 在沒有成交價時是五檔中價（族群雷達沿用）；族群排行只能用實際成交價 → 另存 trade_price。
-            # z＝本次成交價；pz＝前一筆成交價（MIS 有時 z 是「-」但 pz 有值）；兩者都沒有＝今天還沒有可用的成交價
-            z_price, pz_price = _num_field(item, "z"), _num_field(item, "pz")
-            trade_price = z_price if z_price > 0 else pz_price if pz_price > 0 else 0.0
+            # 10-28 審核：族群排行只把 z 當「已核實成交價」；pz 的語義與成交時間還沒核實，另存成候選，不直接當最新成交
+            trade_price = z_price if z_price > 0 else 0.0
             out[code] = {"name": str(item.get("n") or code), "price": price, "prev": previous,
                          "change_pct": round((price / previous - 1) * 100, 2),
                          "value": lots * 1000 * price,     # 成交金額近似值（MIS 沒有逐檔成交金額）
@@ -626,11 +655,15 @@ def _fetch_batch(session, codes: List[str]) -> Dict[str, Dict[str, Any]]:
                          "limit_up": _num_field(item, "u"), "limit_down": _num_field(item, "w"),
                          "traded": _num_field(item, "z") > 0,
                          "lots": lots,                     # 10-25：族群排行 v2 算近 5 分量（累計張數相減）
-                         "trade_price": trade_price,       # 10-27：實際成交價（0＝未知）
+                         "trade_price": trade_price,       # 10-28：只有 z（已核實成交價）；0＝未知
+                         "pz_price": pz_price,             # 10-28：候選價格，語義待核實，排行不直接用
+                         "price_source": source,
                          "trade_time": str(item.get("t") or ""), "exchange_date": str(item.get("d") or "")}
     with _HTTP_LOCK:
         _BATCH_STATS["today"].update(today)
         _BATCH_STATS["no_trade"].update(no_trade)
+        for key, codes_ in kinds.items():
+            _BATCH_STATS[key].update(codes_)
     return out
 
 
@@ -682,8 +715,14 @@ def _fetch_stock_quotes(codes: List[str], deadline_seconds: Optional[float] = No
         unknown, today = len(_BATCH_STATS["unknown"]), len(_BATCH_STATS["today"])
         no_trade = len(_BATCH_STATS["no_trade"])
         errors, empty = sorted(_BATCH_STATS["conn_error"]), len(_BATCH_STATS["empty"])
+        # 最終去重：同一檔在重試中拿到 z 就算 z，不和前一次的分類重複計
+        z_ok = _BATCH_STATS["z_ok"]
+        pz_only = _BATCH_STATS["pz_only"] - z_ok
+        quote_only = _BATCH_STATS["quote_only"] - z_ok - pz_only
+        no_price = _BATCH_STATS["no_price"] - z_ok - pz_only - quote_only
+        kinds_text = f"z可用={len(z_ok)}｜只有pz={len(pz_only)}｜只有五檔={len(quote_only)}｜都沒有={len(no_price)}"
     print(f"📡 MIS 成員報價｜requested={len(codes)}｜returned={len(out)}｜missing={len(missing)}"
-          f"｜市場別不明={unknown}｜中價估算={no_trade}/{today}（MIS 無成交價）"
+          f"｜市場別不明={unknown}｜同日行情={today}｜{kinds_text}"
           + (f"｜錯誤類型={'/'.join(errors)}" if errors else "") + (f"｜空回應批次={empty}" if empty else "")
           + f"｜http_calls={sent}（{len(batches)} 批＋重試）｜{time.perf_counter() - began:.1f}s"
           + (f"｜{','.join(missing[:15])}" if missing else ""), flush=True)

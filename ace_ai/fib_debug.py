@@ -181,10 +181,11 @@ def render(data: dict) -> Image.Image:
     x0 = px(max(start, sel["a"]["idx"])) if sel else left
     for lv in levels:
         yy, color = py(lv["price"]), KIND_COLOR[lv["kind"]]
+        x1 = left if lv["kind"] == "support" else x0   # 下跌支撐來自更早的結構，整條畫滿才看得到
         if lv["ai"]:
-            draw.line((x0, yy, right, yy), fill=color, width=3)
+            draw.line((x1, yy, right, yy), fill=color, width=3)
         else:
-            xx = x0
+            xx = x1
             while xx < right:
                 draw.line((xx, yy, min(xx + 12, right), yy), fill=color, width=2)
                 xx += 20
@@ -208,8 +209,9 @@ def render(data: dict) -> Image.Image:
             draw.ellipse((xx - 10, yy - 10, xx + 10, yy + 10), outline="#C2410C", width=4)
             label = key.upper()
             ly = yy - 42 if p["type"] == "H" else yy + 14
-            draw.rectangle((xx - 14, ly, xx + 14, ly + 28), fill="#FFFFFF", outline="#C2410C")
-            text(xx - tw(label, 21, True) / 2, ly + 1, label, 21, "#C2410C", True)
+            cx = min(max(xx, left + 16), right - 16)   # 10-28：最後幾根的錨點字框不能伸進右側價位標籤
+            draw.rectangle((cx - 14, ly, cx + 14, ly + 28), fill="#FFFFFF", outline="#C2410C")
+            text(cx - tw(label, 21, True) / 2, ly + 1, label, 21, "#C2410C", True)
 
     tags = [{"y": py(lv["price"]), "text": f"{lv.get('tag') or lv['label'].replace('前波高點', '前高').replace(' ', '')}｜{lv['price']:.2f}",
              "color": KIND_COLOR[lv["kind"]],
@@ -218,8 +220,8 @@ def render(data: dict) -> Image.Image:
     _spread(tags, 25, top - 10, bottom)
     for tag in tags:
         if abs(tag["ly"] - tag["y"]) > 2:
-            draw.line((right, tag["y"], right + 8, tag["ly"]), fill=tag["color"], width=1)
-        text(right + 10, tag["ly"] - 12, tag["text"], 19, tag["color"], tag["bold"])
+            draw.line((right + 4, tag["y"], right + 14, tag["ly"]), fill=tag["color"], width=1)
+        text(right + 16, tag["ly"] - 12, tag["text"], 19, tag["color"], tag["bold"])   # 與最後一根的錨點圓圈留空隙
 
     tick_gap = max(1, math.ceil(len(visible) / 9))
     for i in range(start, end + 1, tick_gap):

@@ -178,13 +178,13 @@ def compute(frame: pd.DataFrame, events: Optional[Dict[str, Any]] = None) -> Dic
                 pairs.append({"a": a, "b": b, "dir": 1 if b["type"] == "H" else -1})
         out = []
         ups = []
-        for g in pairs:   # 1. 收盤所在的最大一段上漲（同向小段併入）：0.618／0.786／1.0
+        for g in pairs:   # 1. 收盤所在、起點最近的一段上漲（同向小段併入）：0.618／0.786／1.0
             if g["dir"] > 0:
                 ga, gb = anchors(g)[:2]
-                if ga["price"] < close < gb["price"]:
+                if ga["price"] < close < gb["price"] and gb["idx"] != top["idx"]:   # 終點就是這次下跌起點＝正在回撤的那段反彈，不算大波段
                     ups.append((gb["price"] - ga["price"], ga, gb))
-        if ups:
-            amp_u, ga, gb = max(ups, key=lambda x: x[0])
+        if ups:   # 10-28：取起點最近的一段，不取幅度最大的（一年資料會選到太早的起漲點，價位離現價太遠）
+            amp_u, ga, gb = max(ups, key=lambda x: x[1]["idx"])
             for r in SUPPORT_RETRACE:
                 price = gb["price"] - amp_u * r
                 if price < close:
@@ -320,10 +320,13 @@ def compute(frame: pd.DataFrame, events: Optional[Dict[str, Any]] = None) -> Dic
                            f"等幅測量 {box['top']:.2f}＋{box['height']:.2f}＝{box['target']:.2f}")
         selected["box"] = box
         falling = bool(provisional and provisional["dir"] < 0 and provisional["b"]["idx"] >= last - 5)
-        if falling:   # 10-28（2308）：還在創低＝要看可能跌到哪
+        if falling:   # 10-28（2308）：還在創低＝要看可能跌到哪；說法改寫成一句，不再接「下跌後反彈」
+            pa, pb = provisional["a"], provisional["b"]
             mode = "falling"
-            mode_text += "；最近幾天還在創低，下方看大波段回撤、前波低點與下跌等幅"
-            levels += support_levels(provisional["a"])
+            mode_text = (note + "；" if note else "") + (
+                f"還在下跌：{dates[pa['idx']][5:]} 高點 {pa['price']:.2f} 跌到 {pb['price']:.2f}（約 {provisional['amp_atr']:.1f} ATR，"
+                f"低點還沒確認）；下方看支撐，反彈先看最近的壓力")
+            levels += support_levels(pa)
         for item in levels:
             price = item["price"]
             hits = [x["text"] for x in refs if 1e-6 < abs(x["price"] - price) <= tol and x.get("level") is not item]   # 同價＝自己（前波低點就是那個轉折）
@@ -340,9 +343,11 @@ def compute(frame: pd.DataFrame, events: Optional[Dict[str, Any]] = None) -> Dic
         if mode == "extend":
             for item in [x for x in levels if x["kind"] == "extend" and x["above"]][:EXTEND_AI]:
                 item["ai"] = True
-        if falling:   # 收盤之下最近的幾個價位（支撐或原本的回撤）直接交給 AI
+        if falling:   # 收盤之下最近幾個價位直接交給 AI；上方只留最近幾個反彈壓力，數字不要太多
             for item in sorted([x for x in levels if not x["above"]], key=lambda x: -x["price"])[:SUPPORT_AI]:
                 item["ai"] = True
+            for item in sorted([x for x in levels if x["above"] and x["ai"]], key=lambda x: x["price"])[SUPPORT_AI:]:
+                item["ai"] = False
         word = "上漲" if d > 0 else "下跌"
         summary.append(f"選用波段：A {a['price']:.2f}（{dates[a['idx']]}）→ B {b['price']:.2f}（{dates[b['idx']]}），"
                        f"{word} {amp:.2f}（約 {selected['amp_atr']:.1f} ATR）" + ("；後續同向小段已併入" if merged else "")
@@ -350,7 +355,7 @@ def compute(frame: pd.DataFrame, events: Optional[Dict[str, Any]] = None) -> Dic
         if box:
             summary.append(box["line"])
         picks = [x for x in levels if x["ai"] and x["above"]]
-        summary.append("交給 AI 的上方參考：" + ("、".join(f"{x['label']} {x['price']:.2f}" for x in picks) if picks
+        summary.append(("交給 AI 的反彈壓力：" if falling else "交給 AI 的上方參考：") + ("、".join(f"{x['label']} {x['price']:.2f}" for x in picks) if picks
                                                  else "沒有在收盤之上且有共振的價位，AI 不提費波參考價"))
         if falling:
             downs = sorted([x for x in levels if x["ai"] and not x["above"]], key=lambda x: -x["price"])

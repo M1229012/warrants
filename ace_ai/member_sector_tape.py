@@ -156,17 +156,25 @@ def trade_price(q: Optional[Dict[str, Any]]) -> Optional[float]:
     return None
 
 
-def last_trade(code: str, max_age: float = KEEP_SECONDS) -> Optional[Tuple[float, float]]:
-    """這一檔今天最近一次的實際成交價（價格, 觀測時間）；超過 max_age 秒或今天沒有就回 None。"""
+def last_trade(code: str, max_age: float = KEEP_SECONDS) -> Optional[Tuple[float, float, float]]:
+    """這一檔今天最近一次的已核實成交價（價格, 觀測時間, 當時累計張數）；超過 max_age 秒或今天沒有就回 None。
+    10-28 審核：要不要沿用由呼叫端比對「這筆價格當時的累計量」和最新累計量，不靠 TTL 判斷。"""
     cutoff, day = _now_ts() - max_age, _day()
     with _LOCK:
         for ts, snap_day, quotes in reversed(_SNAPS):
             if snap_day != day or ts < cutoff:
                 return None
-            price = trade_price(quotes.get(code))
+            q = quotes.get(code)
+            price = trade_price(q)
             if price:
-                return price, ts
+                return price, ts, float((q or {}).get("lots") or 0)
     return None
+
+
+def carry_allowed(base_lots: float, lots_now: float) -> bool:
+    """舊成交價可以沿用＝最新累計量「等於」那筆已核實價格對應的累計量（同一天，last_trade 已限定）。
+    量增加（之後有新成交、價格未知）、倒退或重置、任一邊缺值，都不能沿用。"""
+    return base_lots > 0 and lots_now > 0 and abs(lots_now - base_lots) < 1e-9
 
 
 def _quote_before(code: str, target: float) -> Optional[Tuple[float, Dict[str, Any]]]:

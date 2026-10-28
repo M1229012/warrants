@@ -214,14 +214,18 @@ def quotes(codes: List[str]) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]
         wanted = set(codes)
         raw = {c: q for c, q in (snap[1] if snap else {}).items() if c in wanted}
         out: Dict[str, Dict[str, Any]] = {}
-        carried = no_trade = 0
+        carried = moved = no_trade = 0
         for c, q in raw.items():
             prev = float(q.get("prev") or 0)
             price = tape.trade_price(q)
             if not price:
+                # 10-28 審核：只有「最新累計量等於那筆已核實價格當時的累計量」才沿用；
+                # 量已增加＝之後有新成交、最新價未知，不能拿舊價當最新價
                 last = tape.last_trade(c)
-                if last:
+                if last and tape.carry_allowed(last[2], float(q.get("lots") or 0)):
                     price, carried = last[0], carried + 1
+                elif last:
+                    moved += 1
             if not price or prev <= 0:
                 no_trade += 1
                 continue
@@ -233,10 +237,15 @@ def quotes(codes: List[str]) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]
             out[c] = {"change_pct": (price / prev - 1) * 100, "price": price, "est_value": value, "prev": prev,
                       "name": q.get("name", ""), "high": float(q.get("high") or 0), "low": float(q.get("low") or 0),
                       "limit_up": float(q.get("limit_up") or 0), "limit_down": float(q.get("limit_down") or 0)}
-        print(f"🎞️ 族群排行報價｜可用 {len(out)}/{len(codes)}｜沿用稍早成交價 {carried}｜沒有成交價 {no_trade}", flush=True)
-        if len(out) < len(codes) * LIVE_MIN_SHARE:
+        print(f"🎞️ 族群排行報價｜已核實成交價 {len(out)}/{len(codes)}｜同日行情 {len(raw)}"
+              f"｜沿用（量未增加）{carried}｜量已增加、最新價未知 {moved}｜沒有成交價 {no_trade}", flush=True)
+        official = _official_session_today()
+        short = len(out) < len(codes) * LIVE_MIN_SHARE
+        if short and official is not True:
             # 10-26：颱風假、臨時休市等平日沒有今天的盤中報價 → 改用本地日 K 最新一個交易日，不要回空
-            print(f"📊 今日族群排行｜盤中報價只有 {len(out)}/{len(codes)} 檔（今天可能休市），改用最新交易日收盤資料", flush=True)
+            # 10-28 審核：只有官方日曆確認休市，或日曆沒涵蓋今天時才這樣做；官方確認開市就標「資料不足」，不能說成休市
+            print(f"📊 今日族群排行｜盤中報價只有 {len(out)}/{len(codes)} 檔、官方日曆{'確認休市' if official is False else '未涵蓋今天'}"
+                  f"，改用最新交易日收盤資料", flush=True)
             out, info = _closed_quotes(codes)
             return out, dict(info, fallback=True)
         bad = _verify_reference(out)
@@ -258,8 +267,20 @@ def quotes(codes: List[str]) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]
             basis, live = "盤中", True
         return out, {"live": live, "basis": basis,
                      "time": tape_status["time"] or now.strftime("%H:%M:%S"), "date": now.strftime("%Y-%m-%d"),
-                     "tape": tape_status}
+                     "tape": tape_status, "data_short": short, "verified": len(out), "requested": len(codes)}
     return _closed_quotes(codes)
+
+
+def _official_session_today() -> Optional[bool]:
+    """官方交易日曆：True＝今天開市、False＝今天休市、None＝日曆沒涵蓋今天或讀取失敗。"""
+    day = tools.taipei_now().strftime("%Y-%m-%d")
+    try:
+        saved = local_market_cache.get_state(local_market_cache.MARKET_SESSIONS_KEY, {}) or {}
+        if not saved or str(saved.get("last") or "") < day or str(saved.get("first") or "9999") > day:
+            return None
+        return bool(local_market_cache.market_sessions_between(day, day))
+    except Exception:
+        return None
 
 
 # 盤中有效報價不到名單 2 成＝今天沒開盤（颱風假等），改用最新交易日。
@@ -873,6 +894,10 @@ def panel(data: Dict[str, Any], names: Optional[Dict[str, str]] = None) -> Dict[
         banner = f"行情 {int((tape.get('age') or 0) // 60)} 分鐘未更新，以下是 {tape.get('time', '')} 的資料。"
     elif info["live"] and tape.get("state") in ("warming", "none"):
         banner = "剛開始取樣，近5分資料累積中，先顯示今日累計排行。"
+    if info.get("data_short"):
+        # 10-28 審核：開市日盤中缺價＝資料不足，不是休市
+        banner = "．".join(x for x in (banner, f"盤中已核實成交價只有 {info.get('verified', 0)}／{info.get('requested', 0)} 檔，"
+                                                 "資料不足，排行可能不完整。") if x)
     if (data.get("pool_meta") or {}).get("base_stale"):
         banner = "．".join(x for x in (banner, "日K底庫還沒更新到前一交易日，流動性名單可能不完整。") if x)
     if info["live"]:
