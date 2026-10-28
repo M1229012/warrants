@@ -13,6 +13,8 @@ import kline_debug
 
 _COMMAND = re.compile(r"(?:費波|斐波|費氏|費布|fibo?)\s*\w{0,4}?\s*驗證|驗證\s*\w{0,3}?(?:費波|斐波|費氏|費布)", re.IGNORECASE)
 _CODE_RE = re.compile(r"(?<![0-9A-Za-z])(?:[0-9]{4,6}[A-Za-z]?|TAIEX|TPEX)(?![0-9A-Za-z])", re.IGNORECASE)
+YEAR_PERIOD = "400d"         # 與分點一年日K同一個抓取區間（約 270 個交易日）
+YEAR_TTL_SECONDS = 6 * 3600  # 同檔同日只抓一次 FinMind
 KIND_COLOR = {"retrace": "#1478B5", "prior": "#C76C00", "extend": "#8044B8", "box": "#2F855A"}
 
 
@@ -43,9 +45,44 @@ def find_codes(q: str, example: str, limit: int = 10) -> list[str]:
 
 
 def load_panel(code: str) -> dict[str, Any]:
-    """僅管理員路由呼叫；行情入口與型態驗證相同（只用正式收盤 K）。"""
+    """僅管理員路由呼叫；行情入口與型態驗證相同（只用正式收盤 K），前面再接約一年日K看大結構。"""
     code, name, frame, events = kline_debug.load_closed(code)
-    return build_panel(frame, events, code, name)
+    frame, note = extend_history(code, frame, events)
+    panel = build_panel(frame, events, code, name)
+    if note:
+        panel["fib_debug"]["flags"].append(note)
+    return panel
+
+
+def extend_history(code: str, closed: pd.DataFrame, events: dict | None) -> tuple[pd.DataFrame, str]:
+    """10-28：另抓約一年日K（與分點一年日K同區間），整段用同一份公司行動、同一個 as_of 還原後，
+    只取正式收盤 K 之前的部分接上；同檔同日只抓一次。抓不到就用原本的日K並註明，不擋驗證。"""
+    import price_adjustment
+    import warrant_ai_tools as tools
+
+    def fetch():
+        raw, _, _ = tools.core().fetch_stock_data_yf(code, period=YEAR_PERIOD)
+        tools.record_api_event("FinMindData", status=200)
+        return tools._formal_daily_frame(tools._drop_invalid_bars(code, raw, "費波一年日K"))
+
+    columns = [c for c in ("Open", "High", "Low", "Close", "Volume") if c in closed.columns]
+    try:
+        raw = tools._cached(f"fib_year_{code}_{tools.taipei_now():%Y-%m-%d}", YEAR_TTL_SECONDS, fetch)
+        if raw is None or raw.empty:
+            return closed, "一年日K：來源沒有資料，只用原本的日K"
+        raw = raw.copy()
+        raw.index = pd.to_datetime(raw.index)
+        adjusted = price_adjustment.adjust_shares(raw[[c for c in columns if c in raw.columns]], events,
+                                                  as_of=closed.index[-1], allow_jumps=str(code) in tools.get_emerging_codes())
+        older = adjusted.loc[adjusted.index < closed.index[0]]
+        if older.empty:
+            return closed, ""
+        merged = pd.concat([older, closed[columns]]).sort_index()
+        # 較早的權值事件已在整段還原時套用；記進 attrs，費波的除息還原才不會把它們當成「未還原」
+        merged.attrs = dict(closed.attrs, share_adjustments=adjusted.attrs.get("share_adjustments") or [])
+        return merged, ""
+    except Exception as exc:
+        return closed, f"一年日K未接上（{tools.err_text(exc)}），只用原本的日K"
 
 
 def build_panel(frame: pd.DataFrame, events: dict | None, code: str, name: str = "") -> dict:
@@ -229,7 +266,8 @@ def render(data: dict) -> Image.Image:
     for g in (data.get("legs") or [])[-10:]:
         if g["selected"]:
             note = "選用" + (f"（後續併入，B 移到 {sel['b']['date'][5:]}）" if sel and sel.get("merged") else "") \
-                + ("（備援：回看區間最低／最高點，不是大轉折）" if g.get("fallback") else "")
+                + ("（備援：回看區間最低／最高點，不是大轉折）" if g.get("fallback") else "") \
+                + ("（終點未確認：最後一個大轉折到目前極值）" if g.get("provisional") else "")
         else:
             note = g["status"] or "合格（較舊，未選用）"
         leg_rows.append(([lw(g["a"]), lw(g["b"]), "上漲" if g["dir"] > 0 else "下跌", f"{g['amp_atr']:.1f}", note],
