@@ -113,6 +113,22 @@ def compute(frame: pd.DataFrame, events: Optional[Dict[str, Any]] = None) -> Dic
     return _compute(frame, events, LOOKBACK, widened=True)
 
 
+def _hits(item: Dict[str, Any], refs: List[Dict[str, Any]], zones: List[Dict[str, Any]], tol: float) -> List[tuple]:
+    """價位的共振對象（文字, 距離）。10-28：依來源身分排除自己（同一個轉折、同一個整理區），
+    不能用「價格完全相同」排除——不同日期、不同波段剛好同價是最強的重合。"""
+    price = item["price"]
+    out = [(x["text"], abs(x["price"] - price)) for x in refs
+           if abs(x["price"] - price) <= tol and x.get("level") is not item
+           and not (x.get("idx") is not None and x["idx"] == item.get("src_idx"))]
+    out += [(f"大量區 {z['low']:.2f}～{z['high']:.2f}", max(0.0, abs(z["price"] - price) - (z["high"] - z["low"]) / 2))
+            for z in zones if abs(z["price"] - price) <= tol + (z["high"] - z["low"]) / 2]
+    step = round_step(price)
+    nearest = round(price / step) * step
+    if nearest > 0 and abs(nearest - price) <= tol:
+        out.append((f"整數關卡 {nearest:g}", abs(nearest - price)))
+    return out
+
+
 def _area_text(area: Dict[str, Any]) -> str:
     if len(area["members"]) == 1:
         x = area["members"][0]
@@ -191,7 +207,7 @@ def _compute(frame: pd.DataFrame, events: Optional[Dict[str, Any]], lookback: in
         j = p["idx"] + 1 + int(np.argmax(span) if p["type"] == "L" else np.argmin(span))
         e = {"type": "H" if p["type"] == "L" else "L", "idx": j, "price": float(span[j - p["idx"] - 1]), "confirm": last}
         amp = abs(e["price"] - p["price"])
-        if amp / ref >= LEG_ATR:
+        if amp / ref >= LEG_ATR and j >= begin:   # 10-28：終點也要在回看範圍內，與已確認波段同一條件
             provisional = {"a": p, "b": e, "dir": 1 if e["type"] == "H" else -1, "amp": amp, "amp_atr": amp / ref,
                            "status": "", "provisional": True}
 
@@ -215,12 +231,13 @@ def _compute(frame: pd.DataFrame, events: Optional[Dict[str, Any]], lookback: in
                 price = gb["price"] - amp_u * r
                 if price < close:
                     out.append({"label": f"大波段回撤 {r:g}（{dates[ga['idx']][5:]}～{dates[gb['idx']][5:]}）",
-                                "tag": f"大段{r:g}", "kind": "support", "ratio": r, "price": price})
+                                "tag": f"大段{r:g}", "kind": "support", "ratio": r, "price": price,
+                                "src_idx": int(ga["idx"]) if r == 1.0 else None})   # 回撤 1.0＝起點那個轉折本身
         lows = [p for p in major if p["type"] == "L" and p["price"] < close]
         if lows:   # 2. 收盤下方最近的大轉折低點（已跌破的前低在收盤之上，自然不列）
             p = max(lows, key=lambda p: p["price"])
             out.append({"label": f"前波低點（{dates[p['idx']]}）", "tag": "前低", "kind": "support", "ratio": 1.0,
-                        "price": float(p["price"])})
+                        "price": float(p["price"]), "src_idx": int(p["idx"])})
         downs = [g for g in pairs if g["dir"] < 0 and g["b"]["idx"] <= top["idx"] and g["a"]["price"] > top["price"]]
         if downs:   # 3. 上一段大跌（高點比這次高）的幅度，從這次的較低高點往下量；10-28：跌破那段的低點不影響投射
             g = downs[-1]
@@ -325,7 +342,8 @@ def _compute(frame: pd.DataFrame, events: Optional[Dict[str, Any]], lookback: in
         anchor_idx = {a["idx"], b["idx"]} | ({cpt["idx"]} if cpt else set())
         for p in minor:
             if p["idx"] >= ref_begin and p["idx"] not in anchor_idx:
-                refs.append({"price": float(p["price"]), "text": f"{'前高' if p['type'] == 'H' else '前低'} {dates[p['idx']][5:]}"})
+                refs.append({"price": float(p["price"]), "idx": int(p["idx"]),
+                             "text": f"{'前高' if p['type'] == 'H' else '前低'} {dates[p['idx']][5:]}"})
         zones = _volume_zones(h, l, c, v, ref_begin, last, ref)
         for g in [g for g in qualified if all(g is not u for u in used)][-OTHER_LEGS:]:
             g_lo, g_hi = sorted((g["a"]["price"], g["b"]["price"]))
@@ -358,14 +376,7 @@ def _compute(frame: pd.DataFrame, events: Optional[Dict[str, Any]], lookback: in
         test_tol = TEST_ATR * ref
         for item in levels:
             price = item["price"]
-            hits = [(x["text"], abs(x["price"] - price)) for x in refs
-                    if 1e-6 < abs(x["price"] - price) <= tol and x.get("level") is not item]   # 同價＝自己（前波低點就是那個轉折）
-            hits += [(f"大量區 {z['low']:.2f}～{z['high']:.2f}", max(0.0, abs(z["price"] - price) - (z["high"] - z["low"]) / 2))
-                     for z in zones if abs(z["price"] - price) <= tol + (z["high"] - z["low"]) / 2]
-            step = round_step(price)
-            nearest = round(price / step) * step
-            if nearest > 0 and abs(nearest - price) <= tol:
-                hits.append((f"整數關卡 {nearest:g}", abs(nearest - price)))
+            hits = _hits(item, refs, zones, tol)
             watch = abs(price - close) <= test_tol   # 10-28：貼著收盤＝股價正在這條線附近，不是目標價
             # 10-28：價位依賴終點還沒確認的錨點（未確認波段的 B 本身、由它算出的回撤／延伸）＝暫定
             tentative = selected["provisional"] and (item["kind"] in ("retrace", "extend")

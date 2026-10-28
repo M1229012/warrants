@@ -3504,7 +3504,7 @@ def ai_card(draw, y: float, data: dict, dry: bool) -> int:
         return 46
 
     if data.get('why'):
-        cy += section('為什麼這樣看')
+        cy += section(data.get('why_title') or '為什麼這樣看')       # 10-28：族群解讀改標「族群解讀」
         cy += _para(pen, ix0, cy, data['why'], 29, INK, width) + 16
     scenarios = [s for s in data.get('scenarios') or [] if s.get('text')][:2]
     if scenarios:
