@@ -127,7 +127,9 @@ def render(data: dict) -> Image.Image:
     text(margin, 25, f"{data['stock_code']} {data.get('stock_name', '')}｜管理員費波驗證", 37, bold=True)
     text(margin, 86, f"正式收盤截至 {bars[end]['date']}｜顯示 {len(visible)} 根／計算 {len(bars)} 根（還原價）｜前一日 ATR20：{data['atr']:.2f}"
                      f"｜共振距離 {data['tolerance']:.2f}", 22, muted)
-    text(margin, 120, f"大轉折門檻 {params['major_atr']:g} ATR｜合格波段 ≥ {params['leg_atr']:g} ATR｜終點在最近 {params['lookback']} 根"
+    scope = (f"近 {params['near_lookback']} 根找不到，放寬到 {params['lookback']} 根" if data.get("widened")
+             else f"終點在最近 {params['lookback']} 根")
+    text(margin, 120, f"大轉折門檻 {params['major_atr']:g} ATR｜合格波段 ≥ {params['leg_atr']:g} ATR｜{scope}"
                       f"｜確認日當天的轉折不使用", 22, muted)
     x = margin
     for label, color in (("回撤／反彈", KIND_COLOR["retrace"]), ("前波高點", KIND_COLOR["prior"]), ("延伸", KIND_COLOR["extend"]),
@@ -136,19 +138,22 @@ def render(data: dict) -> Image.Image:
         text(x + 60, 166, label, 21, color)
         x += 60 + tw(label, 21) + 34
     draw.rectangle((x, 170, x + 44, 190), fill="#FFEFC7")
-    text(x + 54, 166, "共振區", 21, muted)
-    x += 54 + tw("共振區", 21) + 34
+    text(x + 54, 166, "AI 價位區", 21, muted)
+    x += 54 + tw("AI 價位區", 21) + 34
     draw.rectangle((x, 170, x + 44, 190), outline=KIND_COLOR["box"], width=2)
     text(x + 54, 166, "整理區", 21, muted)
-    text(margin, 202, "實線＝交給 AI｜點線＝交給 AI 但暫定（低點確認後才成立）｜虛線＝不交給 AI｜灰點小轉折、黑圈大轉折", 21, muted)
+    text(margin, 202, "實線＝交給 AI｜點線＝交給 AI，依未確認錨點試算｜虛線＝不交給 AI｜灰點小轉折、黑圈大轉折", 21, muted)
 
     left, right, top, bottom = 115, 1215, 255, 755
     step = (right - left) / max(1, len(visible))
     px = lambda i: left + (i - start + 0.5) * step
-    prices = [b[k] for b in visible for k in ("Low", "High")] + [lv["price"] for lv in levels]
+    prices = [b[k] for b in visible for k in ("Low", "High")]
+    # 10-28：只顯示近段時，交給 AI／現價附近的價位一定入圖；其餘離圖太遠的只列在下方表格，不把 K 線壓扁
+    prices += [lv["price"] for lv in levels if lv["ai"] or lv.get("watch") or min(prices) <= lv["price"] <= max(prices)]
     low, high = min(prices), max(prices)
     padding = max((high - low) * 0.06, abs(high) * 0.003, 0.01)
     low, high = low - padding, high + padding
+    levels = [lv for lv in levels if low <= lv["price"] <= high]
     py = lambda p: bottom - (p - low) / (high - low) * (bottom - top)
     for j in range(7):
         value = low + (high - low) * j / 6
@@ -157,9 +162,9 @@ def render(data: dict) -> Image.Image:
         label = f"{value:.2f}"
         text(left - 10 - tw(label, 18), yy - 12, label, 18, muted)
 
-    for lv in levels:   # 共振區先畫，K 棒蓋在上面；10-28：只畫交給 AI 的，其餘共振寫在下方表格
-        if lv["confluence"] and lv["ai"]:
-            draw.rectangle((left, py(lv["price"]) - 5, right, py(lv["price"]) + 5), fill="#FFEFC7")
+    for area in data.get("areas") or []:   # 交給 AI 的價位區先畫，K 棒蓋在上面；其餘共振寫在下方表格
+        if area["ai"] and low <= area["low"] and area["high"] <= high:
+            draw.rectangle((left, py(area["high"]) - 5, right, py(area["low"]) + 5), fill="#FFEFC7")
     box = (sel or {}).get("box")
     if box and box["end"] >= start:   # 整理區：收盤高低框（虛線上下緣），不加文字以免壓到 K 棒
         bx0, bx1 = px(max(start, box["start"])) - step / 2, px(box["end"]) + step / 2
@@ -219,7 +224,7 @@ def render(data: dict) -> Image.Image:
             text(cx - tw(label, 21, True) / 2, ly + 1, label, 21, "#C2410C", True)
 
     tags = [{"y": py(lv["price"]), "text": f"{lv.get('tag') or lv['label'].replace('前波高點', '前高').replace(' ', '')}｜{lv['price']:.2f}"
-                                           + (" 測試中" if lv.get("testing") else " 暫定" if lv["ai"] and lv.get("tentative") else ""),
+                                           + (" 現價附近" if lv.get("watch") else " 暫定" if lv["ai"] and lv.get("tentative") else ""),
              "color": KIND_COLOR[lv["kind"]],
              "bold": lv["ai"]} for lv in levels]
     tags.append({"y": py(data["close"]), "text": f"收盤｜{data['close']:.2f}", "color": ink, "bold": True})
@@ -282,12 +287,18 @@ def render(data: dict) -> Image.Image:
                          ink if g["selected"] else muted))
     table("大級別波段（最近 10 段）｜沒選上的寫出原因",
           [(margin + 12, "起點", 230), (300, "終點", 230), (545, "方向", 90), (650, "幅度 ATR", 130), (800, "狀態", 640)], leg_rows)
+    def conf_text(lv):
+        tight = lv.get("tight") or []
+        near = [t for t in lv["confluence"] if t not in tight]
+        return "｜".join(s for s in (("緊密：" + "、".join(tight)) if tight else "",
+                                     ("附近：" + "、".join(near)) if near else "") if s) or "無"
+
     level_rows = [([lv["label"], f"{lv['price']:.2f}",
-                    "正在測試" if lv.get("testing") else "收盤之上" if lv["above"] else "收盤之下",
-                    "、".join(lv["confluence"]) or "無",
+                    "現價附近" if lv.get("watch") else "收盤之上" if lv["above"] else "收盤之下",
+                    conf_text(lv),
                     ("是（暫定）" if lv.get("tentative") else "是") if lv["ai"] else "否"], ink if lv["ai"] else muted)
-                  for lv in sorted(levels, key=lambda x: -x["price"])]
-    table("費波價位｜共振＝距其他結構在共振距離內",
+                  for lv in sorted(data.get("levels") or [], key=lambda x: -x["price"])]   # 表格列全部價位（含圖外的）
+    table(f"費波價位｜緊密＝{params['tight_atr']:g} ATR 內、附近＝{params['conf_atr']:g} ATR 內｜相距 {params['zone_atr']:g} ATR 內併成一區",
           [(margin + 12, "價位", 330), (410, "價格", 130), (550, "位置", 130), (690, "共振對象", 620), (1330, "交給 AI", 110)], level_rows)
 
     y += 20

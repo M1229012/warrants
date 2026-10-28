@@ -3,17 +3,19 @@
 
 錨點規則（寫死，同一檔同一天一定抓同一組點）：
   1. 大級別轉折＝ZigZag 門檻放大 MAJOR_MULT 倍；確認日當天不用（與型態驗證一致）。
-  2. 回看 LOOKBACK 根內、幅度 ≥ LEG_ATR 倍 ATR 的最近一段＝選用波段 A→B；後續同向小段創更高（低）時併入，B 往後移。
+  2. 先找終點在最近 NEAR_LOOKBACK 根內、幅度 ≥ LEG_ATR 倍 ATR 的最近一段＝選用波段 A→B；找不到可用的才放寬到 LOOKBACK（約一年）。
+     後續同向小段創更高（低）時併入，B 往後移。
   3. 上漲段：B 回撤 0.382／0.5／0.618 為下方支撐；B 之後已確認的回檔低點 C 存在時，C＋(B−A)×1.0／1.382／1.618 為延伸目標；
      沒有 C 就創新高時，A＋(B−A)×1.382／1.618／2／2.618。
      下跌段：B＋(A−B)×0.382／0.5／0.618 為反彈參考，A 為前波高點；收盤已站上 A 時改看 B＋(A−B)×1.382／1.618／2／2.618。
-  4. 價位落在其他結構 CONF_ATR 倍 ATR 內＝共振；只有「在收盤之上且有共振」的費波價位（及前波高點）才交給 AI。
-     創新高（延伸模式）上方沒有結構可共振，收盤之上最近 EXTEND_AI 個延伸價位直接交給 AI。
+  4. 價位落在其他結構 CONF_ATR 倍 ATR 內＝共振（TIGHT_ATR 內另標「緊密」）；只有「在收盤之上且有共振」的費波價位（及前波高點）才交給 AI。
+     創新高（延伸模式）上方沒有結構可共振，收盤之上最近 EXTEND_AI 區延伸價位直接交給 AI。
   5. 最近結束的整理區（≥ BOX_MIN 根、收盤高低差 ≤ BOX_ATR 倍 ATR）：上緣＋整理高度＝等幅測量，畫成價位並當共振對象。
-  6. 還在下跌（最後一段 ≥ LEG_ATR、低點在最近 5 根內）：另算下方參考——收盤所在大波段的 0.618／0.786／1.0 回撤、
-     前波低點、上一段大跌從這次高點往下量 0.618／1.0；收盤之下最近 SUPPORT_AI 個交給 AI。
-     反彈價位是用還沒確認的低點算的＝暫定（tentative），仍交給 AI 但要註明低點確認後才成立。
-  7. 離收盤 ≤ TEST_ATR 倍 ATR 的價位＝正在測試（testing），不是目標價，不交給 AI，順延到下一個。
+  6. 下跌低點還沒確認（最後一段是幅度 ≥ LEG_ATR 的未確認下跌）：另算下方參考——收盤所在大波段的 0.618／0.786／1.0 回撤、
+     前波低點、上一段大跌從這次高點往下量 0.618／1.0；收盤之下最近 SUPPORT_AI 區交給 AI。
+  7. 依未確認錨點（終點還沒確認的波段）算出的價位＝暫定（tentative）：仍交給 AI，但註明確認前可能調整。
+  8. 離收盤 ≤ TEST_ATR 倍 ATR 的價位＝現價附近觀察位（watch）：不當目標價，以現況資訊交給 AI。
+  9. 相距 ≤ ZONE_ATR 倍 ATR 的價位先合併成一區，交給 AI 的名額以「區」計算。
 """
 from __future__ import annotations
 
@@ -30,10 +32,14 @@ def _env(name: str, default: float) -> float:
 
 
 MAJOR_MULT = _env("MAJOR_MULT", 2.5)      # 大級別轉折門檻＝ZIGZAG_ATR × 此倍數
-LOOKBACK = int(_env("LOOKBACK", 120))     # 波段終點要在最近 N 根內（起點可以更早）
 HISTORY = int(_env("HISTORY", 260))       # 計算只用最後 N 根（含 ATR 暖機），結果不隨載入的歷史長短改變
+NEAR_LOOKBACK = int(_env("NEAR_LOOKBACK", 70))   # 10-28：先找終點在最近 N 根內的波段，驗證圖也只顯示這段
+LOOKBACK = int(_env("LOOKBACK", HISTORY))        # 近段找不到可用波段才放寬到這裡（約一年）
+REF_LOOKBACK = int(_env("REF_LOOKBACK", 120))    # 共振用的前高低、大量區、整理區回看根數（不隨選段範圍改變）
 LEG_ATR = _env("LEG_ATR", 6.0)            # 合格波段幅度 ≥ 此倍數 ATR（波段終點當日的前一日 ATR）
 CONF_ATR = _env("CONF_ATR", 1.0)          # 共振距離：目前 ATR 的倍數
+TIGHT_ATR = _env("TIGHT_ATR", 0.25)       # 共振中「緊密重合」的距離
+ZONE_ATR = _env("ZONE_ATR", 0.25)         # 相距在此倍數 ATR 內的價位合併成一區（2308：1406／1425 相差 0.23 ATR）
 OTHER_LEGS = int(_env("OTHER_LEGS", 2))   # 另外拿最近幾段合格波段的回撤價做群聚比對
 VOL_BIN_ATR = _env("VOL_BIN_ATR", 0.5)    # 大量區價格格寬（ATR 倍數）
 VOL_TOP = int(_env("VOL_TOP", 3))         # 最多取幾個大量區
@@ -44,11 +50,11 @@ BOX_MIN = int(_env("BOX_MIN", 20))        # 整理區至少幾根
 BOX_ATR = _env("BOX_ATR", 4.5)            # 整理區收盤高低差 ≤ 此倍數 ATR（整理區最後一天的前一日 ATR）
 BOX_RECENT = int(_env("BOX_RECENT", 10))  # 整理區要在最近幾根內結束（離太久的整理不算這次突破）
 BREAKOUT = (1.382, 1.618, 2.0, 2.618)   # 越過波段端點、沒有 C 可用時，從低點起算的延伸倍數
-EXTEND_AI = int(_env("EXTEND_AI", 2))     # 創新高時收盤之上最近幾個延伸價位直接交給 AI（上方沒有結構可共振）
-SUPPORT_RETRACE = (0.618, 0.786, 1.0)   # 還在下跌時：大波段回撤（只取收盤之下的）
-DROP_PROJECT = (0.618, 1.0)             # 還在下跌時：上一段大跌幅度從這次高點往下量
-SUPPORT_AI = int(_env("SUPPORT_AI", 2))   # 還在下跌時，收盤上下各最近幾個價位交給 AI
-TEST_ATR = _env("TEST_ATR", 0.5)          # 離收盤在此倍數 ATR 內＝正在測試，不當目標價（2308：1504 貼著收盤 1510）
+EXTEND_AI = int(_env("EXTEND_AI", 2))     # 創新高時收盤之上最近幾區延伸價位直接交給 AI（上方沒有結構可共振）
+SUPPORT_RETRACE = (0.618, 0.786, 1.0)   # 下跌低點未確認時：大波段回撤（只取收盤之下的）
+DROP_PROJECT = (0.618, 1.0)             # 下跌低點未確認時：上一段大跌幅度從這次高點往下量
+SUPPORT_AI = int(_env("SUPPORT_AI", 2))   # 下跌低點未確認時，收盤上下各最近幾區交給 AI
+TEST_ATR = _env("TEST_ATR", 0.5)          # 離收盤在此倍數 ATR 內＝現價附近觀察位，不當目標價（2308：1504 貼著收盤 1510）
 
 
 def round_step(price: float) -> float:
@@ -84,7 +90,7 @@ def _volume_zones(h, l, c, v, begin: int, last: int, ref: float) -> List[Dict[st
 
 def find_box(c, atr, last: int) -> Optional[Dict[str, Any]]:
     """最近結束的整理區：終點在最近 BOX_RECENT 根內，往回延伸到收盤高低差超過 BOX_ATR 倍 ATR 為止，取最長的一段。"""
-    floor = max(0, last - LOOKBACK + 1)
+    floor = max(0, last - REF_LOOKBACK + 1)
     best = None
     for e in range(last - 1, max(floor + BOX_MIN - 1, last - BOX_RECENT) - 1, -1):
         if np.isnan(atr[e]):
@@ -99,6 +105,22 @@ def find_box(c, atr, last: int) -> Optional[Dict[str, Any]]:
 
 
 def compute(frame: pd.DataFrame, events: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """10-28：先用最近 NEAR_LOOKBACK 根找波段（大多數股票這樣就畫得出來，圖也只顯示這段）；
+    找不到可用波段（只剩備援或失效段）才放寬到約一年。"""
+    near = _compute(frame, events, NEAR_LOOKBACK)
+    if near["found"] or LOOKBACK <= NEAR_LOOKBACK:
+        return near
+    return _compute(frame, events, LOOKBACK, widened=True)
+
+
+def _area_text(area: Dict[str, Any]) -> str:
+    if len(area["members"]) == 1:
+        x = area["members"][0]
+        return f"{x['label']} {x['price']:.2f}"
+    return f"{area['low']:.2f}～{area['high']:.2f}（" + "、".join(x["label"] for x in area["members"]) + "）"
+
+
+def _compute(frame: pd.DataFrame, events: Optional[Dict[str, Any]], lookback: int, widened: bool = False) -> Dict[str, Any]:
     need = ["Open", "High", "Low", "Close"]
     if frame is None or not set(need) <= set(frame.columns):
         raise ValueError("日 K 欄位不足，無法計算費波")
@@ -116,8 +138,9 @@ def compute(frame: pd.DataFrame, events: Optional[Dict[str, Any]] = None) -> Dic
     if np.isnan(ref) or ref <= 0:
         raise ValueError("ATR 資料不足，無法計算費波")
     close = float(c[last])
-    begin = max(0, last - LOOKBACK + 1)
-    tol = CONF_ATR * ref
+    begin = max(0, last - lookback + 1)
+    ref_begin = max(0, last - REF_LOOKBACK + 1)
+    tol, tight = CONF_ATR * ref, TIGHT_ATR * ref
     minor = [p for p in kp.zigzag(h, l, c, atr) if p["confirm"] < last]
     major = [p for p in kp.zigzag(h, l, c, atr * MAJOR_MULT) if p["confirm"] < last]
 
@@ -146,20 +169,20 @@ def compute(frame: pd.DataFrame, events: Optional[Dict[str, Any]] = None) -> Dic
         cpt = (min(after, key=lambda p: p["price"]) if d > 0 else max(after, key=lambda p: p["price"])) if after and not broken else None
         return a, b, cpt, merged, broken
 
-    def stale(leg, a, b, cpt, broken) -> str:
-        """10-28（2308、6179）：股價已越過起點 A，或已漲過最遠的延伸價位＝這組錨點過時。"""
+    def stale(leg, a, b, cpt, broken):
+        """10-28：錨點過時分三種——原方向判斷失效、漲過最遠延伸要重新量測、跌破 B＝跌勢延續。回傳（類別, 原因）。"""
         if broken:
-            return "後續已反向越過波段起點 A"
+            return "已失效", "後續已反向越過波段起點 A"
         amp = abs(b["price"] - a["price"])
         if leg["dir"] > 0:
             if b["idx"] < last and l[b["idx"] + 1:].min() < a["price"]:
-                return "股價已跌破波段起點 A"
+                return "已失效", "股價已跌破波段起點 A，原上漲判斷失效"
             top = cpt["price"] + amp * EXTEND[-1] if cpt else a["price"] + amp * BREAKOUT[-1]
         else:
             if b["idx"] < last and l[b["idx"] + 1:].min() < b["price"]:
-                return "股價已跌破波段低點 B，還在破底"
+                return "跌勢延續", "股價已跌破波段低點 B，改量新的一段"
             top = b["price"] + amp * BREAKOUT[-1]
-        return "收盤已越過最遠的延伸價位" if close > top else ""
+        return ("需重新量測", "收盤已漲過最遠的延伸價位，原量尺用完") if close > top else ("", "")
 
     provisional = None   # 最後一個大轉折到目前極值：終點尚未確認，但幅度夠大就是最新的一段
     if major and major[-1]["idx"] < last:
@@ -173,7 +196,7 @@ def compute(frame: pd.DataFrame, events: Optional[Dict[str, Any]] = None) -> Dic
                            "status": "", "provisional": True}
 
     def support_levels(top) -> List[Dict[str, Any]]:
-        """還在下跌時的下方參考（都在收盤之下）：大波段回撤、前波低點、下跌等幅。top＝這次下跌的起點（最後一個大轉折高點）。"""
+        """下跌低點未確認時的下方參考（都在收盤之下）：大波段回撤、前波低點、下跌等幅。top＝這次下跌的起點（最後一個大轉折高點）。"""
         pairs = []
         for a, b in zip(major, major[1:]):
             unit = atr[b["idx"]] if not np.isnan(atr[b["idx"]]) else ref
@@ -194,13 +217,12 @@ def compute(frame: pd.DataFrame, events: Optional[Dict[str, Any]] = None) -> Dic
                     out.append({"label": f"大波段回撤 {r:g}（{dates[ga['idx']][5:]}～{dates[gb['idx']][5:]}）",
                                 "tag": f"大段{r:g}", "kind": "support", "ratio": r, "price": price})
         lows = [p for p in major if p["type"] == "L" and p["price"] < close]
-        if lows:   # 2. 收盤下方最近的大轉折低點
+        if lows:   # 2. 收盤下方最近的大轉折低點（已跌破的前低在收盤之上，自然不列）
             p = max(lows, key=lambda p: p["price"])
             out.append({"label": f"前波低點（{dates[p['idx']]}）", "tag": "前低", "kind": "support", "ratio": 1.0,
                         "price": float(p["price"])})
-        downs = [g for g in pairs if g["dir"] < 0 and g["b"]["idx"] <= top["idx"] and g["a"]["price"] > top["price"]
-                 and g["b"]["price"] < close]
-        if downs:   # 3. 上一段大跌（高點比這次高、低點還沒跌破）的幅度，從這次的較低高點往下量
+        downs = [g for g in pairs if g["dir"] < 0 and g["b"]["idx"] <= top["idx"] and g["a"]["price"] > top["price"]]
+        if downs:   # 3. 上一段大跌（高點比這次高）的幅度，從這次的較低高點往下量；10-28：跌破那段的低點不影響投射
             g = downs[-1]
             amp_d = g["a"]["price"] - g["b"]["price"]
             for r in DROP_PROJECT:
@@ -210,7 +232,7 @@ def compute(frame: pd.DataFrame, events: Optional[Dict[str, Any]] = None) -> Dic
                                 "tag": f"等幅{r:g}", "kind": "support", "ratio": r, "price": price})
         return out
 
-    # 選段順序：最近的合格大波段 → 失效時改用未確認的最後一段 → 再沒有就用回看區間最低／最高點（備援）
+    # 選段順序：最近的合格大波段 → 過時改用未確認的最後一段 → 再沒有就用回看區間最低／最高點（備援）
     chosen, note, primary = None, "", None
     if qualified:
         leg = qualified[-1]
@@ -222,16 +244,16 @@ def compute(frame: pd.DataFrame, events: Optional[Dict[str, Any]] = None) -> Dic
             leg = prev   # 大回檔但守住起點＝上漲段的 A→B→C，仍以上漲段為主（才算得出延伸）
             used.append(leg)
         primary = (leg, used, anchors(leg))
-        why = stale(leg, *primary[2][:3], primary[2][4])
-        if why:
-            leg["status"] = f"已失效：{why}"
-            note = f"原波段 {leg['a']['price']:.2f}→{leg['b']['price']:.2f} 已失效（{why}）"
+        kind, why = stale(leg, *primary[2][:3], primary[2][4])
+        if kind:
+            leg["status"] = f"{kind}：{why}"
+            note = f"原波段 {leg['a']['price']:.2f}→{leg['b']['price']:.2f} {kind}（{why}）"
         else:
             chosen = primary
     if chosen is None and provisional:
         legs.append(provisional)
         chosen = (provisional, [provisional], (provisional["a"], provisional["b"], None, False, False))
-    if chosen is None:   # 備援：每檔都畫得出來
+    if chosen is None:   # 備援：每檔都畫得出來，但只算區間量測
         lo_i = begin + int(np.argmin(l[begin:last + 1]))
         hi_i = begin + int(np.argmax(h[begin:last + 1]))
         if lo_i != hi_i and h[hi_i] > l[lo_i]:
@@ -241,12 +263,13 @@ def compute(frame: pd.DataFrame, events: Optional[Dict[str, Any]] = None) -> Dic
             legs.append({"a": a, "b": b, "dir": 1 if b["type"] == "H" else -1, "amp": amp,
                          "amp_atr": amp / ref, "status": "", "fallback": True})
             chosen = (legs[-1], legs[-1:], anchors(legs[-1]))
-    if chosen is None and primary:   # 連備援都沒有（價格不動）：保留失效的原波段並註明
+    if chosen is None and primary:   # 連備援都沒有（價格不動）：保留過時的原波段並註明
         chosen = primary
     fallback = bool(chosen and chosen[0].get("fallback"))
+    found = bool(chosen and not fallback and not (chosen is primary and note))
 
-    selected, levels, summary = None, [], []
-    mode, mode_text = "none", f"最近 {LOOKBACK} 根價格沒有波動，不給費波價位"
+    selected, levels, areas, summary = None, [], [], []
+    mode, mode_text = "none", f"最近 {lookback} 根價格沒有波動，不給費波價位"
     if chosen:
         leg, used, (a, b, cpt, merged, broken) = chosen
         d = leg["dir"]
@@ -292,7 +315,7 @@ def compute(frame: pd.DataFrame, events: Optional[Dict[str, Any]] = None) -> Dic
         if broken:
             mode_text += "；後續已反向越過波段起點 A，此段僅供參考"
         if fallback:
-            mode_text = f"（備援）回看 {LOOKBACK} 根沒有可用的大級別波段，改用區間最低／最高點；" + mode_text
+            mode_text = f"（備援）沒有合格費波主段，以下僅為區間量測（最近 {lookback} 根最低／最高點）；" + mode_text
         elif selected["provisional"]:
             mode_text = "（未確認波段）最後一個大轉折到目前極值，終點還沒確認；" + mode_text
         if note:
@@ -301,9 +324,9 @@ def compute(frame: pd.DataFrame, events: Optional[Dict[str, Any]] = None) -> Dic
         refs = []
         anchor_idx = {a["idx"], b["idx"]} | ({cpt["idx"]} if cpt else set())
         for p in minor:
-            if p["idx"] >= begin and p["idx"] not in anchor_idx:
+            if p["idx"] >= ref_begin and p["idx"] not in anchor_idx:
                 refs.append({"price": float(p["price"]), "text": f"{'前高' if p['type'] == 'H' else '前低'} {dates[p['idx']][5:]}"})
-        zones = _volume_zones(h, l, c, v, begin, last, ref)
+        zones = _volume_zones(h, l, c, v, ref_begin, last, ref)
         for g in [g for g in qualified if all(g is not u for u in used)][-OTHER_LEGS:]:
             g_lo, g_hi = sorted((g["a"]["price"], g["b"]["price"]))
             for r in RETRACE:
@@ -322,57 +345,91 @@ def compute(frame: pd.DataFrame, events: Optional[Dict[str, Any]] = None) -> Dic
                            f"（{box['end'] - box['start'] + 1} 根），{'已向上突破' if box['broke'] else '尚未向上突破'}；"
                            f"等幅測量 {box['top']:.2f}＋{box['height']:.2f}＝{box['target']:.2f}")
         selected["box"] = box
-        falling = bool(provisional and provisional["dir"] < 0 and provisional["b"]["idx"] >= last - 5)
-        if falling:   # 10-28（2308）：還在創低＝要看可能跌到哪；說法改寫成一句，不再接「下跌後反彈」
+        # 10-28：下跌低點還沒確認就看下方支撐（不只最近 5 根創低；橫盤沒再破底不等於低點已確認）
+        falling = bool(provisional and provisional["dir"] < 0)
+        if falling:
             pa, pb = provisional["a"], provisional["b"]
             mode = "falling"
+            head = "還在下跌" if pb["idx"] >= last - 5 else f"下跌後低點還沒確認（{dates[pb['idx']][5:]} 低點之後反彈未達確認門檻）"
             mode_text = (note + "；" if note else "") + (
-                f"還在下跌：{dates[pa['idx']][5:]} 高點 {pa['price']:.2f} 跌到 {pb['price']:.2f}（約 {provisional['amp_atr']:.1f} ATR，"
+                f"{head}：{dates[pa['idx']][5:]} 高點 {pa['price']:.2f} 跌到 {pb['price']:.2f}（約 {provisional['amp_atr']:.1f} ATR，"
                 f"低點還沒確認）；下方看支撐，反彈先看最近的壓力")
             levels += support_levels(pa)
-        tentative = falling and selected["provisional"]   # 反彈價位用還沒確認的低點算，低點再破就會往下移
         test_tol = TEST_ATR * ref
         for item in levels:
             price = item["price"]
-            hits = [x["text"] for x in refs if 1e-6 < abs(x["price"] - price) <= tol and x.get("level") is not item]   # 同價＝自己（前波低點就是那個轉折）
-            hits += [f"大量區 {z['low']:.2f}～{z['high']:.2f}" for z in zones
-                     if abs(z["price"] - price) <= tol + (z["high"] - z["low"]) / 2]
+            hits = [(x["text"], abs(x["price"] - price)) for x in refs
+                    if 1e-6 < abs(x["price"] - price) <= tol and x.get("level") is not item]   # 同價＝自己（前波低點就是那個轉折）
+            hits += [(f"大量區 {z['low']:.2f}～{z['high']:.2f}", max(0.0, abs(z["price"] - price) - (z["high"] - z["low"]) / 2))
+                     for z in zones if abs(z["price"] - price) <= tol + (z["high"] - z["low"]) / 2]
             step = round_step(price)
             nearest = round(price / step) * step
             if nearest > 0 and abs(nearest - price) <= tol:
-                hits.append(f"整數關卡 {nearest:g}")
-            testing = abs(price - close) <= test_tol   # 10-28：貼著收盤＝股價已經在這條線上，不是目標價
-            item.update(price=float(price), above=price > close, confluence=hits, testing=testing,
-                        tentative=bool(tentative and item["kind"] == "retrace"),
-                        ai=bool(price > close and not testing and (hits or item["kind"] in ("prior", "box"))))
+                hits.append((f"整數關卡 {nearest:g}", abs(nearest - price)))
+            watch = abs(price - close) <= test_tol   # 10-28：貼著收盤＝股價正在這條線附近，不是目標價
+            # 10-28：價位依賴終點還沒確認的錨點（未確認波段的 B 本身、由它算出的回撤／延伸）＝暫定
+            tentative = selected["provisional"] and (item["kind"] in ("retrace", "extend")
+                                                     or (item["kind"] == "prior" and abs(price - b["price"]) < 1e-9))
+            item.update(price=float(price), above=price > close, confluence=[t for t, _ in hits],
+                        tight=[t for t, dist in hits if dist <= tight], watch=watch, tentative=bool(tentative),
+                        ai=bool(price > close and not watch and (hits or item["kind"] in ("prior", "box"))))
         selected["zones"] = zones
         levels.sort(key=lambda x: x["price"])
+
+        # 10-28：相近價位先合併成一區，名額以區計算（同一區兩種依據不是兩道防線）
+        gap = ZONE_ATR * ref
+        for item in [x for x in levels if not x["watch"]]:
+            last_area = areas[-1] if areas else None
+            if (last_area and item["price"] - last_area["members"][-1]["price"] <= gap and item["price"] - last_area["low"] <= 2 * gap
+                    and (item["price"] > close) == (last_area["low"] > close)):   # 不跨過收盤
+                last_area["members"].append(item)
+                last_area["high"] = item["price"]
+            else:
+                areas.append({"low": item["price"], "high": item["price"], "members": [item]})
+        for area in areas:
+            area["above"] = area["low"] > close
+            area["ai"] = any(x["ai"] for x in area["members"])
         if mode == "extend":
-            for item in [x for x in levels if x["kind"] == "extend" and x["above"] and not x["testing"]][:EXTEND_AI]:
-                item["ai"] = True
-        if falling:   # 收盤之下最近幾個價位直接交給 AI（跳過正在測試的）；上方只留最近幾個反彈壓力，數字不要太多
-            for item in sorted([x for x in levels if not x["above"] and not x["testing"]], key=lambda x: -x["price"])[:SUPPORT_AI]:
-                item["ai"] = True
-            for item in sorted([x for x in levels if x["above"] and x["ai"]], key=lambda x: x["price"])[SUPPORT_AI:]:
-                item["ai"] = False
+            for area in [z for z in areas if z["above"] and any(x["kind"] == "extend" for x in z["members"])][:EXTEND_AI]:
+                area["ai"] = True
+        if falling:   # 收盤之下最近幾區直接交給 AI；上方只留最近幾區反彈壓力，數字不要太多
+            for area in sorted([z for z in areas if not z["above"]], key=lambda z: -z["high"])[:SUPPORT_AI]:
+                area["ai"] = True
+            for area in [z for z in areas if z["above"] and z["ai"]][SUPPORT_AI:]:
+                area["ai"] = False
+        for k, area in enumerate(areas):
+            area["tentative"] = any(x["tentative"] for x in area["members"])
+            for x in area["members"]:
+                x["ai"], x["area"] = area["ai"], k
+        for item in levels:
+            item.setdefault("area", None)
+
         word = "上漲" if d > 0 else "下跌"
         summary.append(f"選用波段：A {a['price']:.2f}（{dates[a['idx']]}）→ B {b['price']:.2f}（{dates[b['idx']]}），"
                        f"{word} {amp:.2f}（約 {selected['amp_atr']:.1f} ATR）" + ("；後續同向小段已併入" if merged else "")
                        + (f"；C {cpt['price']:.2f}（{dates[cpt['idx']]}）" if cpt else ""))
         if box:
             summary.append(box["line"])
-        picks = [x for x in levels if x["ai"] and x["above"]]
-        head = ("交給 AI 的反彈壓力（暫定：用還沒確認的低點算，低點確認後才成立）：" if tentative
-                else "交給 AI 的反彈壓力：" if falling else "交給 AI 的上方參考：")
-        summary.append(head + ("、".join(f"{x['label']} {x['price']:.2f}" for x in picks) if picks
+        ups = [z for z in areas if z["ai"] and z["above"]]
+        end_word = "低點" if d < 0 else "高點"
+        if fallback:
+            head = "交給 AI 的區間量測參考（非費波主段）："
+        elif any(z["tentative"] for z in ups):
+            head = (f"交給 AI 的反彈壓力（依目前{end_word}試算，{end_word}確認前可能調整）：" if falling
+                    else f"交給 AI 的上方參考（依目前{end_word}試算，{end_word}確認前可能調整）：")
+        else:
+            head = "交給 AI 的反彈壓力：" if falling else "交給 AI 的上方參考："
+        summary.append(head + ("、".join(_area_text(z) for z in ups) if ups
                                else "沒有在收盤之上且有共振的價位，AI 不提費波參考價"))
         if falling:
-            downs = sorted([x for x in levels if x["ai"] and not x["above"]], key=lambda x: -x["price"])
-            summary.append("交給 AI 的下方參考：" + ("、".join(f"{x['label']} {x['price']:.2f}" for x in downs) or "收盤之下沒有參考價位"))
-        near = [x for x in levels if x["testing"]]
+            downs = sorted([z for z in areas if z["ai"] and not z["above"]], key=lambda z: -z["high"])
+            summary.append("交給 AI 的下方參考：" + ("、".join(_area_text(z) for z in downs) or "收盤之下沒有參考價位"))
+        near = [x for x in levels if x["watch"]]
         if near:
-            summary.append(f"正在測試（離收盤 ≤ {TEST_ATR:g} ATR，不當目標價、不交給 AI）："
+            summary.append(f"現價附近的觀察價位（離收盤 ≤ {TEST_ATR:g} ATR，不列為目標，尚待確認支撐／壓力反應）："
                            + "、".join(f"{x['label']} {x['price']:.2f}" for x in near))
+    if widened:
+        mode_text = f"最近 {NEAR_LOOKBACK} 根找不到可用波段，放寬到約一年；" + mode_text
     summary.insert(0, f"最新收盤 {close:.2f}｜{mode_text}")
     for g in legs:
         g.setdefault("selected", False)
@@ -380,8 +437,12 @@ def compute(frame: pd.DataFrame, events: Optional[Dict[str, Any]] = None) -> Dic
     bars = [{"date": dates[i], "Open": float(o[i]), "High": float(h[i]), "Low": float(l[i]), "Close": float(c[i]),
              "Volume": float(v[i]) if not np.isnan(v[i]) else 0.0} for i in range(len(c))]
     flags = list(adjust_flags.get("F2") or [])
-    show = 0   # 10-28：驗證圖顯示全部計算用的 K 棒（約一年），大結構與起點 A 都看得到
+    # 10-28：近段找得到就只顯示近段（A 更早時往前延伸到 A）；放寬時顯示整年
+    show = begin if not widened else 0
+    if selected:
+        show = max(0, min(show, selected["a"]["idx"] - 3))
     return {"bars": bars, "display_start": show, "last": last, "atr": ref, "close": close, "tolerance": tol,
+            "found": found, "widened": widened,
             "minor": [_pivot(p, dates) for p in minor if p["idx"] >= show],
             "major": [_pivot(p, dates) for p in major if p["idx"] >= show],
             "legs": [{"a": _pivot(g["a"], dates), "b": _pivot(g["b"], dates), "dir": g["dir"], "amp": float(g["amp"]),
@@ -391,6 +452,10 @@ def compute(frame: pd.DataFrame, events: Optional[Dict[str, Any]] = None) -> Dic
                 selected, a=_pivot(selected["a"], dates), b=_pivot(selected["b"], dates),
                 c=_pivot(selected["c"], dates) if selected["c"] else None, amp=float(selected["amp"]),
                 amp_atr=float(selected["amp_atr"])),
-            "mode": mode, "levels": levels, "summary": summary, "flags": flags,
+            "mode": mode, "levels": levels,
+            "areas": [{"low": z["low"], "high": z["high"], "above": z["above"], "ai": z["ai"], "tentative": z["tentative"],
+                       "labels": [x["label"] for x in z["members"]]} for z in areas],
+            "summary": summary, "flags": flags,
             "params": {"major_atr": kp.ZIGZAG_ATR * MAJOR_MULT, "minor_atr": kp.ZIGZAG_ATR, "leg_atr": LEG_ATR,
-                       "lookback": LOOKBACK, "conf_atr": CONF_ATR}}
+                       "lookback": lookback, "near_lookback": NEAR_LOOKBACK, "conf_atr": CONF_ATR,
+                       "tight_atr": TIGHT_ATR, "zone_atr": ZONE_ATR}}
