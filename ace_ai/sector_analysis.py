@@ -62,6 +62,10 @@ def _residual(question: str, pattern: str) -> str:
     return value
 
 
+_TODAY_RE = re.compile(r"今天|今日|盤中|強嗎|弱嗎|強不強|弱不弱|新聞|消息|利多|利空|為什麼|為何|漲什麼|跌什麼")
+_TECH_RE = re.compile(r"型態|技術|線型|均線|支撐|壓力|三角|K線")
+
+
 def detect_request(question: str) -> Optional[Dict[str, str]]:
     """判斷這題是不是族群問題；族群名稱一律由 sector_match 決定（全系統唯一入口）。"""
     if sector_match.is_market_level(question):
@@ -91,6 +95,13 @@ def detect_request(question: str) -> Optional[Dict[str, str]]:
         if action == "blocked":
             return {"mode": "unsupported", "industry": "", "name": hit["name"],
                     "message": "族群目前支援成分股名單、技術型態與漲幅排行；分點、權證、新聞與基本面請指定個股查詢。"}
+        if (sector_match.MEMBER_ONLY and _TODAY_RE.search(text) and not _TECH_RE.search(text)
+                and (action != "members" or re.search(r"新聞|消息|利多|利空", text))):
+            # 10-28 審核：「ASIC今天強嗎／有什麼新聞」→ 和排行、大類共用同一套今日數據與族群解讀（含新聞），
+            # 不走只有技術資料的總覽（AI 只能講均線與壓力價）
+            return {"mode": "group_today", "industry": hit["industry"], "name": hit["name"],
+                    "children": [hit["name"]], "question": question,
+                    **({"matched_by": f"「{hit['alias_used']}」對應族群：{hit['name']}"} if hit.get("alias_used") else {})}
         mode = action if action in ("members", "technical", "momentum") else "technical"
         # 「CCL 族群最近怎樣／表現／走勢」問的是族群整體 → 總覽＋AI 族群解讀；「誰最強／排行」仍是成分股排行
         if (mode in ("technical", "momentum") and _OVERVIEW_RE.search(text)
@@ -1190,7 +1201,10 @@ def _overview_answer(request: Dict[str, Any], gateway, validate) -> Dict[str, An
               "why＝0至3點，依問題選擇成交額與上漲家數、價格結構、領漲與拖累等真正相關的證據，不固定順序、不湊點數。"
               "有根據才點名股票或數字，不重複朗讀表格；成交額不能直接當成淨流入。"
               "watch＝有需要才給最關鍵的觀察重點與意義（具體股票或價位），沒有新增資訊留空。"
-              "stocks_by_turnover 依成交額排序，前面的是權值股。只能用資料中的數字；不預測漲跌、不給買賣建議、不說成功或失敗。\n"
+              # 10-28 審核：成交額大不等於市值大或指數權重高；也不能從漲跌跳到資金、抗跌、型態確認的結論
+              "stocks_by_turnover 依成交額排序，前面是交易較活躍的股票（不是市值大或指數權重高的權值股）。"
+              "價格上漲不能說成資金淨流入或買盤力道；沒有同期大盤比較不能說抗跌；候選型態不能當成已確認的強勢結構；"
+              "個股價位突破或站回均線不能代表整個族群轉強。只能用資料中的數字；不預測漲跌、不給買賣建議、不說成功或失敗。\n"
               + json.dumps(payload, ensure_ascii=False))
     result = gateway.generate(prompt, purpose="sector_answer", schema=schema, temperature=0.2)
     usage = {"input_tokens": int(getattr(result, "input_tokens", 0) or 0), "output_tokens": int(getattr(result, "output_tokens", 0) or 0),
@@ -1243,6 +1257,18 @@ def answer(request: Dict[str, str], gateway, validate) -> Dict[str, Any]:
         return {"text": "", "calls": 0, "cacheable": True, "panels": [catalog_panel()]}
     if mode == "parent_members":
         return _parent_members_answer(request)
+    if mode == "group_today":
+        import member_sector_rank
+        try:
+            result = member_sector_rank.answer(str(request.get("question") or ""), gateway, validate,
+                                               only=[request["name"]], title=request["name"], single=True)
+        except Exception as exc:
+            print(f"⚠️ {request['name']} 今日表現失敗｜{tools.err_text(exc)}", flush=True)
+            result = None
+        if result:
+            return result
+        # 今日排行排不出這一群（資料不足）→ 退回原本的族群總覽，不空手
+        return _overview_answer(dict(request, mode="overview"), gateway, validate)
     if mode == "parent_rank":
         import member_sector_rank
         try:

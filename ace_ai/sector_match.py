@@ -548,7 +548,8 @@ def groups_of(stock_code: str) -> List[str]:
 _RANK_RE = re.compile(r"最強|最好|最弱|最差|排行|排名|前[一二三四五六七八九十\d]+名|誰比較|哪一?檔比較|強勢股")
 _LIST_RE = re.compile(r"成分|名單|名冊|有哪些|有那些|有什麼|有啥|有誰|哪些股|哪幾[檔支]|包含|組成|誰在裡面|(?:族群|類股|概念股|產業)(?:股票|個股|有誰)")
 _BELONG_RE = re.compile(r"屬於|是不是.*(族群|類股)|算不算|歸類|哪些族群|什麼族群|哪個族群")
-_BLOCK_RE = re.compile(r"分點|籌碼|買超|賣超|新聞|營收|基本面|estimate|便宜|估值|勝率|權證")
+# 10-28 審核：「新聞」不再擋——族群問新聞改走族群解讀（會抓成分股新聞並歸納族群共同題材）
+_BLOCK_RE = re.compile(r"分點|籌碼|買超|賣超|營收|基本面|estimate|便宜|估值|勝率|權證")
 
 
 def action_of(text: str, default: str = "technical") -> str:
