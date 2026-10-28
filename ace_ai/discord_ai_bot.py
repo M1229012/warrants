@@ -8574,9 +8574,9 @@ class AceQueryEngine:
             request = dict(request, mode="overview")
         if on_demand.enabled():
             if request.get("mode") == "market_momentum" and sector_analysis.sector_match.MEMBER_ONLY:
-                # 10-27：今日族群排行只用盤中快照／最近收盤，不必等日 K 補齊；補資料丟背景，不再卡 40 秒（曾讓整題逾時）
-                threading.Thread(target=on_demand.market_ready, kwargs={"budget_seconds": 120.0, "log": self.log},
-                                 name="ace-market-ready", daemon=True).start()
+                # 10-28：今日族群排行的股票池只抓前一交易日收盤表（member_sector_rank._ensure_prev_day），
+                # 不再觸發全市場日K補齊與型態分數重算（測試版關背景就是為了省這段）
+                pass
             else:
                 on_demand.market_ready(budget_seconds=40.0, log=self.log)   # 按需模式：族群排行用的底庫補到最新
             on_demand.wake_radar()

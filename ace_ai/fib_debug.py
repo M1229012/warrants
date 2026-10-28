@@ -15,7 +15,7 @@ _COMMAND = re.compile(r"(?:費波|斐波|費氏|費布|fibo?)\s*\w{0,4}?\s*驗�
 _CODE_RE = re.compile(r"(?<![0-9A-Za-z])(?:[0-9]{4,6}[A-Za-z]?|TAIEX|TPEX)(?![0-9A-Za-z])", re.IGNORECASE)
 YEAR_PERIOD = "400d"         # 與分點一年日K同一個抓取區間（約 270 個交易日）
 YEAR_TTL_SECONDS = 6 * 3600  # 同檔同日只抓一次 FinMind
-KIND_COLOR = {"retrace": "#1478B5", "prior": "#C76C00", "extend": "#8044B8", "box": "#2F855A"}
+KIND_COLOR = {"retrace": "#1478B5", "prior": "#C76C00", "extend": "#8044B8", "box": "#2F855A", "support": "#B4232C"}
 
 
 def is_request(question: str) -> bool:
@@ -131,7 +131,7 @@ def render(data: dict) -> Image.Image:
                       f"｜確認日當天的轉折不使用", 22, muted)
     x = margin
     for label, color in (("回撤／反彈", KIND_COLOR["retrace"]), ("前波高點", KIND_COLOR["prior"]), ("延伸", KIND_COLOR["extend"]),
-                         ("整理區等幅", KIND_COLOR["box"])):
+                         ("整理區等幅", KIND_COLOR["box"]), ("下跌支撐", KIND_COLOR["support"])):
         draw.line((x, 180, x + 50, 180), fill=color, width=4)
         text(x + 60, 166, label, 21, color)
         x += 60 + tw(label, 21) + 34
@@ -211,7 +211,7 @@ def render(data: dict) -> Image.Image:
             draw.rectangle((xx - 14, ly, xx + 14, ly + 28), fill="#FFFFFF", outline="#C2410C")
             text(xx - tw(label, 21, True) / 2, ly + 1, label, 21, "#C2410C", True)
 
-    tags = [{"y": py(lv["price"]), "text": f"{lv['label'].replace('前波高點', '前高').replace(' ', '')}｜{lv['price']:.2f}",
+    tags = [{"y": py(lv["price"]), "text": f"{lv.get('tag') or lv['label'].replace('前波高點', '前高').replace(' ', '')}｜{lv['price']:.2f}",
              "color": KIND_COLOR[lv["kind"]],
              "bold": lv["ai"]} for lv in levels]
     tags.append({"y": py(data["close"]), "text": f"收盤｜{data['close']:.2f}", "color": ink, "bold": True})
@@ -278,7 +278,7 @@ def render(data: dict) -> Image.Image:
                     "、".join(lv["confluence"]) or "無", "是" if lv["ai"] else "否"], ink if lv["ai"] else muted)
                   for lv in sorted(levels, key=lambda x: -x["price"])]
     table("費波價位｜共振＝距其他結構在共振距離內",
-          [(margin + 12, "價位", 200), (270, "價格", 130), (410, "位置", 130), (550, "共振對象", 760), (1330, "交給 AI", 110)], level_rows)
+          [(margin + 12, "價位", 330), (410, "價格", 130), (550, "位置", 130), (690, "共振對象", 620), (1330, "交給 AI", 110)], level_rows)
 
     y += 20
     text(margin, y, "僅管理員驗證｜忠實呈現目前演算法，找不到合格波段時不補畫｜費波為技術參考，不代表預測能力或買賣建議", 20, muted)

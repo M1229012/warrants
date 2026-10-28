@@ -10,6 +10,8 @@
   4. 價位落在其他結構 CONF_ATR 倍 ATR 內＝共振；只有「在收盤之上且有共振」的費波價位（及前波高點）才交給 AI。
      創新高（延伸模式）上方沒有結構可共振，收盤之上最近 EXTEND_AI 個延伸價位直接交給 AI。
   5. 最近結束的整理區（≥ BOX_MIN 根、收盤高低差 ≤ BOX_ATR 倍 ATR）：上緣＋整理高度＝等幅測量，畫成價位並當共振對象。
+  6. 還在下跌（最後一段 ≥ LEG_ATR、低點在最近 5 根內）：另算下方參考——收盤所在大波段的 0.618／0.786／1.0 回撤、
+     前波低點、上一段大跌從這次高點往下量 0.618／1.0；收盤之下最近 SUPPORT_AI 個交給 AI。
 """
 from __future__ import annotations
 
@@ -40,7 +42,10 @@ BOX_MIN = int(_env("BOX_MIN", 20))        # 整理區至少幾根
 BOX_ATR = _env("BOX_ATR", 4.5)            # 整理區收盤高低差 ≤ 此倍數 ATR（整理區最後一天的前一日 ATR）
 BOX_RECENT = int(_env("BOX_RECENT", 10))  # 整理區要在最近幾根內結束（離太久的整理不算這次突破）
 BREAKOUT = (1.382, 1.618, 2.0, 2.618)   # 越過波段端點、沒有 C 可用時，從低點起算的延伸倍數
-EXTEND_AI = int(_env("EXTEND_AI", 2))   # 創新高時收盤之上最近幾個延伸價位直接交給 AI（上方沒有結構可共振）
+EXTEND_AI = int(_env("EXTEND_AI", 2))
+SUPPORT_RETRACE = (0.618, 0.786, 1.0)   # 還在下跌時：大波段回撤（只取收盤之下的）
+DROP_PROJECT = (0.618, 1.0)             # 還在下跌時：上一段大跌幅度從這次高點往下量
+SUPPORT_AI = int(_env("SUPPORT_AI", 2))   # 還在下跌時，收盤之下最近幾個價位交給 AI   # 創新高時收盤之上最近幾個延伸價位直接交給 AI（上方沒有結構可共振）
 
 
 def round_step(price: float) -> float:
@@ -164,6 +169,44 @@ def compute(frame: pd.DataFrame, events: Optional[Dict[str, Any]] = None) -> Dic
             provisional = {"a": p, "b": e, "dir": 1 if e["type"] == "H" else -1, "amp": amp, "amp_atr": amp / ref,
                            "status": "", "provisional": True}
 
+    def support_levels(top) -> List[Dict[str, Any]]:
+        """還在下跌時的下方參考（都在收盤之下）：大波段回撤、前波低點、下跌等幅。top＝這次下跌的起點（最後一個大轉折高點）。"""
+        pairs = []
+        for a, b in zip(major, major[1:]):
+            unit = atr[b["idx"]] if not np.isnan(atr[b["idx"]]) else ref
+            if abs(b["price"] - a["price"]) / unit >= LEG_ATR:
+                pairs.append({"a": a, "b": b, "dir": 1 if b["type"] == "H" else -1})
+        out = []
+        ups = []
+        for g in pairs:   # 1. 收盤所在的最大一段上漲（同向小段併入）：0.618／0.786／1.0
+            if g["dir"] > 0:
+                ga, gb = anchors(g)[:2]
+                if ga["price"] < close < gb["price"]:
+                    ups.append((gb["price"] - ga["price"], ga, gb))
+        if ups:
+            amp_u, ga, gb = max(ups, key=lambda x: x[0])
+            for r in SUPPORT_RETRACE:
+                price = gb["price"] - amp_u * r
+                if price < close:
+                    out.append({"label": f"大波段回撤 {r:g}（{dates[ga['idx']][5:]}～{dates[gb['idx']][5:]}）",
+                                "tag": f"大段{r:g}", "kind": "support", "ratio": r, "price": price})
+        lows = [p for p in major if p["type"] == "L" and p["price"] < close]
+        if lows:   # 2. 收盤下方最近的大轉折低點
+            p = max(lows, key=lambda p: p["price"])
+            out.append({"label": f"前波低點（{dates[p['idx']]}）", "tag": "前低", "kind": "support", "ratio": 1.0,
+                        "price": float(p["price"])})
+        downs = [g for g in pairs if g["dir"] < 0 and g["b"]["idx"] <= top["idx"] and g["a"]["price"] > top["price"]
+                 and g["b"]["price"] < close]
+        if downs:   # 3. 上一段大跌（高點比這次高、低點還沒跌破）的幅度，從這次的較低高點往下量
+            g = downs[-1]
+            amp_d = g["a"]["price"] - g["b"]["price"]
+            for r in DROP_PROJECT:
+                price = top["price"] - amp_d * r
+                if 0 < price < close:
+                    out.append({"label": f"下跌等幅 {r:g}（{dates[g['a']['idx']][5:]}～{dates[g['b']['idx']][5:]}）",
+                                "tag": f"等幅{r:g}", "kind": "support", "ratio": r, "price": price})
+        return out
+
     # 選段順序：最近的合格大波段 → 失效時改用未確認的最後一段 → 再沒有就用回看區間最低／最高點（備援）
     chosen, note, primary = None, "", None
     if qualified:
@@ -276,9 +319,14 @@ def compute(frame: pd.DataFrame, events: Optional[Dict[str, Any]] = None) -> Dic
                            f"（{box['end'] - box['start'] + 1} 根），{'已向上突破' if box['broke'] else '尚未向上突破'}；"
                            f"等幅測量 {box['top']:.2f}＋{box['height']:.2f}＝{box['target']:.2f}")
         selected["box"] = box
+        falling = bool(provisional and provisional["dir"] < 0 and provisional["b"]["idx"] >= last - 5)
+        if falling:   # 10-28（2308）：還在創低＝要看可能跌到哪
+            mode = "falling"
+            mode_text += "；最近幾天還在創低，下方看大波段回撤、前波低點與下跌等幅"
+            levels += support_levels(provisional["a"])
         for item in levels:
             price = item["price"]
-            hits = [x["text"] for x in refs if abs(x["price"] - price) <= tol and x.get("level") is not item]
+            hits = [x["text"] for x in refs if 1e-6 < abs(x["price"] - price) <= tol and x.get("level") is not item]   # 同價＝自己（前波低點就是那個轉折）
             hits += [f"大量區 {z['low']:.2f}～{z['high']:.2f}" for z in zones
                      if abs(z["price"] - price) <= tol + (z["high"] - z["low"]) / 2]
             step = round_step(price)
@@ -292,15 +340,21 @@ def compute(frame: pd.DataFrame, events: Optional[Dict[str, Any]] = None) -> Dic
         if mode == "extend":
             for item in [x for x in levels if x["kind"] == "extend" and x["above"]][:EXTEND_AI]:
                 item["ai"] = True
+        if falling:   # 收盤之下最近的幾個價位（支撐或原本的回撤）直接交給 AI
+            for item in sorted([x for x in levels if not x["above"]], key=lambda x: -x["price"])[:SUPPORT_AI]:
+                item["ai"] = True
         word = "上漲" if d > 0 else "下跌"
         summary.append(f"選用波段：A {a['price']:.2f}（{dates[a['idx']]}）→ B {b['price']:.2f}（{dates[b['idx']]}），"
                        f"{word} {amp:.2f}（約 {selected['amp_atr']:.1f} ATR）" + ("；後續同向小段已併入" if merged else "")
                        + (f"；C {cpt['price']:.2f}（{dates[cpt['idx']]}）" if cpt else ""))
         if box:
             summary.append(box["line"])
-        picks = [x for x in levels if x["ai"]]
+        picks = [x for x in levels if x["ai"] and x["above"]]
         summary.append("交給 AI 的上方參考：" + ("、".join(f"{x['label']} {x['price']:.2f}" for x in picks) if picks
                                                  else "沒有在收盤之上且有共振的價位，AI 不提費波參考價"))
+        if falling:
+            downs = sorted([x for x in levels if x["ai"] and not x["above"]], key=lambda x: -x["price"])
+            summary.append("交給 AI 的下方參考：" + ("、".join(f"{x['label']} {x['price']:.2f}" for x in downs) or "收盤之下沒有參考價位"))
     summary.insert(0, f"最新收盤 {close:.2f}｜{mode_text}")
     for g in legs:
         g.setdefault("selected", False)

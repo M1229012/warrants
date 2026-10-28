@@ -66,8 +66,43 @@ def universe() -> List[str]:
     return sorted(codes)
 
 
-POOL_STATE_KEY = "member_rank_pool_v1"
+POOL_STATE_KEY = "member_rank_pool_v2"   # 10-28：v1 曾把「只有 7 檔有前一日 K」的不完整名單存成當日名單
 POOL_STALE_RETRY = 600.0          # 日 K 底庫還沒到最新交易日時，名單 10 分鐘後重算（不寫入持久化）
+
+
+def _light_pool() -> bool:
+    """10-28：背景同步關閉（測試版省錢）時，股票池只看前一交易日成交額。
+    抓證交所＋櫃買各一次前一交易日收盤表，不補 20 日日K、不算型態分數。"""
+    try:
+        import on_demand
+        return on_demand.enabled()
+    except Exception:
+        return False
+
+
+def _prev_day_complete(prev_day: str) -> bool:
+    """前一交易日上市、上櫃收盤表都已完整寫進底庫（market_days 狀態 complete）。
+    不能用「有任何一檔有前一日 K」判斷：只有零星個股被單獨查過時會誤判完整。"""
+    if not prev_day:
+        return False
+    try:
+        status = local_market_cache.market_status([prev_day])[prev_day]
+    except Exception:
+        return False
+    return all(status.get(m) == "complete" for m in local_market_cache.MARKETS)
+
+
+def _ensure_prev_day(prev_day: str) -> bool:
+    """前一交易日收盤表不完整時，抓證交所＋櫃買各一次（market_data.sync_day）；回傳抓完後是否完整。"""
+    if _prev_day_complete(prev_day):
+        return True
+    try:
+        import pandas as pd
+        import market_data
+        market_data.sync_day(pd.Timestamp(prev_day).date())
+    except Exception as exc:
+        print(f"⚠️ 族群排行名單：前一交易日 {prev_day} 收盤表取得失敗｜{tools.err_text(exc)}", flush=True)
+    return _prev_day_complete(prev_day)
 
 
 def _expected_sessions(day: str) -> Optional[List[str]]:
@@ -103,20 +138,25 @@ def liquid_pool(day: Optional[str] = None) -> Dict[str, Dict[str, float]]:
             _POOL_CACHE.update(key=key, pool=saved["pool"], meta=saved.get("meta") or {}, expires=None)
         return saved["pool"]
     sessions = _expected_sessions(day)
-    stats = local_market_cache.liquidity_before(day, LIQUIDITY_DAYS, sessions=sessions)
+    prev_day = sessions[0] if sessions else ""
+    light = _light_pool()
+    if light:
+        complete = _ensure_prev_day(prev_day)
+        stats = local_market_cache.liquidity_before(day, 1, sessions=[prev_day]) if prev_day else {}
+    else:
+        complete = _prev_day_complete(prev_day)
+        stats = local_market_cache.liquidity_before(day, LIQUIDITY_DAYS, sessions=sessions)
     pool = {}
     codes = universe()
     for code in codes:
         row = stats.get(code) or {}
-        full = int(row.get("days") or 0) >= LIQUIDITY_DAYS
+        full = not light and int(row.get("days") or 0) >= LIQUIDITY_DAYS
         avg_ok = full and float(row.get("avg_value") or 0) >= MIN_VALUE
         last_ok = float(row.get("last_value") or 0) >= MIN_VALUE
         if avg_ok or last_ok:
             pool[code] = {"avg_value": float(row.get("avg_value") or 0), "last_value": float(row.get("last_value") or 0)}
-    prev_day = sessions[0] if sessions else ""
-    have_prev = any(float((stats.get(c) or {}).get("last_value") or 0) > 0 for c in codes)
-    meta = {"calendar": bool(sessions), "prev_day": prev_day,
-            "base_stale": bool(sessions) and not have_prev}
+    meta = {"calendar": bool(sessions), "prev_day": prev_day, "mode": "prev_day" if light else "20d_or_prev",
+            "base_stale": bool(sessions) and not complete}
     with _POOL_LOCK:
         _POOL_CACHE.update(key=key, pool=pool, meta=meta,
                            expires=(time.monotonic() + POOL_STALE_RETRY) if meta["base_stale"] else None)
@@ -126,9 +166,10 @@ def liquid_pool(day: Optional[str] = None) -> Dict[str, Dict[str, float]]:
         except Exception as exc:
             print(f"⚠️ 族群排行名單存檔失敗（只影響重啟後是否沿用）｜{tools.err_text(exc)}", flush=True)
     print(f"📋 今日族群排行名單｜{day}｜成分股 {len(codes)} 檔｜通過流動性 {len(pool)} 檔"
-          f"｜門檻 {MIN_VALUE / 1e4:,.0f} 萬（{LIQUIDITY_DAYS} 日均或前一日，收盤價×成交股數估計）｜JSON {sector_match.member_version()}"
+          f"｜門檻 {MIN_VALUE / 1e4:,.0f} 萬（{'只看前一交易日' if light else f'{LIQUIDITY_DAYS} 日均或前一日'}，"
+          f"收盤價×成交股數估計）｜JSON {sector_match.member_version()}"
           + (f"｜前一交易日 {prev_day}（官方日曆）" if sessions else "｜⚠️ 官方日曆未涵蓋，改用底庫已確認日期")
-          + ("｜⚠️ 日 K 底庫還沒有前一交易日資料，名單不完整、10 分鐘後重算" if meta["base_stale"] else ""), flush=True)
+          + ("｜⚠️ 前一交易日上市／上櫃收盤表不完整，名單不完整、10 分鐘後重算" if meta["base_stale"] else ""), flush=True)
     return pool
 
 
