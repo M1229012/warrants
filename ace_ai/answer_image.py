@@ -3522,11 +3522,12 @@ def ai_card(draw, y: float, data: dict, dry: bool) -> int:
             _para(pen, bx + 22, cy + 60, item['text'], 27, INK, col - 44)
         cy += box_h + 18
     if data.get('summary'):
-        label_w = font(24, True).getlength('一句話總結') + 36
+        label = data.get('summary_label') or '一句話總結'      # 10-28：族群解讀改標「觀察重點」
+        label_w = font(24, True).getlength(label) + 36
         h = _para(None, 0, 0, data['summary'], 29, INK, width - label_w - 24, True) + 30
         if pen:
             draw.rounded_rectangle((ix0, cy, ix1, cy + h), radius=12, fill=ACCENT_BG)
-            text_at(draw, (ix0 + 20, cy + 16), '一句話總結', 24, ACCENT, True)
+            text_at(draw, (ix0 + 20, cy + 16), label, 24, ACCENT, True)
         _para(pen, ix0 + label_w, cy + 15, data['summary'], 29, INK, width - label_w - 24, True)
         cy += h + 16
     if data.get('footer'):

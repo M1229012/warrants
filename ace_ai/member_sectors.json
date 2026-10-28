@@ -1,6 +1,6 @@
 {
  "_note": "會員族群唯一來源（10-27 重整）。kind=industry 為產業族群：每檔股票只在一個產業族群；kind=concept 為概念族群：可跟產業族群重疊，但每檔最多一個概念族群。產業族群目標 5～20 檔。分類以 Tide、FinLab 等外部網站為主，不一致時看 MoneyDJ 營收比重；興櫃不放。parent 是上層類別（例：IC設計），目前只供顯示與之後分層查詢。family 每群獨立，排行不再互相隱藏。舊版備份：member_sectors.before_regroup_1027.json（scratchpad）。",
- "version": "2026-10-28.3",
+ "version": "2026-10-28.4",
  "groups": {
   "晶圓代工": {
    "key": "FOUNDRY",
@@ -230,7 +230,8 @@
    "parent": "半導體",
    "aliases": [
     "IC-半導體設備",
-    "半導體設備"
+    "半導體設備",
+    "前段設備"
    ],
    "stocks": [
     [
@@ -285,7 +286,9 @@
    "family": "半導體自動化與檢測",
    "kind": "industry",
    "parent": "半導體",
-   "aliases": [],
+   "aliases": [
+    "半導體自動化"
+   ],
    "stocks": [
     [
      "2464",
@@ -656,7 +659,9 @@
    "family": "類比與電源管理IC",
    "kind": "industry",
    "parent": "IC設計",
-   "aliases": [],
+   "aliases": [
+    "電源管理IC"
+   ],
    "stocks": [
     [
      "6138",
@@ -718,7 +723,10 @@
    "family": "驅動IC與觸控",
    "kind": "industry",
    "parent": "IC設計",
-   "aliases": [],
+   "aliases": [
+    "驅動IC",
+    "觸控"
+   ],
    "stocks": [
     [
      "3034",
@@ -776,7 +784,10 @@
    "family": "高速傳輸與網通IC",
    "kind": "industry",
    "parent": "IC設計",
-   "aliases": [],
+   "aliases": [
+    "高速傳輸",
+    "網通IC"
+   ],
    "stocks": [
     [
      "2454",
@@ -846,7 +857,10 @@
    "family": "MCU與消費IC",
    "kind": "industry",
    "parent": "IC設計",
-   "aliases": [],
+   "aliases": [
+    "MCU",
+    "消費IC"
+   ],
    "stocks": [
     [
      "4919",
@@ -912,7 +926,10 @@
    "family": "影像感測與PC周邊IC",
    "kind": "industry",
    "parent": "IC設計",
-   "aliases": [],
+   "aliases": [
+    "影像感測",
+    "PC周邊IC"
+   ],
    "stocks": [
     [
      "3227",
@@ -1108,7 +1125,10 @@
    "parent": "被動元件",
    "aliases": [
     "PASSIVE",
-    "電容"
+    "電容",
+    "積層陶瓷電容",
+    "MLCC股",
+    "MLCC"
    ],
    "stocks": [
     [
@@ -1213,7 +1233,8 @@
    "kind": "industry",
    "parent": "被動元件",
    "aliases": [
-    "電感"
+    "電感",
+    "磁性元件"
    ],
    "stocks": [
     [
@@ -1267,7 +1288,8 @@
    "aliases": [
     "石英元件",
     "石英",
-    "濾波器"
+    "濾波器",
+    "頻率元件"
    ],
    "stocks": [
     [
@@ -1570,7 +1592,8 @@
     "DRILL_TOOL",
     "鑽孔與耗材",
     "鑽孔",
-    "鑽針"
+    "鑽針",
+    "PCB設備"
    ],
    "stocks": [
     [
@@ -1783,7 +1806,9 @@
    "family": "電源線與線材",
    "kind": "industry",
    "parent": "連接器",
-   "aliases": [],
+   "aliases": [
+    "電源線"
+   ],
    "stocks": [
     [
      "6133",
@@ -1836,7 +1861,9 @@
    "source": "own",
    "family": "企業與資料中心網通",
    "kind": "industry",
-   "aliases": [],
+   "aliases": [
+    "資料中心網通"
+   ],
    "stocks": [
     [
      "2345",
@@ -1893,7 +1920,9 @@
    "aliases": [
     "WiFi 6",
     "WiFi",
-    "5G"
+    "5G",
+    "寬頻",
+    "無線網通"
    ],
    "stocks": [
     [
@@ -1976,7 +2005,10 @@
    "source": "own",
    "family": "無線模組與射頻",
    "kind": "industry",
-   "aliases": [],
+   "aliases": [
+    "無線模組",
+    "射頻"
+   ],
    "stocks": [
     [
      "3694",
@@ -2016,7 +2048,8 @@
    "aliases": [
     "低軌衛星",
     "LEO_SAT",
-    "衛星"
+    "衛星",
+    "微波"
    ],
    "stocks": [
     [
@@ -2067,7 +2100,8 @@
    "family": "電信服務",
    "kind": "industry",
    "aliases": [
-    "電信"
+    "電信",
+    "電信股"
    ],
    "stocks": [
     [
@@ -2166,7 +2200,10 @@
    "source": "own",
    "family": "背光與光學膜",
    "kind": "industry",
-   "aliases": [],
+   "aliases": [
+    "背光",
+    "光學膜"
+   ],
    "stocks": [
     [
      "6176",
@@ -2402,7 +2439,8 @@
    "family": "筆電與品牌",
    "kind": "industry",
    "aliases": [
-    "AI PC"
+    "AI PC",
+    "筆電"
    ],
    "stocks": [
     [
@@ -2445,7 +2483,8 @@
    "family": "主機板與板卡",
    "kind": "industry",
    "aliases": [
-    "主機板"
+    "主機板",
+    "板卡"
    ],
    "stocks": [
     [
@@ -2491,7 +2530,8 @@
     "伺服器機殼",
     "SERVER_CASE",
     "機殼 (AI 伺服器)",
-    "機殼"
+    "機殼",
+    "滑軌"
    ],
    "stocks": [
     [
@@ -2673,7 +2713,9 @@
    "source": "own",
    "family": "電源與電腦周邊",
    "kind": "industry",
-   "aliases": [],
+   "aliases": [
+    "電腦周邊"
+   ],
    "stocks": [
     [
      "1471",
@@ -2813,7 +2855,10 @@
    "source": "own",
    "family": "強固型與車載電腦",
    "kind": "industry",
-   "aliases": [],
+   "aliases": [
+    "強固型",
+    "車載電腦"
+   ],
    "stocks": [
     [
      "3416",
@@ -2862,7 +2907,10 @@
    "source": "own",
    "family": "電子代工與消費電子",
    "kind": "industry",
-   "aliases": [],
+   "aliases": [
+    "電子代工",
+    "消費電子"
+   ],
    "stocks": [
     [
      "2312",
@@ -3015,7 +3063,10 @@
    "family": "企業軟體",
    "kind": "industry",
    "parent": "資訊服務",
-   "aliases": [],
+   "aliases": [
+    "SaaS",
+    "企業SaaS"
+   ],
    "stocks": [
     [
      "6752",
@@ -3137,7 +3188,8 @@
    "parent": "資訊服務",
    "aliases": [
     "系統整合",
-    "SI"
+    "SI",
+    "應用開發"
    ],
    "stocks": [
     [
@@ -3230,7 +3282,8 @@
    "family": "汽車整車與通路",
    "kind": "industry",
    "aliases": [
-    "整車"
+    "整車",
+    "汽車整車"
    ],
    "stocks": [
     [
@@ -3429,7 +3482,8 @@
    "aliases": [
     "觀光",
     "TOURISM",
-    "旅遊"
+    "旅遊",
+    "飯店"
    ],
    "stocks": [
     [
@@ -3516,7 +3570,8 @@
     "SHIPPING",
     "航運概念股",
     "貨櫃",
-    "海運"
+    "海運",
+    "航運股"
    ],
    "stocks": [
     [
@@ -3697,7 +3752,8 @@
    "family": "橡膠與輪胎",
    "kind": "industry",
    "aliases": [
-    "橡膠"
+    "橡膠",
+    "輪胎"
    ],
    "stocks": [
     [
@@ -4510,7 +4566,10 @@
    "source": "own",
    "family": "農畜與飼料",
    "kind": "industry",
-   "aliases": [],
+   "aliases": [
+    "農畜",
+    "飼料"
+   ],
    "stocks": [
     [
      "1210",
@@ -4587,7 +4646,9 @@
    "source": "own",
    "family": "媒體與娛樂",
    "kind": "industry",
-   "aliases": [],
+   "aliases": [
+    "媒體"
+   ],
    "stocks": [
     [
      "2926",
@@ -4746,7 +4807,9 @@
    "source": "own",
    "family": "航空與物流",
    "kind": "industry",
-   "aliases": [],
+   "aliases": [
+    "物流"
+   ],
    "stocks": [
     [
      "2646",
@@ -4956,7 +5019,11 @@
    "family": "醫療服務與CDMO",
    "kind": "industry",
    "parent": "生技",
-   "aliases": [],
+   "aliases": [
+    "CDMO",
+    "CRO",
+    "醫療服務"
+   ],
    "stocks": [
     [
      "3118",
@@ -5021,7 +5088,10 @@
    "source": "own",
    "family": "環保與資源回收",
    "kind": "industry",
-   "aliases": [],
+   "aliases": [
+    "環保",
+    "資源回收"
+   ],
    "stocks": [
     [
      "6641",
@@ -5667,7 +5737,8 @@
    "aliases": [
     "BBU",
     "BBU (電池備援)",
-    "電池備援"
+    "電池備援",
+    "電池模組"
    ],
    "stocks": [
     [
@@ -5730,7 +5801,9 @@
    "family": "金控",
    "kind": "industry",
    "parent": "金融",
-   "aliases": [],
+   "aliases": [
+    "金控股"
+   ],
    "stocks": [
     [
      "2880",
@@ -6448,7 +6521,8 @@
    "aliases": [
     "車用電子",
     "車聯網",
-    "汽車零件"
+    "汽車零件",
+    "底盤"
    ],
    "stocks": [
     [
@@ -6688,7 +6762,8 @@
    "kind": "industry",
    "aliases": [
     "機能布與成衣",
-    "紡織纖維"
+    "紡織纖維",
+    "鞋材"
    ],
    "stocks": [
     [
@@ -6750,7 +6825,8 @@
    "parent": "營建",
    "aliases": [
     "建設開發",
-    "營造"
+    "營造",
+    "大型營建"
    ],
    "stocks": [
     [
@@ -6833,7 +6909,8 @@
    "family": "眼科與隱形眼鏡",
    "kind": "industry",
    "aliases": [
-    "隱形眼鏡"
+    "隱形眼鏡",
+    "眼科"
    ],
    "stocks": [
     [
@@ -6993,7 +7070,8 @@
    "kind": "industry",
    "aliases": [
     "車燈",
-    "AM"
+    "AM",
+    "AM件"
    ],
    "stocks": [
     [
@@ -7148,7 +7226,9 @@
    "kind": "industry",
    "aliases": [
     "紡紗",
-    "織布"
+    "織布",
+    "紡紗織布",
+    "染整"
    ],
    "stocks": [
     [
@@ -7231,7 +7311,10 @@
    "source": "own",
    "family": "醫學影像與智慧醫療",
    "kind": "industry",
-   "aliases": [],
+   "aliases": [
+    "醫學影像",
+    "智慧醫療"
+   ],
    "stocks": [
     [
      "4153",
@@ -7401,7 +7484,10 @@
    "source": "own",
    "family": "家具與衛浴",
    "kind": "industry",
-   "aliases": [],
+   "aliases": [
+    "家具",
+    "衛浴"
+   ],
    "stocks": [
     [
      "2062",
@@ -7470,7 +7556,10 @@
    "source": "own",
    "family": "生物製劑與細胞治療",
    "kind": "industry",
-   "aliases": [],
+   "aliases": [
+    "生物製劑",
+    "細胞治療"
+   ],
    "stocks": [
     [
      "4142",
@@ -7536,7 +7625,9 @@
    "source": "own",
    "family": "植入與骨科",
    "kind": "industry",
-   "aliases": [],
+   "aliases": [
+    "骨科"
+   ],
    "stocks": [
     [
      "1783",
@@ -7582,7 +7673,9 @@
    "source": "own",
    "family": "樹脂與膠",
    "kind": "industry",
-   "aliases": [],
+   "aliases": [
+    "樹脂"
+   ],
    "stocks": [
     [
      "4720",
@@ -7982,7 +8075,8 @@
    "parent": "生技",
    "aliases": [
     "植入與醫療耗材",
-    "醫療器材"
+    "醫療器材",
+    "醫療耗材"
    ],
    "stocks": [
     [
@@ -8109,7 +8203,8 @@
    "kind": "industry",
    "aliases": [
     "檢測與診斷器材",
-    "醫材"
+    "醫材",
+    "監測器材"
    ],
    "stocks": [
     [
