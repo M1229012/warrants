@@ -227,6 +227,7 @@ GROUPS = [
     ("前波高低點", lambda r: r["kind"] == "prior" and not r["watch"]),
     ("延伸", lambda r: r["kind"] == "extend" and not r["watch"]),
     ("整理區等幅", lambda r: r["kind"] == "box" and not r["watch"]),
+    ("整理區上下緣", lambda r: r["kind"] == "box_edge" and not r["watch"]),
     ("下跌支撐（大段／前低／等幅）", lambda r: r["kind"] == "support" and not r["watch"]),
     ("暫定（未確認錨點）", lambda r: r["tentative"] and not r["watch"]),
     ("錨點已確認", lambda r: not r["tentative"] and not r["watch"]),

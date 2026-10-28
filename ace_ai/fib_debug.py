@@ -15,7 +15,8 @@ _COMMAND = re.compile(r"(?:費波|斐波|費氏|費布|fibo?)\s*\w{0,4}?\s*驗�
 _CODE_RE = re.compile(r"(?<![0-9A-Za-z])(?:[0-9]{4,6}[A-Za-z]?|TAIEX|TPEX)(?![0-9A-Za-z])", re.IGNORECASE)
 YEAR_PERIOD = "400d"         # 與分點一年日K同一個抓取區間（約 270 個交易日）
 YEAR_TTL_SECONDS = 6 * 3600  # 同檔同日只抓一次 FinMind
-KIND_COLOR = {"retrace": "#1478B5", "prior": "#C76C00", "extend": "#8044B8", "box": "#2F855A", "support": "#B4232C"}
+KIND_COLOR = {"retrace": "#1478B5", "prior": "#C76C00", "extend": "#8044B8", "box": "#2F855A", "box_edge": "#2F855A",
+              "support": "#B4232C"}
 
 
 def is_request(question: str) -> bool:
@@ -133,7 +134,7 @@ def render(data: dict) -> Image.Image:
                       f"｜確認日當天的轉折不使用", 22, muted)
     x = margin
     for label, color in (("回撤／反彈", KIND_COLOR["retrace"]), ("前波高點", KIND_COLOR["prior"]), ("延伸", KIND_COLOR["extend"]),
-                         ("整理區等幅", KIND_COLOR["box"]), ("下跌支撐", KIND_COLOR["support"])):
+                         ("整理區上下緣／等幅", KIND_COLOR["box"]), ("下跌支撐", KIND_COLOR["support"])):
         draw.line((x, 180, x + 50, 180), fill=color, width=4)
         text(x + 60, 166, label, 21, color)
         x += 60 + tw(label, 21) + 34

@@ -16,6 +16,8 @@
   7. 依未確認錨點（終點還沒確認的波段）算出的價位＝暫定（tentative）：仍交給 AI，但註明確認前可能調整。
   8. 離收盤 ≤ TEST_ATR 倍 ATR 的價位＝現價附近觀察位（watch）：不當目標價，以現況資訊交給 AI。
   9. 相距 ≤ ZONE_ATR 倍 ATR 的價位先合併成一區，交給 AI 的名額以「區」計算。
+ 10. 整數關卡只顯示、不單獨給 AI 資格；所有模式收盤之上最多 ABOVE_AI 區（資格→合併→延伸加選→留最近幾區）。
+ 11. 整理區上下緣本身也是價位；未突破時等幅標「突破上緣後才成立」。
 """
 from __future__ import annotations
 
@@ -53,7 +55,8 @@ BREAKOUT = (1.382, 1.618, 2.0, 2.618)   # 越過波段端點、沒有 C 可用�
 EXTEND_AI = int(_env("EXTEND_AI", 2))     # 創新高時收盤之上最近幾區延伸價位直接交給 AI（上方沒有結構可共振）
 SUPPORT_RETRACE = (0.618, 0.786, 1.0)   # 下跌低點未確認時：大波段回撤（只取收盤之下的）
 DROP_PROJECT = (0.618, 1.0)             # 下跌低點未確認時：上一段大跌幅度從這次高點往下量
-SUPPORT_AI = int(_env("SUPPORT_AI", 2))   # 下跌低點未確認時，收盤上下各最近幾區交給 AI
+SUPPORT_AI = int(_env("SUPPORT_AI", 2))   # 下跌低點未確認時，收盤之下最近幾區交給 AI
+ABOVE_AI = int(_env("ABOVE_AI", 2))       # 所有模式：收盤之上最多幾區交給 AI（2881：延伸一路給到 300）
 TEST_ATR = _env("TEST_ATR", 0.5)          # 離收盤在此倍數 ATR 內＝現價附近觀察位，不當目標價（2308：1504 貼著收盤 1510）
 
 
@@ -354,11 +357,16 @@ def _compute(frame: pd.DataFrame, events: Optional[Dict[str, Any]], lookback: in
         if box:   # 10-27（3034 案例）：整理區等幅測量＝上緣＋整理高度；畫成價位，也當費波的共振對象
             box.update(height=box["top"] - box["bottom"], target=2 * box["top"] - box["bottom"], broke=close > box["top"],
                        start_date=dates[box["start"]], end_date=dates[box["end"]])
-            item = {"label": "整理區等幅" if box["broke"] else "整理區等幅（突破後）", "kind": "box", "ratio": 1.0,
-                    "price": box["target"]}
+            item = {"label": "整理區等幅" if box["broke"] else "整理區等幅（突破上緣後才成立）",
+                    "tag": "整理區等幅" if box["broke"] else "等幅（突破後）", "kind": "box", "ratio": 1.0,
+                    "price": box["target"], "conditional": not box["broke"]}
             levels.append(item)
             refs.append({"price": box["target"], "text": f"整理區等幅 {box['target']:.2f}", "level": item})
-            refs.append({"price": box["top"], "text": f"整理區上緣 {box['top']:.2f}"})
+            # 10-28（2881）：整理區上下緣本身也是價位（貼著收盤時就是現價附近觀察位）
+            for name, edge in (("上緣", box["top"]), ("下緣", box["bottom"])):
+                edge_item = {"label": f"整理區{name}", "tag": f"整理區{name}", "kind": "box_edge", "ratio": 1.0, "price": edge}
+                levels.append(edge_item)
+                refs.append({"price": edge, "text": f"整理區{name} {edge:.2f}", "level": edge_item})
             box["line"] = (f"整理區：{box['start_date'][5:]}～{box['end_date'][5:]} 收盤 {box['bottom']:.2f}～{box['top']:.2f}"
                            f"（{box['end'] - box['start'] + 1} 根），{'已向上突破' if box['broke'] else '尚未向上突破'}；"
                            f"等幅測量 {box['top']:.2f}＋{box['height']:.2f}＝{box['target']:.2f}")
@@ -381,9 +389,11 @@ def _compute(frame: pd.DataFrame, events: Optional[Dict[str, Any]], lookback: in
             # 10-28：價位依賴終點還沒確認的錨點（未確認波段的 B 本身、由它算出的回撤／延伸）＝暫定
             tentative = selected["provisional"] and (item["kind"] in ("retrace", "extend")
                                                      or (item["kind"] == "prior" and abs(price - b["price"]) < 1e-9))
+            # 10-28（2881）：整數關卡保留顯示，但不能單獨讓價位取得 AI 資格（遠處延伸很容易剛好靠近整數）
+            basis = [t for t, _ in hits if not t.startswith("整數關卡")]
             item.update(price=float(price), above=price > close, confluence=[t for t, _ in hits],
                         tight=[t for t, dist in hits if dist <= tight], watch=watch, tentative=bool(tentative),
-                        ai=bool(price > close and not watch and (hits or item["kind"] in ("prior", "box"))))
+                        ai=bool(price > close and not watch and (basis or item["kind"] in ("prior", "box", "box_edge"))))
         selected["zones"] = zones
         levels.sort(key=lambda x: x["price"])
 
@@ -403,11 +413,12 @@ def _compute(frame: pd.DataFrame, events: Optional[Dict[str, Any]], lookback: in
         if mode == "extend":
             for area in [z for z in areas if z["above"] and any(x["kind"] == "extend" for x in z["members"])][:EXTEND_AI]:
                 area["ai"] = True
-        if falling:   # 收盤之下最近幾區直接交給 AI；上方只留最近幾區反彈壓力，數字不要太多
+        if falling:   # 收盤之下最近幾區直接交給 AI
             for area in sorted([z for z in areas if not z["above"]], key=lambda z: -z["high"])[:SUPPORT_AI]:
                 area["ai"] = True
-            for area in [z for z in areas if z["above"] and z["ai"]][SUPPORT_AI:]:
-                area["ai"] = False
+        # 10-28（2881）：所有模式統一——資格、合併、延伸加選之後，上方只留最近 ABOVE_AI 區；不足就少給
+        for area in [z for z in areas if z["above"] and z["ai"]][ABOVE_AI:]:
+            area["ai"] = False
         for k, area in enumerate(areas):
             area["tentative"] = any(x["tentative"] for x in area["members"])
             for x in area["members"]:
