@@ -24,6 +24,7 @@ import re
 import statistics
 import threading
 import time
+from collections import Counter
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -554,6 +555,36 @@ def _enrich(row: Dict[str, Any], quote: Dict[str, Dict[str, Any]], info: Dict[st
     row["d5"] = (sum(moves) / len(moves)) if moves and len(moves) >= max(1, int(len(codes) * 0.8)) else None
 
 
+CONCEPT_EXCESS = max(0.0, tools._env_float("DISCORD_AI_CONCEPT_EXCESS", 1.0))   # 概念族群要比所屬產業多 ≥ 1 個百分點
+
+
+def _concept_check(rows: List[Dict[str, Any]], groups: Dict[str, Dict[str, Any]], weak: bool) -> Dict[str, str]:
+    """10-28 產業族群優先：概念族群（kind=concept）要比「成分股所屬產業族群」的平均更強，才代表概念本身在動。
+    超額＝概念平均 − 各有效成分股所屬產業族群平均的平均（按檔數）。強勢要 ≥ CONCEPT_EXCESS、弱勢要 ≤ −CONCEPT_EXCESS；
+    不到就是產業連動（例：TPU 的創意、世芯其實是 ASIC 在漲），不上榜。回 {不上榜的概念族群: 原因}。
+    成分股所屬產業有一半以上排不出名次（無法比較）時照常上榜。"""
+    industry_of = {code: name for name, info in groups.items() if info.get("kind") != "concept"
+                   for code, _ in info.get("stocks") or []}
+    industry_avg = {r["name"]: r["avg"] for r in rows if (groups.get(r["name"]) or {}).get("kind") != "concept"}
+    out: Dict[str, str] = {}
+    for row in rows:
+        if (groups.get(row["name"]) or {}).get("kind") != "concept":
+            continue
+        codes = row.get("codes") or []
+        base = [industry_avg[industry_of[c]] for c in codes if industry_of.get(c) in industry_avg]
+        if not codes or len(base) * 2 < len(codes):
+            row["concept_excess"] = None
+            continue
+        excess = row["avg"] - sum(base) / len(base)
+        row["concept_excess"] = excess
+        if (excess > -CONCEPT_EXCESS) if weak else (excess < CONCEPT_EXCESS):
+            linked = Counter(industry_of[c] for c in codes if industry_of.get(c) in industry_avg).most_common(2)
+            out[row["name"]] = f"超額 {excess:+.2f}%，主要是{'、'.join(n for n, _ in linked)}連動"
+    if out:
+        print("📊 概念族群不上榜（產業連動）｜" + "｜".join(f"{k}：{v}" for k, v in out.items()), flush=True)
+    return out
+
+
 def rank(day: Optional[str] = None, direction: str = "strong") -> Optional[Dict[str, Any]]:
     """所有會員族群的今日排行（完整結果）；direction＝strong（平均漲幅高到低）或 weak（低到高）。
     名單或報價都拿不到時回 None。"""
@@ -601,9 +632,10 @@ def rank(day: Optional[str] = None, direction: str = "strong") -> Optional[Dict[
     rows.sort(key=lambda r: ((r["avg"] if weak else -r["avg"]), r["name"]))
     for index, row in enumerate(rows, 1):
         row["raw_rank"] = index
+    subsumed = _concept_check(rows, groups, weak)
     shown, families = [], set()
     for row in rows:                      # 同家族只在顯示時取一個，向後遞補
-        if row["family"] in families:
+        if row["family"] in families or row["name"] in subsumed:
             continue
         families.add(row["family"])
         shown.append(row)
