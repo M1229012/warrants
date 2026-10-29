@@ -911,6 +911,15 @@ def _intraday_radar_answer() -> Optional[Dict[str, Any]]:
     return {"text": "\n".join(lines), "calls": 0, "cacheable": False, "panels": [panel]}
 
 
+def _rank_unavailable_text() -> str:
+    """10-29：今日族群排行排不出來時，收盤後要講清楚是在等今天的收盤表（不是籠統的資料不足）。"""
+    try:
+        import member_sector_rank
+        return member_sector_rank.unavailable_text()
+    except Exception:
+        return ""
+
+
 def _market_radar_answer(mode: str, request: Optional[Dict[str, Any]] = None, gateway=None, validate=None) -> Dict[str, Any]:
     """全市場族群排行：盤中漲幅先用即時雷達，其餘一律用本地底庫，不為單一問題掃市場。"""
     if mode == "market_momentum" and sector_match.MEMBER_ONLY:
@@ -923,7 +932,8 @@ def _market_radar_answer(mode: str, request: Optional[Dict[str, Any]] = None, ga
             result = None
         if result:
             return result
-        return {"text": "今日族群排行的行情或名單資料暫時不足，請稍後再試。", "calls": 0, "cacheable": False}
+        reason = _rank_unavailable_text()
+        return {"text": reason or "今日族群排行的行情或名單資料暫時不足，請稍後再試。", "calls": 0, "cacheable": False}
     if mode == "market_momentum":
         live = _intraday_radar_answer()
         if live:
@@ -1279,8 +1289,9 @@ def answer(request: Dict[str, str], gateway, validate) -> Dict[str, Any]:
             result = None
         if result:
             return result
-        return {"text": f"{request['name']}底下的族群今天行情資料不足，暫時排不出來，請稍後再試。"
-                        f"\n包含：{'、'.join(request.get('children') or [])}", "calls": 0, "cacheable": False}
+        reason = _rank_unavailable_text()
+        return {"text": (reason or f"{request['name']}底下的族群今天行情資料不足，暫時排不出來，請稍後再試。")
+                        + f"\n包含：{'、'.join(request.get('children') or [])}", "calls": 0, "cacheable": False}
     if mode == "belongs":
         code = str(request.get("stock_code") or request.get("name") or "")
         names = sector_match.groups_of(code)

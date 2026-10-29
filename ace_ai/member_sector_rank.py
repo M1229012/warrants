@@ -281,10 +281,16 @@ def quotes(codes: List[str]) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]
                      "time": tape_status["time"] or now.strftime("%H:%M:%S"), "date": now.strftime("%Y-%m-%d"),
                      "tape": tape_status, "data_short": short, "verified": len(out), "requested": len(codes),
                      "estimated": sum(1 for q in out.values() if q.get("estimated"))}
+    # 10-29：盤後查核視窗（15:30）過後也要先抓當日官方收盤表；以前這裡只讀本地日 K，背景同步關閉時拿不到今天的收盤
+    official_close = _official_close_quotes(codes, tools.taipei_now())
+    if official_close is not None:
+        return official_close
     return _closed_quotes(codes)
 
 
-OFFICIAL_CLOSE_MINUTE = 14 * 60 + 35     # 證交所／櫃買當日收盤表大約 14:30 前後公布
+# 證交所／櫃買當日收盤表大約 14:30 前後公布。10-29：改成 13:45 起就試（還沒公布時 sync_day 記 pending、
+# 不算完整，照舊用盤後快照），每 10 分鐘最多試一次；公布時間有早有晚，不能等到固定時間才開始抓。
+OFFICIAL_CLOSE_MINUTE = 13 * 60 + 45
 _CLOSE_TRY: Dict[str, float] = {}
 
 
@@ -300,8 +306,11 @@ def _book_estimate(q: Dict[str, Any], tape: Any, code: str, snap_ts: float) -> O
 
 
 def _official_close_quotes(codes: List[str], clock) -> Optional[Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]]:
-    """10-28：收盤後（14:35 起）改用證交所＋櫃買當日正式收盤價；當日收盤表還沒完整就回 None（照舊用盤後快照）。"""
-    if clock.hour * 60 + clock.minute < OFFICIAL_CLOSE_MINUTE or _official_session_today() is not True:
+    """10-28：收盤後改用證交所＋櫃買當日正式收盤價；當日收盤表還沒完整就回 None（照舊用盤後快照）。
+    10-29：官方日曆沒涵蓋今天（None）的平日也要試——收盤表本身會說今天有沒有資料；只有日曆確認休市才不抓。"""
+    if clock.hour * 60 + clock.minute < OFFICIAL_CLOSE_MINUTE or clock.weekday() >= 5:
+        return None
+    if _official_session_today() is False:
         return None
     day = clock.strftime("%Y-%m-%d")
     if not _prev_day_complete(day):
@@ -337,15 +346,22 @@ PRICE_LIMIT_GUARD = 10.5
 
 
 def latest_trade_day() -> str:
-    """本地日 K 最新的交易日（假日、連假、颱風假都會停在最後一個有開盤的日子）。"""
-    dates = local_market_cache.known_dates(limit=1)
+    """本地日 K 最新的交易日（假日、連假、颱風假都會停在最後一個有開盤的日子）。
+    10-29：要上市、上櫃收盤表都完整的那一天。只有零星個股被單獨查過的日子不算——
+    測試版背景同步關閉時，收盤後最新日期只有幾檔有 K 棒，族群全部變成資料不足。"""
+    dates = local_market_cache.known_dates(limit=10)
+    for day in dates:
+        if _prev_day_complete(day):
+            return day
     return dates[0] if dates else ""
 
 
 def _closed_quotes(codes: List[str]) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
     """最新交易日收盤（純本地日 K）；除權息的上市股改用公告參考價重算漲跌。
-    10-27 審核：參考價來源失敗時不靜默照用未調整漲跌；超過單日漲跌幅上限、又沒有公告參考價的股票不納入。"""
-    changes = local_market_cache.latest_changes(codes)
+    10-27 審核：參考價來源失敗時不靜默照用未調整漲跌；超過單日漲跌幅上限、又沒有公告參考價的股票不納入。
+    10-29：每檔都看同一個完整交易日（不能有的拿今天零星 K 棒、有的拿昨天）。"""
+    day = latest_trade_day()
+    changes = local_market_cache.latest_changes(codes, as_of={c: day for c in codes} if day else None)
     latest = max((str(v.get("date") or "") for v in changes.values()), default="")
     out = {c: {"change_pct": float(v["change_pct"]), "price": float(v["close"]),
                "est_value": float(v["close"]) * float(v.get("volume") or 0)}
@@ -620,10 +636,15 @@ def rank(day: Optional[str] = None, direction: str = "strong",
         return None
     t_pool = time.perf_counter() - began
     quote, info = quotes(sorted(pool))
-    if info.get("fallback") and info.get("date") and info["date"] != day:
-        pool = liquid_pool(info["date"])        # 颱風假改用收盤資料：名單也換成那一天的
+    if (info.get("fallback") or info.get("official_close")) and info.get("date") and info["date"] != day:
+        # 颱風假／收盤後改用收盤資料：名單也換成那一天的（10-29：官方收盤表當場抓到今天的也一樣，
+        # 名單原本是用「抓之前」的最新完整交易日算的）
+        flags = {k: True for k in ("fallback", "official_close") if info.get(k)}
+        pool = liquid_pool(info["date"])
         quote, info = _closed_quotes(sorted(pool))
-        info["fallback"] = True
+        info.update(flags)
+        if flags.get("official_close"):
+            info["basis"] = "收盤"
     print(f"⏱️ 今日族群排行｜名單 {t_pool:.1f}s｜報價 {time.perf_counter() - began - t_pool:.1f}s"
           f"｜{info.get('basis', '')} {info.get('date', '')}", flush=True)
     if not quote:
@@ -1265,8 +1286,27 @@ def _value_text(value: Any) -> str:
 
 
 def _latest_hint(info: Dict[str, Any]) -> str:
-    """假日、連假、颱風假顯示的是之前的交易日：標「最新交易日」，避免被當成今天。"""
-    return "・最新交易日" if info.get("date") and info["date"] != _today() else ""
+    """假日、連假、颱風假顯示的是之前的交易日：標「最新交易日」，避免被當成今天。
+    10-29：今天有開盤、已經收盤，卻還是顯示之前的日子（今天收盤表還沒取得）→ 直接講清楚，不能只寫「最新交易日」。"""
+    if not info.get("date") or info["date"] == _today():
+        return ""
+    now = tools.taipei_now()
+    if now.hour * 60 + now.minute >= CLOSE_MINUTE and _official_session_today() is True:
+        return "・今天收盤資料還沒取得"
+    return "・最新交易日"
+
+
+def unavailable_text() -> str:
+    """rank() 排不出來時要給會員看的原因（10-29：收盤後只說「資料不足、請稍後再試」，會員不知道要等什麼）。
+    今天有開盤、已收盤：證交所／櫃買收盤表還沒公布、盤後快照又湊不齊。其餘情況回空字串，用原本的說法。"""
+    now = tools.taipei_now()
+    minute = now.hour * 60 + now.minute
+    if minute < CLOSE_MINUTE or now.weekday() >= 5 or _official_session_today() is False:
+        return ""
+    if minute < 15 * 60 + 30:
+        return ("今天的收盤資料還在整理：證交所、櫃買收盤表通常 14:30 前後公布，公布後就能排出今天收盤的排行，"
+                "請過幾分鐘再問。")
+    return "今天的證交所、櫃買收盤表暫時沒有取得（來源沒有回應或還沒公布完整），請稍後再問。"
 
 
 def _md(day: str) -> str:

@@ -153,6 +153,7 @@ def ai_reference(res: Dict[str, Any]) -> Dict[str, Any]:
     areas = [z for z in res.get("areas") or [] if z["ai"]]
     ups = sorted([z for z in areas if z["above"]], key=lambda z: z["low"])
     out = {"資料日": res["bars"][res["last"]]["date"], "收盤": round(res["close"], 2),
+           "模式": res["mode"], "ATR": round(res["atr"], 4),   # Bot 用來分上漲／還在下跌、和觀察重點價位去重
            "說明": res["summary"][0].split("｜", 1)[-1],
            "目前壓力": [item(z) for z in ups if not z["conditional"]],
            "突破後條件目標": [item(z) for z in ups if z["conditional"]],
