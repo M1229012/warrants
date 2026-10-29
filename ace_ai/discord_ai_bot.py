@@ -2986,8 +2986,9 @@ def fib_reference_map(results: Sequence[tools.ToolResult]) -> Dict[str, Any]:
 
 FINAL_FIB_RULES = ("【費波參考價（測試版，優先於規則 3 的「不給目標價」）】可以用費波參考價稍微說明可能的參考目標，"
     "但一定要講明是費波參考價、不保證會到。payload.fib_reference 是程式算好的每檔費波南西參考價："
-    "目前壓力、突破後條件目標、下方候選支撐、現價附近觀察。問型態時在 why 或 scenarios 用一到兩句稍微說明可能的目標價或壓力支撐位置，"
-    "支撐壓力仍以 watch_plan 為主，費波價位和 watch_plan 價位接近時合併成一句，不重複列。"
+    "目前壓力、突破後條件目標、下方候選支撐、現價附近觀察。有 fib_reference 的股票，why 一定要有一句以「費波參考」開頭的句子，"
+    "說明可能的目標價或壓力支撐位置（例：「費波參考上方壓力約 164.5，若突破整理區上緣，條件目標約 179.5；下方候選支撐約 143.5」），"
+    "這一句不受「關鍵價位固定用 watch_plan」的限制；其他句子的支撐壓力仍以 watch_plan 為主，價位接近時不重複列。"
     "只能用 fib_reference 裡的價位，不自行計算其他比例；不寫比例計算過程、錨點日期或 A、B、C 代號。"
     "「突破後條件目標」一定寫成條件（例如「若突破整理區上緣，費波參考目標約在 X」），不可說成已啟動的目標；"
     "有「註記」的價位要說明是依目前高低點試算、之後可能調整；有「可信度」欄位時要說只是區間量測。"
@@ -9087,6 +9088,11 @@ class AceQueryEngine:
         fibs = fib_reference_map(results)
         if fibs and payload["pattern_focus"]:
             payload["fib_reference"] = fibs   # 10-29（測試版）：問型態時稍微說明費波參考目標與壓力支撐
+        if payload["pattern_focus"]:   # 10-29：診斷用——有沒有拿到費波、各類幾區
+            asked = [str(c.kwargs.get("stock_code")) for c in plan.tool_calls if c.name == "get_technical_analysis"]
+            self.log("費波參考價｜" + ("｜".join(
+                f"{c} " + ("壓力{}／條件{}／支撐{}".format(*(len(fibs[c].get(k) or []) for k in ("目前壓力", "突破後條件目標", "下方候選支撐")))
+                           if c in fibs else "無") for c in asked) or "本題沒有技術面"))
         context = getattr(getattr(self, "_request_local", None), "member_chart_context", None)
         if context and (context.get("compound") or any(v.get("triangle") or not v.get("show_bollinger", True) for v in context.get("stocks", {}).values())):
             payload = member_pattern.scoped_payload(payload, context)
@@ -9151,6 +9157,11 @@ class AceQueryEngine:
         if card is not None:
             raw_card, removed = dict(card), []
             card = self._check_ai_card(card, payload, facts, removed)
+            if payload.get("fib_reference"):   # 10-29 診斷：AI 有沒有寫費波句、核對後還在不在
+                said = "費波" in json.dumps(raw_card, ensure_ascii=False)
+                kept = card is not None and "費波" in json.dumps(card, ensure_ascii=False)
+                cut = [str(r)[:80] for r in removed if "費波" in str(r)]
+                self.log(f"費波句｜AI {'有寫' if said else '沒寫'}｜核對後{'保留' if kept else '不在'}" + (f"｜被刪：{cut[:2]}" if cut else ""))
             if removed and FACT_REPAIR_ENABLE and (card is None or len(removed) >= 2
                                                    or (raw_card.get("scenarios") and not card.get("scenarios"))):
                 fixed, fixed_removed = self._repair_ai_card(raw_card, removed, payload, facts)
