@@ -55,6 +55,13 @@ def load_panel(code: str) -> dict[str, Any]:
     return panel
 
 
+def ai_reference(code: str) -> dict[str, Any]:
+    """10-29（測試版）：問型態時給 AI 的費波參考價；與費波驗證圖同一份資料（正式收盤 K＋一年日K）與計算。"""
+    code, _, frame, events = kline_debug.load_closed(code)
+    frame, _ = extend_history(code, frame, events)
+    return fib_levels.ai_reference(fib_levels.compute(frame, events))
+
+
 def extend_history(code: str, closed: pd.DataFrame, events: dict | None) -> tuple[pd.DataFrame, str]:
     """10-28：另抓約一年日K（與分點一年日K同區間），整段用同一份公司行動、同一個 as_of 還原後，
     只取正式收盤 K 之前的部分接上；同檔同日只抓一次。抓不到就用原本的日K並註明，不擋驗證。"""

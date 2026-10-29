@@ -134,6 +134,35 @@ def _hits(item: Dict[str, Any], refs: List[Dict[str, Any]], zones: List[Dict[str
     return out
 
 
+def ai_reference(res: Dict[str, Any]) -> Dict[str, Any]:
+    """10-29：問型態時給 AI 的費波參考價（和費波驗證圖同一份 compute 結果）。只放交給 AI 的價位區，分成
+    目前壓力／突破後條件目標／下方候選支撐／現價附近觀察；不帶比例計算過程與錨點代號。"""
+    if not res.get("selected"):
+        return {"狀態": "沒有可用的費波波段，不提費波價位"}
+
+    def item(z):
+        out = {"依據": "、".join(z["labels"])}
+        if z["high"] - z["low"] < 1e-9:
+            out["價位"] = round(z["low"], 2)
+        else:
+            out["價位區"] = f"{z['low']:.2f}～{z['high']:.2f}"
+        if z["tentative"]:
+            out["註記"] = "依目前高低點試算，確認前可能調整"
+        return out
+
+    areas = [z for z in res.get("areas") or [] if z["ai"]]
+    ups = sorted([z for z in areas if z["above"]], key=lambda z: z["low"])
+    out = {"資料日": res["bars"][res["last"]]["date"], "收盤": round(res["close"], 2),
+           "說明": res["summary"][0].split("｜", 1)[-1],
+           "目前壓力": [item(z) for z in ups if not z["conditional"]],
+           "突破後條件目標": [item(z) for z in ups if z["conditional"]],
+           "下方候選支撐": [item(z) for z in sorted([z for z in areas if not z["above"]], key=lambda z: -z["high"])],
+           "現價附近觀察": [{"依據": lv["label"], "價位": round(lv["price"], 2)} for lv in res["levels"] if lv["watch"]]}
+    if res["selected"].get("fallback"):
+        out["可信度"] = "沒有合格費波主段，以下僅為區間量測"
+    return {k: v for k, v in out.items() if v not in ([], "", None)}
+
+
 def _area_text(area: Dict[str, Any]) -> str:
     if len(area["members"]) == 1:
         x = area["members"][0]

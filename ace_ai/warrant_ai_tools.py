@@ -3149,6 +3149,21 @@ def _kline_patterns(df: pd.DataFrame, code: str = "", provisional_today: bool = 
         return {"triangle_validation": {"status": "unavailable"}, "triangle": None}
 
 
+FIB_REFERENCE = os.getenv("DISCORD_AI_FIB_REFERENCE", "1") != "0"   # 10-29 測試版：技術面附費波參考價
+
+
+def _fib_reference(code: str) -> Dict[str, Any]:
+    """10-29（測試版）：費波參考價給問型態的 AI 說明目標價、壓力支撐；失敗不影響其他技術資料。"""
+    if not FIB_REFERENCE or code in INDEX_CODES or getattr(_LOCAL_ONLY, "on", False):   # 離線批次（族群總覽等）不另抓一年日K
+        return {}
+    try:
+        import fib_debug
+        return fib_debug.ai_reference(code)
+    except Exception as exc:
+        print(f"⚠️ 費波參考價略過｜{code}｜{err_text(exc)}", flush=True)
+        return {}
+
+
 def _drawdown_facts(df: pd.DataFrame) -> Dict[str, Any]:
     """10-20：這波跌了多少——近 10 個交易日（約 2 週）高點（價、日）、距高點跌幅、今日漲跌、連跌天數、近 60 日前低（價、日）。
     使用者：重點是「短短 1～2 週就跌一大段」，所以看 10 日高點，不看 20 日。資料不足回空。"""
@@ -3241,6 +3256,7 @@ def get_technical_analysis(stock_code: str) -> Dict[str, Any]:
         "bollinger": analyze_bollinger(df),
         "ma_kline_signals": safe_signal(kf.get_ma_kline_signals),
         "kline_patterns": _kline_patterns(df, code, bool(use_live and (intraday.get("is_live") or intraday.get("post_close_provisional")))),
+        "fib_reference": _fib_reference(code),   # 只用正式收盤 K；Bot 只在問型態時交給 AI（payload.fib_reference）
         # 給 AI 看近期走勢：近 10 日 K 棒（日期 開 高 低 收）＋均線近 3 日（看均線往上／往下彎）
         "drawdown": _drawdown_facts(df),
         "recent_bars_10": [[_fmt_date(i)[5:], _num(r.get("Open")), _num(r.get("High")), _num(r.get("Low")), _num(r.get("Close"))]

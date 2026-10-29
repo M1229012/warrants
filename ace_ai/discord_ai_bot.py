@@ -2729,6 +2729,7 @@ def _compact_tool_data(name: str, data: Dict[str, Any], has_scorecard: bool) -> 
             out["margin"] = {"events": data["margin"]["events"][-3:]}
         return out
     if name == "get_technical_analysis":
+        data.pop("fib_reference", None)   # 10-29：費波另放 payload.fib_reference，只在問型態時送
         data["bollinger"] = {k: v for k, v in (data.get("bollinger") or {}).items() if k in _BOLLINGER_KEEP}
         import kline_patterns
         data_full_patterns = kline_patterns.ai_pattern_facts(data.get("kline_patterns") or {},
@@ -2972,6 +2973,28 @@ def watch_plan(payload: Dict[str, Any], chart_levels: Optional[Dict[str, Dict[st
     return plans
 
 
+def fib_reference_map(results: Sequence[tools.ToolResult]) -> Dict[str, Any]:
+    """10-29（測試版）：各檔技術面附帶的費波參考價（有可用價位的才放）。"""
+    out = {}
+    for r in results:
+        if r.ok and r.name == "get_technical_analysis" and isinstance(r.data, dict):
+            ref = r.data.get("fib_reference") or {}
+            if any(ref.get(k) for k in ("目前壓力", "突破後條件目標", "下方候選支撐")):
+                out[str(r.data.get("stock_code"))] = ref
+    return out
+
+
+FINAL_FIB_RULES = ("【費波參考價（測試版，優先於規則 3 的「不給目標價」）】可以用費波參考價稍微說明可能的參考目標，"
+    "但一定要講明是費波參考價、不保證會到。payload.fib_reference 是程式算好的每檔費波南西參考價："
+    "目前壓力、突破後條件目標、下方候選支撐、現價附近觀察。問型態時在 why 或 scenarios 用一到兩句稍微說明可能的目標價或壓力支撐位置，"
+    "支撐壓力仍以 watch_plan 為主，費波價位和 watch_plan 價位接近時合併成一句，不重複列。"
+    "只能用 fib_reference 裡的價位，不自行計算其他比例；不寫比例計算過程、錨點日期或 A、B、C 代號。"
+    "「突破後條件目標」一定寫成條件（例如「若突破整理區上緣，費波參考目標約在 X」），不可說成已啟動的目標；"
+    "有「註記」的價位要說明是依目前高低點試算、之後可能調整；有「可信度」欄位時要說只是區間量測。"
+    "說法用「費波參考價」「可能遇到壓力／支撐的位置」，不說一定會到、會漲到，不給買賣指令。"
+    "某一類是空的就不提那一類；沒有 fib_reference 就完全不提費波。")
+
+
 _SPOT_TECH_KEEP = ("stock_code", "stock_name", "data_date", "signal_status", "close", "change_pct", "ma_alignment",
                    "kline_patterns", "triangle_validation", "volume_trend", "drawdown")
 
@@ -3210,6 +3233,8 @@ def build_final_prompt(payload: Dict[str, Any]) -> str:
             # 10-11：使用者問的不是型態，三角只帶一句，篇幅留給本題
             sections.append("本題不是問型態：有正式或候選三角時只用一句帶過（例如「目前在三角收斂內」或「先前已跌破三角」），"
                             "不展開上下緣價位、碰線次數與事件日期；沒有三角就不提。篇幅以使用者所問的內容為主。")
+    if payload.get("fib_reference"):
+        sections.append(FINAL_FIB_RULES)
     if "get_recent_news" in names:
         sections.append(FINAL_NEWS_RULES)
     if "get_sheet_stock_chips" in names:
@@ -9059,6 +9084,9 @@ class AceQueryEngine:
                 payload["pattern_focus"] = False       # 全部股票都不是問型態
         if getattr(plan, "brief_quote", False):
             payload["brief_quote"] = True
+        fibs = fib_reference_map(results)
+        if fibs and payload["pattern_focus"]:
+            payload["fib_reference"] = fibs   # 10-29（測試版）：問型態時稍微說明費波參考目標與壓力支撐
         context = getattr(getattr(self, "_request_local", None), "member_chart_context", None)
         if context and (context.get("compound") or any(v.get("triangle") or not v.get("show_bollinger", True) for v in context.get("stocks", {}).values())):
             payload = member_pattern.scoped_payload(payload, context)
