@@ -85,7 +85,14 @@ def parse(item: Dict[str, Any], today: str) -> Optional[Dict[str, Any]]:
             "trade_price": price,                        # 奇摩的 price 是最新成交價（不是五檔中價）
             "pz_price": 0.0, "bid": _raw(item.get("bid")), "ask": _raw(item.get("ask")),
             "price_source": "yahoo", "trade_time": moment.strftime("%H:%M:%S"),
+            # 10-30 審核：來源成交時間另外存（快照時間只代表「剛抓完」，不代表每檔行情都是最新）
+            "source_ts": moment.timestamp(),
             "exchange_date": moment.strftime("%Y%m%d")}
+
+
+def source_ages(quotes: Dict[str, Dict[str, Any]], now_ts: float) -> List[float]:
+    """每檔「現在 − 來源最後成交時間」（秒）；冷門股本來就可能幾分鐘沒成交，要看整體分布。"""
+    return sorted(max(0.0, now_ts - float(q["source_ts"])) for q in quotes.values() if q.get("source_ts"))
 
 
 def fetch(codes: List[str], deadline_seconds: Optional[float] = None) -> Dict[str, Dict[str, Any]]:
@@ -130,6 +137,8 @@ def fetch(codes: List[str], deadline_seconds: Optional[float] = None) -> Dict[st
                     break
             if start + BATCH < len(names):
                 time.sleep(GAP_SECONDS)
+    ages = source_ages(out, tools.taipei_now().timestamp())
+    age_text = (f"｜來源成交時間 中位 {ages[len(ages) // 2]:.0f}s、超過 180s {sum(a > 180 for a in ages)} 檔" if ages else "")
     print(f"📡 Yahoo 成員報價｜requested={len(codes)}｜returned={len(out)}｜市場別不明={len(codes) - len(symbols)}"
-          f"｜http_calls={calls}｜失敗 {errors} 批｜{time.perf_counter() - began:.1f}s", flush=True)
+          f"｜http_calls={calls}｜失敗 {errors} 批｜{time.perf_counter() - began:.1f}s{age_text}", flush=True)
     return out
