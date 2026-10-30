@@ -3100,6 +3100,34 @@ def _gr_v3_row(draw, x: float, y: float, width: float, row: dict, data: dict, dr
     return int(h)
 
 
+GR_COMPACT_H = 64
+
+
+def _gr_v3_compact(draw, x: float, y: float, width: float, row: dict, data: dict, dry: bool) -> int:
+    """10-29 大類子族群排行：第 4 名以後每群一行（名次、名稱、上漲家數、平均）。12 群全詳細圖太長。"""
+    if dry:
+        return GR_COMPACT_H
+    right, rank_w = x + width, 60
+    avg = _finite(row.get('avg'))
+    value = f'{avg:+.2f}%' if avg is not None else '—'
+    up, valid = int(row.get('up', 0) or 0), int(row.get('valid', 0) or 0)
+    stats = f"上漲 {up}/{valid}" + (f"（{up / valid * 100:.0f}%）" if valid else '')
+    tag = _gr_tag(row)
+    value_w = font(32, True).getlength(value)
+    stats_w = font(22).getlength(stats)
+    cy = y + GR_COMPACT_H / 2
+    draw.line((x, y, right, y), fill=LINE, width=2)
+    draw.text((x + 4, cy), str(int(row.get('rank') or 0)), font=font(28, True), fill=INK, anchor='lm')
+    name, size = fit(str(row.get('name') or ''), 28, width - rank_w - value_w - stats_w - 80
+                     - (font(19, True).getlength(tag) + 12 if tag else 0), True, 22)
+    draw.text((x + rank_w, cy), name, font=font(size, True), fill=INK, anchor='lm')
+    if tag:
+        draw.text((x + rank_w + font(size, True).getlength(name) + 12, cy + 2), tag, font=font(19, True), fill=MUTED, anchor='lm')
+    draw.text((right - value_w - 36, cy), stats, font=font(22), fill=MUTED, anchor='rm')
+    draw.text((right, cy), value, font=font(32, True), fill=_signed_ink(avg), anchor='rm')
+    return GR_COMPACT_H
+
+
 def _gr_banner(draw, x: float, y: float, width: float, text: str, warn: bool, dry: bool) -> int:
     lines = wrap(text, 22, width - 40)
     h = len(lines) * 34 + 24
@@ -3201,8 +3229,18 @@ def group_rank_card(draw, y: float, data: dict, dry: bool) -> int:
             if not dry:
                 text_at(draw, (px, y + h + 10), '目前沒有足夠的同日資料可以排名，請稍後再試。', GR_BODY, MUTED)
             h += 60
-        for row in rows:
-            h += _gr_v3_row(draw, px, y + h, width, row, data, dry)
+        # 10-29：大類子族群排行（detail_top＝3）只有前幾名畫完整，其餘一行；一般 TOP5 不受影響
+        detail = int(data.get('detail_top') or 0) or len(rows)
+        for i, row in enumerate(rows):
+            h += (_gr_v3_row if i < detail else _gr_v3_compact)(draw, px, y + h, width, row, data, dry)
+        # 10-30：被超額條件擋下的題材，灰字註明原始名次
+        foot = wrap(str(data.get('footnote') or ''), 20, width)
+        if foot:
+            if not dry:
+                draw.line((px, y + h, right, y + h), fill=LINE, width=2)
+                for i, line in enumerate(foot):
+                    text_at(draw, (px, y + h + 14 + i * 30), line, 20, MUTED)
+            h += 14 + len(foot) * 30 + 6
         return int(h + 16)
     h = 34
     stamp = str(data.get('stamp') or '')

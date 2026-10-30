@@ -1199,6 +1199,10 @@ def _overview_answer(request: Dict[str, Any], gateway, validate) -> Dict[str, An
     detail = [{k: r[k] for k in ("name", "code", "d1", "d5", "d20", "vs_high_pct", "new_high_60d", "above_ma20",
                                  "above_ma60", "shape", "resistance", "support")}
               for r in sorted(rows, key=lambda r: -r["value20"])[:15]]
+    roles = {s["stock_code"]: s["role"] for s in data["stocks"] if s.get("role")}
+    for item in detail:                       # 10-30：角色（服務商、集團投資…）要讓 AI 看得到
+        if roles.get(item["code"]):
+            item["role"] = roles[item["code"]]
     unverified = sum("公司行動資料未核實" in (r.get("flags") or []) for r in rows)
     payload = {"group": title, "data_date": date, "stats": stats, "stocks_by_turnover": detail,
                "data_flags": ([f"{unverified} 檔的型態判斷未核對除權息等公司行動（未還原價格），"
@@ -1214,7 +1218,8 @@ def _overview_answer(request: Dict[str, Any], gateway, validate) -> Dict[str, An
               # 10-28 審核：成交額大不等於市值大或指數權重高；也不能從漲跌跳到資金、抗跌、型態確認的結論
               "stocks_by_turnover 依成交額排序，前面是交易較活躍的股票（不是市值大或指數權重高的權值股）。"
               "價格上漲不能說成資金淨流入或買盤力道；沒有同期大盤比較不能說抗跌；候選型態不能當成已確認的強勢結構；"
-              "個股價位突破或站回均線不能代表整個族群轉強。只能用資料中的數字；不預測漲跌、不給買賣建議、不說成功或失敗。\n"
+              "個股價位突破或站回均線不能代表整個族群轉強。只能用資料中的數字；不預測漲跌、不給買賣建議、不說成功或失敗。"
+              + sector_match.ROLE_RULE + "\n"
               + json.dumps(payload, ensure_ascii=False))
     result = gateway.generate(prompt, purpose="sector_answer", schema=schema, temperature=0.2)
     usage = {"input_tokens": int(getattr(result, "input_tokens", 0) or 0), "output_tokens": int(getattr(result, "output_tokens", 0) or 0),

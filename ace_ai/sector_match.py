@@ -96,8 +96,15 @@ def _data() -> Dict[str, Any]:
             "member": dict(member_raw.get("groups") or {}),
             "member_parents": dict(member_raw.get("parents") or {}),
             "member_version": str(member_raw.get("version") or ""),
+            # 10-30：停牌／停止買賣（照官方公告）；保留分類，排行股票池排除
+            "trading_status": dict(member_raw.get("trading_status") or {}),
         })
     return _CACHE
+
+
+def trading_status() -> Dict[str, Dict[str, Any]]:
+    """{代號: {status, note, source, as_of}}：官方公告停牌／停止買賣的股票。不是從缺報價推定的。"""
+    return _data().get("trading_status") or {}
 
 
 def member_groups() -> Dict[str, Dict[str, Any]]:
@@ -496,8 +503,9 @@ def _member_members(name: str) -> Dict[str, Any]:
     codes = member_codes(name)
     names = sector_roster._name_map()
     markets = sector_roster._market_map()
+    roles = member_roles(name)
     stocks = [{"stock_code": c, "stock_name": names.get(c) or listed.get(c, ""), "market": markets.get(c, ""),
-               "member_state": member_state(group, c)} for c in codes]
+               "member_state": member_state(group, c), **({"role": roles[c]} if roles.get(c) else {})} for c in codes]
     counts = {state: sum(s["member_state"] == state for s in stocks) for state in ("confirmed", "pending")}
     return {
         "industry": "custom:" + name, "name": name, "stocks": stocks,
@@ -507,6 +515,19 @@ def _member_members(name: str) -> Dict[str, Any]:
         "market_counts": {"twse": sum(s["market"] == "twse" for s in stocks),
                           "tpex": sum(s["market"] == "tpex" for s in stocks)},
     }
+
+
+# 10-30：族群 JSON 的 roles 送進 AI 時一起附上的規則（族群總覽、今日排行解讀共用）
+ROLE_RULE = ("有 role 欄位的股票，只能照 role 描述它在這個族群的角色：寫服務商就不能說成製造商、"
+             "寫集團投資或投資曝險就不能說成自家產品、寫未確認量產或待確認就不能說成已出貨或已有營收；"
+             "有產品關聯不等於今天因為這個題材上漲。")
+
+
+def member_roles(name: str) -> Dict[str, str]:
+    """10-30：個股在這一群扮演的角色（服務商、集團投資、材料、待確認量產…）；沒寫的股票不回。
+    AI 解讀要看得到，才不會把清洗服務商、投資控股說成製造商。"""
+    roles = (member_groups().get(name) or {}).get("roles") or {}
+    return {str(c): str(r) for c, r in roles.items() if str(r).strip()}
 
 
 def custom_members(name: str) -> Dict[str, Any]:

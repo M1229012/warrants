@@ -40,6 +40,7 @@ MIN_COVERAGE = min(1.0, max(0.0, tools._env_float("DISCORD_AI_MEMBER_RANK_MIN_CO
 MIN_VALID = max(1, tools._env_int("DISCORD_AI_MEMBER_RANK_MIN_VALID", 3))
 SMALL_MAX = max(MIN_VALID, tools._env_int("DISCORD_AI_MEMBER_RANK_SMALL_MAX", 4))              # ≤ 此數附註小樣本
 TOP_N = max(1, tools._env_int("DISCORD_AI_MEMBER_RANK_TOP", 5))                                # 10-24：TOP5
+PARENT_DETAIL_TOP = 3        # 10-29：大類子族群排行圖卡只有前 3 名畫完整，其餘每群一行（圖不能太長）
 MOVERS = 3
 FLAT_EPS = 1e-9
 LIMIT_PCT = 9.5            # 收盤模式沒有漲跌停價：漲跌幅 ≥9.5% 視為漲（跌）停（近似值，圖上註明）
@@ -60,11 +61,11 @@ def _today() -> str:
 
 
 def universe() -> List[str]:
-    """所有會員族群成分股（去重、去掉 excluded）。"""
+    """所有會員族群成分股（去重、去掉 excluded）。10-30：官方公告停牌／停止買賣的股票不進排行股票池（分類保留）。"""
     codes = set()
     for name in sector_match.member_groups():
         codes.update(sector_match.member_codes(name))
-    return sorted(codes)
+    return sorted(codes - set(sector_match.trading_status()))
 
 
 POOL_STATE_KEY = "member_rank_pool_v2"   # 10-28：v1 曾把「只有 7 檔有前一日 K」的不完整名單存成當日名單
@@ -572,46 +573,56 @@ def _enrich(row: Dict[str, Any], quote: Dict[str, Dict[str, Any]], info: Dict[st
 
 
 CONCEPT_EXCESS = max(0.0, tools._env_float("DISCORD_AI_CONCEPT_EXCESS", 1.0))   # 概念族群要比所屬產業多 ≥ 1 個百分點
+# 10-30 第四次審查：比較基準和排名用同一套資料完整度——產業有量成分股至少 MIN_VALID 檔有價、
+# 而且有價比例 ≥ MIN_COVERAGE，才當這個產業的平均。不夠就是「無法比較」，不補零、不當作通過。
+# （10-28 ASIC 覆蓋不足時 TPU 會因此變成「無法比較」；改用奇摩報價後覆蓋率已大幅提高。）
 
 
 def _industry_reference(groups: Dict[str, Dict[str, Any]], pool: Dict[str, Any],
                         quote: Dict[str, Dict[str, Any]]) -> Dict[str, float]:
-    """各產業族群「有拿到價格的成分股」平均漲跌幅，不管這群能不能排名（覆蓋不足、樣本不足也照算）。
-    10-28：ASIC 收盤覆蓋不足沒有名次時，TPU 的創意、世芯仍要拿 ASIC 的實際漲幅比，不能跳過。"""
+    """各產業族群的比較基準：通過流動性、且有有效報價的成分股平均漲跌幅（資料完整度同排名門檻）。"""
     out = {}
     for name, info in groups.items():
         if info.get("kind") == "concept":
             continue
-        changes = [quote[c]["change_pct"] for c in sector_match.member_codes(name) if c in pool and c in quote]
-        if changes:
+        liquid = [c for c in sector_match.member_codes(name) if c in pool]
+        changes = [quote[c]["change_pct"] for c in liquid if c in quote]
+        if len(changes) >= MIN_VALID and len(changes) >= len(liquid) * MIN_COVERAGE:
             out[name] = sum(changes) / len(changes)
     return out
 
 
 def _concept_check(rows: List[Dict[str, Any]], groups: Dict[str, Dict[str, Any]], weak: bool,
-                   reference: Optional[Dict[str, float]] = None) -> Dict[str, str]:
-    """10-28 產業族群優先：概念族群（kind=concept）要比「成分股所屬產業族群」的平均更強，才代表概念本身在動。
-    超額＝概念平均 − 各有效成分股所屬產業族群平均的平均（按檔數）。強勢要 ≥ CONCEPT_EXCESS、弱勢要 ≤ −CONCEPT_EXCESS；
-    不到就是產業連動（例：TPU 的創意、世芯其實是 ASIC 在漲），不上榜。回 {不上榜的概念族群: 原因}。
-    成分股所屬產業有一半以上排不出名次（無法比較）時照常上榜。"""
+                   reference: Optional[Dict[str, float]] = None,
+                   quote: Optional[Dict[str, Dict[str, Any]]] = None) -> Dict[str, str]:
+    """10-28 產業族群優先：概念族群要比「成分股所屬產業族群」更強，才代表概念本身在動；不到 CONCEPT_EXCESS 不上榜。
+    10-30 第四次審查的公式（有 quote 時）：
+      可比較題材股 C＝本身有有效報價、而且所屬產業有合格基準的題材成分股；
+      題材超額＝平均〔個股漲幅 − 該股所屬產業平均〕，只算 C。
+      C 少於 MIN_VALID 檔或不到題材有效檔數的一半＝無法比較：照常上榜、標「無法比較」，不當作通過也不補零。
+    沒有 quote（舊呼叫）時退回：題材平均 − 各成分所屬產業平均的平均。"""
     industry_of = {code: name for name, info in groups.items() if info.get("kind") != "concept"
                    for code, _ in info.get("stocks") or []}
-    industry_avg = dict(reference) if reference is not None else \
-        {r["name"]: r["avg"] for r in rows if (groups.get(r["name"]) or {}).get("kind") != "concept"}
+    industry_avg = dict(reference) if reference is not None else         {r["name"]: r["avg"] for r in rows if (groups.get(r["name"]) or {}).get("kind") != "concept"}
     out: Dict[str, str] = {}
     for row in rows:
         if (groups.get(row["name"]) or {}).get("kind") != "concept":
             continue
         codes = row.get("codes") or []
-        base = [industry_avg[industry_of[c]] for c in codes if industry_of.get(c) in industry_avg]
-        if not codes or len(base) * 2 < len(codes):
+        comparable = [c for c in codes if industry_of.get(c) in industry_avg and (quote is None or c in quote)]
+        row["concept_comparable"], row["concept_valid"] = len(comparable), len(codes)
+        if not codes or len(comparable) < min(MIN_VALID, len(codes)) or len(comparable) * 2 < len(codes):
             row["concept_excess"] = None
             continue
-        excess = row["avg"] - sum(base) / len(base)
+        if quote is not None:
+            excess = sum(quote[c]["change_pct"] - industry_avg[industry_of[c]] for c in comparable) / len(comparable)
+        else:
+            excess = row["avg"] - sum(industry_avg[industry_of[c]] for c in comparable) / len(comparable)
         row["concept_excess"] = excess
         if (excess > -CONCEPT_EXCESS) if weak else (excess < CONCEPT_EXCESS):
-            linked = Counter(industry_of[c] for c in codes if industry_of.get(c) in industry_avg).most_common(2)
-            out[row["name"]] = f"超額 {excess:+.2f}%，主要是{'、'.join(n for n, _ in linked)}連動"
+            linked = Counter(industry_of[c] for c in comparable).most_common(2)
+            out[row["name"]] = (f"超額 {excess:+.2f}%（可比較 {len(comparable)}／有效 {len(codes)}），"
+                                f"主要是{'、'.join(n for n, _ in linked)}連動")
     if out:
         print("📊 概念族群不上榜（產業連動）｜" + "｜".join(f"{k}：{v}" for k, v in out.items()), flush=True)
     return out
@@ -673,7 +684,7 @@ def rank(day: Optional[str] = None, direction: str = "strong",
     rows.sort(key=lambda r: ((r["avg"] if weak else -r["avg"]), r["name"]))
     for index, row in enumerate(rows, 1):
         row["raw_rank"] = index
-    subsumed = {} if only else _concept_check(rows, groups, weak, _industry_reference(groups, pool, quote))
+    subsumed = {} if only else _concept_check(rows, groups, weak, _industry_reference(groups, pool, quote), quote)
     shown, families = [], set()
     for row in rows:                      # 同家族只在顯示時取一個，向後遞補
         if row["family"] in families or row["name"] in subsumed:
@@ -709,7 +720,13 @@ def rank(day: Optional[str] = None, direction: str = "strong",
     return {"rows": shown, "all_rows": rows, "info": info, "bench": bench, "bench_valid": len(valid_pool),
             "pool": len(pool), "groups": len(groups), "skipped": len(skipped), "direction": "weak" if weak else "strong",
             "quote": quote, "moves": stock_moves, "pool_meta": pool_meta(),
-            "unranked": [s.split(":", 1)[0] for s in skipped]}
+            "unranked": [s.split(":", 1)[0] for s in skipped],
+            # 10-30：沒排名的原因分開講（有效樣本不足≠報價覆蓋不足），不能籠統說成市場沒在交易
+            "unranked_reasons": {s.split(":", 1)[0]: s.split(":", 1)[1].split("(", 1)[0] for s in skipped},
+            # 10-30 審核：被超額條件擋下的題材要留原始名次，圖卡註明，避免會員以為題材不強
+            "hidden_concepts": [{"name": r["name"], "raw_rank": r["raw_rank"], "excess": r.get("concept_excess"),
+                                 "comparable": r.get("concept_comparable"), "valid": r.get("concept_valid")}
+                                for r in rows if r["name"] in subsumed and r["raw_rank"] <= top_n * 2]}
 
 
 def _group_m5(row: Dict[str, Any], stock_moves: Dict[str, Dict[str, Any]]) -> Optional[float]:
@@ -998,8 +1015,15 @@ def insight_card(data: Dict[str, Any], question: str, gateway, validate, names: 
     def pct(v):
         return round(v, 2) if v is not None else None
 
-    def stock(code, change):
-        return {"stock": names.get(code, code), "change_pct": pct(change)}
+    # 10-30：個股角色（服務商、集團投資、待確認量產…）一起送給 AI，避免被說成製造商
+    roles = {g["name"]: sector_match.member_roles(g["name"]) for g in rows}
+
+    def stock(code, change, group=""):
+        out = {"stock": names.get(code, code), "change_pct": pct(change)}
+        role = (roles.get(group) or {}).get(code)
+        if role:
+            out["role"] = role
+        return out
 
     payload = {
         "question": question, "date": data["info"]["date"], "basis": data["info"]["basis"],
@@ -1018,8 +1042,8 @@ def insight_card(data: Dict[str, Any], question: str, gateway, validate, names: 
             "limit_up_count": g.get("limit_up"),
             "volume_vs_avg_times": pct(g.get("heat")) if not data["info"].get("live") else None,
             "change_5d_pct": pct(g.get("d5")),
-            "leaders": [stock(m["code"], m["change_pct"]) for m in _leaders(g, weak)[:2]],
-            "laggards": [stock(s["code"], s["change_pct"])
+            "leaders": [stock(m["code"], m["change_pct"], g["name"]) for m in _leaders(g, weak)[:2]],
+            "laggards": [stock(s["code"], s["change_pct"], g["name"])
                          for s in (list(reversed(g.get("stocks") or [])) if not weak else list(g.get("stocks") or []))[:2]],
         } for g in rows],
         "news": [{"stock": names.get(c, c), "items": news.get(c, [])} for c in targets],
@@ -1041,7 +1065,8 @@ def insight_card(data: Dict[str, Any], question: str, gateway, validate, names: 
         "watch＝一到兩句觀察重點，從族群角度講接下來要看什麼（族群同步性能否延續、相對股票池的強度、落後子族群或落後股能否跟上）。\n"
         "規則：數字只能用資料裡的漲跌幅、家數、倍數；新聞裡的營收、目標價等數字不要引用；"
         "價格上漲不能說成資金淨流入或買盤力道；沒有和股票池比較就不能說抗跌；"
-        "unranked_groups 是資料不足沒排名的族群，不要說它弱；不預測漲跌、不給買賣建議；用繁體中文、口語但專業。\n"
+        "unranked_groups 是資料不足沒排名的族群，不要說它弱；不預測漲跌、不給買賣建議；用繁體中文、口語但專業。"
+        + sector_match.ROLE_RULE + "\n"
         + json.dumps(payload, ensure_ascii=False))
     result = gateway.generate(prompt, purpose="sector_answer", schema=INSIGHT_SCHEMA, temperature=0.3)
     usage = {"input_tokens": int(getattr(result, "input_tokens", 0) or 0),
@@ -1114,6 +1139,8 @@ def answer(question: str = "", gateway=None, validate=None, only: Optional[List[
     if title:
         data["title"] = (f"{title} 今日表現（全部族群第 {data['market_rank']} 名）" if data.get("single")
                          else f"{title} 子族群排行")
+    if only and not single:
+        data["parent"] = True
     names = _names()
     info = data["info"]
     when = (f"盤中 {info['time']}" if info["live"] else
@@ -1124,7 +1151,7 @@ def answer(question: str = "", gateway=None, validate=None, only: Optional[List[
     # 10-27：主數字＝等權平均；中位數、上漲比例表示整群是否同步；比大盤＝平均 − 股票池基準（同一口徑）
     lines = [f"**{heading}{'' if data.get('title') else ' TOP' + str(len(data['rows']))}｜{when}**"]
     if data.get("unranked") and only:
-        lines.append("資料不足、暫不排名：" + "、".join(data["unranked"]))
+        lines.extend(unranked_lines(data))
     for row in data["rows"]:
         rel = f"｜比股票池 {row['rel']:+.2f}%" if row.get("rel") is not None else ""
         m5 = f"｜近5分 {row['m5']:+.2f}%" if row.get("m5") is not None else ""
@@ -1137,6 +1164,8 @@ def answer(question: str = "", gateway=None, validate=None, only: Optional[List[
         lines.append(f"{row['rank']}. {row['name']}{f'【{tag}】' if tag else ''} 平均 {row['avg']:+.2f}%"
                      f"｜中位數 {row['median']:+.2f}%｜上漲 {row['up_count']}/{row['valid']}{rel}{m5}"
                      f"｜{'領跌' if weak else '領漲'} {_movers_text(row, names, weak)}{lag}")
+    if hidden_concepts_text(data):
+        lines.append(hidden_concepts_text(data))
     lines.append("盤中快照・僅供研究參考，非買賣建議。" if info["live"] else "收盤資料・僅供研究參考，非買賣建議。")
     panels = [panel(data, names)]
     # 10-27：跟漲觀察卡只在使用者問跟漲／補漲／落後股時才附上（只問族群強弱不顯示）
@@ -1216,7 +1245,37 @@ def panel(data: Dict[str, Any], names: Optional[Dict[str, str]] = None) -> Dict[
         "time": info.get("time", ""), "direction": "weak" if weak else "strong",
         # 10-27：主數字＝等權平均；摘要行顯示上漲比例＋中位數（同步程度），灰字顯示比大盤、有效／成分檔數
         "rows": rows, "sync_info": True,
+        # 10-29：大類子族群排行（半導體 12 群、生技 12 群）全部詳細太長 → 前 3 名詳細、其餘一行
+        "detail_top": PARENT_DETAIL_TOP if data.get("parent") else 0,
+        "footnote": hidden_concepts_text(data),
     }}
+
+
+UNRANKED_WORDS = {"樣本不足": "有效樣本不足、今日暫不參與排行", "資料不足": "報價覆蓋不足、暫時無法比較"}
+
+
+def unranked_lines(data: Dict[str, Any]) -> List[str]:
+    """10-30：沒排名的族群依原因分開列。樣本不足＝通過流動性又有價格的不到 3 檔（低於 2000 萬的股票仍可能有交易，
+    只是不符合排行的流動性條件）；資料不足＝有量股票裡有價格的不到 80%。"""
+    reasons = data.get("unranked_reasons") or {}
+    out = []
+    for status, words in UNRANKED_WORDS.items():
+        names = [n for n in data.get("unranked") or [] if reasons.get(n, "資料不足") == status]
+        if names:
+            out.append(f"{words}：" + "、".join(names))
+    return out
+
+
+def hidden_concepts_text(data: Dict[str, Any]) -> str:
+    """10-30 審核：題材群因「沒比所屬產業多漲 1 個百分點」沒上榜時，寫出原始名次與超額，不讓會員以為題材不強。"""
+    hidden = data.get("hidden_concepts") or []
+    if not hidden:
+        return ""
+    weak = data.get("direction") == "weak"
+    items = [f"{h['name']}（原第 {h['raw_rank']} 名" + (f"，比所屬產業 {h['excess']:+.2f}%" if h.get("excess") is not None else "")
+             + (f"，可比較 {h['comparable']}／有效 {h['valid']}" if h.get("valid") else "") + "）" for h in hidden]
+    return (f"題材未列入：{'、'.join(items)}——{'跌' if weak else '漲'}幅和所屬產業差不到 {CONCEPT_EXCESS:g} 個百分點，"
+            "主要是產業一起動。")
 
 
 def _head_tail(stocks: List[Any], tail: int = 2) -> List[Any]:
