@@ -58,8 +58,21 @@ BACKGROUND_DEADLINE = max(20.0, tools._env_float("DISCORD_AI_MEMBER_TAPE_DEADLIN
 
 
 def _fetch(codes: List[str], deadline: Optional[float] = None) -> Dict[str, Dict[str, Any]]:
+    """10-30：先抓奇摩（有最新成交價）；奇摩沒回的股票（冷卻中、今天還沒成交、市場別不明）再用 MIS 補。
+    MIS 盤中 96% 沒有成交價（10-30 Log：750 檔只有 23 檔 z），只當備援。"""
     import sector_radar
-    return sector_radar._fetch_stock_quotes(list(codes), deadline)
+    import yahoo_quotes
+    codes = list(codes)
+    began = time.monotonic()
+    out = yahoo_quotes.fetch(codes, deadline)
+    missing = [c for c in codes if c not in out]
+    if missing:
+        left = None if deadline is None else max(5.0, deadline - (time.monotonic() - began))
+        backup = sector_radar._fetch_stock_quotes(missing, left)
+        out.update(backup)
+        if out and len(missing) < len(codes):
+            print(f"🎞️ 族群排行報價來源｜Yahoo {len(codes) - len(missing)} 檔｜MIS 補 {len(backup)}/{len(missing)} 檔", flush=True)
+    return out
 
 
 def _fetch_order(codes) -> List[str]:
