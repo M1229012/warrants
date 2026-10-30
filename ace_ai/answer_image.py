@@ -3023,12 +3023,12 @@ def _gr3_lines(row: dict, data: dict, inner: float) -> tuple:
     rel = _finite(row.get('rel'))
     med = _finite(row.get('median'))
     if sync and med is not None:
-        # 10-27：主數字是等權平均；這一行放上漲比例＋中位數，看整群是否同步（平均高、中位數低＝漲勢集中在少數幾檔）
+        # 這一行放上漲比例＋中位數＋平均，看整群是否同步（平均高、中位數低＝漲勢集中在少數幾檔）
         stats.append([('中位數 ', MUTED, False), (f'{med:+.2f}%', _signed_ink(med), True), ('　', INK, False)])
-        score = _finite(row.get('score'))
-        if score is not None:
-            # 10-30：名次依排序值（平均、中位數取不利者），列出來免得看起來像照平均排錯
-            stats.append([('排序值 ', MUTED, False), (f'{score:+.2f}%', _signed_ink(score), True), ('　', INK, False)])
+        avg = _finite(row.get('avg'))
+        if avg is not None and _finite(row.get('score')) is not None:
+            # 10-30：主數字改成排序值，平均移到這裡（主數字放平均時，第 1 名 -7.52%、第 2 名 -7.63% 看起來像排錯）
+            stats.append([('平均 ', MUTED, False), (f'{avg:+.2f}%', _signed_ink(avg), True), ('　', INK, False)])
     elif rel is not None:
         stats.append([('比股票池 ', MUTED, False), (f'{rel:+.2f}%', _signed_ink(rel), True), ('　', INK, False)])
     if data.get('live'):
@@ -3041,13 +3041,13 @@ def _gr3_lines(row: dict, data: dict, inner: float) -> tuple:
     lead = _gr_flow(_gr3_stock_units(str(data.get('leader_label') or '領漲'), head), inner, GR_BODY) if head else []
     lag = _gr_flow(_gr3_stock_units(str(data.get('lag_label') or '落後'), tail), inner, GR_BODY) if tail else []
     if sync:
-        # 10-27 審核正名：比較對象是追蹤股票池（不是加權指數）→「比股票池」；平均 − 股票池平均，和主數字同一口徑。
+        # 10-27 審核正名：比較對象是追蹤股票池（不是加權指數）→「比股票池」；10-30：這個值是平均 − 股票池平均，主數字改排序值後要寫明。
         # 10-28：有效／有量／成分＝有已核實成交價／通過流動性股票池／名單候選檔數（已扣 excluded）。
         # 「有效 4／有量 4」是報價完整、只是有量股少；「有效 4／有量 12」才是報價不足，兩種要看得出差別。
         liquid = row.get("liquid")
         counts = f"有效 {valid}／" + (f"有量 {int(liquid)}／" if liquid is not None else "") \
             + f"成分 {int(row.get('members') or valid)} 檔"
-        meta = [f'比股票池 {rel:+.2f}%' if rel is not None else '', counts]
+        meta = [f'平均比股票池 {rel:+.2f}%' if rel is not None else '', counts]
     else:
         meta = [f'中位數 {med:+.2f}%' if med is not None else '']
     heat = _finite(row.get('heat'))
@@ -3066,11 +3066,17 @@ def _gr3_lines(row: dict, data: dict, inner: float) -> tuple:
     return _gr_flow(stats, inner, GR_BODY), lead, lag, '｜'.join(m for m in meta if m)
 
 
+def _gr_main_value(row: dict):
+    """10-30：族群列右上主數字＝排序值（名次依這個排）；舊資料沒有排序值才用平均。"""
+    score = _finite(row.get('score'))
+    return score if score is not None else _finite(row.get('avg'))
+
+
 def _gr_v3_row(draw, x: float, y: float, width: float, row: dict, data: dict, dry: bool) -> int:
     right, pad, rank_w = x + width, 20, 60
     nx, inner = x + rank_w, width - rank_w
-    avg = _finite(row.get('avg'))
-    value = f'{avg:+.2f}%' if avg is not None else '—'
+    main = _gr_main_value(row)
+    value = f'{main:+.2f}%' if main is not None else '—'
     tag = _gr_tag(row)
     tag_ink = WARN_INK if row.get('label') == '漲勢不均' else MUTED
     if row.get('label') == '漲勢不均':
@@ -3094,7 +3100,7 @@ def _gr_v3_row(draw, x: float, y: float, width: float, row: dict, data: dict, dr
     text_at(draw, (nx, cy), name, size, INK, True)
     if tag:
         text_at(draw, (nx + font(size, True).getlength(name) + 14, cy + 9), tag, 21, tag_ink, True)
-    draw.text((right, cy + 22), value, font=font(44, True), fill=_signed_ink(avg), anchor='rm')
+    draw.text((right, cy + 22), value, font=font(44, True), fill=_signed_ink(main), anchor='rm')
     ly = cy + 52
     for line in stats + lead + lag:
         _gr_draw_line(draw, nx, ly, line, GR_BODY)
@@ -3108,12 +3114,12 @@ GR_COMPACT_H = 64
 
 
 def _gr_v3_compact(draw, x: float, y: float, width: float, row: dict, data: dict, dry: bool) -> int:
-    """10-29 大類子族群排行：第 4 名以後每群一行（名次、名稱、上漲家數、平均）。12 群全詳細圖太長。"""
+    """10-29 大類子族群排行：第 4 名以後每群一行（名次、名稱、上漲家數、排序值）。12 群全詳細圖太長。"""
     if dry:
         return GR_COMPACT_H
     right, rank_w = x + width, 60
-    avg = _finite(row.get('avg'))
-    value = f'{avg:+.2f}%' if avg is not None else '—'
+    main = _gr_main_value(row)
+    value = f'{main:+.2f}%' if main is not None else '—'
     up, valid = int(row.get('up', 0) or 0), int(row.get('valid', 0) or 0)
     stats = f"上漲 {up}/{valid}" + (f"（{up / valid * 100:.0f}%）" if valid else '')
     tag = _gr_tag(row)
@@ -3128,7 +3134,7 @@ def _gr_v3_compact(draw, x: float, y: float, width: float, row: dict, data: dict
     if tag:
         draw.text((x + rank_w + font(size, True).getlength(name) + 12, cy + 2), tag, font=font(19, True), fill=MUTED, anchor='lm')
     draw.text((right - value_w - 36, cy), stats, font=font(22), fill=MUTED, anchor='rm')
-    draw.text((right, cy), value, font=font(32, True), fill=_signed_ink(avg), anchor='rm')
+    draw.text((right, cy), value, font=font(32, True), fill=_signed_ink(main), anchor='rm')
     return GR_COMPACT_H
 
 

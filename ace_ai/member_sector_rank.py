@@ -7,7 +7,8 @@
    缺報價、停牌、尚無成交不當成 0%，只計入「缺報價」。
 3. 相對強度＝族群等權平均 − 追蹤股票池基準（名單去重、每檔一次的等權平均，只用有效報價）。
 4. 可排名：有效報價 ≥ 3 檔，且有效報價 ÷ 通過流動性檔數 ≥ 80%；3～4 檔附註小樣本。
-5. 依等權平均漲幅排序；同家族只在顯示時取一個，向後遞補；合格不足三個就只顯示實際數量。
+   10-30：大榜有足夠的正常族群時，小樣本不進 TOP，圖卡註明原名次；單一族群、大類查詢照常列出。
+5. 依排序值（平均、中位數取不利者）排序；同家族只在顯示時取一個，向後遞補；合格不足三個就只顯示實際數量。
 6. 標籤依序判定：強勢 → 漲勢不均 → 一般上漲 → 抗跌 → 偏弱 → 持平。
 7. 試行族群：另算「只用 confirmed」版本（同一批報價、同一份名單、同一個基準）寫進 Log，樣本不足就標樣本不足。
 
@@ -706,19 +707,33 @@ def rank(day: Optional[str] = None, direction: str = "strong",
     # 單一榜。10-27 試過「10 檔分榜＋中位數主排序」後撤回（為了讓大族群排前面另加規則，沒有依據）。
     # 10-30 使用者決定：排序用「平均、中位數取較不利的那個」（_rank_score）。
     # 實例：食品飲料 4 檔只有味全漲停，平均 +2.53%、中位數 +0.58%，原本排第 2——一檔拉抬不算族群行情。
-    # 整群一起動時平均和中位數都高，名次不受影響；圖上主數字仍是等權平均。
+    # 整群一起動時平均和中位數都高，名次不受影響；10-30 起圖上主數字也改成排序值，和名次一致。
     rows.sort(key=lambda r: ((_rank_score(r, weak) if weak else -_rank_score(r, weak)), r["name"]))
     for index, row in enumerate(rows, 1):
         row["raw_rank"] = index
     subsumed = {} if only else _concept_check(rows, groups, weak, _industry_reference(groups, pool, quote), quote)
-    shown, families = [], set()
-    for row in rows:                      # 同家族只在顯示時取一個，向後遞補
-        if row["family"] in families or row["name"] in subsumed:
-            continue
-        families.add(row["family"])
-        shown.append(row)
-        if len(shown) >= top_n:
-            break
+
+    def pick(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        picked, families = [], set()
+        for row in candidates:            # 同家族只在顯示時取一個，向後遞補
+            if row["family"] in families or row["name"] in subsumed:
+                continue
+            families.add(row["family"])
+            picked.append(row)
+            if len(picked) >= top_n:
+                break
+        return picked
+
+    # 10-30 使用者：貨櫃航運有效 3 檔、食品飲料成分 24 檔只剩 4 檔有效，卻排在最前面。
+    # 正常族群排得滿 TOP 時，小樣本不進榜（原名次寫在圖卡）；排不滿（大類查詢、族群很少）才照原排序。
+    shown = pick([r for r in rows if not r.get("small")])
+    if len(shown) < top_n:
+        shown = pick(rows)
+    shown_names = {r["name"] for r in shown}
+    last_shown = max((r["raw_rank"] for r in shown), default=0)
+    hidden_small = [{"name": r["name"], "raw_rank": r["raw_rank"], "valid": r["valid"]} for r in rows
+                    if r.get("small") and r["name"] not in shown_names and r["name"] not in subsumed
+                    and r["raw_rank"] < last_shown]
     stock_moves: Dict[str, Dict[str, Any]] = {}
     if info.get("live") and info.get("tape"):
         import member_sector_tape as tape
@@ -749,6 +764,7 @@ def rank(day: Optional[str] = None, direction: str = "strong",
             "unranked": [s.split(":", 1)[0] for s in skipped],
             # 10-30：沒排名的原因分開講（有效樣本不足≠報價覆蓋不足），不能籠統說成市場沒在交易
             "unranked_reasons": {s.split(":", 1)[0]: s.split(":", 1)[1].split("(", 1)[0] for s in skipped},
+            "hidden_small": hidden_small,
             # 10-30 審核：被超額條件擋下的題材要留原始名次，圖卡註明，避免會員以為題材不強
             "hidden_concepts": [{"name": r["name"], "raw_rank": r["raw_rank"], "excess": r.get("concept_excess"),
                                  "comparable": r.get("concept_comparable"), "valid": r.get("concept_valid")}
@@ -1180,10 +1196,15 @@ def insight_card(data: Dict[str, Any], question: str, gateway, validate, names: 
     theme_type = str(out.get("theme_type") or "")
     theme = str(out.get("theme") or "").strip()
     removed = []
-    if not theme or not ok(theme) or not clean(theme, False):
-        if theme:
-            removed.append("消息面")
+    # 10-30：AI 寫的消息面被擋，不等於沒有新聞；有抓到新聞也不能寫「沒有相關新聞」（頁尾還列著新聞來源）
+    has_news = any(news.values())
+    if not theme:
         theme_type, theme = "沒有相關新聞", "本次未取得足以解釋這次行情的共同消息。"
+    elif not ok(theme) or not clean(theme, False):
+        removed.append("消息面")
+        theme_type, theme = "消息面未列出", "AI 歸納的消息未通過事實與用詞檢查，這次不顯示；不代表沒有新聞。"
+    if theme_type == "沒有相關新聞" and has_news:
+        theme_type = "沒有共同消息"
     watch = str(out.get("watch") or "").strip()
     why = analysis if analysis and ok(analysis) and clean(analysis) else ""
     summary = watch if watch and ok(watch) and clean(watch) else ""
@@ -1212,7 +1233,7 @@ def _single_group(data: Optional[Dict[str, Any]], name: str) -> Optional[Dict[st
     row["rank"] = row.get("raw_rank") or 1
     _enrich(row, data.get("quote") or {}, data["info"])          # 沒進 TOP5 的族群原本沒補盤中欄位、近 5 日
     row["m5"] = _group_m5(row, data.get("moves") or {})
-    return dict(data, rows=[row], single=True, market_rank=f"{row['rank']}/{len(rows)}", unranked=[])
+    return dict(data, rows=[row], single=True, market_rank=f"{row['rank']}/{len(rows)}", unranked=[], hidden_small=[])
 
 
 def answer(question: str = "", gateway=None, validate=None, only: Optional[List[str]] = None,
@@ -1264,7 +1285,7 @@ def answer(question: str = "", gateway=None, validate=None, only: Optional[List[
                      f"｜排序值 {_rank_score(row, weak):+.2f}%"
                      f"｜中位數 {row['median']:+.2f}%｜上漲 {row['up_count']}/{row['valid']}{rel}{m5}"
                      f"｜{'領跌' if weak else '領漲'} {_movers_text(row, names, weak)}{lag}")
-    for note in (rank_rule_note(data), hidden_concepts_text(data)):
+    for note in (rank_rule_note(data), hidden_small_text(data), hidden_concepts_text(data)):
         if note:
             lines.append(note)
     lines.append("盤中快照・僅供研究參考，非買賣建議。" if info["live"] else "收盤資料・僅供研究參考，非買賣建議。")
@@ -1357,7 +1378,7 @@ def panel(data: Dict[str, Any], names: Optional[Dict[str, str]] = None) -> Dict[
         "rows": rows, "sync_info": True,
         # 10-29：大類子族群排行（半導體 12 群、生技 12 群）全部詳細太長 → 前 3 名詳細、其餘一行
         "detail_top": PARENT_DETAIL_TOP if data.get("parent") else 0,
-        "footnote": " ".join(t for t in (rank_rule_note(data), hidden_concepts_text(data)) if t),
+        "footnote": " ".join(t for t in (rank_rule_note(data), hidden_small_text(data), hidden_concepts_text(data)) if t),
     }}
 
 
@@ -1367,8 +1388,8 @@ def rank_rule_note(data: Dict[str, Any]) -> str:
     if not data.get("rows"):
         return ""
     if data.get("direction") == "weak":
-        return "排序值＝平均、中位數取較高者，由低到高排；上漲家數和「漲勢不均」標籤要一起看，排名不等於整群同步。"
-    return "排序值＝平均、中位數取較低者，由高到低排；上漲家數和「漲勢不均」標籤要一起看，排名不等於整群同步。"
+        return "右上數字是排序值（平均、中位數取較高者），由低到高排；上漲家數和「漲勢不均」標籤要一起看，排名不等於整群同步。"
+    return "右上數字是排序值（平均、中位數取較低者），由高到低排；上漲家數和「漲勢不均」標籤要一起看，排名不等於整群同步。"
 
 
 UNRANKED_WORDS = {"樣本不足": "有效樣本不足、今日暫不參與排行", "資料不足": "報價覆蓋不足、暫時無法比較"}
@@ -1384,6 +1405,16 @@ def unranked_lines(data: Dict[str, Any]) -> List[str]:
         if names:
             out.append(f"{words}：" + "、".join(names))
     return out
+
+
+def hidden_small_text(data: Dict[str, Any]) -> str:
+    """10-30：小樣本沒進 TOP 時寫出原名次與有效檔數，不讓會員以為這群沒在動。"""
+    hidden = data.get("hidden_small") or []
+    if not hidden:
+        return ""
+    items = "、".join(f"{h['name']}（原第 {h['raw_rank']} 名，有效 {h['valid']} 檔）" for h in hidden[:TOP_N])
+    more = f"等 {len(hidden)} 群" if len(hidden) > TOP_N else ""
+    return f"小樣本未列入：{items}{more}——有效不到 {SMALL_MAX + 1} 檔，只代表少數股票。"
 
 
 def hidden_concepts_text(data: Dict[str, Any]) -> str:
