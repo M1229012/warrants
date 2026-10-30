@@ -3025,6 +3025,10 @@ def _gr3_lines(row: dict, data: dict, inner: float) -> tuple:
     if sync and med is not None:
         # 10-27：主數字是等權平均；這一行放上漲比例＋中位數，看整群是否同步（平均高、中位數低＝漲勢集中在少數幾檔）
         stats.append([('中位數 ', MUTED, False), (f'{med:+.2f}%', _signed_ink(med), True), ('　', INK, False)])
+        score = _finite(row.get('score'))
+        if score is not None:
+            # 10-30：名次依排序值（平均、中位數取不利者），列出來免得看起來像照平均排錯
+            stats.append([('排序值 ', MUTED, False), (f'{score:+.2f}%', _signed_ink(score), True), ('　', INK, False)])
     elif rel is not None:
         stats.append([('比股票池 ', MUTED, False), (f'{rel:+.2f}%', _signed_ink(rel), True), ('　', INK, False)])
     if data.get('live'):

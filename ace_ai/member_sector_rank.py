@@ -628,6 +628,12 @@ def _concept_check(rows: List[Dict[str, Any]], groups: Dict[str, Dict[str, Any]]
     return out
 
 
+def _rank_score(row: Dict[str, Any], weak: bool) -> float:
+    """排序分數：強榜取平均和中位數較低者、弱榜取較高者（較接近 0 的那個）。
+    只有一兩檔大漲（或大跌）時中位數會把它拉回來，整群同步時兩者接近、不影響名次。"""
+    return max(row["avg"], row["median"]) if weak else min(row["avg"], row["median"])
+
+
 def rank(day: Optional[str] = None, direction: str = "strong",
          only: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
     """所有會員族群的今日排行（完整結果）；direction＝strong（平均漲幅高到低）或 weak（低到高）。
@@ -678,10 +684,11 @@ def rank(day: Optional[str] = None, direction: str = "strong",
                               + (f"｜只算已查證 {confirmed['avg']:+.2f}%（{confirmed['valid']} 檔）"
                                  if confirmed["status"] == "ok" else f"｜只算已查證：{confirmed['status']}（{confirmed['valid']} 檔）"))
         rows.append(stat)
-    # 單一榜、依等權平均排序（和 XQ 細產業指數、CMoney 主力動向公開的算法一致）。
-    # 10-27 試過「10 檔分榜＋中位數主排序」後撤回：沒有依據，不為了讓大族群排前面另加規則；
-    # 中位數、上漲比例只當「整群是否同步」的資訊顯示。
-    rows.sort(key=lambda r: ((r["avg"] if weak else -r["avg"]), r["name"]))
+    # 單一榜。10-27 試過「10 檔分榜＋中位數主排序」後撤回（為了讓大族群排前面另加規則，沒有依據）。
+    # 10-30 使用者決定：排序用「平均、中位數取較不利的那個」（_rank_score）。
+    # 實例：食品飲料 4 檔只有味全漲停，平均 +2.53%、中位數 +0.58%，原本排第 2——一檔拉抬不算族群行情。
+    # 整群一起動時平均和中位數都高，名次不受影響；圖上主數字仍是等權平均。
+    rows.sort(key=lambda r: ((_rank_score(r, weak) if weak else -_rank_score(r, weak)), r["name"]))
     for index, row in enumerate(rows, 1):
         row["raw_rank"] = index
     subsumed = {} if only else _concept_check(rows, groups, weak, _industry_reference(groups, pool, quote), quote)
@@ -710,7 +717,7 @@ def rank(day: Optional[str] = None, direction: str = "strong",
     print(f"📊 今日族群排行（{'最弱' if weak else '最強'}）｜{info['basis']} {info['date']} {info['time']}｜可排名 {len(rows)}／{len(groups)} 族群"
           f"｜基準 {('%+.2f%%' % bench) if bench is not None else '不足'}（有效 {len(valid_pool)}/{len(pool)}）"
           f"｜{time.perf_counter() - began:.1f}s", flush=True)
-    print("📊 今日族群排行前十（含同家族，依平均）｜" + "｜".join(
+    print("📊 今日族群排行前十（含同家族，依平均與中位數取不利者）｜" + "｜".join(
         f"{r['raw_rank']}.{r['name']} 中位{r['median']:+.2f}% 平均{r['avg']:+.2f}% {r['valid']}檔 {r['label']}"
         for r in rows[:10]), flush=True)
     if skipped:
@@ -1032,11 +1039,14 @@ def insight_card(data: Dict[str, Any], question: str, gateway, validate, names: 
                   ("今日最弱的幾個族群" if weak else "今日最強的幾個族群")),
         # 10-28：單一族群附上在全部族群裡的名次，才講得出「相對市場」強不強
         "rank_among_all_groups": data.get("market_rank"),
+        "ranking_rule": ("名次依 rank_score_pct＝max（平均，中位數），由低到高" if weak
+                         else "名次依 rank_score_pct＝min（平均，中位數），由高到低"),
         "stock_pool_avg_pct": pct(data.get("bench")),
         "category_overall": ({"avg_change_pct": pct(overall["avg"]), "up_count": overall["up"], "valid": overall["valid"],
                               "vs_stock_pool_pct": pct(overall["rel"])} if overall else None),
         "groups": [{
             "group": g["name"], "avg_change_pct": pct(g["avg"]), "median_change_pct": pct(g["median"]),
+            "rank_score_pct": pct(_rank_score(g, weak)),     # 10-30：名次依這個，不是平均
             "up_count": g.get("up_count"), "valid": g["valid"], "vs_stock_pool_pct": pct(g.get("rel")),
             # 10-28 審核：盤中的成交額是累計到現在，不能和整日均量比 → 盤中不給倍數
             "limit_up_count": g.get("limit_up"),
@@ -1066,6 +1076,9 @@ def insight_card(data: Dict[str, Any], question: str, gateway, validate, names: 
         "規則：數字只能用資料裡的漲跌幅、家數、倍數；新聞裡的營收、目標價等數字不要引用；"
         "價格上漲不能說成資金淨流入或買盤力道；沒有和股票池比較就不能說抗跌；"
         "unranked_groups 是資料不足沒排名的族群，不要說它弱；不預測漲跌、不給買賣建議；用繁體中文、口語但專業。"
+        "名次照 ranking_rule 的排序值，不是照平均；解釋名次要用排序值和上漲家數，不能說「平均最高所以第一」；"
+        "上漲家數不到一半、或平均遠高於中位數（少數股票拉抬），不能說成整群同步強勢；"
+        "全部族群都下跌時，排前面的是跌得比較少（相對抗跌），不能說成上漲或轉強。"
         + sector_match.ROLE_RULE + "\n"
         + json.dumps(payload, ensure_ascii=False))
     result = gateway.generate(prompt, purpose="sector_answer", schema=INSIGHT_SCHEMA, temperature=0.3)
@@ -1162,10 +1175,12 @@ def answer(question: str = "", gateway=None, validate=None, only: Optional[List[
                 f"{names.get(s['code'], s['code'])} {s['change_pct']:+.2f}%" for s in stocks[-2:])
         tag = _label_text(row)
         lines.append(f"{row['rank']}. {row['name']}{f'【{tag}】' if tag else ''} 平均 {row['avg']:+.2f}%"
+                     f"｜排序值 {_rank_score(row, weak):+.2f}%"
                      f"｜中位數 {row['median']:+.2f}%｜上漲 {row['up_count']}/{row['valid']}{rel}{m5}"
                      f"｜{'領跌' if weak else '領漲'} {_movers_text(row, names, weak)}{lag}")
-    if hidden_concepts_text(data):
-        lines.append(hidden_concepts_text(data))
+    for note in (rank_rule_note(data), hidden_concepts_text(data)):
+        if note:
+            lines.append(note)
     lines.append("盤中快照・僅供研究參考，非買賣建議。" if info["live"] else "收盤資料・僅供研究參考，非買賣建議。")
     panels = [panel(data, names)]
     # 10-27：跟漲觀察卡只在使用者問跟漲／補漲／落後股時才附上（只問族群強弱不顯示）
@@ -1247,8 +1262,18 @@ def panel(data: Dict[str, Any], names: Optional[Dict[str, str]] = None) -> Dict[
         "rows": rows, "sync_info": True,
         # 10-29：大類子族群排行（半導體 12 群、生技 12 群）全部詳細太長 → 前 3 名詳細、其餘一行
         "detail_top": PARENT_DETAIL_TOP if data.get("parent") else 0,
-        "footnote": hidden_concepts_text(data),
+        "footnote": " ".join(t for t in (rank_rule_note(data), hidden_concepts_text(data)) if t),
     }}
+
+
+def rank_rule_note(data: Dict[str, Any]) -> str:
+    """10-30 審核：排序規則固定寫在圖卡上（不是只有名次和平均順序相反時才出現）。
+    強榜：min（平均，中位數）由高到低；弱榜：max（平均，中位數）由低到高。不是取「比較接近 0」的那個。"""
+    if not data.get("rows"):
+        return ""
+    if data.get("direction") == "weak":
+        return "排序值＝平均、中位數取較高者，由低到高排；上漲家數和「漲勢不均」標籤要一起看，排名不等於整群同步。"
+    return "排序值＝平均、中位數取較低者，由高到低排；上漲家數和「漲勢不均」標籤要一起看，排名不等於整群同步。"
 
 
 UNRANKED_WORDS = {"樣本不足": "有效樣本不足、今日暫不參與排行", "資料不足": "報價覆蓋不足、暫時無法比較"}
@@ -1288,6 +1313,7 @@ def _head_tail(stocks: List[Any], tail: int = 2) -> List[Any]:
 def _panel_rows(board: List[Dict[str, Any]], names: Dict[str, str], weak: bool) -> List[Dict[str, Any]]:
     return [{
         "rank": row["rank"], "name": row["name"], "avg": round(row["avg"], 2), "median": round(row["median"], 2),
+        "score": round(_rank_score(row, weak), 2),            # 10-30：排序值（平均、中位數取不利者）
         "up": row.get("up_count", 0), "valid": row["valid"], "liquid": row["liquid"], "members": row["members"],
         "rel": round(row["rel"], 2) if row.get("rel") is not None else None,
         "label": row["label"], "small": bool(row.get("small")), "trial": bool(row.get("trial")),
