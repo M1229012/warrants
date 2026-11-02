@@ -1341,7 +1341,7 @@ def review_text(payload: Dict[str, Any], review: Dict[str, Any]) -> str:
     return "\n".join(lines).strip()
 
 
-_UP_COLOR, _DOWN_COLOR = "#E85D5D", "#2CB39A"      # 台股慣例：漲紅跌綠（和 K 線同色）
+_UP_COLOR, _DOWN_COLOR = "#E85D5D", "#0B7A60"      # 台股慣例：漲紅跌綠；11-02 綠色和型態圖的股價／漲跌幅同色（answer_image.DOWN_TEXT）
 
 
 def _pct_color(value: Optional[float]) -> str:

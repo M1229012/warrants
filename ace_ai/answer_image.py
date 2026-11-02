@@ -3454,7 +3454,7 @@ def contribution_card(draw, y: float, data: dict, dry: bool) -> int:
 
     half = (right - ix - 40) / 2
     table_y = sy + summary_h
-    for column, (items, label, color) in enumerate(((top, f'拉升指數 TOP{len(top) or CONTRIB_LIST_MAX}', UP), (bottom, f'拖累指數 TOP{len(bottom) or CONTRIB_LIST_MAX}', DOWN))):
+    for column, (items, label, color) in enumerate(((top, f'拉升指數 TOP{len(top) or CONTRIB_LIST_MAX}', UP), (bottom, f'拖累指數 TOP{len(bottom) or CONTRIB_LIST_MAX}', DOWN_TEXT))):
         cx = ix + column * (half + 40)
         draw.rounded_rectangle((cx, table_y, cx + half, table_y + CONTRIB_HEAD_H), radius=8, fill=TILE_BG)
         draw.text((cx + 12, table_y + CONTRIB_HEAD_H / 2), label, font=font(19, True), fill=color, anchor='lm')
@@ -3480,7 +3480,7 @@ def contribution_card(draw, y: float, data: dict, dry: bool) -> int:
                     draw.text((cx + half - 205, mid), change_label, font=font(17, True), fill='white', anchor='rm')
                 else:
                     draw.text((cx + half - 205, mid), change_label, font=font(17),
-                              fill=UP if change > 0 else DOWN if change < 0 else MUTED, anchor='rm')
+                              fill=UP if change > 0 else DOWN_TEXT if change < 0 else MUTED, anchor='rm')
             price = _finite(item.get('close'))
             if price is not None:
                 draw.text((cx + half - 112, mid), price_text(price), font=font(17), fill=INK, anchor='rm')
@@ -3980,7 +3980,7 @@ def _branch_section(draw, x0: float, x1: float, y: float, section: dict, dry: bo
                         text_at(draw, (tx + 16, ty + 10 + j * 26), line, lsize, MUTED)
                     vy = ty + 12 + len(labels) * 26
                     raw = str(chunk[i].get('value', '')).strip()        # tone=signed：正紅負綠（台股慣例）
-                    color = ((UP if raw.startswith('+') else DOWN if raw.startswith('-') else INK)
+                    color = ((UP if raw.startswith('+') else DOWN_TEXT if raw.startswith('-') else INK)
                              if chunk[i].get('tone') == 'signed' else INK)
                     for j, line in enumerate(values):
                         text_at(draw, (tx + 16, vy + j * 34), line, vsize, color, True)
