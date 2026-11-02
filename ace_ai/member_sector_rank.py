@@ -1110,9 +1110,12 @@ def _without_leader(g: Dict[str, Any], weak: bool) -> Tuple[Optional[str], Optio
     return lead["code"], sum(rest) / len(rest)
 
 
+# 11-02 使用者：跟漲觀察先取消。程式保留，設環境變數 DISCORD_AI_MEMBER_RANK_FOLLOW=1 才會開。
+FOLLOW_ENABLED = tools._env_int("DISCORD_AI_MEMBER_RANK_FOLLOW", 0) > 0
 # 11-02 使用者：問跟漲時 AI 只講族群排名，沒回答「哪些還沒漲」。問跟漲才加這段，優先於一般族群解讀的寫法。
 FOLLOW_RULE = (
     "這題使用者在問強勢族群裡還沒漲、可能跟漲的股票，重點是回答這題，不是重述族群排名。"
+    "不可寫出 follow.status、picks、laggards 這些資料欄位名稱。"
     "headline 要直接回答並點名股票，不放數字：follow.picks 有股票就點名它們；沒有就說目前沒有符合條件的跟漲觀察股，"
     "再點名 follow.laggards 裡幾檔目前漲得比族群少的股票；"
     "analysis 這次要逐檔點名（最多 5 檔，這條優先於「不要逐檔列股票」），用 picks、laggards 說明屬於哪個族群、比族群中位數少漲多少；"
@@ -1363,10 +1366,11 @@ def answer(question: str = "", gateway=None, validate=None, only: Optional[List[
     lines.append("盤中快照・僅供研究參考，非買賣建議。" if info["live"] else "收盤資料・僅供研究參考，非買賣建議。")
     panels = [panel(data, names)]
     # 10-27：跟漲觀察卡只在使用者問跟漲／補漲／落後股時才附上（只問族群強弱不顯示）
-    if intent.get("wants_follow") and not info["live"]:
+    wants_follow = FOLLOW_ENABLED and intent.get("wants_follow")
+    if wants_follow and not info["live"]:
         lines.insert(-1, "跟漲觀察只在盤中提供（要用盤中每分鐘的價量變化），收盤後沒有這項資料。")
     follow_card = None
-    if info["live"] and not weak and intent.get("wants_follow"):
+    if info["live"] and not weak and wants_follow:
         follow_panel = follow_card_panel(data, names)
         panels.append(follow_panel)
         follow_card = follow_panel["sector_follow"]
@@ -1383,7 +1387,7 @@ def answer(question: str = "", gateway=None, validate=None, only: Optional[List[
             lines.insert(1, f"{title}整體：平均 {overall['avg']:+.2f}%{rel}｜上漲 {overall['up']}/{overall['valid']} 檔")
     if gateway is not None:
         # 10-28：族群問題一律附 AI 解讀（結論、漲勢結構／量能／位置、最新利多利空新聞、觀察重點），不只列排行
-        follow_ai = _follow_for_ai(data, names, follow_card) if intent.get("wants_follow") and not weak else None
+        follow_ai = _follow_for_ai(data, names, follow_card) if wants_follow and not weak else None
         card, used = insight_card(data, question, gateway, validate, names, parent=title if only else "", follow=follow_ai)
         usage = {k: usage[k] + int(used.get(k, 0)) for k in usage}
         calls += 1

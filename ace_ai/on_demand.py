@@ -84,6 +84,33 @@ def market_ready(budget_seconds: float, log: Callable[[str], None] = print) -> D
     return {"ready": not pending and not stale, **_score_progress()}
 
 
+def base_ready(budget_seconds: float, log: Callable[[str], None] = print) -> Dict[str, Any]:
+    """11-02：只把日K底庫補到最新收盤，不算型態分數。族群總覽、大類型態用不到分數；
+    market_ready 會把 40 秒全花在算分數，一題只有 50 秒，AI 來不及就逾時。做不完交給背景，這題先用現有資料。"""
+    if not enabled():
+        return {"ready": True, "skipped": True}
+    import market_data
+    if not _MARKET_LOCK.acquire(blocking=False):
+        return {"ready": False, "busy": True}
+    try:
+        info = market_data.coverage()
+        if _market_stale(info):
+            log(f"🗂️ 按需補全市場日K（不算分數）｜目前最新 {info.get('last_day') or '-'}")
+            market_data.sync(budget_seconds=budget_seconds, log=lambda m: None)
+        stale = _market_stale(market_data.coverage())
+    finally:
+        _MARKET_LOCK.release()
+    if stale:
+        _run_background("market_base", lambda: _finish_base())
+    return {"ready": not stale}
+
+
+def _finish_base() -> None:
+    import market_data
+    with _MARKET_LOCK:
+        market_data.sync(budget_seconds=300, log=lambda m: None)
+
+
 def _finish_market(log: Callable[[str], None]) -> None:
     """排名當下沒算完的分數，背景接著算完（每輪 240 秒，最多 10 輪）。"""
     import market_data

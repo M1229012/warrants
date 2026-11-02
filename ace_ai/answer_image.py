@@ -3080,8 +3080,13 @@ def _gr_main_value(row: dict):
     return score if score is not None else _finite(row.get('avg'))
 
 
+def _gr_rank_width(rank: int, size: int) -> float:
+    """名次欄寬：平常 60；單一族群的名次可能到三位數（113），要再放寬才不會壓到族群名稱。"""
+    return max(60.0, 4 + font(size, True).getlength(str(rank)) + 14)
+
+
 def _gr_v3_row(draw, x: float, y: float, width: float, row: dict, data: dict, dry: bool) -> int:
-    right, pad, rank_w = x + width, 20, 60
+    right, pad, rank_w = x + width, 20, _gr_rank_width(int(row.get('rank') or 0), 34)
     nx, inner = x + rank_w, width - rank_w
     main = _gr_main_value(row)
     value = f'{main:+.2f}%' if main is not None else '—'
@@ -3125,7 +3130,7 @@ def _gr_v3_compact(draw, x: float, y: float, width: float, row: dict, data: dict
     """10-29 大類子族群排行：第 4 名以後每群一行（名次、名稱、上漲家數、排序值）。12 群全詳細圖太長。"""
     if dry:
         return GR_COMPACT_H
-    right, rank_w = x + width, 60
+    right, rank_w = x + width, _gr_rank_width(int(row.get('rank') or 0), 28)
     main = _gr_main_value(row)
     value = f'{main:+.2f}%' if main is not None else '—'
     up, valid = int(row.get('up', 0) or 0), int(row.get('valid', 0) or 0)

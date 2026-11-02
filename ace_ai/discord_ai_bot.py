@@ -8686,6 +8686,8 @@ class AceQueryEngine:
                 # 10-28：今日族群排行的股票池只抓前一交易日收盤表（member_sector_rank._ensure_prev_day），
                 # 不再觸發全市場日K補齊與型態分數重算（測試版關背景就是為了省這段）
                 pass
+            elif request.get("mode") in ("overview", "parent_pattern") and sector_analysis.sector_match.MEMBER_ONLY:
+                on_demand.base_ready(budget_seconds=10.0, log=self.log)      # 11-02：只要日K，不算分數（40 秒分數會吃光 50 秒的題目時限）
             else:
                 on_demand.market_ready(budget_seconds=40.0, log=self.log)   # 按需模式：族群排行用的底庫補到最新
             on_demand.wake_radar()
