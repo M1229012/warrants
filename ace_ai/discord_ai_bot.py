@@ -2069,6 +2069,11 @@ def _question_calls_exhausted() -> bool:
     return bool(st) and st["calls"] >= QUESTION_MAX_GEMINI_CALLS
 _TIMEOUT_RE = re.compile(r"timed? ?out|timeout|ReadTimeout|deadline exceeded", re.IGNORECASE)
 GEMINI_MINUTE_COOLDOWN = 60                                                                          # 每分鐘限流：這把金鑰×模型暫停
+# 11-02 Log：同模型金鑰 1 兩秒回、金鑰 2 連 4 次 504，每輪到它就白等 10 秒。連續逾時的金鑰先跳過
+GEMINI_KEY_TIMEOUT_LIMIT = 2
+GEMINI_KEY_TIMEOUT_COOLDOWN = max(60, tools._env_int("DISCORD_AI_GEMINI_KEY_TIMEOUT_COOLDOWN", 300))
+# 這題自己的時間或次數用完（還沒打到 API，或不是金鑰的問題），不能算到金鑰頭上
+_LOCAL_WAIT_RE = re.compile(r"Gemini 執行名額|Gemini 等名額|整題")
 _OVERLOAD_RE = re.compile(r"\b503\b|UNAVAILABLE|overloaded|high demand|\b500\b|INTERNAL", re.IGNORECASE)
 _RATE_RE = re.compile(r"\b429\b|RESOURCE_EXHAUSTED|quota|rate limit|(?<!DEADLINE_)exceeded", re.IGNORECASE)
 # 10-08：504／DEADLINE_EXCEEDED＝逾時塞車，不是限流（原本被 "exceeded" 誤判成每分鐘限流而冷卻 60 秒）
@@ -2112,6 +2117,7 @@ class GeminiQuota:
         self._model_down: Dict[str, float] = {}               # 模型塞車暫停到何時
         self._disabled: set = set()                           # 找不到的模型（設定錯誤）
         self._bad_keys: Dict[int, float] = {}                 # 金鑰無效
+        self._key_timeouts: Dict[Tuple[int, str], int] = {}   # (金鑰, 模型) 連續逾時次數；成功才歸零
         self._rr = 0
 
     def _load_day(self) -> None:
@@ -2194,7 +2200,7 @@ class GeminiQuota:
         return max(0.0, 1.0 - used / capacity)
 
     def note_error(self, key: int, model: str, error: str) -> str:
-        """依錯誤種類調整狀態，回傳 overloaded／daily／minute／missing_model／bad_key／other。"""
+        """依錯誤種類調整狀態，回傳 overloaded／daily／minute／timeout／local_wait／missing_model／bad_key／other。"""
         with self._lock:
             now = time.monotonic()
             if _MISSING_MODEL_RE.search(error):
@@ -2203,8 +2209,15 @@ class GeminiQuota:
             if _BAD_KEY_RE.search(error):
                 self._bad_keys[key] = now + 3600
                 return "bad_key"
-            if _DEADLINE_RE.search(error):
-                return "timeout"          # 不冷卻，直接換下一把金鑰／模型
+            if _LOCAL_WAIT_RE.search(error):
+                return "local_wait"
+            if _DEADLINE_RE.search(error) or _TIMEOUT_RE.search(error):
+                # 偶爾一次不冷卻；同一把連續逾時才暫停。暫停後次數不歸零，恢復後再逾時一次就馬上再停
+                count = self._key_timeouts[(key, model)] = self._key_timeouts.get((key, model), 0) + 1
+                if count >= GEMINI_KEY_TIMEOUT_LIMIT:
+                    self._blocked[(key, model)] = now + GEMINI_KEY_TIMEOUT_COOLDOWN
+                    print(f"⚠️ Gemini 金鑰 {key + 1}｜{model}｜連續逾時 {count} 次，暫停 {GEMINI_KEY_TIMEOUT_COOLDOWN} 秒", flush=True)
+                return "timeout"
             if _RATE_RE.search(error):
                 if _DAILY_RE.search(error):
                     self._blocked[(key, model)] = float("inf")
@@ -2220,6 +2233,11 @@ class GeminiQuota:
         """重試成功＝塞車已過，解除模型暫停，下一題不必再走備援。"""
         with self._lock:
             self._model_down.pop(model, None)
+
+    def note_key_ok(self, key: int, model: str) -> None:
+        """這把金鑰回得來：連續逾時次數歸零。"""
+        with self._lock:
+            self._key_timeouts.pop((key, model), None)
 
     def rows(self, n_keys: int) -> List[Dict[str, Any]]:
         """「/ace 用量」圖卡用：每個模型今日已用、上限、剩餘％、可用金鑰、狀態。"""
@@ -2288,6 +2306,7 @@ class GeminiGateway:
     """Bot 自己的 Gemini 呼叫（不再經過週報主程式）：
     - 模型鏈 GEMINI_MODEL_CHAIN 依序嘗試；金鑰輪流用；每個金鑰×模型各自記錄額度與限流（GeminiQuota）
     - 503 塞車整個模型暫停、429 每日額度用完停到太平洋時間午夜、每分鐘限流停 60 秒、404 模型停用
+    - 逾時先換金鑰再試一次，兩把都逾時才換模型；同一把連續逾時暫停 5 分鐘
     - 同時最多 DISCORD_AI_GEMINI_CONCURRENCY（預設 4）個請求在路上；只在真的打 API 時佔名額，不會一題卡住全部
     - 整體時限 DEADLINE；最終解讀逾時後保留同一次結果，最多再等5分鐘覆蓋原圖，其餘用途丟棄"""
 
@@ -2430,6 +2449,7 @@ class GeminiGateway:
             if not self.quota.model_ready(model):
                 continue
             overload_retried = False
+            model_timeouts = 0
             for key in self.quota.key_order(model, len(keys)):
                 left = (deadline - time.monotonic()) if deadline else None
                 if (left is not None and left < GEMINI_MIN_CALL_SECONDS) or attempts >= GEMINI_MAX_ATTEMPTS or _question_calls_exhausted():
@@ -2465,13 +2485,19 @@ class GeminiGateway:
                         overload_retried = True    # 主模型塞車多半一下就過：等一下換金鑰再試一次，省下備援額度
                         time.sleep(GEMINI_OVERLOAD_RETRY_WAIT)
                         continue
-                    if kind in ("overloaded", "missing_model", "timeout") or _TIMEOUT_RE.search(last_error):
-                        break          # 整個模型的問題（含單次逾時）：換金鑰沒用，直接換下一個模型
+                    if kind in ("overloaded", "missing_model", "local_wait"):
+                        break          # 整個模型的問題或這題沒時間了：換金鑰沒用，直接換下一個模型
+                    if kind == "timeout":
+                        model_timeouts += 1
+                        if model_timeouts >= 2:
+                            break      # 兩把都逾時才算模型塞車；只有一把逾時多半是那把的專案有問題，換金鑰也省備援額度
+                        continue
                     if kind in ("daily", "minute"):
                         attempts -= 1  # 10-16：額度用完是立即失敗，不占總嘗試次數，否則輪不到下一個備援模型（次數仍受金鑰×模型數限制）
                     continue
                 if overload_retried:
                     self.quota.note_ok(model)
+                self.quota.note_key_ok(key, model)
                 text = str(getattr(response, "text", "") or "").strip()
                 latency = time.perf_counter() - started
                 tools.record_api_event("Gemini", status=200 if text else 500, latency=time.perf_counter() - call_started,
