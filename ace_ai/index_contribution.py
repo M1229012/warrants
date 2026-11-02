@@ -590,11 +590,9 @@ def _fetch_mis_batch(market: str, codes: List[str], deadline: float) -> Tuple[Di
                 continue
             current = _number(item.get("z"))
             previous = _number(item.get("y"))
-            if previous <= 0:
+            if previous <= 0 or current <= 0:
+                # 11-02：MIS 大多沒有成交價（z 是「-」），原本當成昨收，全部變成沒漲沒跌，貢獻榜整張是空的。沒價就不算有報價。
                 continue
-            if current <= 0:
-                # 尚未成交時維持昨收，不拿開盤價硬當最新價。
-                current = previous
             bucket["quotes"][code] = {
                 "close": current,
                 "prev_close": previous,
@@ -605,6 +603,21 @@ def _fetch_mis_batch(market: str, codes: List[str], deadline: float) -> Tuple[Di
         return {c: bucket["quotes"][c] for c in codes if c in bucket["quotes"]}, dict(bucket.get("benchmark") or {})
     finally:
         _MIS_LOCK.release()
+
+
+def _live_stock_quotes(market: str, codes: List[str], deadline: float) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
+    """盤中個股價先用奇摩（有成交價），沒回的才用 MIS 補；MIS 同時提供指數昨收與現值。"""
+    quotes: Dict[str, Dict[str, Any]] = {}
+    try:
+        import yahoo_quotes
+        yahoo_quotes.prime(codes, max(0.5, deadline - time.monotonic()))
+        quotes = {c: {"close": q["price"], "source": "奇摩"} for c, q in yahoo_quotes.fresh_quotes(codes).items()}
+    except Exception as exc:
+        print(f"⚠️ {INDEX_OF[market][1]} 奇摩批次報價略過｜{tools.err_text(exc)}", flush=True)
+    mis, benchmark = _fetch_mis_batch(market, [c for c in codes if c not in quotes] or codes[:1], deadline)
+    for code, item in mis.items():
+        quotes.setdefault(code, dict(item, source="TWSE-MIS"))
+    return quotes, benchmark
 
 
 def _fugle_fallback(rows: List[Dict[str, Any]], market: str, deadline: float) -> int:
@@ -872,15 +885,15 @@ def contribution(market: str, live: bool, top: int = 5, *, deadline: Optional[fl
             batch = ranked[batch_start:batch_start + LIVE_BATCH_SIZE]
             requested = [r["stock_code"] for r in batch]
             try:
-                quotes, batch_benchmark = _fetch_mis_batch(market, requested, deadline)
+                quotes, batch_benchmark = _live_stock_quotes(market, requested, deadline)
             except Exception as exc:
-                print(f"⚠️ {index_name} MIS 批次報價失敗｜{tools.err_text(exc)}", flush=True)
+                print(f"⚠️ {index_name} 批次報價失敗｜{tools.err_text(exc)}", flush=True)
                 quotes, batch_benchmark = {}, {}
             if batch_benchmark:
                 benchmark = batch_benchmark
             missing = [c for c in requested if c not in quotes]
             if missing:
-                print(f"⚠️ {index_name} MIS batch requested={len(requested)} returned={len(quotes)} missing={','.join(missing[:12])}", flush=True)
+                print(f"⚠️ {index_name} 報價 batch requested={len(requested)} returned={len(quotes)} missing={','.join(missing[:12])}", flush=True)
             for row in batch:
                 item = quotes.get(row["stock_code"])
                 if not item:
@@ -892,7 +905,7 @@ def contribution(market: str, live: bool, top: int = 5, *, deadline: Optional[fl
                 row["price_change"] = float(current) - row["prev_close"]
                 row["change_pct"] = row["price_change"] / row["prev_close"] * 100.0
                 row["live_quote"] = True
-                row["price_source"] = "TWSE-MIS"
+                row["price_source"] = str(item.get("source") or "TWSE-MIS")
                 live_used += 1
 
             if benchmark.get("prev"):
@@ -1049,6 +1062,7 @@ def report(live: Optional[bool] = None, top: int = 5) -> Dict[str, Any]:
     def pending_estimate(market: str) -> Dict[str, Any]:
         row = contribution(market, live=True, top=top, deadline=time.monotonic() + LIVE_BUDGET_SECONDS)
         row["basis"] = "收盤暫定・僅計市值前段"
+        row["concentration"] = str(row.get("concentration") or "").replace("盤中估算", "收盤暫定")
         row["pending_official_close"] = True
         print(f"ℹ️ {INDEX_OF[market][1]} 官方收盤檔未發布，改用即時報價估算今天的貢獻", flush=True)
         return row
