@@ -3400,7 +3400,7 @@ CONTRIB_LIST_MAX = 10
 
 
 def contribution_card(draw, y: float, data: dict, dry: bool) -> int:
-    """單一市場指數貢獻：拉升榜／拖累榜（11-02 起各列前 10），直接顯示漲跌、股價（漲跌停紅綠底）與貢獻點數。"""
+    """單一市場指數貢獻：拉升榜／拖累榜（11-02 起各列前 10），直接顯示漲跌（漲跌停紅綠底）、股價與貢獻點數。"""
     top = _contrib_rows(data.get('top'), True)[:CONTRIB_LIST_MAX]
     bottom = _contrib_rows(data.get('bottom'), False)[:CONTRIB_LIST_MAX]
     lines = max(len(top), len(bottom), 1)
@@ -3471,19 +3471,19 @@ def contribution_card(draw, y: float, data: dict, dry: bool) -> int:
             draw.text((cx + 12, mid), text, font=font(size), fill=INK, anchor='lm')
             change = _finite(item.get('change_pct'))
             if change is not None:
-                draw.text((cx + half - 205, mid), f'{change:+.2f}%', font=font(17),
-                          fill=UP if change > 0 else DOWN if change < 0 else MUTED, anchor='rm')
-            price = _finite(item.get('close'))
-            if price is not None:
-                price_label = price_text(price)
+                change_label = f'{change:+.2f}%'
                 badge = _GR3_BADGE.get(str(item.get('limit_state') or ''))
                 if badge:                                # 漲跌停：和族群排行同一種紅底／綠底白字
-                    pw = font(17, True).getlength(price_label)
-                    draw.rounded_rectangle((cx + half - 112 - pw - GR_BADGE_PAD, mid - 14, cx + half - 112 + GR_BADGE_PAD, mid + 14),
+                    pw = font(17, True).getlength(change_label)
+                    draw.rounded_rectangle((cx + half - 205 - pw - GR_BADGE_PAD, mid - 14, cx + half - 205 + GR_BADGE_PAD, mid + 14),
                                            radius=8, fill=badge)
-                    draw.text((cx + half - 112, mid), price_label, font=font(17, True), fill='white', anchor='rm')
+                    draw.text((cx + half - 205, mid), change_label, font=font(17, True), fill='white', anchor='rm')
                 else:
-                    draw.text((cx + half - 112, mid), price_label, font=font(17), fill=INK, anchor='rm')
+                    draw.text((cx + half - 205, mid), change_label, font=font(17),
+                              fill=UP if change > 0 else DOWN if change < 0 else MUTED, anchor='rm')
+            price = _finite(item.get('close'))
+            if price is not None:
+                draw.text((cx + half - 112, mid), price_text(price), font=font(17), fill=INK, anchor='rm')
             value = _finite(item.get('points')) or 0.0
             draw.text((cx + half - 10, mid), f'{value:+.2f}', font=font(21, True), fill=color, anchor='rm')
             draw.line((cx, ry + CONTRIB_ROW_H, cx + half, ry + CONTRIB_ROW_H), fill=LINE)
