@@ -1097,7 +1097,10 @@ def _overview_rows(codes: List[str]) -> List[Dict[str, Any]]:
     """族群總覽的每檔資料：歷史只讀本地日K底庫；今天那一根是奇摩報價，整批先抓一次。大量區用與型態評分卡相同的演算法。"""
     try:
         import yahoo_quotes
-        yahoo_quotes.prime(codes)
+        today = tools.taipei_now().strftime("%Y-%m-%d")
+        # 今天的官方收盤表已進底庫就用正式資料，不用再打奇摩
+        if not all(v == "complete" for v in local_market_cache.market_status([today])[today].values()):
+            yahoo_quotes.prime(codes)
     except Exception as exc:                     # 抓不到就是這題全用最近收盤
         print(f"⚠️ 族群總覽：即時報價略過｜{tools.err_text(exc)}", flush=True)
     try:
@@ -1363,6 +1366,10 @@ def answer(request: Dict[str, str], gateway, validate) -> Dict[str, Any]:
     mode = request["mode"]
     if mode == "unsupported":
         return {"text": request["message"], "calls": 0, "cacheable": True}
+    if mode in ("overview", "technical", "momentum", "members") and not request.get("industry"):
+        # 11-02：對不到族群就照實說，不要往下丟例外變成整題失敗
+        return {"text": f"查不到「{request.get('name') or '這個'}」這個族群。可以輸入「族群清單」看看目前有哪些族群。",
+                "calls": 0, "cacheable": False}
     if mode == "overview":
         return _overview_answer(request, gateway, validate)
     if mode in ("market_momentum", "market_technical"):

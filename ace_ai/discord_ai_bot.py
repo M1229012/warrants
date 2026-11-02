@@ -5010,6 +5010,11 @@ def render_answer_image(question: str, text: str, panels=None, *, image_style: s
 # 句子同時出現「大盤層級的對象」與「廣度／貢獻的問法」時，一律走盤面結構，不進族群解析。
 _MARKET_SCOPE_RE = re.compile(r"大盤|加權|櫃買|指數|盤面|盤感|權值|市場")
 _BREADTH_RE = re.compile(r"盤感|盤面|市場廣度|廣度|權值股|權值|只有大型股|大盤漲.{0,6}個股|個股沒跟上|普漲|齊漲|拉指數|撐盤|貢獻|拉抬|誰在拉|誰拉|誰讓大盤|加.{0,4}點|扣.{0,4}點|拉升|拖累|漲的都是|指數失真|多數個股|中小型股|內資|盤勢結構")
+def _is_market_rank_target(target: Any) -> bool:
+    """AI 需求表的排行對象是大盤（不是某個族群）。"""
+    return bool(_MARKET_SCOPE_RE.search(str(target)) and not re.search(r"族群|類股|產業|題材", str(target)))
+
+
 ASK_MARK_MODE = (os.getenv("DISCORD_AI_ASK_MARK_MODE", "event").strip().lower() or "event")
 INTENT_FALLBACK_ENABLE = tools._env_int("DISCORD_AI_INTENT_FALLBACK", 1)
 # 測試版型態頁照正式版顯示型態評分卡（正式版拿掉評分卡前，用來比對評分修正）
@@ -7808,11 +7813,20 @@ class AceQueryEngine:
         """Authoritative per-target plan: never infer extra needs from the raw question again."""
         items = getattr(parsed, "needs_items", [])
         drop = getattr(parsed, "needs_excluded", set())
+        sector = parsed.sector or parsed.sector_context
+        # 11-02 Log：「今天哪些股票撐大盤」AI 判斷是問大盤的排行，名冊卻把「撐大盤」當成查不到的族群，硬轉型態後整題出錯。
+        # 大盤的排行走盤面結構（權值股、指數貢獻點數）；真的查不到的族群維持原本「查不到」的回覆。
+        if ("sector" not in drop and (not sector or sector.get("mode") == "unsupported")
+                and any(n.get("type") == "rank" and _is_market_rank_target(t) for n in items for t in n.get("targets") or [])):
+            parsed.sector = parsed.sector_context = None
+            plan = QueryPlan(route="rule_breadth", need_final_llm=True)
+            plan.add("get_index_contribution")
+            plan.add("get_market_breadth")
+            return plan
         if "sector" not in drop and any(n.get("type") in ("members", "rank") for n in items):
-            sector = parsed.sector or parsed.sector_context
             if sector:
                 parsed.sector = dict(sector)
-                if parsed.sector.get("mode") != "belongs":
+                if parsed.sector.get("mode") not in ("belongs", "unsupported"):
                     parsed.sector["mode"] = "technical" if any(n.get("type") == "rank" for n in items) else "members"
                 nonsector = {c: v - {"sector"} for c, v in per_stock.items()}
                 if not any(nonsector.values()):
