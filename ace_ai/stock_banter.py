@@ -117,7 +117,8 @@ def question_scope(question):
 def user_response_prompt(prompt, purpose, schema=None):
     if purpose not in USER_TEXT_PURPOSES:
         return prompt  # 分類、理由對照、OCR 不寫笑話。
-    for rules in (RESPONSE_LANGUAGE_RULES, NATURAL_ANALYSIS_RULES, ALL_TOPIC_RESPONSE_RULES):
+    import ai_text_guard
+    for rules in (RESPONSE_LANGUAGE_RULES, NATURAL_ANALYSIS_RULES, ALL_TOPIC_RESPONSE_RULES, ai_text_guard.PROMPT_RULE.strip()):
         if rules not in prompt:
             prompt += '\n\n' + rules
     question = _QUESTION.get()

@@ -4501,7 +4501,8 @@ _NOTE_PREFIX = ('資料時間', '※', '資料來源', '⚠️', '🧡', '(', '�
 
 def _brief_ai(data: dict) -> dict:
     """AI 解讀卡最多 2 個理由、2 個情境（圖上已有的數字不再長篇重述）。"""
-    data = dict(data or {})
+    import ai_text_guard
+    data = ai_text_guard.clean_card(data)            # 11-02：所有 AI 解讀卡都經過這裡，資料欄位名稱不可出現在圖上
     for key in ('why', 'scenarios'):
         if isinstance(data.get(key), list):
             data[key] = data[key][:2]

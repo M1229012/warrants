@@ -31,6 +31,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+import ai_text_guard
 import local_market_cache
 import sector_match
 import warrant_ai_tools as tools
@@ -1115,17 +1116,17 @@ FOLLOW_ENABLED = tools._env_int("DISCORD_AI_MEMBER_RANK_FOLLOW", 0) > 0
 # 11-02 使用者：問跟漲時 AI 只講族群排名，沒回答「哪些還沒漲」。問跟漲才加這段，優先於一般族群解讀的寫法。
 FOLLOW_RULE = (
     "這題使用者在問強勢族群裡還沒漲、可能跟漲的股票，重點是回答這題，不是重述族群排名。"
-    "不可寫出 follow.status、picks、laggards 這些資料欄位名稱。"
-    "headline 要直接回答並點名股票，不放數字：follow.picks 有股票就點名它們；沒有就說目前沒有符合條件的跟漲觀察股，"
-    "再點名 follow.laggards 裡幾檔目前漲得比族群少的股票；"
-    "analysis 這次要逐檔點名（最多 5 檔，這條優先於「不要逐檔列股票」），用 picks、laggards 說明屬於哪個族群、比族群中位數少漲多少；"
-    "follow.status 不是 normal 時要照 follow.note 講目前的狀況，不能說成已經有跟漲訊號；"
+    "headline 要直接回答並點名 2～4 檔股票，不放數字：follow 裡的 picks 有股票就先點名它們，"
+    "否則點名 laggards 裡幾檔目前漲得比族群少的股票；"
+    "analysis 這次要逐檔點名（最多 5 檔，這條優先於「不要逐檔列股票」），說明屬於哪個族群、比族群中位數少漲多少（用 behind_median_pct）；"
+    "follow 裡的 note 有內容就照著講目前的狀況；"
     "落後只代表今天漲得比族群少，不代表會補漲，不可寫可以買、可以跟；"
-    "watch 寫這些股票接下來要看什麼，例如近 5 分鐘能否比族群強。\n")
+    "watch 寫這些股票接下來要看什麼，例如能否比族群強。\n")
 
 
 def _follow_for_ai(data: Dict[str, Any], names: Dict[str, str], card: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    """給 AI 回答跟漲題的資料：程式篩出的跟漲觀察股（picks）＋前幾名族群目前落後中位數的股票（laggards）。"""
+    """給 AI 回答跟漲題的資料：前幾名族群目前落後中位數的股票（laggards）。
+    11-02：跟漲觀察區塊取消後問跟漲還是要回答，只有打開區塊（card）時才另外有篩出的觀察股（picks）。"""
     laggards = []
     for g in (data.get("rows") or [])[:NEWS_GROUPS]:
         behind = [s for s in reversed(g.get("stocks") or []) if s.get("change_pct") is not None and s["change_pct"] < g["median"]]
@@ -1133,8 +1134,8 @@ def _follow_for_ai(data: Dict[str, Any], names: Dict[str, str], card: Optional[D
                       "group_median_pct": round(g["median"], 2), "behind_median_pct": round(g["median"] - s["change_pct"], 2)}
                      for s in behind[:2]]
     if not card:
-        return {"status": "closed", "note": "跟漲觀察只在盤中提供，現在是收盤資料。", "picks": [], "laggards": laggards}
-    return {"status": card["mode"], "note": card["banner"], "laggards": laggards,
+        return {"note": "", "picks": [], "laggards": laggards}
+    return {"note": card["banner"], "laggards": laggards,
             "picks": [{"stock": p["name"], "group": p["group"], "change_pct": p["day"], "behind_median_pct": round(-p["lag"], 2),
                        "m5_pct": p["m5"]} for p in card["items"]]}
 
@@ -1207,7 +1208,7 @@ def insight_card(data: Dict[str, Any], question: str, gateway, validate, names: 
         "量能（只有收盤後才有 volume_vs_avg_times：小於 1 是量縮、大於 1.3 是放量；是 null 就不要談量縮放量）、"
         "近 5 日（change_5d_pct 只是現價對 5 個交易日前收盤的累計漲跌，沒有中間走勢：只能說近五日累計漲或跌多少，"
         "不得判斷盤整、突破、持續轉強、跌深反彈或反彈無力）合起來說明這波族群行情；"
-        "avg_without_top_stock_pct 是扣掉 top_stock 後的平均，和平均差很多就要直說「主要由 top_stock 帶動」，不能說整群大漲；"
+        "avg_without_top_stock_pct 是扣掉 top_stock 那一檔後的平均，和平均差很多就要直說主要由那一檔帶動（寫股票名稱），不能說整群大漲；"
         "只挑最關鍵的一兩個數字佐證，不要逐項重複圖上數字，不要分點、不要逐檔列股票、不要用個股價位代表整個族群；\n"
         "theme_type＋theme＝消息面：把 news 裡各檔股票的新聞歸納起來，判斷是不是整個族群共同的題材"
         "（例：報價調漲、需求回溫、法說會釋出展望），要說出影響哪幾家；只是個別公司的消息（研究報告、單一公司營收、股價技術面）"
@@ -1248,7 +1249,8 @@ def insight_card(data: Dict[str, Any], question: str, gateway, validate, names: 
         except (ValueError, TypeError):
             usage["dropped"] = "AI 回覆格式異常"
             return None, usage
-        bad = sorted({w for k, path in fields.items() for w in overclaims(str(out.get(k) or ""), volume_ok, path)})
+        bad = sorted({w for k, path in fields.items() for w in overclaims(str(out.get(k) or ""), volume_ok, path)}
+                     | {w for k in fields for w in ai_text_guard.field_names(out.get(k))})      # 11-02：欄位名稱也要重寫
         if not bad:
             break
         print(f"⚠️ 族群 AI 解讀用了資料無法證明的說法：{'、'.join(bad)}｜{'重寫' if attempt == 0 else '重寫後仍有，移除有問題的段落'}",
@@ -1387,7 +1389,7 @@ def answer(question: str = "", gateway=None, validate=None, only: Optional[List[
             lines.insert(1, f"{title}整體：平均 {overall['avg']:+.2f}%{rel}｜上漲 {overall['up']}/{overall['valid']} 檔")
     if gateway is not None:
         # 10-28：族群問題一律附 AI 解讀（結論、漲勢結構／量能／位置、最新利多利空新聞、觀察重點），不只列排行
-        follow_ai = _follow_for_ai(data, names, follow_card) if wants_follow and not weak else None
+        follow_ai = _follow_for_ai(data, names, follow_card) if intent.get("wants_follow") and not weak else None
         card, used = insight_card(data, question, gateway, validate, names, parent=title if only else "", follow=follow_ai)
         usage = {k: usage[k] + int(used.get(k, 0)) for k in usage}
         calls += 1
