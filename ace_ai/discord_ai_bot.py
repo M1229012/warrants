@@ -1166,7 +1166,7 @@ def branch_stock_events_card(data: Dict[str, Any], numbers: Optional[Dict[str, i
         {"type": "tiles", "items": tiles[:3]},
         {"type": "tiles", "items": tiles[3:]},
         {"type": "rows", "items": rows},
-        {"type": "note", "text": "※ " + ("列出此分點在這檔股票的所有 A～E 事件（新到舊）" if total <= len(events)
+        {"type": "note", "keep": True, "text": "※ " + ("列出此分點在這檔股票的所有 A～E 事件（新到舊）" if total <= len(events)
                                           else f"共 {total} 筆，列出最近 {len(events)} 筆（新到舊）")
                                  + (f"；K 線涵蓋近 {chart_bars} 個交易日" if chart_bars else "") + "，圈號＝K 線上的標記編號。"
                                  + "報酬只計此分點×此股票回測表的已出清有效樣本，採簡單平均，非分點所有股票績效或實際帳戶報酬。"}]}
@@ -1323,7 +1323,7 @@ def branch_store_window_sections(d: Dict[str, Any]) -> List[Dict[str, Any]]:
     if table:
         sections.append({"type": "table", "columns": ["標的", "買進", "賣出", "剩餘張數", "剩餘%"],
                          "rows": table, "signed": ("買進", "賣出"), "accent": ("剩餘張數", "剩餘%")})
-    sections.append({"type": "note", "text": f"※ 賣出為市值（含損益）；剩餘以 FIFO 張數計算。資料至 {str(d.get('store_date', '')).replace('-', '/')}，"
+    sections.append({"type": "note", "keep": True, "text": f"※ 賣出為市值（含損益）；剩餘以 FIFO 張數計算。資料至 {str(d.get('store_date', '')).replace('-', '/')}，"
                                              "之後以 Sheet 補。"})
     return sections
 
@@ -1381,7 +1381,7 @@ def branch_store_warrant_sections(d: Dict[str, Any]) -> List[Dict[str, Any]]:
         tail += f"{'、'.join(d['store_missing'][:3])} 張數依事件表。"
     if d.get("near_expiry_holdings"):
         tail += f"快到期仍持有：{'、'.join(x.split(' ')[0] for x in d['near_expiry_holdings'][:3])}。"
-    sections.append({"type": "note", "text": f"※ 只列 A～E 事件的權證；天期、價內外、槓桿為現在數值，槓桿以歷史波動率估算；估算報酬＝依標的漲跌與時間推算的理論值，非權證實際成交價。{tail}"})
+    sections.append({"type": "note", "keep": True, "text": f"※ 只列 A～E 事件的權證；天期、價內外、槓桿為現在數值，槓桿以歷史波動率估算；估算報酬＝依標的漲跌與時間推算的理論值，非權證實際成交價。{tail}"})
     return sections
 
 
@@ -5900,7 +5900,7 @@ def my_quota_card(policy: Optional["QuotaPolicy"], user: str, roles: Sequence[st
             items.append({"label": "一般提問（不含 AI）", "value": f"剩 {st['plain_left']} 題"})
         note = "※ AI 解讀用完仍可以繼續提問，只是回答不附 AI 解讀"
     return {"branch": title, "tags": ["艾斯 AI"], "label": f"{QUOTA_RESET_LABEL}恢復",
-            "sections": [{"type": "stats", "items": items}, {"type": "note", "text": note}]}
+            "sections": [{"type": "stats", "items": items}, {"type": "note", "keep": True, "text": note}]}
 
 
 def my_quota_text(policy: Optional["QuotaPolicy"], user: str, roles: Sequence[str], unlimited: bool) -> str:
@@ -7256,7 +7256,7 @@ class AceQueryEngine:
                     {"label": "平均／最慢耗時", "value": f"{info['avg_elapsed']}s／{info['slowest']}s"},
                     {"label": "會員額度模式", "value": mode},
                     {"label": "尖峰時段", "value": str(info.get("busiest_hour") or "-")}]},
-            ] + [{"type": "note", "text": "※ " + l.replace("**", "")} for l in cost]
+            ] + [{"type": "note", "keep": True, "text": "※ " + l.replace("**", "")} for l in cost]
             card = {"branch": "艾斯 AI 用量", "tags": ["管理員"], "label": info["day"], "sections": sections}
             api_text = "、".join(f"{k} {v}" for k, v in (info.get("api_counts") or {}).items()) or "-"
             text = (f"**用量｜{info['day']}**" + chr(10) +
@@ -9488,9 +9488,11 @@ def schedule_late_ai_image(engine, original, target, make_files, no_mentions):
 
 
 PUBLIC_ANSWER_ROUTES = frozenset(("planner", "answer_cache"))
-PUBLIC_ADMIN_ROUTES = frozenset(("admin_kline_debug", "admin_fib_debug", "admin_cdp_debug"))
+# 11-02：/ace 問族群雷達（哪些族群正在轉強）和 /ask 一樣公開
+PUBLIC_ADMIN_ROUTES = frozenset(("admin_kline_debug", "admin_fib_debug", "admin_cdp_debug", "admin_radar"))
 # /ace 管理指令字眼：含內部狀態、路徑、快取、筆數、log 的回覆一開始就 ephemeral defer。
-_ADMIN_PRIVATE_RE = re.compile(r"錯誤|ERROR|狀態|用量|使用量|USAGE|底庫|名冊|維護|DEBUG|LOG|日誌|快取|CACHE|草稿|說明|HELP|指令|記憶體", re.IGNORECASE)
+# 11-02：「記憶體」只比對管理指令本身；「記憶體族群誰最強」是族群問題，要公開。
+_ADMIN_PRIVATE_RE = re.compile(r"錯誤|ERROR|狀態|用量|使用量|USAGE|底庫|名冊|維護|DEBUG|LOG|日誌|快取|CACHE|草稿|說明|HELP|指令|記憶體明細|^\s*記憶體\s*$", re.IGNORECASE)
 
 
 # 週精選（只有管理員能用）：排名、草稿、改稿、套用文字、精選圖片都公開，不會因為 ephemeral 重新整理後消失
@@ -10751,7 +10753,7 @@ def run_discord_bot(config: BotConfig) -> None:
             card = my_quota_card(engine._quota_policy, str(target.id), roles, unlimited=str(target.id) in quota_exempt_ids(),
                                  title=f"{name} 的額度")
             mode = QUOTA_MODE_LABELS.get(engine._quota_policy.mode, engine._quota_policy.mode)
-            card["sections"].append({"type": "note", "text": f"※ 目前模式：{mode}（Gemini 主模型剩 {engine._gemini_remaining_ratio():.0%}）"})
+            card["sections"].append({"type": "note", "keep": True, "text": f"※ 目前模式：{mode}（Gemini 主模型剩 {engine._gemini_remaining_ratio():.0%}）"})
             panels = [{"branch_card": card, "hide_text": True}]
         await interaction_image(interaction, "額度管理", text, panels, ephemeral=True)
 

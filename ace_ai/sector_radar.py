@@ -1138,8 +1138,8 @@ def _panel(section: str, data: Dict[str, Any], rows: List[Dict[str, Any]], membe
         "name": _title(section, data, tier), "mode": "market_momentum", "comparison_date": "",
         "title_suffix": "",                 # 不加「漲幅排行」：轉強／轉弱卡是依 Δ 排序
         "stamp_text": stamp, "stamp_live": live,
-        "footer_text": ("股市艾斯  /  盤中漲幅為暫定值，收盤前會變動" if live
-                        else "股市艾斯  /  類股指數為當日最後一張盤中快照"),
+        "footer_text": ("股市艾斯  /  盤中漲幅為暫定值，收盤前會變動・僅供研究參考，非買賣建議" if live
+                        else "股市艾斯  /  類股指數為當日最後一張盤中快照・僅供研究參考，非買賣建議"),
         "rows": items[:3], "others": [],
         "coverage_note": "", "liquidity_note": note,
         "live_time": str(data.get("time", "")),

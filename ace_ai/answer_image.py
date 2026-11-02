@@ -264,12 +264,22 @@ def body_blocks(text: str) -> list[Block]:
             lines = wrap(title, 29, CONTENT - 80, True)
             blocks.append(Block('heading', lines, len(lines) * 42 + 22))
             raw = heading.group(3).strip()
+        if raw and _is_comment_note(raw):
+            print(f"📝 圖卡註解（只記 Log）｜{raw}", flush=True)
+            continue
         if raw:
             small = raw.startswith(('資料時間', '※', '資料來源', '⚠️', '🧡'))
             size, line_height = (23, 36) if small else (29, 45)
             lines = wrap(raw, size, CONTENT - 80)
             blocks.append(Block('note' if small else 'text', lines, len(lines) * line_height + 10))
     return blocks
+
+
+def _is_comment_note(text: str) -> bool:
+    """11-02 使用者：「※」開頭的註解使用者不需要知道，只寫 Log。延續上一題、操作提示（含「重新開始」）要留著。
+    帶資料或聲明的註解（資料日期、筆數、週精選聲明）在來源標 keep。"""
+    text = str(text or '')
+    return text.startswith('※') and '重新開始' not in text
 
 
 def text_at(draw, xy, text, size=29, fill=INK, bold=False):
@@ -2516,10 +2526,9 @@ def sector_card(draw, y: float, data: dict, dry: bool) -> int:
     else:
         stamp = f"{_sector_date(data.get('comparison_date'))} 收盤" if data.get('comparison_date') else ''
         stamp_bg, stamp_ink = TILE_BG, MUTED
-    disclaimer = '※ 排名僅供研究與觀察參考，不代表未來表現，亦非買賣建議。'
-    note = str(data.get('liquidity_note') or '')
-    if note:
-        disclaimer = f"{note}　｜　{disclaimer}"
+    # 11-02 使用者：範圍與條件說明只寫 Log，圖上不放；非買賣建議的提醒放在頁尾
+    if not dry and data.get('liquidity_note'):
+        print(f"📝 族群圖卡註解（只記 Log）｜{data['liquidity_note']}", flush=True)
     if not dry:
         draw.rectangle((px, y + h + 6, px + 5, y + h + 38), fill=ACCENT)
         text_at(draw, (px + 18, y + h), title, 32, INK, True)
@@ -2527,8 +2536,7 @@ def sector_card(draw, y: float, data: dict, dry: bool) -> int:
             sw = font(19, True).getlength(stamp) + 30
             draw.rounded_rectangle((x1 - SECTOR_PAD - sw, y + h + 2, x1 - SECTOR_PAD, y + h + 38), radius=18, fill=stamp_bg)
             draw.text((x1 - SECTOR_PAD - sw / 2, y + h + 20), stamp, font=font(19, True), fill=stamp_ink, anchor='mm')
-        text_at(draw, (px, y + h + 58), disclaimer, 18, MUTED)
-    h += 56 + 38
+    h += 62
     # 不另畫「Top5 一覽」橫條：前三名卡片＋其他名次表已經列出同樣的分數，重複又拉長圖片
     if not rows:
         if not dry:
@@ -3243,14 +3251,6 @@ def group_rank_card(draw, y: float, data: dict, dry: bool) -> int:
         detail = int(data.get('detail_top') or 0) or len(rows)
         for i, row in enumerate(rows):
             h += (_gr_v3_row if i < detail else _gr_v3_compact)(draw, px, y + h, width, row, data, dry)
-        # 10-30：被超額條件擋下的題材，灰字註明原始名次
-        foot = wrap(str(data.get('footnote') or ''), 20, width)
-        if foot:
-            if not dry:
-                draw.line((px, y + h, right, y + h), fill=LINE, width=2)
-                for i, line in enumerate(foot):
-                    text_at(draw, (px, y + h + 14 + i * 30), line, 20, MUTED)
-            h += 14 + len(foot) * 30 + 6
         return int(h + 16)
     h = 34
     stamp = str(data.get('stamp') or '')
@@ -4208,6 +4208,10 @@ def _branch_section(draw, x0: float, x1: float, y: float, section: dict, dry: bo
             draw.text((x0 + w / 2, y + 18), section['text'], font=font(20, True), fill=WARN_INK, anchor='mm')
         return 50
     if kind == 'note':
+        if _is_comment_note(section.get('text', '')) and not section.get('keep'):
+            if not dry:
+                print(f"📝 圖卡註解（只記 Log）｜{section.get('text', '')}", flush=True)
+            return 0
         lines = wrap(section.get('text', ''), 20, width, False)
         if not dry:
             for i, line in enumerate(lines):

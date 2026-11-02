@@ -2460,7 +2460,7 @@ def layout_card(layout: Dict[str, Any], title: str, label: str, disclaimers: Lis
             # 原文數字以緊湊行內資訊呈現，不為單筆數字建立滿版小格
             sections.append({"type": "stats", "presentation": "inline", "items": [{"label": r["label"], "value": r["value"]} for r in sec["rows"]]})
     notes = [re.sub(r"^[^\w一-鿿]+", "", str(d)).strip() for d in disclaimers]
-    sections.append({"type": "note", "text": "※ " + "｜".join(n for n in notes if n)})
+    sections.append({"type": "note", "keep": True, "text": "※ " + "｜".join(n for n in notes if n)})
     return {"branch": title, "tags": [], "label": label, "sections": sections, "weekly_note": True}
 
 
