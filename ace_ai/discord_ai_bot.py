@@ -1620,7 +1620,7 @@ class QueryRouter:
         if not parsed.branches and _BREADTH_RE.search(parsed.original) and not (parsed.stocks and "index" not in parsed.intents):
             # 盤面廣度：指數漲跌 vs 多數個股，不需要任何個股資料。
             plan = QueryPlan(route="rule_breadth", need_final_llm=True)
-            plan.add("get_index_contribution")
+            plan.add("get_index_contribution", market=_contribution_market(parsed.original))
             plan.add("get_market_breadth")
             if "futures" in parsed.intents:
                 plan.add("get_futures_positions")
@@ -3159,7 +3159,7 @@ FINAL_FOCUS_RULES = ("【先回答重點】payload.question_focus 是使用者�
                      "重點需要的資料若失敗或沒有，第一句就說明取不到，不可改寫成一般技術面來帶過。")
 
 
-FINAL_BREADTH_RULES = ("【盤面結構】沒有 get_index_contribution 時，第一句就要說「今天的指數貢獻榜要等官方收盤檔發布後才有」，不可以拿漲幅排名或前一個交易日的資料當成今天的貢獻榜。有 get_index_contribution 就直接回答哪些股票在撐或拖累，basis 是收盤暫定時說明是估算、官方檔發布後會更新，不要再說貢獻榜還沒有。回答『今天是不是都在拉權值股／誰在拉大盤／誰拖累指數』時，必須先看 get_index_contribution，不可只看漲跌幅。先直接回答結論，再分別列加權與櫃買的拉升 TOP5、拖累 TOP5；每檔優先引用 points（貢獻點數）、weight_pct（指數權重）與 change_pct（漲跌幅）。top5_positive_share_pct／top5_negative_share_pct 是前五大貢獻占已涵蓋正／負貢獻的比例，可用來說明集中度；concentration 是規則式集中度結論。盤中一定說明 basis=盤中估算、market_cap_coverage_pct（市值涵蓋率）與收盤前仍會變動；若 top5_positive_certified／top5_negative_certified 為 false，不可把榜單講成交易所最終完整排名。get_market_breadth 只用來補充加權與櫃買差異、上漲比率與中小型股是否跟上，不可取代貢獻點數。不要預測未來指數點位，也不要給買賣建議。")
+FINAL_BREADTH_RULES = ("【盤面結構】沒有 get_index_contribution 時，第一句就要說「今天的指數貢獻榜要等官方收盤檔發布後才有」，不可以拿漲幅排名或前一個交易日的資料當成今天的貢獻榜。有 get_index_contribution 就直接回答哪些股票在撐或拖累，要依貢獻點數判斷（權重×漲跌），不可只看漲跌幅；漲最多的不一定撐最多，權重大的小漲小跌影響可能更大。basis 是收盤暫定時說明是估算、官方檔發布後會更新，不要再說貢獻榜還沒有。回答『今天是不是都在拉權值股／誰在拉大盤／誰拖累指數』時，必須先看 get_index_contribution，不可只看漲跌幅。先直接回答結論，再寫資料裡有的市場（只有加權就只寫加權，不要提櫃買沒資料）。top、bottom 是所有成分股依貢獻點數排出的拉升榜與拖累榜；點名個股一定要寫貢獻點數，例如「鴻海貢獻 +12.3 點（權重 3.1%、漲 2.0%）」，用 points（貢獻點數）、weight_pct（指數權重）與 change_pct（漲跌幅）。大盤下跌時，要點出逆勢上漲、對指數有正貢獻的股票，包含權重不大的。top5_positive_share_pct／top5_negative_share_pct 是前五大貢獻占已涵蓋正／負貢獻的比例，可用來說明集中度；concentration 是規則式集中度結論。盤中一定說明 basis=盤中估算、market_cap_coverage_pct（市值涵蓋率）與收盤前仍會變動；若 top5_positive_certified／top5_negative_certified 為 false，不可把榜單講成交易所最終完整排名。get_market_breadth 只用來補充加權與櫃買差異、上漲比率與中小型股是否跟上，不可取代貢獻點數。不要預測未來指數點位，也不要給買賣建議。")
 
 
 FINAL_INDEX_COMPARE_RULES = ("【加權 vs 櫃買】圖上已經有兩邊的 K 線、均線與型態分數比較表，文字只寫結論：第一句直接回答哪一邊比較強"
@@ -4222,7 +4222,8 @@ def _breadth_panel(data: Dict[str, Any]) -> Dict[str, Any]:
     return {"sector": {"name": title, "mode": "market_momentum",
                        "comparison_date": "", "rows": rows, "others": others,
                        "coverage_note": "", "liquidity_note": note,
-                       "live_time": str(data.get("time") or "")}}
+                       # 11-02：收盤後不能寫「盤中 13:33｜收盤前會變動」
+                       **({"live_time": str(data.get("time") or "")} if live else {"stamp_text": "今日收盤"})}}
 
 
 def format_index_contribution(data: Dict[str, Any]) -> str:
@@ -4246,7 +4247,7 @@ def format_index_contribution(data: Dict[str, Any]) -> str:
             if items:
                 lines.append(label + "：" + "、".join(
                     f"{x['stock_name']}({x['stock_code']}) {x['points']:+.2f}點 / 權重{x.get('weight_pct', 0):.2f}% / {x.get('change_pct', 0):+.2f}%"
-                    for x in items[:5]))
+                    for x in items))
             else:
                 lines.append(label + "：目前沒有可列出的成分股")
     lines.append("※ 盤中為官方即時報價估算；收盤後改用交易所全市場收盤快照計算，缺價成分股以最近收盤計入市值、不計貢獻。")
@@ -5010,26 +5011,36 @@ def render_answer_image(question: str, text: str, panels=None, *, image_style: s
 # 句子同時出現「大盤層級的對象」與「廣度／貢獻的問法」時，一律走盤面結構，不進族群解析。
 _MARKET_SCOPE_RE = re.compile(r"大盤|加權|櫃買|指數|盤面|盤感|權值|市場")
 _BREADTH_RE = re.compile(r"盤感|盤面|市場廣度|廣度|權值股|權值|只有大型股|大盤漲.{0,6}個股|個股沒跟上|普漲|齊漲|拉指數|撐盤|貢獻|拉抬|誰在拉|誰拉|誰讓大盤|加.{0,4}點|扣.{0,4}點|拉升|拖累|漲的都是|指數失真|多數個股|中小型股|內資|盤勢結構")
+
+
+def _contribution_market(question: str) -> str:
+    """問櫃買就算櫃買；同時問兩個才都算（回空字串）；其餘都是問大盤＝加權。
+    11-02：所有成分股都要算，一題只算問到的市場才來得及。"""
+    tpex = bool(re.search(r"櫃買|上櫃|OTC", str(question or ""), re.I))
+    twse = bool(re.search(r"大盤|加權|台股|上市", str(question or "")))
+    return "" if tpex and twse else "tpex" if tpex else "twse"
+
+
 def _market_structure_panels(question: str, contribution: Optional[Dict[str, Any]], breadth: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """盤面結構的圖卡：指數貢獻榜＋權值股漲跌。"""
     markets = list((contribution or {}).get("markets") or [])
-    # 問大盤就只給加權、問櫃買就只給櫃買；沒指定才兩個都給，不要拿另一個市場充數。
-    want = "tpex" if re.search(r"櫃買|上櫃|OTC", question, re.I) else (
-        "twse" if re.search(r"大盤|加權|台股", question) else "")
+    want = _contribution_market(question)
     if want:
         markets = [m for m in markets if m.get("market") == want]
     # 11-02：一檔都列不出來的貢獻卡（全部 +0.00 點）不放，那不是答案
     panels: List[Dict[str, Any]] = [{"contribution": m} for m in markets if m.get("top") or m.get("bottom")]
-    # 明確問貢獻點數時，貢獻榜就是答案，不用漲幅排行卡充數；其他問法（撐大盤、權值股）兩張都看。
+    # 11-02 使用者：撐大盤要看權重×漲跌，不是只看漲幅。貢獻榜有資料就只放它；
+    # 漲幅排行卡只在貢獻榜出不來時補位，明確問點數時也不補（那不是答案）。
     points_question = bool(re.search(r"點|貢獻|拉抬|拉指數|撐盤|誰在拉|誰拉|拖累", question))
-    if breadth and not points_question and (breadth.get("heavyweights") or breadth.get("strongest") or breadth.get("weakest")):
+    if not panels and breadth and not points_question and (breadth.get("heavyweights") or breadth.get("strongest") or breadth.get("weakest")):
         panels.append(_breadth_panel(breadth))
     return panels
 
 
 def _is_market_rank_target(target: Any) -> bool:
     """AI 需求表的排行對象是大盤（不是某個族群）。"""
-    return bool(_MARKET_SCOPE_RE.search(str(target)) and not re.search(r"族群|類股|產業|題材", str(target)))
+    return bool((_MARKET_SCOPE_RE.search(str(target)) or re.search(r"台股|TAIEX|TPEX", str(target), re.I))
+                and not re.search(r"族群|類股|產業|題材", str(target)))
 
 
 ASK_MARK_MODE = (os.getenv("DISCORD_AI_ASK_MARK_MODE", "event").strip().lower() or "event")
@@ -7736,7 +7747,8 @@ class AceQueryEngine:
                   "branch_warrants＝這個分點買了哪些權證、權證明細／權證買賣明細／清單／代號、剩餘天數、槓桿、價內外、估算報酬；"
                   "branch_events＝這個分點的 A～E 事件、什麼時候進場或出場（不是要列權證）；branch_position＝這個分點部位還在嗎、持有或出清；"
                   "branch_perf＝這個分點的勝率、績效、報酬。沒有指定分點才用 chips。\n"
-                  "問哪些股票在撐、拉抬或拖累大盤、指數，是問股票排行，type 用 rank、targets 寫大盤，不是 pattern。"
+                  "問哪些股票影響大盤、指數，是問股票排行，type 用 rank、targets 寫大盤，不是 pattern；"
+                  "白話也算，只要是在問誰撐住、帶領、拉抬、領漲、拖累、拉低、壓著、扛著大盤，或大盤今天靠誰、被誰拖、誰害的、誰最有貢獻。"
                   "個股或大盤問怎麼看、如何、看法、分析、支撐壓力、快突破了嗎、如何防守，都屬pattern；price 只限問數字（股價多少、漲跌幾%）。不需要使用者說三角。三角由程式資料判定，不由你猜。"
                   "不同股票各問新聞與型態不是比較，不要新增compare或chips；未明確要求include_score填false。"
                   "targets：這項需求的股票名稱／代號或族群名稱；date_range：提到的期間（沒有填空字串）。\n"
@@ -7838,7 +7850,7 @@ class AceQueryEngine:
                 and any(n.get("type") == "rank" and _is_market_rank_target(t) for n in items for t in n.get("targets") or [])):
             parsed.sector = parsed.sector_context = None
             plan = QueryPlan(route="rule_breadth", need_final_llm=True)
-            plan.add("get_index_contribution")
+            plan.add("get_index_contribution", market=_contribution_market(getattr(parsed, "original", "")))
             plan.add("get_market_breadth")
             return plan
         if "sector" not in drop and any(n.get("type") in ("members", "rank") for n in items):

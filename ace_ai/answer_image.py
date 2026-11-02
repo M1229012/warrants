@@ -3396,10 +3396,13 @@ def _contrib_rows(items: list, positive: bool) -> list[dict]:
     return rows
 
 
+CONTRIB_LIST_MAX = 10
+
+
 def contribution_card(draw, y: float, data: dict, dry: bool) -> int:
-    """單一市場指數貢獻：拉升 TOP5／拖累 TOP5，直接顯示漲跌、權重與貢獻點數。"""
-    top = _contrib_rows(data.get('top'), True)[:5]
-    bottom = _contrib_rows(data.get('bottom'), False)[:5]
+    """單一市場指數貢獻：拉升榜／拖累榜（11-02 起各列前 10），直接顯示漲跌、權重與貢獻點數。"""
+    top = _contrib_rows(data.get('top'), True)[:CONTRIB_LIST_MAX]
+    bottom = _contrib_rows(data.get('bottom'), False)[:CONTRIB_LIST_MAX]
     lines = max(len(top), len(bottom), 1)
     summary_h = 48
     height = int(96 + summary_h + CONTRIB_HEAD_H + lines * CONTRIB_ROW_H + 28)
@@ -3446,14 +3449,14 @@ def contribution_card(draw, y: float, data: dict, dry: bool) -> int:
 
     half = (right - ix - 40) / 2
     table_y = sy + summary_h
-    for column, (items, label, color) in enumerate(((top, '拉升指數 TOP5', UP), (bottom, '拖累指數 TOP5', DOWN))):
+    for column, (items, label, color) in enumerate(((top, f'拉升指數 TOP{len(top) or CONTRIB_LIST_MAX}', UP), (bottom, f'拖累指數 TOP{len(bottom) or CONTRIB_LIST_MAX}', DOWN))):
         cx = ix + column * (half + 40)
         draw.rounded_rectangle((cx, table_y, cx + half, table_y + CONTRIB_HEAD_H), radius=8, fill=TILE_BG)
         draw.text((cx + 12, table_y + CONTRIB_HEAD_H / 2), label, font=font(19, True), fill=color, anchor='lm')
         # 右側欄名，讓會員知道不是單純漲跌幅排行。
         draw.text((cx + half - 205, table_y + CONTRIB_HEAD_H / 2), '漲跌', font=font(15), fill=MUTED, anchor='rm')
         draw.text((cx + half - 112, table_y + CONTRIB_HEAD_H / 2), '權重', font=font(15), fill=MUTED, anchor='rm')
-        draw.text((cx + half - 10, table_y + CONTRIB_HEAD_H / 2), '貢獻', font=font(15), fill=MUTED, anchor='rm')
+        draw.text((cx + half - 10, table_y + CONTRIB_HEAD_H / 2), '貢獻點數', font=font(15), fill=MUTED, anchor='rm')
 
         ry = table_y + CONTRIB_HEAD_H
         for item in items:

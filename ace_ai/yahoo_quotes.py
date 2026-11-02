@@ -36,6 +36,7 @@ TIMEOUT_SECONDS = 10.0
 DEFAULT_DEADLINE = 20.0          # 查詢當下補拍的整次時限（和 MIS 的查詢補拍相同）
 SINGLE_DEADLINE = 6.0            # 單一檔的時限：抓不到就先用最近收盤，不拖累整題
 QUOTE_MAX_AGE = 60.0             # 一分鐘內抓過的報價直接沿用，同一檔不重打
+AFTER_CLOSE_MAX_AGE = 1800.0     # 盤後定價（14:30）結束後
 COOLDOWN_SECONDS = 300.0         # 被擋或連續失敗：5 分鐘內不再打，全部改走 MIS
 MAX_ERRORS = 3
 OPEN_MINUTE = 9 * 60             # 09:00 前的價格是試撮，不是成交
@@ -99,32 +100,39 @@ def source_ages(quotes: Dict[str, Dict[str, Any]], now_ts: float) -> List[float]
     return sorted(max(0.0, now_ts - float(q["source_ts"])) for q in quotes.values() if q.get("source_ts"))
 
 
-def _fresh(code: str, max_age: float) -> Optional[Dict[str, Any]]:
+def _max_age() -> float:
+    """收盤後價格不會再變，可以沿用久一點，少打奇摩。"""
+    now = tools.taipei_now()
+    return AFTER_CLOSE_MAX_AGE if (now.hour, now.minute) >= (14, 35) else QUOTE_MAX_AGE
+
+
+def _fresh(code: str) -> Optional[Dict[str, Any]]:
     hit = _QUOTES.get(code)
-    return hit[1] if hit and time.monotonic() - hit[0] <= max_age else None
+    return hit[1] if hit and time.monotonic() - hit[0] <= _max_age() else None
 
 
-def prime(codes: List[str], deadline_seconds: Optional[float] = None) -> None:
-    """11-02：一題要好幾檔（族群總覽、大類型態）先一次批次抓好，不要逐檔各打一次。"""
-    missing = [c for c in codes if not _fresh(c, QUOTE_MAX_AGE)]
+def prime(codes: List[str], deadline_seconds: Optional[float] = None,
+          known_markets: Optional[Dict[str, str]] = None) -> None:
+    """11-02：一題要好幾檔（族群總覽、大類型態、指數貢獻）先一次批次抓好，不要逐檔各打一次。"""
+    missing = [c for c in codes if not _fresh(c)]
     if missing:
-        fetch(missing, deadline_seconds)
+        fetch(missing, deadline_seconds, known_markets)
 
 
 def fresh_quotes(codes: List[str]) -> Dict[str, Dict[str, Any]]:
-    """一分鐘內抓過的報價（prime 之後取用）；沒有的代號不回傳。"""
-    return {c: q for c, q in ((c, _fresh(c, QUOTE_MAX_AGE)) for c in codes) if q}
+    """還沒過期的報價（prime 之後取用）；沒有的代號不回傳。"""
+    return {c: q for c, q in ((c, _fresh(c)) for c in codes) if q}
 
 
 def stock_quote(code: str, market: str = "") -> Dict[str, Any]:
     """單一檔的今天報價（只有今天這一根）。族群排行每分鐘的快照也會存進來，有新的就不再打奇摩；
     族群快照正在抓就等它抓完再看，減少被擋的機會。抓不到回空 dict。"""
-    quote = _fresh(code, QUOTE_MAX_AGE)
+    quote = _fresh(code)
     if quote:
         return quote
     if _LOCK.acquire(timeout=DEFAULT_DEADLINE):
         _LOCK.release()
-        quote = _fresh(code, QUOTE_MAX_AGE)
+        quote = _fresh(code)
         if quote:
             return quote
     return fetch([code], SINGLE_DEADLINE, {code: market}).get(code) or {}

@@ -12,10 +12,10 @@
 - TAIEX：依證交所正式編製要點，以所有符合納入規則的上市普通股與官方發行股數重建；
   證交所每日精確成分權重檔屬 Data E-Shop 商品，未取得該授權檔時不宣稱為官方公布權重。
 - 收盤後：使用本地全市場官方日 K，所有可辨識成分股都參與計算，不做前 N 大權值股截斷。
-- 盤中：使用 TWSE MIS 官方即時報價「批次」抓取，依昨日市值由大到小逐批補價；
-  一旦未抓股票依一般 ±10% 漲跌幅上限也不可能擠進正／負貢獻 TOP5，就提前停止。
+- 盤中：先用奇摩批次報價把所有成分股抓完（依昨日市值由大到小），指數基準看 TWSE MIS；
+  11-02 起不因前幾名確定就提前停止，再小的成分股都要算。
   同時設總時間預算，連線慢時直接回傳目前已取得結果，不讓 Discord 問答卡死。
-- 若 MIS 完全失敗，才退回原本少量 Fugle 單股即時報價；不逐檔掃全市場。
+- 奇摩整批沒回才用 MIS 補；若 MIS 也完全失敗，才退回原本少量 Fugle 單股即時報價；不逐檔掃全市場。
 
 盤中結果一律標示「估算」與市值涵蓋率；收盤後依完整母體計算，並在 log 留下成分數、價格覆蓋率與指數殘差供對帳。
 """
@@ -56,18 +56,20 @@ _SHARES_REFRESHING = [False]
 LIVE_TOP_TWSE = max(3, tools._env_int("DISCORD_AI_CONTRIB_LIVE_TWSE", 12))
 LIVE_TOP_TPEX = max(3, tools._env_int("DISCORD_AI_CONTRIB_LIVE_TPEX", 6))
 
-# 盤中批次抓取：總時間預算是「加權＋櫃買合計」，避免網路慢時 Discord 逾時。
-# 收盤後、官方收盤檔尚未發布時要不要給估算榜（只計市值前段，標「收盤暫定」）。
+# 盤中批次抓取：總時間預算是「每個市場」各一份，一題只算問到的市場，避免網路慢時 Discord 逾時。
+# 收盤後、官方收盤檔尚未發布時要不要給估算榜（所有成分股用即時報價估算，標「收盤暫定」）。
 # 11-02 使用者：正式資料出來前都看即時，預設打開；官方檔更新後自動換正式榜。設 0 退回「請稍後再查」。
 PENDING_CLOSE_ESTIMATE = bool(tools._env_int("DISCORD_AI_CONTRIB_PENDING_ESTIMATE", 1))
 
 
 class OfficialClosePending(tools.ToolDataError):
     """指數已到今天，但全市場官方收盤檔還停在前一個交易日。"""
-LIVE_BUDGET_SECONDS = max(3.0, tools._env_float("DISCORD_AI_CONTRIB_BUDGET", 9.0))
+# 11-02 使用者：再小的成分股都要算，大盤差的日子相對強的小股票才看得到。整個市場奇摩約 20 秒，一題只算問到的市場。
+LIVE_BUDGET_SECONDS = max(3.0, tools._env_float("DISCORD_AI_CONTRIB_BUDGET", 25.0))
+SUMMARY_TOP = 5          # 圖卡摘要與集中度固定看前五大；榜單可以列更多
 LIVE_BATCH_SIZE = max(20, tools._env_int("DISCORD_AI_CONTRIB_BATCH_SIZE", 70))
-LIVE_MAX_TWSE = max(LIVE_BATCH_SIZE, tools._env_int("DISCORD_AI_CONTRIB_MAX_TWSE", 350))
-LIVE_MAX_TPEX = max(LIVE_BATCH_SIZE, tools._env_int("DISCORD_AI_CONTRIB_MAX_TPEX", 280))
+LIVE_MAX_TWSE = max(LIVE_BATCH_SIZE, tools._env_int("DISCORD_AI_CONTRIB_MAX_TWSE", 5000))
+LIVE_MAX_TPEX = max(LIVE_BATCH_SIZE, tools._env_int("DISCORD_AI_CONTRIB_MAX_TPEX", 5000))
 LIVE_MIS_TIMEOUT = max(2.0, tools._env_float("DISCORD_AI_CONTRIB_MIS_TIMEOUT", 4.5))
 LIVE_CACHE_SECONDS = max(5, tools._env_int("DISCORD_AI_CONTRIB_CACHE_SECONDS", 20))
 # 一般上市櫃普通股每日 ±10%；只拿來判斷「未抓股票理論上是否仍可能擠進 TOP5」。
@@ -606,18 +608,19 @@ def _fetch_mis_batch(market: str, codes: List[str], deadline: float) -> Tuple[Di
 
 
 def _live_stock_quotes(market: str, codes: List[str], deadline: float) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
-    """盤中個股價先用奇摩（有成交價），沒回的才用 MIS 補；MIS 同時提供指數昨收與現值。"""
+    """盤中個股價用奇摩（contribution 開始前已整批抓好）。這批有回，沒回的股票就是今天沒成交，
+    不再逐批打 MIS；整批都沒回才用 MIS 補。"""
     quotes: Dict[str, Dict[str, Any]] = {}
     try:
         import yahoo_quotes
-        yahoo_quotes.prime(codes, max(0.5, deadline - time.monotonic()))
-        quotes = {c: {"close": q["price"], "source": "奇摩"} for c, q in yahoo_quotes.fresh_quotes(codes).items()}
+        quotes = {c: {"close": q["price"], "prev_close": q.get("prev"), "source": "奇摩"}
+                  for c, q in yahoo_quotes.fresh_quotes(codes).items()}
     except Exception as exc:
         print(f"⚠️ {INDEX_OF[market][1]} 奇摩批次報價略過｜{tools.err_text(exc)}", flush=True)
-    mis, benchmark = _fetch_mis_batch(market, [c for c in codes if c not in quotes] or codes[:1], deadline)
-    for code, item in mis.items():
-        quotes.setdefault(code, dict(item, source="TWSE-MIS"))
-    return quotes, benchmark
+    if quotes:
+        return quotes, {}
+    mis, benchmark = _fetch_mis_batch(market, codes, deadline)
+    return {code: dict(item, source="TWSE-MIS") for code, item in mis.items()}, benchmark
 
 
 def _fugle_fallback(rows: List[Dict[str, Any]], market: str, deadline: float) -> int:
@@ -878,10 +881,19 @@ def contribution(market: str, live: bool, top: int = 5, *, deadline: Optional[fl
         max_candidates = LIVE_MAX_TWSE if market == "twse" else LIVE_MAX_TPEX
         ranked = ranked[:max_candidates]
         benchmark: Dict[str, Any] = {}
+        ranked_codes = [r["stock_code"] for r in ranked]
+        try:
+            _, benchmark = _fetch_mis_batch(market, ranked_codes[:1], deadline)      # 指數昨收與現值先拿，整批抓完可能到時限
+        except Exception as exc:
+            print(f"⚠️ {index_name} MIS 指數基準略過｜{tools.err_text(exc)}", flush=True)
+        try:
+            import yahoo_quotes
+            yahoo_quotes.prime(ranked_codes, max(0.5, deadline - time.monotonic()), {c: market for c in ranked_codes})
+        except Exception as exc:
+            print(f"⚠️ {index_name} 奇摩整批報價略過｜{tools.err_text(exc)}", flush=True)
 
+        # 這裡只是套用已抓好的報價，不看時限：時間到了也要把抓到的算完（MIS 過時限會直接回空）
         for batch_start in range(0, len(ranked), LIVE_BATCH_SIZE):
-            if time.monotonic() >= deadline:
-                break
             batch = ranked[batch_start:batch_start + LIVE_BATCH_SIZE]
             requested = [r["stock_code"] for r in batch]
             try:
@@ -901,6 +913,13 @@ def contribution(market: str, live: bool, top: int = 5, *, deadline: Optional[fl
                 current = tools._num(item.get("close"))
                 if not current or current <= 0:
                     continue
+                # 11-02：昨收以報價來源為準。收盤後本地底庫已有今天的 K 棒，「最新收盤」就是今天，
+                # 拿它當昨收會讓每檔都沒漲沒跌（貢獻榜又是空的）；除權息的參考價也要跟來源一致。
+                source_prev = tools._num(item.get("prev_close"))
+                if source_prev and source_prev > 0:
+                    new_value = float(source_prev) * row["shares"]
+                    total_prev_value += new_value - row["prev_value"]
+                    row["prev_close"], row["prev_value"] = float(source_prev), new_value
                 row["close"] = float(current)
                 row["price_change"] = float(current) - row["prev_close"]
                 row["change_pct"] = row["price_change"] / row["prev_close"] * 100.0
@@ -908,21 +927,19 @@ def contribution(market: str, live: bool, top: int = 5, *, deadline: Optional[fl
                 row["price_source"] = str(item.get("source") or "TWSE-MIS")
                 live_used += 1
 
-            if benchmark.get("prev"):
-                prev_index = float(benchmark["prev"])
-                now_index = float(benchmark.get("current") or benchmark["prev"])
-                data_date = tools.taipei_now().strftime("%Y-%m-%d")
-            elif prev_index is None:
-                prev_index, now_index, data_date = _index_prev_close(index_code)
+        if benchmark.get("prev"):
+            prev_index = float(benchmark["prev"])
+            now_index = float(benchmark.get("current") or benchmark["prev"])
+            data_date = tools.taipei_now().strftime("%Y-%m-%d")
+        elif prev_index is None:
+            prev_index, now_index, data_date = _index_prev_close(index_code)
 
-            if prev_index:
-                factor_tmp = float(prev_index) / total_prev_value
-                for row in rows:
-                    row["weight_pct"] = row["prev_value"] / total_prev_value * 100.0
-                    row["points"] = row["price_change"] * row["shares"] * factor_tmp
-                top_safe, bottom_safe, unseen_bound = _rank_safety(rows, float(prev_index), top)
-                if top_safe and bottom_safe:
-                    break
+        if prev_index:
+            factor_tmp = float(prev_index) / total_prev_value
+            for row in rows:
+                row["weight_pct"] = row["prev_value"] / total_prev_value * 100.0
+                row["points"] = row["price_change"] * row["shares"] * factor_tmp
+            top_safe, bottom_safe, unseen_bound = _rank_safety(rows, float(prev_index), top)
 
         if live_used == 0 and time.monotonic() < deadline:
             live_used = _fugle_fallback(rows, market, deadline)
@@ -958,8 +975,8 @@ def contribution(market: str, live: bool, top: int = 5, *, deadline: Optional[fl
 
     positive_total = sum(r["points"] for r in positives)
     negative_total = abs(sum(r["points"] for r in negatives))
-    top_lift = sum(r["points"] for r in top_rows)
-    top_drag = sum(r["points"] for r in bottom_rows)
+    top_lift = sum(r["points"] for r in positives[:SUMMARY_TOP])
+    top_drag = sum(r["points"] for r in negatives[:SUMMARY_TOP])
     positive_share = (top_lift / positive_total * 100.0) if positive_total > 0 else None
     negative_share = (abs(top_drag) / negative_total * 100.0) if negative_total > 0 else None
 
@@ -1045,8 +1062,8 @@ def contribution(market: str, live: bool, top: int = 5, *, deadline: Optional[fl
     }
 
 
-def report(live: Optional[bool] = None, top: int = 5) -> Dict[str, Any]:
-    """加權與櫃買一起計算；盤中共享一個總時間預算，避免連線慢時拖垮問答。"""
+def report(live: Optional[bool] = None, top: int = 5, market: str = "") -> Dict[str, Any]:
+    """加權與櫃買一起計算（market 指定就只算那一個）；盤中共享一個總時間預算，避免連線慢時拖垮問答。"""
     if not tools.stock_live_quotes():
         live = False
     if live is None:
@@ -1054,20 +1071,20 @@ def report(live: Optional[bool] = None, top: int = 5) -> Dict[str, Any]:
         live = now.weekday() < 5 and 9 * 60 <= now.hour * 60 + now.minute <= 13 * 60 + 35
     reasons: List[str] = []
     out: Dict[str, Any] = {"basis": "盤中估算" if live else "收盤精算", "markets": []}
-    overall_deadline = time.monotonic() + LIVE_BUDGET_SECONDS if live else None
-    markets_order = ("twse", "tpex")
+    markets_order = (market,) if market in INDEX_OF else ("twse", "tpex")
+    overall_deadline = time.monotonic() + LIVE_BUDGET_SECONDS * len(markets_order) if live else None
     can_estimate = tools.stock_live_quotes() and not live and PENDING_CLOSE_ESTIMATE
     official_pending = False
 
-    def pending_estimate(market: str) -> Dict[str, Any]:
-        row = contribution(market, live=True, top=top, deadline=time.monotonic() + LIVE_BUDGET_SECONDS)
-        row["basis"] = "收盤暫定・僅計市值前段"
+    def pending_estimate(name: str) -> Dict[str, Any]:
+        row = contribution(name, live=True, top=top, deadline=time.monotonic() + LIVE_BUDGET_SECONDS)
+        row["basis"] = "收盤暫定估算"
         row["concentration"] = str(row.get("concentration") or "").replace("盤中估算", "收盤暫定")
         row["pending_official_close"] = True
-        print(f"ℹ️ {INDEX_OF[market][1]} 官方收盤檔未發布，改用即時報價估算今天的貢獻", flush=True)
+        print(f"ℹ️ {INDEX_OF[name][1]} 官方收盤檔未發布，改用即時報價估算今天的貢獻", flush=True)
         return row
 
-    for idx, market in enumerate(markets_order):
+    for idx, name in enumerate(markets_order):
         # 平分「剩餘」時間，保證加權不會把整個 budget 吃光而讓櫃買沒有即時榜單。
         if live and overall_deadline is not None:
             now_mono = time.monotonic()
@@ -1078,25 +1095,25 @@ def report(live: Optional[bool] = None, top: int = 5) -> Dict[str, Any]:
             market_deadline = None
         try:
             # 11-02 Log：加權已確認官方檔沒更新，櫃買還下載 40 秒才發現一樣不能用，AI 就沒時間寫了 → 直接估算
-            out["markets"].append(pending_estimate(market) if official_pending
-                                  else contribution(market, live=bool(live), top=top, deadline=market_deadline))
+            out["markets"].append(pending_estimate(name) if official_pending
+                                  else contribution(name, live=bool(live), top=top, deadline=market_deadline))
         except Exception as exc:
             # 已收盤、但交易所當天的全市場收盤檔還沒發布時，改用即時報價估算今天的貢獻，
             # 而不是回頭拿前一個交易日的榜（那會變成昨天的答案）。
             if can_estimate and not official_pending:
                 official_pending = isinstance(exc, OfficialClosePending)
                 try:
-                    out["markets"].append(pending_estimate(market))
+                    out["markets"].append(pending_estimate(name))
                     continue
                 except Exception as retry_exc:
                     exc = retry_exc
             reasons.append(str(exc))
-            print(f"⚠️ {INDEX_OF[market][1]} 貢獻點數略過：{type(exc).__name__}: {exc}", flush=True)
+            print(f"⚠️ {INDEX_OF[name][1]} 貢獻點數略過：{type(exc).__name__}: {exc}", flush=True)
     if not out["markets"]:
         # 把真正的原因帶給使用者（多半是「今天的收盤檔還沒發布」），不要只說算不出來。
         raise tools.ToolDataError(reasons[0] if reasons else "目前無法計算指數貢獻點數")
     if any(m.get("pending_official_close") for m in out["markets"]):
-        out["basis"] = "收盤暫定・僅計市值前段"
+        out["basis"] = "收盤暫定估算"
 
     twse = next((m for m in out["markets"] if m.get("market") == "twse"), None)
     tpex = next((m for m in out["markets"] if m.get("market") == "tpex"), None)
@@ -1117,6 +1134,6 @@ def report(live: Optional[bool] = None, top: int = 5) -> Dict[str, Any]:
         "依交易所發行量加權公式計算：收盤後直接讀 TWSE / TPEx 官方全市場收盤快照的收盤價與漲跌價差，"
         "再以官方收盤指數與完整成分母體總發行市值換算每檔貢獻點數；"
         "櫃買優先使用官方公開成分股名冊，TAIEX 依官方編製要點與免費公開資料建立母體。"
-        "官方收盤資料未發布前，改用即時報價估算市值前段成分股，並標示收盤暫定。"
+        "官方收盤資料未發布前，改用即時報價估算所有成分股（市值涵蓋率寫在圖上），並標示收盤暫定。"
     )
     return out

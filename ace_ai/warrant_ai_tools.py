@@ -881,7 +881,7 @@ _TOOL_FAILURE_MESSAGES = {
     "get_institutional_flow": "目前三大法人資料取得失敗",
     "get_market_institutional": "目前全市場三大法人資料取得失敗",
     "get_retail_futures": "目前散戶多空比資料取得失敗",
-    "get_index_contribution": "指數貢獻點數：加權與櫃買各自的拉升 TOP5 與拖累 TOP5（權重 × 漲跌，非漲幅排名）",
+    "get_index_contribution": "指數貢獻點數：所有成分股依權重 × 漲跌排序的拉升榜與拖累榜（非漲幅排名）",
     "get_market_breadth": "盤面廣度資料取得失敗",
     "get_index_contribution": "指數貢獻點數計算失敗",
     "get_warrant_branch": "目前權證分點資料取得失敗",
@@ -7009,10 +7009,10 @@ def get_market_breadth() -> Dict[str, Any]:
     return result
 
 
-def get_index_contribution(top: int = 5) -> Dict[str, Any]:
-    """加權與櫃買的指數貢獻點數：誰把指數拉上去、誰把它拖下來（權重 × 漲跌）。"""
+def get_index_contribution(top: int = 10, market: str = "") -> Dict[str, Any]:
+    """加權與櫃買的指數貢獻點數：誰把指數拉上去、誰把它拖下來（權重 × 漲跌）。market 指定就只算那個市場。"""
     import index_contribution
-    return index_contribution.report(top=max(3, int(top or 5)))
+    return index_contribution.report(top=max(3, int(top or 10)), market=str(market or ""))
 
 
 # K 線圖大約 3 個月；三大法人柱狀圖要蓋滿整張 K 線，所以抓的天數比統計用的 20 日多。
