@@ -34,6 +34,8 @@ BATCH = 50                       # 10-30 實測：50 檔可以、100 檔回 400
 GAP_SECONDS = 0.3                # 每批之間的間隔
 TIMEOUT_SECONDS = 10.0
 DEFAULT_DEADLINE = 20.0          # 查詢當下補拍的整次時限（和 MIS 的查詢補拍相同）
+SINGLE_DEADLINE = 6.0            # 單一檔的時限：抓不到就先用最近收盤，不拖累整題
+QUOTE_MAX_AGE = 60.0             # 一分鐘內抓過的報價直接沿用，同一檔不重打
 COOLDOWN_SECONDS = 300.0         # 被擋或連續失敗：5 分鐘內不再打，全部改走 MIS
 MAX_ERRORS = 3
 OPEN_MINUTE = 9 * 60             # 09:00 前的價格是試撮，不是成交
@@ -41,6 +43,8 @@ HEADERS = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
 
 _COOL_UNTIL = [0.0]
 _LOCK = threading.Lock()
+_QUOTES: Dict[str, Any] = {}     # {代號: (抓到的時間, 報價)}
+_LAST_CALL = [0.0]
 
 
 def enabled() -> bool:
@@ -95,14 +99,43 @@ def source_ages(quotes: Dict[str, Dict[str, Any]], now_ts: float) -> List[float]
     return sorted(max(0.0, now_ts - float(q["source_ts"])) for q in quotes.values() if q.get("source_ts"))
 
 
-def fetch(codes: List[str], deadline_seconds: Optional[float] = None) -> Dict[str, Dict[str, Any]]:
+def _fresh(code: str, max_age: float) -> Optional[Dict[str, Any]]:
+    hit = _QUOTES.get(code)
+    return hit[1] if hit and time.monotonic() - hit[0] <= max_age else None
+
+
+def prime(codes: List[str], deadline_seconds: Optional[float] = None) -> None:
+    """11-02：一題要好幾檔（族群總覽、大類型態）先一次批次抓好，不要逐檔各打一次。"""
+    missing = [c for c in codes if not _fresh(c, QUOTE_MAX_AGE)]
+    if missing:
+        fetch(missing, deadline_seconds)
+
+
+def stock_quote(code: str, market: str = "") -> Dict[str, Any]:
+    """單一檔的今天報價（只有今天這一根）。族群排行每分鐘的快照也會存進來，有新的就不再打奇摩；
+    族群快照正在抓就等它抓完再看，減少被擋的機會。抓不到回空 dict。"""
+    quote = _fresh(code, QUOTE_MAX_AGE)
+    if quote:
+        return quote
+    if _LOCK.acquire(timeout=DEFAULT_DEADLINE):
+        _LOCK.release()
+        quote = _fresh(code, QUOTE_MAX_AGE)
+        if quote:
+            return quote
+    return fetch([code], SINGLE_DEADLINE, {code: market}).get(code) or {}
+
+
+def fetch(codes: List[str], deadline_seconds: Optional[float] = None,
+          known_markets: Optional[Dict[str, str]] = None) -> Dict[str, Dict[str, Any]]:
     """批次抓奇摩報價；回 {代號: 報價}。冷卻中、市場別不明、超過時限的股票不回傳（呼叫端用 MIS 補）。"""
-    if not codes or not enabled() or tools.closed_quotes_only():
+    if not codes or not enabled() or not tools.stock_live_quotes():
         return {}
     try:
         markets = local_market_cache.stock_markets(codes)
     except Exception:
         markets = {}
+    for code, market in (known_markets or {}).items():
+        markets.setdefault(code, local_market_cache.normalize_market(market))
     symbols = {f"{c}.{'TW' if markets.get(c) == 'twse' else 'TWO'}": c
                for c in codes if markets.get(c) in ("twse", "tpex")}
     today = tools.taipei_now().strftime("%Y-%m-%d")
@@ -117,6 +150,10 @@ def fetch(codes: List[str], deadline_seconds: Optional[float] = None) -> Dict[st
                 break
             batch = names[start:start + BATCH]
             calls += 1
+            gap = _LAST_CALL[0] + GAP_SECONDS - time.monotonic()      # 單檔連續查時也要間隔，不要連打
+            if gap > 0:
+                time.sleep(gap)
+            _LAST_CALL[0] = time.monotonic()
             try:
                 resp = requests.get(URL + urllib.parse.quote(",".join(batch)), headers=HEADERS,
                                     timeout=TIMEOUT_SECONDS)
@@ -129,14 +166,13 @@ def fetch(codes: List[str], deadline_seconds: Optional[float] = None) -> Dict[st
                     quote = parse(item, today) if code else None
                     if quote:
                         out[code] = quote
+                        _QUOTES[code] = (time.monotonic(), quote)
             except Exception as exc:
                 errors += 1
                 print(f"⚠️ Yahoo 成員報價批次失敗｜{len(batch)} 檔｜{tools.err_text(exc)}", flush=True)
                 if errors >= MAX_ERRORS:
                     _cool_down(f"連續 {errors} 批失敗")
                     break
-            if start + BATCH < len(names):
-                time.sleep(GAP_SECONDS)
     ages = source_ages(out, tools.taipei_now().timestamp())
     age_text = (f"｜來源成交時間 中位 {ages[len(ages) // 2]:.0f}s、超過 180s {sum(a > 180 for a in ages)} 檔" if ages else "")
     print(f"📡 Yahoo 成員報價｜requested={len(codes)}｜returned={len(out)}｜市場別不明={len(codes) - len(symbols)}"

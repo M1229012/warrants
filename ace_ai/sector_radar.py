@@ -118,7 +118,7 @@ def mis_get(session, params: Dict[str, Any]) -> Dict[str, Any]:
 
 def fetch_sector_quotes() -> Dict[str, Any]:
     """證交所 MIS 即時類股指數：一次請求拿完，回傳 {rows, benchmarks, time}。"""
-    if tools.closed_quotes_only():
+    if not tools.stock_live_quotes():
         return {"rows": [], "benchmarks": {}, "time": ""}
     channels = "|".join(MIS_CHANNELS + ["tse_t00.tw", "otc_o00.tw"])
     try:
@@ -193,7 +193,7 @@ def _minutes(now=None) -> int:
 
 def session_open(now=None) -> bool:
     now = now or _now()
-    return not tools.closed_quotes_only() and now.weekday() < 5 and 9 * 60 <= _minutes(now) <= 13 * 60 + 35
+    return tools.stock_live_quotes() and now.weekday() < 5 and 9 * 60 <= _minutes(now) <= 13 * 60 + 35
 
 
 def ready_for_query(now=None) -> bool:
@@ -222,7 +222,7 @@ def tick(force: bool = False) -> Dict[str, Any]:
 
 
 def _tick(force: bool) -> Dict[str, Any]:
-    if tools.closed_quotes_only():
+    if not tools.stock_live_quotes():
         return {"saved": False, "reason": "即時行情已停用"}
     now = _now()
     if not force and not session_open(now):
@@ -337,7 +337,7 @@ def _baseline(snaps: List[Dict[str, Any]], latest_minutes: int) -> Tuple[Optiona
 
 def deltas(now=None) -> Dict[str, Any]:
     """L1 主結果：每個類股的現在漲幅、基準漲幅、Δ30m、名次與分位數。"""
-    if tools.closed_quotes_only():
+    if not tools.stock_live_quotes():
         return {"available": False, "reason": "即時行情已停用", "phase": phase(now)}
     now = now or _now()
     day = now.strftime("%Y-%m-%d")
@@ -588,7 +588,7 @@ def _fetch_batch_scoped(request_id: str, codes: List[str]) -> Dict[str, Dict[str
 
 
 def _fetch_batch(session, codes: List[str]) -> Dict[str, Dict[str, Any]]:
-    if tools.closed_quotes_only():
+    if not tools.stock_live_quotes():
         return {}
     session = session or _thread_session()               # 並行時傳 None，各執行緒用自己的 session
     try:
@@ -672,7 +672,7 @@ def _fetch_batch(session, codes: List[str]) -> Dict[str, Dict[str, Any]]:
 def _fetch_stock_quotes(codes: List[str], deadline_seconds: Optional[float] = None) -> Dict[str, Dict[str, Any]]:
     """批次報價＋完整率驗證：缺的用小批重試一次，仍缺就記下來（不猜、不補）。
     deadline_seconds：整次時限（預設 MEMBER_DEADLINE）；背景取樣不趕時間，可以給長一點，一次抓齊。"""
-    if tools.closed_quotes_only():
+    if not tools.stock_live_quotes():
         return {}
     try:
         session = tools.core().get_thread_session()
@@ -733,7 +733,7 @@ def _fetch_stock_quotes(codes: List[str], deadline_seconds: Optional[float] = No
 
 def _quotes_for(codes: List[str]) -> Dict[str, Dict[str, Any]]:
     """同一個 5 分鐘桶內共用報價（背景 tick 與查詢都走這裡）；只補抓還沒有的代號。"""
-    if tools.closed_quotes_only():
+    if not tools.stock_live_quotes():
         return {}
     bucket = _quote_bucket()
     with _QUOTE_LOCK:                                    # 同時查詢時等同一份結果（single-flight）
@@ -1197,7 +1197,7 @@ def answer(direction: str = "both", scope: str = "all", now=None, view: str = "a
     主要族群的強勢區剔除集中拉抬（另列「集中型異動」）；小型族群不剔除，直接標出來。
     direction 目前只保留介面。
     """
-    if tools.closed_quotes_only():
+    if not tools.stock_live_quotes():
         return {"text": "即時族群雷達已停用；可改查最近收盤資料的族群排行。", "panels": [], "title": "族群雷達"}
     # v1.4：初期只看大族群（≥20 檔），「小型／主要族群雷達」都回同一份；問小型／主要時文字先講清楚
     notice = "目前族群雷達暫以官方成分股 ≥20 檔的大族群為主。" if scope in ("small", "main") else ""

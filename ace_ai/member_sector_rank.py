@@ -21,12 +21,15 @@ v3 圖卡（10-25）：百分比一律用 %、說明與門檻只寫 Log、鎖漲
 """
 from __future__ import annotations
 
+import contextvars
 import json
 import re
 import statistics
 import threading
 import time
 from collections import Counter
+from concurrent.futures import Future
+from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -223,7 +226,7 @@ def pool_meta() -> Dict[str, Any]:
 # 報價
 # ============================================================
 
-# 10-24：族群排行開放會員看即時（只限這個功能；個股查詢仍照 closed_quotes_only 規則）。
+# 10-24：族群排行開放會員看即時（11-02 起個股今天那一根也開放，見 tools.stock_live_quotes）。
 # 報價走 member_sector_tape 每 60 秒一張的快照。設 0 退回「會員只看收盤」。
 MEMBER_LIVE = str(__import__("os").getenv("DISCORD_AI_MEMBER_RANK_LIVE", "1")).strip().lower() not in ("0", "false", "no", "off")
 CLOSE_MINUTE = 13 * 60 + 30
@@ -1312,6 +1315,52 @@ def _single_group(data: Optional[Dict[str, Any]], name: str) -> Optional[Dict[st
     return dict(data, rows=[row], single=True, market_rank=f"{row['rank']}/{len(rows)}", unranked=[], hidden_small=[])
 
 
+# 11-02 使用者：第一次問時報價加新聞要 30～40 秒，AI 常來不及寫。改成排行先出圖，新聞和 AI 在背景做完再更新原圖。
+# 只有主程式開了 late_ai_scope（能編輯原訊息）才這樣走；其他呼叫照舊同步寫完。
+_LATE_AI: contextvars.ContextVar = contextvars.ContextVar("member_rank_late_ai", default=None)
+AI_PENDING_NOTE = "AI 解讀撰寫中，完成後會更新這張圖。"
+LATE_AI_SECONDS = 120.0           # 背景抓新聞加寫 AI 的時限
+
+
+@contextmanager
+def late_ai_scope():
+    """範圍內的 answer() 不等 AI：holder 會拿到 future（完成時給 {card, used}）和 base_panels（沒有撰寫中提示的圖卡）。"""
+    holder: Dict[str, Any] = {}
+    token = _LATE_AI.set(holder)
+    try:
+        yield holder
+    finally:
+        _LATE_AI.reset(token)
+
+
+def _start_late_insight(data: Dict[str, Any], question: str, gateway, validate, names: Dict[str, str],
+                        parent: str, follow: Optional[Dict[str, Any]]) -> Future:
+    future: Future = Future()
+
+    def run() -> None:
+        import request_runtime
+        card, used = None, {}
+        try:
+            # 背景有自己的時限，不再受原本「整題 50 秒」限制
+            with request_runtime.scope(request_runtime.new_state(LATE_AI_SECONDS)):
+                card, used = insight_card(data, question, gateway, validate, names, parent=parent, follow=follow)
+        except Exception as exc:
+            used = {"dropped": f"AI 解讀失敗（{tools.err_text(exc)}）"}
+        if not card:
+            print(f"📝 族群 AI 解讀未顯示｜{used.get('dropped') or 'AI 解讀暫時無法使用'}", flush=True)
+        future.set_result({"card": card, "used": used})
+
+    context = contextvars.copy_context()     # 帶著這題的報價政策、問句範圍進背景
+    threading.Thread(target=context.run, args=(run,), name="ace-sector-ai", daemon=True).start()
+    return future
+
+
+def card_lines(card: Dict[str, Any]) -> List[str]:
+    """AI 解讀卡寫回文字版（給 Log 與 --ask）。"""
+    return ["", card["answer"], card["why"]] + [f"{s['title']}：{s['text']}" for s in card["scenarios"]] \
+        + ([f"觀察重點：{card['summary']}"] if card["summary"] else [])
+
+
 def answer(question: str = "", gateway=None, validate=None, only: Optional[List[str]] = None,
            title: str = "", single: bool = False) -> Optional[Dict[str, Any]]:
     """「哪個族群最強／最弱（為什麼）」：TOP5 排行卡；問原因時再加新聞解讀卡。資料不足回 None。
@@ -1390,15 +1439,21 @@ def answer(question: str = "", gateway=None, validate=None, only: Optional[List[
     if gateway is not None:
         # 10-28：族群問題一律附 AI 解讀（結論、漲勢結構／量能／位置、最新利多利空新聞、觀察重點），不只列排行
         follow_ai = _follow_for_ai(data, names, follow_card) if intent.get("wants_follow") and not weak else None
-        card, used = insight_card(data, question, gateway, validate, names, parent=title if only else "", follow=follow_ai)
-        usage = {k: usage[k] + int(used.get(k, 0)) for k in usage}
+        late = _LATE_AI.get()
         calls += 1
+        if late is not None:
+            late.update(future=_start_late_insight(data, question, gateway, validate, names, title if only else "", follow_ai),
+                        base_panels=list(panels))
+            first = panels[0]["sector_groups"]
+            panels[0] = {"sector_groups": dict(first, banner="．".join(x for x in (first.get("banner"), AI_PENDING_NOTE) if x))}
+            card, used = None, {}
+        else:
+            card, used = insight_card(data, question, gateway, validate, names, parent=title if only else "", follow=follow_ai)
+            usage = {k: usage[k] + int(used.get(k, 0)) for k in usage}
         if card:
             panels.append({"ai_card": card})
-            lines += ["", card["answer"], card["why"]] \
-                + [f"{s['title']}：{s['text']}" for s in card["scenarios"]] \
-                + ([f"觀察重點：{card['summary']}"] if card["summary"] else [])
-        else:
+            lines += card_lines(card)
+        elif late is None:
             reason = str(used.get("dropped") or "AI 解讀暫時無法使用")
             lines.append(f"{reason}，這次不顯示 AI 解讀，以上為程式計算的排行。")
             print(f"📝 族群 AI 解讀未顯示｜{reason}", flush=True)

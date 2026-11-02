@@ -833,7 +833,7 @@ def _position_label(df: pd.DataFrame, levels: List[Tuple[str, float]], support: 
 def live_group_ranking() -> Optional[Dict[str, Any]]:
     """盤中族群漲幅排行：自己用證交所即時報價算（有效成分股中位漲幅），不依賴 CMoney 排行表。
     報價走 sector_radar 5 分鐘共用快取；背景 tick 會先暖好，會員查詢通常直接讀快取。"""
-    if tools.closed_quotes_only():
+    if not tools.stock_live_quotes():
         return None
     if sector_match.MEMBER_ONLY:
         # 10-24：會員族群模式下由 member_sector_rank 抓同一批 MIS 報價（背景暖快取也走這裡）
@@ -1094,7 +1094,12 @@ OVERVIEW_TABLE_MAX = 10          # 表格只列成交額前 10 大；其他只�
 
 
 def _overview_rows(codes: List[str]) -> List[Dict[str, Any]]:
-    """族群總覽的每檔資料：只讀本地日K底庫（0 次 API）；大量區用與型態評分卡相同的演算法。"""
+    """族群總覽的每檔資料：歷史只讀本地日K底庫；今天那一根是奇摩報價，整批先抓一次。大量區用與型態評分卡相同的演算法。"""
+    try:
+        import yahoo_quotes
+        yahoo_quotes.prime(codes)
+    except Exception as exc:                     # 抓不到就是這題全用最近收盤
+        print(f"⚠️ 族群總覽：即時報價略過｜{tools.err_text(exc)}", flush=True)
     try:
         kf = tools.core()
     except Exception as exc:                     # 主程式載入失敗：只少大量區，其他照算
@@ -1112,18 +1117,20 @@ def _overview_rows(codes: List[str]) -> List[Dict[str, Any]]:
         try:
             with tools.local_only():
                 canonical = tools._load_price_bundle(code)
-            df = tools.closed_frame(canonical).copy()
+            closed = tools.closed_frame(canonical).copy()
+            # 11-02：有接今天那一根就用它算今日漲跌和目前位置；量和大量區仍只看已收盤的日子
+            df = canonical["df"] if canonical.get("intraday") else closed
             events = canonical.get("corporate_actions") or {"status": "unverified"}
         except Exception as exc:
             print(f"族群總覽 {code} 還原基準尚未可用：{tools.err_text(exc)}", flush=True)
             continue
         c, close = df["Close"], float(df["Close"].iloc[-1])
-        value = df["Close"] * df["Volume"]
+        value = closed["Close"] * closed["Volume"]
         hi60 = float(df["High"].iloc[-61:-1].max())
         ma20, ma60 = float(c.tail(20).mean()), float(c.tail(60).mean())
         cands = [("前高", hi60), ("月線", ma20), ("季線", ma60)]
         try:
-            stats = kf._calculate_weighted_volume_profile_stats(df.tail(70), n_bins=40)
+            stats = kf._calculate_weighted_volume_profile_stats(closed.tail(70), n_bins=40)
             for idx in (int(stats["max_idx"]), int(stats["second_idx"])):
                 lo_z, hi_z = float(stats["bins"][idx]), float(stats["bins"][idx + 1])
                 cands.append(("大量區", lo_z if lo_z > close else hi_z))
@@ -1144,17 +1151,29 @@ def _overview_rows(codes: List[str]) -> List[Dict[str, Any]]:
                      "vs_high_pct": round((close / hi60 - 1) * 100, 2), "new_high_60d": close >= hi60,
                      "above_ma20": close > ma20, "above_ma60": close > ma60, "shape": shape,
                      "resistance": resistance, "support": support,
-                     "data_date": pd.Timestamp(df.index[-1]).strftime("%m/%d"),
+                     "data_date": pd.Timestamp(df.index[-1]).strftime("%m/%d"), "live": canonical.get("intraday") or {},
                      "flags": [] if events.get("status") == "ok" else ["公司行動資料未核實"]})
     return rows
 
 
 # 11-02 使用者：AI 解讀列點一直換行、排版不整齊 → 族群總覽、大類型態都改成一段（和族群排行的解讀一致）
 _AI_PARAGRAPH_RULE = "why＝一段 2～3 句連貫的文字說明為什麼這樣判斷，不要分點、不要加項目符號、不要換行；沒有新增資訊就留空。"
-_AI_POSITION_RULE = "shape 是程式判斷的目前位置（均線、大量區、支撐壓力），照用；不可講三角、箱型、旗形等型態名稱。"
+_AI_POSITION_RULE = ("shape 是程式判斷的目前位置（均線、大量區、支撐壓力），照用；不可講三角、箱型、旗形等型態名稱。"
+                     "data_date 寫盤中或盤後暫定時，今天的價格和位置都是暫定、收盤前會變動：要講盤中，不可寫成收盤確認的突破或跌破。")
 _AI_PARAGRAPH_SCHEMA = {"type": "object", "properties": {
     "answer": {"type": "string"}, "why": {"type": "string"}, "watch": {"type": "string"}},
     "required": ["answer", "why", "watch"]}
+
+
+def _rows_stamp(rows: List[Dict[str, Any]]) -> str:
+    """這批資料的時點：有接今天那一根就寫盤中時間或盤後暫定，否則寫最近收盤日。"""
+    latest = max(r["data_date"] for r in rows)
+    live = [r["live"] for r in rows if r.get("live") and r["data_date"] == latest]
+    if not live:
+        return f"{latest} 收盤"
+    if any(v.get("is_live") for v in live):
+        return f"{latest} 盤中 {max(str(v.get('time') or '') for v in live)}"
+    return f"{latest} 盤後暫定"
 
 
 def _ai_paragraph_card(prompt: str, gateway, validate, check: Dict[str, Any], date: str, panels: List[Dict[str, Any]],
@@ -1178,7 +1197,7 @@ def _ai_paragraph_card(prompt: str, gateway, validate, check: Dict[str, Any], da
         return result, usage, False
     panels.append({"ai_card": {"answer": answer_text, "why": why, "why_title": "為什麼這樣看", "scenarios": [],
                                "summary": watch, "summary_label": "觀察重點",
-                               "footer": f"資料時間：{date} 收盤｜AI 解讀僅供參考，不構成投資建議。"}})
+                               "footer": f"資料時間：{date}｜AI 解讀僅供參考，不構成投資建議。"}})
     text += ["", answer_text] + ([why] if why else []) + ([f"觀察重點：{watch}"] if watch else [])
     return result, usage, True
 
@@ -1202,8 +1221,8 @@ def _overview_answer(request: Dict[str, Any], gateway, validate) -> Dict[str, An
     table = sorted(sorted(rows, key=lambda r: -r["value20"])[:OVERVIEW_TABLE_MAX], key=lambda r: -r["d5"])
     sig = lambda v: f"{v:+.2f}%"
     title = f"{data['name']}" + (f"（{request['alias']}）" if request.get("alias") else "")
-    date = rows[0]["data_date"]
-    card = {"branch": f"{title}｜族群總覽", "tags": [], "label": f"{date} 收盤", "sections": [
+    date = _rows_stamp(rows)
+    card = {"branch": f"{title}｜族群總覽", "tags": [], "label": date, "sections": [
         {"type": "stats", "items": [
             {"label": "今日中位漲跌", "value": sig(stats["d1_median"])},
             {"label": "近 5 日中位漲跌", "value": sig(stats["d5_median"])},
@@ -1216,7 +1235,7 @@ def _overview_answer(request: Dict[str, Any], gateway, validate) -> Dict[str, An
          "rows": [[r["code"] if r["name"] == r["code"] else f"{r['name']} {r['code']}", sig(r["d1"]), sig(r["d5"]), sig(r["d20"]), r["shape"]]
                   for r in table]}]}
     panels: List[Dict[str, Any]] = [{"branch_card": card, "hide_text": True}]
-    text = [f"**{title}｜族群總覽**（{date} 收盤）",
+    text = [f"**{title}｜族群總覽**（{date}）",
             f"近 5 日中位 {sig(stats['d5_median'])}｜上漲 {stats['up_5d']}/{n} 檔｜成交額 {stats['value5_vs_20']} 倍"]
     detail = [{k: r[k] for k in ("name", "code", "d1", "d5", "d20", "vs_high_pct", "new_high_60d", "above_ma20",
                                  "above_ma60", "shape", "resistance", "support")}
@@ -1284,14 +1303,14 @@ def _parent_pattern_answer(request: Dict[str, Any], gateway, validate) -> Dict[s
     intent = member_sector_rank.read_intent(question, gateway)
     weak = intent["direction"] == "weak"
     ordered = _pattern_order(rows, weak)
-    n, date = len(rows), rows[0]["data_date"]
+    n, date = len(rows), _rows_stamp(rows)
     tiers = [_shape_tier(r["shape"]) for r in rows]
     stats = {"members": n, "good_shape": tiers.count(2), "neutral_shape": tiers.count(1), "bad_shape": tiers.count(0),
              "above_ma20": sum(r["above_ma20"] for r in rows), "above_ma60": sum(r["above_ma60"] for r in rows),
              "d5_median": round(statistics.median(r["d5"] for r in rows), 2)}
     sig = lambda v: f"{v:+.2f}%"
     label = "型態較弱的股票" if weak else "型態較強的股票"
-    card = {"branch": f"{name}｜{label}", "tags": [], "label": f"{date} 收盤", "sections": [
+    card = {"branch": f"{name}｜{label}", "tags": [], "label": date, "sections": [
         {"type": "stats", "items": [
             {"label": "型態偏強", "value": f"{stats['good_shape']}／{n} 檔"},
             {"label": "型態中性", "value": f"{stats['neutral_shape']}／{n} 檔"},
@@ -1304,7 +1323,7 @@ def _parent_pattern_answer(request: Dict[str, Any], gateway, validate) -> Dict[s
          "rows": [[r["code"] if r["name"] == r["code"] else f"{r['name']} {r['code']}", sig(r["d1"]), sig(r["d5"]), sig(r["d20"]), r["shape"]]
                   for r in ordered[:PARENT_PATTERN_TABLE]]}]}
     panels: List[Dict[str, Any]] = [{"branch_card": card, "hide_text": True}]
-    text = [f"**{name}｜{label}**（{date} 收盤）"] + [f"{i}. {r['name']} {r['code']}｜{r['shape']}"
+    text = [f"**{name}｜{label}**（{date}）"] + [f"{i}. {r['name']} {r['code']}｜{r['shape']}"
                                                      for i, r in enumerate(ordered[:PARENT_PATTERN_TABLE], 1)]
     detail = [dict({k: r[k] for k in ("name", "code", "d1", "d5", "d20", "vs_high_pct", "above_ma20", "above_ma60", "shape",
                                       "resistance", "support")}, group=group_of.get(r["code"], ""),

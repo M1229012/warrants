@@ -6765,13 +6765,13 @@ class AceQueryEngine:
 
     def answer(self, question: str, context_key: str = "", on_queue: Optional[Callable[[int], None]] = None,
                is_admin: bool = False, admin_mode: bool = False, access=None, image=None) -> AnswerResult:
-        # /ask always stays closed, including requests from administrators.
+        # 11-02：所有題目都看即時（stock_live，來源奇摩、MIS）；富果只有 /ace 能用，/ask 維持不開（管理員也一樣）。
         allowed = bool(access.admin_mode) if access is not None else bool(is_admin and admin_mode)
         own_clock = getattr(_QUESTION_CLOCK, "state", None) is None
         if own_clock:       # 10-08：整題期限從收到問題就開始（排隊、解析、工具、AI、圖卡都在內）
             _QUESTION_CLOCK.state = __import__("request_runtime").state() or __import__("request_runtime").new_state(QUESTION_DEADLINE_SECONDS)
         try:
-            with __import__("request_runtime").scope(_QUESTION_CLOCK.state), stock_banter.question_scope(question), tools.quote_policy(admin_live=allowed):
+            with __import__("request_runtime").scope(_QUESTION_CLOCK.state), stock_banter.question_scope(question), tools.quote_policy(admin_live=allowed, stock_live=True):
                 return self._answer_with_quote_policy(question, context_key, on_queue,
                                                       is_admin, admin_mode, access, image)
         finally:
@@ -8680,18 +8680,30 @@ class AceQueryEngine:
 
         if request.get("mode") == "technical":
             request = dict(request, mode="overview")
-        if on_demand.enabled():
-            if request.get("mode") in ("market_momentum", "parent_rank", "parent_members", "group_today") \
-                    and sector_analysis.sector_match.MEMBER_ONLY:
+        member_only = sector_analysis.sector_match.MEMBER_ONLY
+        # 11-02：單純問名單只讀名單，不碰行情、不開盤中取樣；原本問名單會花 38 秒算全市場分數，沒算完還轉背景繼續算
+        if on_demand.enabled() and not (member_only and request.get("mode") in ("members", "parent_members", "catalog", "unsupported")):
+            if request.get("mode") in ("market_momentum", "parent_rank", "group_today") and member_only:
                 # 10-28：今日族群排行的股票池只抓前一交易日收盤表（member_sector_rank._ensure_prev_day），
                 # 不再觸發全市場日K補齊與型態分數重算（測試版關背景就是為了省這段）
                 pass
-            elif request.get("mode") in ("overview", "parent_pattern") and sector_analysis.sector_match.MEMBER_ONLY:
+            elif request.get("mode") in ("overview", "parent_pattern", "belongs") and member_only:
                 on_demand.base_ready(budget_seconds=10.0, log=self.log)      # 11-02：只要日K，不算分數（40 秒分數會吃光 50 秒的題目時限）
             else:
                 on_demand.market_ready(budget_seconds=40.0, log=self.log)   # 按需模式：族群排行用的底庫補到最新
             on_demand.wake_radar()
-        result = sector_analysis.answer(request, self.gateway, validate)
+        # 11-02：今日排行類先出圖，新聞和 AI 背景做完再更新原圖；今日 AI 次數用完就照舊（不寫 AI）
+        local = getattr(self, "_request_local", None)
+        import member_sector_rank
+        deferrable = (local is not None and member_only and getattr(_AI_GATE, "allowed", True)
+                      and request.get("mode") in ("market_momentum", "parent_rank", "group_today"))
+        with (member_sector_rank.late_ai_scope() if deferrable else contextlib.nullcontext({})) as late:
+            result = sector_analysis.answer(request, self.gateway, validate)
+        if late.get("future"):
+            _AI_GATE.used = True                 # 背景執行緒的 Gemini 不會記到這題，這裡先算一次
+            local.late_ai = dict(sector=True, future=late["future"], base_panels=late["base_panels"],
+                                 expires=time.monotonic() + 300, results=[], targets=[])
+            self.log("族群 AI 解讀改背景寫｜先出圖，完成後更新原圖｜最長再等300秒")
         if request.get("matched_by"):
             # 會員講別名（TGV、CCL…）或模糊比對：卡片說明列與文字都註明對應到哪個族群
             result["text"] = f"（{request['matched_by']}）\n" + str(result.get("text") or "")
@@ -9107,11 +9119,28 @@ class AceQueryEngine:
     def _bind_late_cache(self, result, key, eligible=True):
         job=result.late_ai
         access=self._access()
-        if job and eligible and not (access and access.simulation) and all(r.ok for r in job['results']) and not any(p.get('error') for p in result.panels or []):
+        if job and not job.get('sector') and eligible and not (access and access.simulation) and all(r.ok for r in job['results']) and not any(p.get('error') for p in result.panels or []):
             job['targets'].append((key,self.config.answer_cache_seconds))
+
+    def _finish_late_sector(self, original, raw):
+        """族群排行背景 AI 寫完：AI 有寫就加上解讀卡；沒寫成也要換圖，把「撰寫中」提示拿掉。今日行情會變，不存快取。"""
+        job=original.late_ai
+        import member_sector_rank
+        card,used=raw.get('card'),raw.get('used') or {}
+        panels=[dict(p) for p in job['base_panels']]
+        text=original.text
+        if card:
+            panels.append({'ai_card':card})
+            text='\n'.join([text]+member_sector_rank.card_lines(card))
+        return replace(original,text=text,panels=panels,late_ai=None,cacheable=False,
+            input_tokens=original.input_tokens+int(used.get('input_tokens',0)),
+            output_tokens=original.output_tokens+int(used.get('output_tokens',0)),
+            total_tokens=original.total_tokens+int(used.get('total_tokens',0)))
 
     def finish_late_ai(self, original, raw):
         job=original.late_ai
+        if job and job.get('sector'):
+            return self._finish_late_sector(original,raw) if time.monotonic()<job['expires'] else None
         if not job or not raw.ok or time.monotonic()>=job['expires']:
             return None
         with job['lock']:
