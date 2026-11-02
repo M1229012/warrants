@@ -3400,7 +3400,7 @@ CONTRIB_LIST_MAX = 10
 
 
 def contribution_card(draw, y: float, data: dict, dry: bool) -> int:
-    """單一市場指數貢獻：拉升榜／拖累榜（11-02 起各列前 10），直接顯示漲跌、權重與貢獻點數。"""
+    """單一市場指數貢獻：拉升榜／拖累榜（11-02 起各列前 10），直接顯示漲跌、股價（漲跌停紅綠底）與貢獻點數。"""
     top = _contrib_rows(data.get('top'), True)[:CONTRIB_LIST_MAX]
     bottom = _contrib_rows(data.get('bottom'), False)[:CONTRIB_LIST_MAX]
     lines = max(len(top), len(bottom), 1)
@@ -3417,9 +3417,14 @@ def contribution_card(draw, y: float, data: dict, dry: bool) -> int:
     points = _finite(data.get('index_points'))
     title = f"{data.get('index_name', '')}"
     text_at(draw, (ix + 16, y + 26), title, 26, INK, True)
+    tx = ix + 16 + font(26, True).getlength(title) + 14
+    color = UP_TEXT if (points or 0) > 0 else DOWN_TEXT if (points or 0) < 0 else MUTED
+    index_now = _finite(data.get('index_now'))
+    if index_now is not None:
+        now_text = f'{index_now:,.2f}'
+        draw.text((tx, y + 44), now_text, font=font(30, True), fill=color, anchor='lm')
+        tx += font(30, True).getlength(now_text) + 18
     if points is not None:
-        color = UP_TEXT if points > 0 else DOWN_TEXT if points < 0 else MUTED
-        tx = ix + 16 + font(26, True).getlength(title) + 14
         draw.text((tx, y + 44), f'{points:+.2f} 點', font=font(30, True), fill=color, anchor='lm')
 
     note = str(data.get('basis') or '')
@@ -3455,7 +3460,7 @@ def contribution_card(draw, y: float, data: dict, dry: bool) -> int:
         draw.text((cx + 12, table_y + CONTRIB_HEAD_H / 2), label, font=font(19, True), fill=color, anchor='lm')
         # 右側欄名，讓會員知道不是單純漲跌幅排行。
         draw.text((cx + half - 205, table_y + CONTRIB_HEAD_H / 2), '漲跌', font=font(15), fill=MUTED, anchor='rm')
-        draw.text((cx + half - 112, table_y + CONTRIB_HEAD_H / 2), '權重', font=font(15), fill=MUTED, anchor='rm')
+        draw.text((cx + half - 112, table_y + CONTRIB_HEAD_H / 2), '股價', font=font(15), fill=MUTED, anchor='rm')
         draw.text((cx + half - 10, table_y + CONTRIB_HEAD_H / 2), '貢獻點數', font=font(15), fill=MUTED, anchor='rm')
 
         ry = table_y + CONTRIB_HEAD_H
@@ -3468,9 +3473,17 @@ def contribution_card(draw, y: float, data: dict, dry: bool) -> int:
             if change is not None:
                 draw.text((cx + half - 205, mid), f'{change:+.2f}%', font=font(17),
                           fill=UP if change > 0 else DOWN if change < 0 else MUTED, anchor='rm')
-            weight = _finite(item.get('weight_pct'))
-            if weight is not None:
-                draw.text((cx + half - 112, mid), f'{weight:.2f}%', font=font(17), fill=MUTED, anchor='rm')
+            price = _finite(item.get('close'))
+            if price is not None:
+                price_label = price_text(price)
+                badge = _GR3_BADGE.get(str(item.get('limit_state') or ''))
+                if badge:                                # 漲跌停：和族群排行同一種紅底／綠底白字
+                    pw = font(17, True).getlength(price_label)
+                    draw.rounded_rectangle((cx + half - 112 - pw - GR_BADGE_PAD, mid - 14, cx + half - 112 + GR_BADGE_PAD, mid + 14),
+                                           radius=8, fill=badge)
+                    draw.text((cx + half - 112, mid), price_label, font=font(17, True), fill='white', anchor='rm')
+                else:
+                    draw.text((cx + half - 112, mid), price_label, font=font(17), fill=INK, anchor='rm')
             value = _finite(item.get('points')) or 0.0
             draw.text((cx + half - 10, mid), f'{value:+.2f}', font=font(21, True), fill=color, anchor='rm')
             draw.line((cx, ry + CONTRIB_ROW_H, cx + half, ry + CONTRIB_ROW_H), fill=LINE)

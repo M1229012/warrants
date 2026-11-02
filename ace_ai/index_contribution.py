@@ -613,7 +613,8 @@ def _live_stock_quotes(market: str, codes: List[str], deadline: float) -> Tuple[
     quotes: Dict[str, Dict[str, Any]] = {}
     try:
         import yahoo_quotes
-        quotes = {c: {"close": q["price"], "prev_close": q.get("prev"), "source": "奇摩"}
+        quotes = {c: {"close": q["price"], "prev_close": q.get("prev"), "source": "奇摩",
+                      "limit_up": q.get("limit_up"), "limit_down": q.get("limit_down")}
                   for c, q in yahoo_quotes.fresh_quotes(codes).items()}
     except Exception as exc:
         print(f"⚠️ {INDEX_OF[market][1]} 奇摩批次報價略過｜{tools.err_text(exc)}", flush=True)
@@ -621,6 +622,18 @@ def _live_stock_quotes(market: str, codes: List[str], deadline: float) -> Tuple[
         return quotes, {}
     mis, benchmark = _fetch_mis_batch(market, codes, deadline)
     return {code: dict(item, source="TWSE-MIS") for code, item in mis.items()}, benchmark
+
+
+def _limit_state(row: Dict[str, Any]) -> str:
+    """現價在漲跌停價上：limit_up／limit_down，其餘空字串。
+    來源有漲跌停價（奇摩）就用來源的；沒有（官方收盤檔、MIS）用參考價 ±10% 依升降單位算。"""
+    close, reference = float(row.get("close") or 0.0), float(row.get("prev_close") or 0.0)
+    if close <= 0 or reference <= 0:
+        return ""
+    down, up = float(row.get("limit_down") or 0.0), float(row.get("limit_up") or 0.0)
+    if down <= 0 or up <= 0:
+        down, up = tools.limit_prices(reference)
+    return "limit_up" if close >= up - 0.005 else "limit_down" if close <= down + 0.005 else ""
 
 
 def _fugle_fallback(rows: List[Dict[str, Any]], market: str, deadline: float) -> int:
@@ -921,6 +934,7 @@ def contribution(market: str, live: bool, top: int = 5, *, deadline: Optional[fl
                     total_prev_value += new_value - row["prev_value"]
                     row["prev_close"], row["prev_value"] = float(source_prev), new_value
                 row["close"] = float(current)
+                row["limit_up"], row["limit_down"] = tools._num(item.get("limit_up")), tools._num(item.get("limit_down"))
                 row["price_change"] = float(current) - row["prev_close"]
                 row["change_pct"] = row["price_change"] / row["prev_close"] * 100.0
                 row["live_quote"] = True
@@ -971,7 +985,9 @@ def contribution(market: str, live: bool, top: int = 5, *, deadline: Optional[fl
     negatives = sorted((r for r in evaluated if r["points"] < 0), key=lambda r: r["points"])
     top_rows = positives[:top]
     bottom_rows = negatives[:top]
-    keep = ("stock_code", "stock_name", "points", "change_pct", "close", "weight_pct")
+    for row in top_rows + bottom_rows:
+        row["limit_state"] = _limit_state(row)
+    keep = ("stock_code", "stock_name", "points", "change_pct", "close", "weight_pct", "limit_state")
 
     positive_total = sum(r["points"] for r in positives)
     negative_total = abs(sum(r["points"] for r in negatives))
