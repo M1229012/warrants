@@ -6865,6 +6865,16 @@ def _breadth_verdict(data: Dict[str, Any]) -> str:
     return f"權值股和{label}表現接近（差距 {gap:+.2f} 個百分點），盤面沒有明顯偏食"
 
 
+def _heavyweight_quotes(codes: List[str]) -> Dict[str, Dict[str, Any]]:
+    try:
+        import yahoo_quotes
+        yahoo_quotes.prime(codes, HEAVYWEIGHT_BUDGET_SECONDS)
+        return yahoo_quotes.fresh_quotes(codes)
+    except Exception as exc:
+        print(f"⚠️ 盤面廣度：權值股批次報價失敗，改逐檔｜{err_text(exc)}", flush=True)
+        return {}
+
+
 def get_market_breadth() -> Dict[str, Any]:
     """盤面廣度：權值股 vs 其他股票，用來回答「是不是只有權值股在動」。
 
@@ -6896,14 +6906,21 @@ def get_market_breadth() -> Dict[str, Any]:
                     sectors.append({"name": label, "change_pct": row["change_pct"]})
         except Exception as exc:
             print(f"⚠️ 盤面廣度取指數失敗：{err_text(exc)}", flush=True)
-        # 權值股走富果（MIS 的個股報價要 session、又會限流，抓不穩）；只取前幾檔，並沿用既有快取。
+        # 11-02 Log：逐檔載入整份個股資料，6 秒只拿到 1 檔。改成奇摩一個請求整批抓，奇摩沒回的才逐檔補。
         heavy: List[Dict[str, Any]] = []
+        heavy_codes = HEAVYWEIGHT_CODES[:HEAVYWEIGHT_LIMIT]
+        quotes = _heavyweight_quotes(heavy_codes)
         deadline = time.monotonic() + HEAVYWEIGHT_BUDGET_SECONDS
-        for code in HEAVYWEIGHT_CODES[:HEAVYWEIGHT_LIMIT]:
-            if time.monotonic() >= deadline:
-                print(f"⚠️ 盤面廣度：權值股報價已達 {HEAVYWEIGHT_BUDGET_SECONDS:.0f} 秒上限，"
-                      f"改用已取得的 {len(heavy)} 檔", flush=True)
-                break
+        out_of_time = False
+        for code in heavy_codes:
+            quote = quotes.get(code)
+            if quote:
+                heavy.append({"name": quote.get("name") or code, "code": code,
+                              "change_pct": round(float(quote["change_pct"]), 2), "close": _num(quote.get("price"))})
+                continue
+            if out_of_time or time.monotonic() >= deadline:
+                out_of_time = True
+                continue
             try:
                 overview = get_stock_overview(code)
             except Exception:
@@ -6913,6 +6930,9 @@ def get_market_breadth() -> Dict[str, Any]:
                 continue
             heavy.append({"name": overview.get("stock_name") or code, "code": code,
                           "change_pct": round(pct, 2), "close": _num(overview.get("close"))})
+        if out_of_time:
+            print(f"⚠️ 盤面廣度：權值股報價已達 {HEAVYWEIGHT_BUDGET_SECONDS:.0f} 秒上限，"
+                  f"改用已取得的 {len(heavy)} 檔", flush=True)
         if heavy or benchmarks:
             heavy_values = sorted(r["change_pct"] for r in heavy)
             heavy_sorted = sorted(heavy, key=lambda r: -r["change_pct"])

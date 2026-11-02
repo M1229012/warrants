@@ -4712,7 +4712,9 @@ def render_answer(question: str, answer: str, panels: list[dict] | None = None,
         footer = custom or footer
     elif contribution_panels:
         live = any(str((p.get('contribution') or {}).get('basis') or '').startswith('盤中') for p in contribution_panels)
+        pending = any((p.get('contribution') or {}).get('pending_official_close') for p in contribution_panels)
         footer = ('股市艾斯  /  指數貢獻為盤中估算，收盤前會變動' if live
+                  else '股市艾斯  /  指數貢獻為收盤暫定估算，官方收盤檔發布後會更新' if pending
                   else '股市艾斯  /  指數貢獻依收盤資料計算')
     else:
         footer = price_footer(panels) if panels else '股市艾斯  /  AI 資料整理'

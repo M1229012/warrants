@@ -111,6 +111,11 @@ def prime(codes: List[str], deadline_seconds: Optional[float] = None) -> None:
         fetch(missing, deadline_seconds)
 
 
+def fresh_quotes(codes: List[str]) -> Dict[str, Dict[str, Any]]:
+    """一分鐘內抓過的報價（prime 之後取用）；沒有的代號不回傳。"""
+    return {c: q for c, q in ((c, _fresh(c, QUOTE_MAX_AGE)) for c in codes) if q}
+
+
 def stock_quote(code: str, market: str = "") -> Dict[str, Any]:
     """單一檔的今天報價（只有今天這一根）。族群排行每分鐘的快照也會存進來，有新的就不再打奇摩；
     族群快照正在抓就等它抓完再看，減少被擋的機會。抓不到回空 dict。"""

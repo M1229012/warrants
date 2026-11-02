@@ -57,9 +57,13 @@ LIVE_TOP_TWSE = max(3, tools._env_int("DISCORD_AI_CONTRIB_LIVE_TWSE", 12))
 LIVE_TOP_TPEX = max(3, tools._env_int("DISCORD_AI_CONTRIB_LIVE_TPEX", 6))
 
 # 盤中批次抓取：總時間預算是「加權＋櫃買合計」，避免網路慢時 Discord 逾時。
-# 收盤後、官方收盤檔尚未發布（約 13:30～15:00）時要不要給估算榜。
-# 預設關閉：只計市值前段的榜無法和交易所／CMoney 對帳，寧可請使用者稍後再查。
-PENDING_CLOSE_ESTIMATE = bool(tools._env_int("DISCORD_AI_CONTRIB_PENDING_ESTIMATE", 0))
+# 收盤後、官方收盤檔尚未發布時要不要給估算榜（只計市值前段，標「收盤暫定」）。
+# 11-02 使用者：正式資料出來前都看即時，預設打開；官方檔更新後自動換正式榜。設 0 退回「請稍後再查」。
+PENDING_CLOSE_ESTIMATE = bool(tools._env_int("DISCORD_AI_CONTRIB_PENDING_ESTIMATE", 1))
+
+
+class OfficialClosePending(tools.ToolDataError):
+    """指數已到今天，但全市場官方收盤檔還停在前一個交易日。"""
 LIVE_BUDGET_SECONDS = max(3.0, tools._env_float("DISCORD_AI_CONTRIB_BUDGET", 9.0))
 LIVE_BATCH_SIZE = max(20, tools._env_int("DISCORD_AI_CONTRIB_BATCH_SIZE", 70))
 LIVE_MAX_TWSE = max(LIVE_BATCH_SIZE, tools._env_int("DISCORD_AI_CONTRIB_MAX_TWSE", 350))
@@ -696,9 +700,9 @@ def contribution(market: str, live: bool, top: int = 5, *, deadline: Optional[fl
         if not data_date:
             data_date = index_date
         if data_date and index_date and data_date != index_date:
-            raise tools.ToolDataError(
+            raise OfficialClosePending(
                 f"{index_name} 最新交易日為 {index_date}，但全市場收盤資料只到 {data_date}；"
-                f"今日收盤檔通常 15:00 後才發布，稍後再查才會是今天的貢獻榜"
+                f"今日官方收盤檔還沒發布，稍後再查才會是今天的貢獻榜"
             )
 
         # 官方快照至少應覆蓋數百檔；太小視為端點尚未完整更新。
@@ -799,7 +803,7 @@ def contribution(market: str, live: bool, top: int = 5, *, deadline: Optional[fl
             raise tools.ToolDataError(f"{index_name} 有 {len(unpriced)} 檔成分股查無任何價格，無法正確換算貢獻點數")
         if close_cap_coverage < 95.0:
             raise tools.ToolDataError(f"{index_name} 今天取得收盤價的成分股只占市值 {close_cap_coverage:.1f}%，"
-                                      f"資料不足以計算貢獻榜；今日收盤檔通常 15:00 後才發布")
+                                      f"資料不足以計算貢獻榜；今日官方收盤檔還沒發布")
         factor = float(now_index) / current_total_value
         weight_base = current_total_value
         live_used = 0
@@ -986,7 +990,7 @@ def contribution(market: str, live: bool, top: int = 5, *, deadline: Optional[fl
         if len(rows) < max(50, int(len(codes) * 0.7)):
             raise tools.ToolDataError(
                 f"{index_name} 今天只取得 {len(rows)}/{len(codes)} 檔收盤價，資料不足以計算貢獻榜；"
-                f"今日收盤檔通常 15:00 後才發布"
+                f"今日官方收盤檔還沒發布"
             )
         # 防呆：如果個股分解與官方指數相差到離譜，不回傳一張看起來很正式的錯圖。
         # 正常仍可能因停牌保留市值/成分異動/基值事件有小幅殘差，所以只擋極端異常。
@@ -1039,6 +1043,16 @@ def report(live: Optional[bool] = None, top: int = 5) -> Dict[str, Any]:
     out: Dict[str, Any] = {"basis": "盤中估算" if live else "收盤精算", "markets": []}
     overall_deadline = time.monotonic() + LIVE_BUDGET_SECONDS if live else None
     markets_order = ("twse", "tpex")
+    can_estimate = tools.stock_live_quotes() and not live and PENDING_CLOSE_ESTIMATE
+    official_pending = False
+
+    def pending_estimate(market: str) -> Dict[str, Any]:
+        row = contribution(market, live=True, top=top, deadline=time.monotonic() + LIVE_BUDGET_SECONDS)
+        row["basis"] = "收盤暫定・僅計市值前段"
+        row["pending_official_close"] = True
+        print(f"ℹ️ {INDEX_OF[market][1]} 官方收盤檔未發布，改用即時報價估算今天的貢獻", flush=True)
+        return row
+
     for idx, market in enumerate(markets_order):
         # 平分「剩餘」時間，保證加權不會把整個 budget 吃光而讓櫃買沒有即時榜單。
         if live and overall_deadline is not None:
@@ -1049,18 +1063,16 @@ def report(live: Optional[bool] = None, top: int = 5) -> Dict[str, Any]:
         else:
             market_deadline = None
         try:
-            out["markets"].append(contribution(market, live=bool(live), top=top, deadline=market_deadline))
+            # 11-02 Log：加權已確認官方檔沒更新，櫃買還下載 40 秒才發現一樣不能用，AI 就沒時間寫了 → 直接估算
+            out["markets"].append(pending_estimate(market) if official_pending
+                                  else contribution(market, live=bool(live), top=top, deadline=market_deadline))
         except Exception as exc:
             # 已收盤、但交易所當天的全市場收盤檔還沒發布時，改用即時報價估算今天的貢獻，
             # 而不是回頭拿前一個交易日的榜（那會變成昨天的答案）。
-            if tools.stock_live_quotes() and not live and PENDING_CLOSE_ESTIMATE:
+            if can_estimate and not official_pending:
+                official_pending = isinstance(exc, OfficialClosePending)
                 try:
-                    row = contribution(market, live=True, top=top,
-                                       deadline=time.monotonic() + LIVE_BUDGET_SECONDS)
-                    row["basis"] = "收盤暫定・僅計市值前段"
-                    row["pending_official_close"] = True
-                    out["markets"].append(row)
-                    print(f"ℹ️ {INDEX_OF[market][1]} 官方收盤檔未發布，改用即時報價估算今天的貢獻", flush=True)
+                    out["markets"].append(pending_estimate(market))
                     continue
                 except Exception as retry_exc:
                     exc = retry_exc
@@ -1069,6 +1081,8 @@ def report(live: Optional[bool] = None, top: int = 5) -> Dict[str, Any]:
     if not out["markets"]:
         # 把真正的原因帶給使用者（多半是「今天的收盤檔還沒發布」），不要只說算不出來。
         raise tools.ToolDataError(reasons[0] if reasons else "目前無法計算指數貢獻點數")
+    if any(m.get("pending_official_close") for m in out["markets"]):
+        out["basis"] = "收盤暫定・僅計市值前段"
 
     twse = next((m for m in out["markets"] if m.get("market") == "twse"), None)
     tpex = next((m for m in out["markets"] if m.get("market") == "tpex"), None)
@@ -1089,6 +1103,6 @@ def report(live: Optional[bool] = None, top: int = 5) -> Dict[str, Any]:
         "依交易所發行量加權公式計算：收盤後直接讀 TWSE / TPEx 官方全市場收盤快照的收盤價與漲跌價差，"
         "再以官方收盤指數與完整成分母體總發行市值換算每檔貢獻點數；"
         "櫃買優先使用官方公開成分股名冊，TAIEX 依官方編製要點與免費公開資料建立母體。"
-        "此版本停用即時行情；官方收盤資料未發布時不以即時報價估算。"
+        "官方收盤資料未發布前，改用即時報價估算市值前段成分股，並標示收盤暫定。"
     )
     return out
