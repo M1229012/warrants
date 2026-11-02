@@ -8,6 +8,7 @@
 3. 相對強度＝族群等權平均 − 追蹤股票池基準（名單去重、每檔一次的等權平均，只用有效報價）。
 4. 可排名：有效報價 ≥ 3 檔，且有效報價 ÷ 通過流動性檔數 ≥ 80%；3～4 檔附註小樣本。
    10-30：大榜有足夠的正常族群時，小樣本不進 TOP，圖卡註明原名次；單一族群、大類查詢照常列出。
+   名單標記 large_cap 的族群（目前只有晶圓代工）檔數少但都是超大型股，不算小樣本。
 5. 依排序值（平均、中位數取不利者）排序；同家族只在顯示時取一個，向後遞補；合格不足三個就只顯示實際數量。
 6. 標籤依序判定：強勢 → 漲勢不均 → 一般上漲 → 抗跌 → 偏弱 → 持平。
 7. 試行族群：另算「只用 confirmed」版本（同一批報價、同一份名單、同一個基準）寫進 Log，樣本不足就標樣本不足。
@@ -71,6 +72,7 @@ def universe() -> List[str]:
 
 POOL_STATE_KEY = "member_rank_pool_v2"   # 10-28：v1 曾把「只有 7 檔有前一日 K」的不完整名單存成當日名單
 POOL_STALE_RETRY = 600.0          # 日 K 底庫還沒到最新交易日時，名單 10 分鐘後重算（不寫入持久化）
+LIGHT_LOOKBACK_WEEKDAYS = 7       # 日曆沒涵蓋時最多往回找幾個平日（要跨得過春節這類連假）
 
 
 def _light_pool() -> bool:
@@ -97,6 +99,8 @@ def _prev_day_complete(prev_day: str) -> bool:
 
 def _ensure_prev_day(prev_day: str) -> bool:
     """前一交易日收盤表不完整時，抓證交所＋櫃買各一次（market_data.sync_day）；回傳抓完後是否完整。"""
+    if not prev_day:
+        return False
     if _prev_day_complete(prev_day):
         return True
     try:
@@ -108,12 +112,40 @@ def _ensure_prev_day(prev_day: str) -> bool:
     return _prev_day_complete(prev_day)
 
 
+def _prev_weekday(day: str) -> str:
+    """day 的前一個平日（週一回上週五）。只跳過週末；國定假日要靠官方日曆或收盤表判斷。"""
+    import pandas as pd
+    current = pd.Timestamp(day) - pd.Timedelta(days=1)
+    while current.weekday() >= 5:
+        current -= pd.Timedelta(days=1)
+    return current.strftime("%Y-%m-%d")
+
+
+def _latest_closed_table(day: str) -> str:
+    """11-02：日曆沒涵蓋時（背景同步關閉，日曆只有查個股才更新），從前一個平日往回找第一張完整收盤表。
+    確認全市場休市才繼續往回；來源失敗就回空字串，不能把更早的日子當成前一交易日。"""
+    candidate = day
+    try:
+        for _ in range(LIGHT_LOOKBACK_WEEKDAYS):
+            candidate = _prev_weekday(candidate)
+            if local_market_cache.market_closed_days([candidate]):
+                continue
+            if _ensure_prev_day(candidate):
+                return candidate
+            if not local_market_cache.market_closed_days([candidate]):
+                return ""
+    except Exception as exc:
+        print(f"⚠️ 族群排行名單：往回找收盤表失敗｜{tools.err_text(exc)}", flush=True)
+    return ""
+
+
 def _expected_sessions(day: str) -> Optional[List[str]]:
-    """官方交易日曆中 day 之前的交易日（新到舊，最多 LIQUIDITY_DAYS 個）；日曆沒涵蓋到前一天就回 None。"""
+    """官方交易日曆中 day 之前的交易日（新到舊，最多 LIQUIDITY_DAYS 個）；日曆沒涵蓋到前一個平日就回 None。
+    11-02：原本要涵蓋到「前一天」，週一變成要涵蓋週日，日曆只到週五就被判定沒涵蓋。"""
     try:
         import pandas as pd
         saved = local_market_cache.get_state(local_market_cache.MARKET_SESSIONS_KEY, {}) or {}
-        prev_day = (pd.Timestamp(day) - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+        prev_day = _prev_weekday(day)
         if not saved or str(saved.get("last") or "") < prev_day:
             return None
         first = max(str(saved.get("first") or ""), (pd.Timestamp(day) - pd.Timedelta(days=60)).strftime("%Y-%m-%d"))
@@ -136,7 +168,7 @@ def liquid_pool(day: Optional[str] = None) -> Dict[str, Dict[str, float]]:
         if _POOL_CACHE.get("key") == key and time.monotonic() < float(_POOL_CACHE.get("expires") or float("inf")):
             return _POOL_CACHE["pool"]
     saved = local_market_cache.get_state(POOL_STATE_KEY, {}) or {}
-    if saved.get("key") == key and isinstance(saved.get("pool"), dict):
+    if saved.get("key") == key and isinstance(saved.get("pool"), dict) and saved["pool"]:   # 11-02：空名單不沿用，要重算
         with _POOL_LOCK:
             _POOL_CACHE.update(key=key, pool=saved["pool"], meta=saved.get("meta") or {}, expires=None)
         return saved["pool"]
@@ -144,6 +176,7 @@ def liquid_pool(day: Optional[str] = None) -> Dict[str, Dict[str, float]]:
     prev_day = sessions[0] if sessions else ""
     light = _light_pool()
     if light:
+        prev_day = prev_day or _latest_closed_table(day)
         complete = _ensure_prev_day(prev_day)
         stats = local_market_cache.liquidity_before(day, 1, sessions=[prev_day]) if prev_day else {}
     else:
@@ -158,8 +191,9 @@ def liquid_pool(day: Optional[str] = None) -> Dict[str, Dict[str, float]]:
         last_ok = float(row.get("last_value") or 0) >= MIN_VALUE
         if avg_ok or last_ok:
             pool[code] = {"avg_value": float(row.get("avg_value") or 0), "last_value": float(row.get("last_value") or 0)}
+    # 11-02：空名單一律當不完整（不存檔、10 分鐘後重算）；曾把 0 檔存成當日名單，整天都排不出來
     meta = {"calendar": bool(sessions), "prev_day": prev_day, "mode": "prev_day" if light else "20d_or_prev",
-            "base_stale": bool(sessions) and not complete}
+            "base_stale": ((bool(sessions) or light) and not complete) or not pool}
     with _POOL_LOCK:
         _POOL_CACHE.update(key=key, pool=pool, meta=meta,
                            expires=(time.monotonic() + POOL_STALE_RETRY) if meta["base_stale"] else None)
@@ -171,7 +205,10 @@ def liquid_pool(day: Optional[str] = None) -> Dict[str, Dict[str, float]]:
     print(f"📋 今日族群排行名單｜{day}｜成分股 {len(codes)} 檔｜通過流動性 {len(pool)} 檔"
           f"｜門檻 {MIN_VALUE / 1e4:,.0f} 萬（{'只看前一交易日' if light else f'{LIQUIDITY_DAYS} 日均或前一日'}，"
           f"收盤價×成交股數估計）｜JSON {sector_match.member_version()}"
-          + (f"｜前一交易日 {prev_day}（官方日曆）" if sessions else "｜⚠️ 官方日曆未涵蓋，改用底庫已確認日期")
+          + (f"｜前一交易日 {prev_day}（官方日曆）" if sessions
+             else f"｜⚠️ 官方日曆未涵蓋，前一交易日用收盤表確認 {prev_day}" if light and prev_day
+             else "｜⚠️ 官方日曆未涵蓋，收盤表也取不到" if light
+             else "｜⚠️ 官方日曆未涵蓋，改用底庫已確認日期")
           + ("｜⚠️ 前一交易日上市／上櫃收盤表不完整，名單不完整、10 分鐘後重算" if meta["base_stale"] else ""), flush=True)
     return pool
 
@@ -697,6 +734,8 @@ def rank(day: Optional[str] = None, direction: str = "strong",
         if stat["status"] != "ok":
             skipped.append(f"{name}:{stat['status']}({stat['valid']}/{stat['liquid']}/{stat['members']})")
             continue
+        if group.get("large_cap"):        # 10-30 使用者：晶圓代工只有 4 檔但都是超大型股，不算小樣本（名單標記，不看檔數）
+            stat["small"] = False
         if stat["trial"]:
             confirmed = _stats(sector_match.member_codes(name, confirmed_only=True), pool, quote, bench)
             stat["confirmed_only"] = confirmed
