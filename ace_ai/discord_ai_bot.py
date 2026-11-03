@@ -1100,27 +1100,26 @@ def futures_extra(data: Dict[str, Any], focus: str) -> str:
 
 
 def futures_card(data: Dict[str, Any], question: str = "", retail: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """台指期三大法人淨未平倉：各法人一格（淨多／淨空口數＋較前一日變化）；副圖在 K 線下方。"""
+    """台指期三大法人淨未平倉：各法人一格（淨多／淨空口數＋較前一日變化）；副圖在 K 線下方。
+    11-04（測試版）：淨部位寫成帶正負號（淨多 +、淨空 −，紅多綠空），每格加多空單比例條（oi_tiles）。"""
     items = []
     for x in data.get("investors") or []:
         change = x.get("change_vs_prev")
-        delta = "" if change is None else f"淨未平倉較前日 {int(change):+,}"
-        if x.get("short_oi") is not None:   # 10-16：問「空單多少」要看得到空方未平倉口數，不只淨額
-            delta = f"多單 {int(x.get('long_oi') or 0):,}｜空單 {int(x['short_oi']):,}" + (f"｜{delta}" if delta else "")
-        items.append({"label": x["investor"], "value": f"{x['net_text']} 口", "tone": "signed" if x["net_oi"] else "ink",
-                      "sub": delta})
+        # 10-16：問「空單多少」要看得到空方未平倉口數，不只淨額 → 多單／空單寫在比例條下方
+        items.append({"name": x["investor"], "value": f"{int(x['net_oi']):+,} 口" if x["net_oi"] else "0 口",
+                      "long": x.get("long_oi"), "short": x.get("short_oi"),
+                      "change": "" if change is None else f"{int(change):+,} 口"})
     sections = [{"type": "badge", "text": f"資料日期 {data.get('data_date', '-')}｜台指期（{data.get('futures_id', 'TX')}）三大法人未平倉"},
-                {"type": "stats", "items": [{"label": f"{i['label']}｜{i['sub']}" if i["sub"] else i["label"], "value": i["value"]}
-                                            for i in items]},
+                {"type": "oi_tiles", "items": items},
                 {"type": "note", "text": "※ 未平倉含現貨避險部位，不能單獨當作多空訊號；K 線下方紅柱＝淨多增加（空單減少）、綠柱＝淨空增加，金線＝淨未平倉。"}]
     if retail:
         items = []
         for c in retail.get("contracts") or []:
             prev = c.get("ratio_prev_pct")
-            change = f"｜較前日 {c['ratio_pct'] - prev:+.2f}" if prev is not None else ""
-            items.append({"label": f"{c['name']}散戶多空比{change}",
-                          "value": f"{c['ratio_pct']:+.2f}%（多 {c['retail_long']:,}／空 {c['retail_short']:,}）"})
-        sections[-1:-1] = [{"type": "stats", "items": items}]
+            items.append({"name": f"{c['name']}散戶多空比", "value": f"{c['ratio_pct']:+.2f}%",
+                          "long": c["retail_long"], "short": c["retail_short"],
+                          "change": f"{c['ratio_pct'] - prev:+.2f}" if prev is not None else ""})
+        sections[-1:-1] = [{"type": "oi_tiles", "items": items}]
         sections[-1]["text"] += "散戶＝全市場未平倉扣掉三大法人（當天結算到期的契約不計）。"
     return {"branch": "台指期三大法人未平倉", "tags": [futures_focus(question)], "label": "期貨籌碼", "sections": sections}
 
@@ -3120,9 +3119,12 @@ FINAL_TXF_RULES = ("【台指期型態頁（測試版）】TXF＝台指期近月
     "再說靠近哪個支撐或壓力；不可說成已收盤，也不可說成今天日盤的走勢。\n"
     "- intraday.session 是「日盤」：那根含前一晚夜盤＋今天日盤到目前，盤中暫定、收盤前會變動。沒有 intraday：最後一根是已收盤的日 K。\n"
     "- 外資空單要多說明（11-03 使用者；優先於【台指期未平倉】只講前一日變化的限制）：why 用一段 2～3 句講外資台指期未平倉，數字只用 get_futures_positions.foreign_summary："
-    "目前淨空（或淨多）幾口、較前一日與近 5 個交易日是淨空增加還是減少（有「連續」就說連續幾天）、和近期淨空最多的水位比是偏高還是偏低；"
+    "目前淨空（或淨多）幾口、較前一日與近 5 個交易日是淨空增加還是減少（有「連續」就說連續幾天）、和近期淨空最多的水位比是偏高還是偏低"
+    "（這段最多 3 個數字，水位比較用文字講，不再寫一個口數）；"
     "有 get_retail_futures 可再用一句對照散戶多空比。這段最後要說未平倉含現貨避險、不能單獨當多空訊號；"
     "不可說外資看空所以會跌，也不推論明天漲跌。scenarios 可以有一個用外資空單續增或回補當觀察條件。\n"
+    "- why 的順序：均線與最近的支撐壓力（一段）→ 外資空單（一段）→ 費波參考（有的話一句）。KD、MACD、布林通道最多合成半句帶過，"
+    "不逐項列指標（11-04 使用者：逐項列很不順）。\n"
     "- 加權指數現貨和台指期有價差，不可把兩者的價位混用。")
 
 
@@ -3653,6 +3655,12 @@ class FactSheet:
         for result in results:
             if result.ok and isinstance(result.data, dict):
                 self._add_result(result.name, result.data)
+        # 11-04：費波參考價從 tool_results 拿掉、另放 payload.fib_reference，核對時也要認得這些價位
+        # （以前只進 stock_numbers、不進 market，AI 寫的費波句一律被當成「對不上的數字」刪掉半句）
+        for code, ref in (payload.get("fib_reference") or {}).items():
+            numbers = _variants_of(json.dumps(ref, ensure_ascii=False, default=str))
+            self.market.update(numbers)
+            self.stock_numbers.setdefault(str(code), set()).update(numbers)
         self.chart_triangles: Dict[str, Dict[str, Any]] = {}
         self.chart_line_numbers: Dict[str, Dict[str, Set[str]]] = {}
         self._add_chart_triangles(payload.get("chart_context") or {})
@@ -3976,7 +3984,9 @@ class FactSheet:
         full_bull = bool(re.search(r"多頭排列|多頭架構", plain))
         full_bear = bool(re.search(r"空頭排列|空頭架構", plain))
         # Explicitly described short-term subsets may differ from the MA60 direction.
-        subset = bool(re.search(r"短期|短線|MA5.*MA10.*MA20", plain)) and not re.search(r"MA60|所有|全部|完整", plain)
+        # 11-04：只看寫排列的那個子句；「短期均線空頭排列，且盤中跌破所有均線」的「所有」講的是跌破，不是四條排列
+        clause = next((c for c in re.split(r"[，,；;]", plain) if re.search(r"[多空]頭(?:排列|架構)", c)), plain)
+        subset = bool(re.search(r"短期|短線|MA5.*MA10.*MA20", clause)) and not re.search(r"MA60|所有|全部|完整", clause)
         if subset:
             bullish, bearish = ma[0] > ma[1] > ma[2], ma[0] < ma[1] < ma[2]
         for pattern, valid, full in ((_BULL_ALIGN_RE, bullish, full_bull), (_BEAR_ALIGN_RE, bearish, full_bear)):
@@ -4003,6 +4013,7 @@ class FactSheet:
             if value.is_integer() and abs(value) <= 10 and not _PERCENT_AFTER_RE.match(text, match.end()):
                 continue
             forms = {cleaned, cleaned.lstrip("-")}
+            forms |= {re.sub(r"\.0+$", "", f) for f in forms}   # 11-04：AI 寫「39442.0」＝39442，不算對不上
             unit = text[match.end():match.end() + 3].lstrip()[:1]   # 10-16：「3.4 萬張」中間有空白也要換算
             if unit in ("萬", "億"):            # 10-16：「1870 萬張」＝18,709,109 張；換算後在 0.5% 內就算對得上
                 base = 1e4 if unit == "萬" else 1e8
@@ -5379,6 +5390,15 @@ def drop_number_dumps(text: str, limit: int = 4, total: int = 7) -> str:
         used += count
         kept.append(part)
     return "".join(kept).strip()
+
+
+_BIG_DECIMAL_RE = re.compile(r"(?<![\d,.])(\d{4,6})\.(\d+)(?![\d.])(?!\s*[%％萬億倍])")
+
+
+def tidy_big_prices(text: str) -> str:
+    """11-04：千元以上的價位寫整數加千分位（watch_plan 規則）；AI 常寫成「43857.0 點」「45665.22」，核對後由程式改寫。
+    百分比、萬／億、倍數不動。"""
+    return _BIG_DECIMAL_RE.sub(lambda m: f"{round(float(m.group())):,}", str(text or ""))
 
 
 def drop_warrant_listing(text: str, results) -> str:
@@ -9472,18 +9492,23 @@ class AceQueryEngine:
             # 10-20：止穩觀察（持續下跌）時 KD／MACD 沒有意義，AI 還寫就由程式刪；平常照留
             drop_mode = any(isinstance(v, dict) and v.get("止穩觀察") for v in (payload.get("watch_plan") or {}).values())
             osc = drop_oscillator_noise if drop_mode else (lambda t: t)
+            # 11-04：台指期頁 why 要多一段外資空單（3 個數字），整段數字上限放寬，不然那段會被當成念數據整句拿掉
+            txf_page = any(str(k).endswith(":TXF") for k in (payload.get("tool_results") or {}))
             for key in ("answer", "why", "summary"):
-                card[key] = drop_directives(card.get(key, ""))
+                card[key] = tidy_big_prices(drop_directives(card.get(key, "")))
                 card[key] = drop_warrant_listing(card[key], results)
                 card[key] = drop_source_mentions(card[key])
                 card[key] = osc(card[key])
                 if key in ("why", "summary"):
-                    card[key] = drop_number_dumps(card[key], total=6 if payload.get("compare_page") else 7)   # 10-20：念數據的句子拿掉
+                    before = card[key]
+                    card[key] = drop_number_dumps(card[key], total=6 if payload.get("compare_page") else 10 if txf_page else 7)   # 10-20：念數據的句子拿掉
+                    if card[key] != before:
+                        self.log(f"念數據刪句（{key}）｜" + "".join(p for p in re.split(r"(?<=[。！？；])", before) if p not in card[key])[:160])
             # 10-20：結論太長時圖卡會把後半句切成標題下一行小字（例「關鍵觀察 2420 元能否站穩。」）→ 後半段移到「為什麼」開頭
             card["answer"], spill = split_answer_head(drop_filler_head(card.get("answer", "")))
             if spill:
                 card["why"] = (spill + card.get("why", "")).strip()
-            card["scenarios"] = [dict(x, text=osc(drop_source_mentions(drop_directives(x["text"]))),
+            card["scenarios"] = [dict(x, text=osc(drop_source_mentions(tidy_big_prices(drop_directives(x["text"])))),
                                       title=drop_source_mentions(drop_directives(fix_scenario_title(x.get("title", "")))))
                                  for x in card.get("scenarios") or []]
             card["scenarios"] = [x for x in card["scenarios"] if x["text"]]

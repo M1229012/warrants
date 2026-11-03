@@ -1308,6 +1308,8 @@ LEVELS_ON_CHART = True
 LEVEL_TAG_MAX = 3          # 10-20：使用者要多標幾個，最多 3 個
 LEVEL_TAG_H = 32
 LEVEL_TAG_FONT = 20
+FIB_TAG_MAX = 4            # 11-04 費波型態頁：右側框上行寫比例（0.618）、下行寫價格，K 線上畫同色虛線
+FIB_TAG_H = 48
 _TAG_COLORS = (('三角上緣', '#C76C00'), ('三角下緣', '#1478B5'), ('量區', '#0B7F6B'), ('布林', '#667085'),
                # 11-03 費波型態頁：和費波驗證圖同一套顏色（回撤／反彈藍、前波高點橘、延伸紫、整理區綠、下跌支撐紅）
                ('回撤', '#1478B5'), ('反彈', '#1478B5'), ('前波高點', '#C76C00'), ('延伸', '#8044B8'),
@@ -1375,12 +1377,13 @@ def _chart_levels(panel: dict) -> tuple[list[dict], list[dict]]:
     # 不跟著 AI 文字變，同一檔不論問型態或籌碼都一樣
     tagged = [next(x for x in near if x['kind'] == kind) for kind in ('壓力', '支撐') if any(x['kind'] == kind for x in near)]
     tagged += [x for x in near if x not in tagged]
-    tagged = tagged[:LEVEL_TAG_MAX]
+    tagged = tagged[:FIB_TAG_MAX if lead else LEVEL_TAG_MAX]
     used = []
     for item in tagged:
         color = next((c for word, c in _TAG_COLORS if word in item['label']), None) or _ratio_color(item['label']) \
             or MA_COLORS.get('MA20' if item['label'] == '布林中軌' else item['label'], ACCENT)
-        item['color'] = _TAG_SPARE if color in used else color
+        # 費波頁框裡寫了比例，同色不會混淆：回撤一律藍、延伸一律紫，不換備用色
+        item['color'] = _TAG_SPARE if color in used and not lead else color
         used.append(item['color'])
     tagged.sort(key=lambda x: -x['price'])
     rest = [x for x in items if x not in tagged]
@@ -1507,14 +1510,19 @@ def draw_level_legend(draw, x: float, y: float, width: float, panel: dict) -> No
             draw.text((cx, mid), value['name'], font=font(21), fill=INK, anchor='lm')
 
 
+def _tag_height(tagged: list[dict]) -> float:
+    return FIB_TAG_H if any(t.get('lead') for t in tagged) else LEVEL_TAG_H
+
+
 def _tag_positions(tagged: list[dict], py, price_top: float, price_bottom: float) -> list[float]:
     """價格框的中心 y（由上往下）：照真正價位放，太近就往下錯開，超出價格區再整組推回。"""
     if not tagged:
         return []
-    half = LEVEL_TAG_H / 2
+    tag_h = _tag_height(tagged)
+    half = tag_h / 2
     pos: list[float] = []
     for true_y in sorted(py(t['price']) for t in tagged):
-        pos.append(max(true_y, pos[-1] + LEVEL_TAG_H + 6) if pos else true_y)
+        pos.append(max(true_y, pos[-1] + tag_h + 6) if pos else true_y)
     shift = max(0.0, pos[-1] + half - price_bottom)
     pos = [p - shift for p in pos]
     shift = max(0.0, price_top - (pos[0] - half))
@@ -1526,13 +1534,23 @@ def draw_level_tags(draw, tagged: list[dict], py, right: float, price_top: float
     if not tagged:
         return
     items = sorted(((py(t['price']), t) for t in tagged), key=lambda x: x[0])
-    half = LEVEL_TAG_H / 2
+    half = _tag_height(tagged) / 2
     pos = _tag_positions(tagged, py, price_top, price_bottom)
     for (true_y, item), label_y in zip(items, pos):
         color = item['color']
         draw.line((right + 2, true_y, right + 9, true_y), fill=color, width=2)
         draw.line((right + 9, true_y, right + 14, label_y), fill=color, width=1)
         text = price_text(item['price'])
+        if item.get('lead'):
+            # 11-04 費波型態頁：上行比例／名稱（0.618、前波高點），下行價格；欄寬約 104px，名稱太長就縮字不截斷
+            name, name_size = fit(str(item['name']), 18, 90, True, 12)
+            price_font = font(LEVEL_TAG_FONT if len(text) <= 8 else LEVEL_TAG_FONT - 3, True)
+            w = max(font(name_size, True).getlength(name), price_font.getlength(text)) + 14
+            draw.rounded_rectangle((right + 14, label_y - half, right + 14 + w, label_y + half), radius=6,
+                                   fill='white', outline=color, width=1)
+            draw.text((right + 14 + w / 2, label_y - 11), name, font=font(name_size, True), fill=color, anchor='mm')
+            draw.text((right + 14 + w / 2, label_y + 11), text, font=price_font, fill=INK, anchor='mm')
+            continue
         # 欄寬 118px：指數（47,058.30）這種 9 碼以上的長數字用 17 級字，數字不截斷、框不超出卡片
         text_font = font(LEVEL_TAG_FONT if len(text) <= 8 else LEVEL_TAG_FONT - 3, True)
         w = text_font.getlength(text) + 12
@@ -1656,10 +1674,16 @@ def draw_chart(draw, y: int, panel: dict) -> None:
         gy = py(value)
         draw.line((left, gy, right, gy), fill=LINE, width=1)
         # 價格刻度維持在右側；和關鍵價位框太近的那格刻度數字不畫，避免文字重疊
-        if all(abs(gy - ty) > LEVEL_TAG_H for ty in tag_label_ys):
+        if all(abs(gy - ty) > _tag_height(tagged_levels) for ty in tag_label_ys):
             tick = price_text(value)
             tick_size = 23 if len(tick) <= 8 else 20       # 指數的長數字維持 20 級，不超出卡片
             text_at(draw, (right + 14, gy - tick_size // 2), tick, tick_size, MUTED)
+    for item in tagged_levels:
+        if item.get('lead'):
+            # 11-04 費波型態頁：右側框的費波價位在 K 線上畫同色細虛線（畫在 K 棒底下，不遮 K 棒；不另寫字）
+            ly = py(item['price'])
+            for sx in range(int(left), int(right), 14):
+                draw.line((sx, ly, min(sx + 7, right), ly), fill=item['color'], width=1)
     if not panel.get('compact'):
         draw_marks(draw, panel, px, py, step, price_top, price_bottom)
     for i, bar in enumerate(bars):
@@ -3958,6 +3982,40 @@ def _branch_section(draw, x0: float, x1: float, y: float, section: dict, dry: bo
                 value, size = fit(item['value'], 38, tile_w - 36, True, 22)
                 text_at(draw, (tx + 20, y + 50), value, size, _tone_color(item['value'], item.get('tone', 'ink')), True)
         return tile_h + 22
+    if kind == 'oi_tiles':
+        # 11-04（測試版）台指期未平倉：名稱＋較前日、帶正負號的淨部位（紅多綠空）、多空單比例條、多單／空單口數
+        items = section.get('items') or []
+        if not items:
+            return 0
+        gap, tile_h = 12, 156
+        tile_w = (width - gap * (len(items) - 1)) / len(items)
+        if not dry:
+            for i, item in enumerate(items):
+                tx, ty = x0 + i * (tile_w + gap), y
+                left, right = tx + 18, tx + tile_w - 18
+                draw.rounded_rectangle((tx, ty, tx + tile_w, ty + tile_h), radius=12, fill=TILE_BG)
+                change = str(item.get('change') or '')
+                change_w = font(19, True).getlength(change) if change else 0
+                if change:
+                    draw.text((right, ty + 28), change, font=font(19, True), fill=_tone_color(change, 'signed'), anchor='rm')
+                    draw.text((right - change_w - 8, ty + 28), '較前日', font=font(17), fill=MUTED, anchor='rm')
+                name, size = fit(str(item.get('name', '')), 21, right - left - (change_w + 70 if change else 0), True, 16)
+                draw.text((left, ty + 28), name, font=font(size, True), fill=INK, anchor='lm')
+                value = str(item.get('value', ''))
+                value, size = fit(value, 34, right - left, True, 24)
+                draw.text((left, ty + 72), value, font=font(size, True), fill=_tone_color(value, 'signed'), anchor='lm')
+                long_oi, short_oi = float(item.get('long') or 0), float(item.get('short') or 0)
+                if long_oi + short_oi > 0:
+                    by = ty + 106
+                    draw.rounded_rectangle((left, by, right, by + 10), radius=5, fill=DOWN)
+                    split = left + (right - left) * long_oi / (long_oi + short_oi)
+                    if split > left + 1:
+                        draw.rounded_rectangle((left, by, max(split, left + 10), by + 10), radius=5, fill=UP)
+                        if split < right - 5:
+                            draw.rectangle((max(split - 5, left + 5), by, split, by + 10), fill=UP)
+                    draw.text((left, ty + 136), f'多 {long_oi:,.0f}', font=font(18), fill=MUTED, anchor='lm')
+                    draw.text((right, ty + 136), f'空 {short_oi:,.0f}', font=font(18), fill=MUTED, anchor='rm')
+        return tile_h + 14
     if kind == 'stats' and section.get('presentation') == 'inline':
         # Weekly article only: fit label/value pairs on a line; never stretch one value into a full-width tile.
         cursor, row, total = x0, 0, 0
