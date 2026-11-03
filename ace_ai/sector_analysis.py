@@ -80,7 +80,7 @@ def detect_request(question: str) -> Optional[Dict[str, str]]:
             return {"mode": "belongs", "industry": "", "name": code, "stock_code": code}
         return None
 
-    parent = sector_match.match_parent(question) if sector_match.member_only() else None
+    parent = sector_match.match_parent(question) if sector_match.MEMBER_ONLY else None
     if parent and action != "blocked":
         # 10-28：問上層類別（被動元件、IC設計、PCB…）→ 底下所有子族群一起排名；問成分股就列出子族群
         # 11-02 使用者：問大類哪檔型態好要回答型態，不是列子族群漲跌排行
@@ -96,7 +96,7 @@ def detect_request(question: str) -> Optional[Dict[str, str]]:
         if action == "blocked":
             return {"mode": "unsupported", "industry": "", "name": hit["name"],
                     "message": "族群目前支援成分股名單、技術型態與漲幅排行；分點、權證、新聞與基本面請指定個股查詢。"}
-        if (sector_match.member_only() and _TODAY_RE.search(text) and not _TECH_RE.search(text)
+        if (sector_match.MEMBER_ONLY and _TODAY_RE.search(text) and not _TECH_RE.search(text)
                 and (action != "members" or re.search(r"新聞|消息|利多|利空", text))):
             # 10-28 審核：「ASIC今天強嗎／有什麼新聞」→ 和排行、大類共用同一套今日數據與族群解讀（含新聞），
             # 不走只有技術資料的總覽（AI 只能講均線與壓力價）
@@ -661,7 +661,7 @@ def members_panel(data: Dict[str, Any]) -> Dict[str, Any]:
 
 def catalog_panel() -> Dict[str, Any]:
     """會員圖片只列細產業，避免概念題材/大產業全部塞進一張超長圖。"""
-    if sector_match.member_only():
+    if sector_match.MEMBER_ONLY:
         # 11-03：10-27 族群重整後名單全部是自建（source=own），164 個全擠在「主題族群」一區，又長又看不出分類。
         # 改成大類／其他產業／概念三區；大類底下的細項另外問（「半導體族群有哪些」）。
         groups = sector_match.member_groups()
@@ -760,7 +760,7 @@ LIVE_MIN_COVERAGE = 0.8      # 有效成分股報價覆蓋率門檻（全市場�
 
 def _belongs_panel(code: str, label: str, names: List[str], max_groups: int = 5, per_group: int = 5) -> Dict[str, Any]:
     """「3055 是什麼族群」：每個族群列成交額前 5 大（問的那檔放最前）＋最新漲跌；純本地資料（09-30）。"""
-    if sector_match.member_only():
+    if sector_match.MEMBER_ONLY:
         groups = {n: sector_match.member_codes(n) for n in sector_match.member_groups()}
     else:
         groups = {str(v.get("name")): list(v.get("stocks") or []) for v in (sector_roster._load().get("groups") or {}).values()}
@@ -838,7 +838,7 @@ def live_group_ranking() -> Optional[Dict[str, Any]]:
     報價走 sector_radar 5 分鐘共用快取；背景 tick 會先暖好，會員查詢通常直接讀快取。"""
     if not tools.stock_live_quotes():
         return None
-    if sector_match.member_only():
+    if sector_match.MEMBER_ONLY:
         # 10-24：會員族群模式下由 member_sector_rank 抓同一批 MIS 報價（背景暖快取也走這裡）
         import member_sector_rank
         return member_sector_rank.rank() if member_sector_rank._live_allowed() else None
@@ -916,7 +916,7 @@ def _rank_unavailable_text() -> str:
 
 def _market_radar_answer(mode: str, request: Optional[Dict[str, Any]] = None, gateway=None, validate=None) -> Dict[str, Any]:
     """全市場族群排行：盤中漲幅先用即時雷達，其餘一律用本地底庫，不為單一問題掃市場。"""
-    if mode == "market_momentum" and sector_match.member_only():
+    if mode == "market_momentum" and sector_match.MEMBER_ONLY:
         # 10-24：今日族群排行只用會員族群 JSON（TOP5、最強／最弱、問原因時附新聞解讀）
         import member_sector_rank
         try:
@@ -1378,7 +1378,7 @@ def answer(request: Dict[str, str], gateway, validate) -> Dict[str, Any]:
     if mode in ("market_momentum", "market_technical"):
         return _market_radar_answer(mode, request, gateway, validate)
     if mode == "catalog":
-        hint = "大類底下還有細項族群，可以再問「半導體族群有哪些」。" if sector_match.member_only() else ""
+        hint = "大類底下還有細項族群，可以再問「半導體族群有哪些」。" if sector_match.MEMBER_ONLY else ""
         return {"text": hint, "calls": 0, "cacheable": True, "panels": [catalog_panel()]}
     if mode == "parent_members":
         return _parent_members_answer(request)
