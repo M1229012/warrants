@@ -12,10 +12,11 @@
 - TAIEX：依證交所正式編製要點，以所有符合納入規則的上市普通股與官方發行股數重建；
   證交所每日精確成分權重檔屬 Data E-Shop 商品，未取得該授權檔時不宣稱為官方公布權重。
 - 收盤後：使用本地全市場官方日 K，所有可辨識成分股都參與計算，不做前 N 大權值股截斷。
-- 盤中：使用 TWSE MIS 官方即時報價「批次」抓取，依昨日市值由大到小逐批補價；
-  一旦未抓股票依一般 ±10% 漲跌幅上限也不可能擠進正／負貢獻 TOP5，就提前停止。
+- 盤中：先用奇摩批次報價把所有成分股抓完（依昨日市值由大到小），指數基準看 TWSE MIS；
+  11-02 起不因前幾名確定就提前停止，再小的成分股都要算。11-03 起昨收也以奇摩為準（本地日K只當備援），
+  本地沒有日K的成分股照樣算，分母才是完整的成分股市值。
   同時設總時間預算，連線慢時直接回傳目前已取得結果，不讓 Discord 問答卡死。
-- 若 MIS 完全失敗，才退回原本少量 Fugle 單股即時報價；不逐檔掃全市場。
+- 奇摩整批沒回才用 MIS 補；若 MIS 也完全失敗，才退回原本少量 Fugle 單股即時報價；不逐檔掃全市場。
 
 盤中結果一律標示「估算」與市值涵蓋率；收盤後依完整母體計算，並在 log 留下成分數、價格覆蓋率與指數殘差供對帳。
 """
@@ -56,14 +57,20 @@ _SHARES_REFRESHING = [False]
 LIVE_TOP_TWSE = max(3, tools._env_int("DISCORD_AI_CONTRIB_LIVE_TWSE", 12))
 LIVE_TOP_TPEX = max(3, tools._env_int("DISCORD_AI_CONTRIB_LIVE_TPEX", 6))
 
-# 盤中批次抓取：總時間預算是「加權＋櫃買合計」，避免網路慢時 Discord 逾時。
-# 收盤後、官方收盤檔尚未發布（約 13:30～15:00）時要不要給估算榜。
-# 預設關閉：只計市值前段的榜無法和交易所／CMoney 對帳，寧可請使用者稍後再查。
-PENDING_CLOSE_ESTIMATE = bool(tools._env_int("DISCORD_AI_CONTRIB_PENDING_ESTIMATE", 0))
-LIVE_BUDGET_SECONDS = max(3.0, tools._env_float("DISCORD_AI_CONTRIB_BUDGET", 9.0))
+# 盤中批次抓取：總時間預算是「每個市場」各一份，一題只算問到的市場，避免網路慢時 Discord 逾時。
+# 收盤後、官方收盤檔尚未發布時要不要給估算榜（所有成分股用即時報價估算，標「收盤暫定」）。
+# 11-02 使用者：正式資料出來前都看即時，預設打開；官方檔更新後自動換正式榜。設 0 退回「請稍後再查」。
+PENDING_CLOSE_ESTIMATE = bool(tools._env_int("DISCORD_AI_CONTRIB_PENDING_ESTIMATE", 1))
+
+
+class OfficialClosePending(tools.ToolDataError):
+    """指數已到今天，但全市場官方收盤檔還停在前一個交易日。"""
+# 11-02 使用者：再小的成分股都要算，大盤差的日子相對強的小股票才看得到。整個市場奇摩約 20 秒，一題只算問到的市場。
+LIVE_BUDGET_SECONDS = max(3.0, tools._env_float("DISCORD_AI_CONTRIB_BUDGET", 25.0))
+SUMMARY_TOP = 5          # 圖卡摘要與集中度固定看前五大；榜單可以列更多
 LIVE_BATCH_SIZE = max(20, tools._env_int("DISCORD_AI_CONTRIB_BATCH_SIZE", 70))
-LIVE_MAX_TWSE = max(LIVE_BATCH_SIZE, tools._env_int("DISCORD_AI_CONTRIB_MAX_TWSE", 350))
-LIVE_MAX_TPEX = max(LIVE_BATCH_SIZE, tools._env_int("DISCORD_AI_CONTRIB_MAX_TPEX", 280))
+LIVE_MAX_TWSE = max(LIVE_BATCH_SIZE, tools._env_int("DISCORD_AI_CONTRIB_MAX_TWSE", 5000))
+LIVE_MAX_TPEX = max(LIVE_BATCH_SIZE, tools._env_int("DISCORD_AI_CONTRIB_MAX_TPEX", 5000))
 LIVE_MIS_TIMEOUT = max(2.0, tools._env_float("DISCORD_AI_CONTRIB_MIS_TIMEOUT", 4.5))
 LIVE_CACHE_SECONDS = max(5, tools._env_int("DISCORD_AI_CONTRIB_CACHE_SECONDS", 20))
 # 一般上市櫃普通股每日 ±10%；只拿來判斷「未抓股票理論上是否仍可能擠進 TOP5」。
@@ -519,7 +526,7 @@ def _cache_bucket(market: str) -> Dict[str, Any]:
 
 def _fetch_mis_batch(market: str, codes: List[str], deadline: float) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
     """一次 MIS GET 抓一批股票；同時帶 benchmark，回傳 quotes + 指數昨收/現值。"""
-    if tools.closed_quotes_only() or not codes or time.monotonic() >= deadline:
+    if not tools.stock_live_quotes() or not codes or time.monotonic() >= deadline:
         return {}, {}
 
     # 先看 20 秒共享快取。網路呼叫放在 lock 內，併發會員會等第一個人抓完後直接共用結果。
@@ -586,11 +593,9 @@ def _fetch_mis_batch(market: str, codes: List[str], deadline: float) -> Tuple[Di
                 continue
             current = _number(item.get("z"))
             previous = _number(item.get("y"))
-            if previous <= 0:
+            if previous <= 0 or current <= 0:
+                # 11-02：MIS 大多沒有成交價（z 是「-」），原本當成昨收，全部變成沒漲沒跌，貢獻榜整張是空的。沒價就不算有報價。
                 continue
-            if current <= 0:
-                # 尚未成交時維持昨收，不拿開盤價硬當最新價。
-                current = previous
             bucket["quotes"][code] = {
                 "close": current,
                 "prev_close": previous,
@@ -601,6 +606,31 @@ def _fetch_mis_batch(market: str, codes: List[str], deadline: float) -> Tuple[Di
         return {c: bucket["quotes"][c] for c in codes if c in bucket["quotes"]}, dict(bucket.get("benchmark") or {})
     finally:
         _MIS_LOCK.release()
+
+
+def _live_stock_quotes(market: str, codes: List[str], deadline: float,
+                       prefetched: Dict[str, Dict[str, Any]]) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
+    """盤中個股價用奇摩（contribution 開始前已整批抓好，prefetched）。這批有回，沒回的股票就是今天沒成交，
+    不再逐批打 MIS；整批都沒回才用 MIS 補。"""
+    quotes = {c: {"close": q["price"], "prev_close": q.get("prev"), "source": "奇摩",
+                  "limit_up": q.get("limit_up"), "limit_down": q.get("limit_down")}
+              for c, q in ((c, prefetched.get(c)) for c in codes) if q and q.get("price")}
+    if quotes:
+        return quotes, {}
+    mis, benchmark = _fetch_mis_batch(market, codes, deadline)
+    return {code: dict(item, source="TWSE-MIS") for code, item in mis.items()}, benchmark
+
+
+def _limit_state(row: Dict[str, Any]) -> str:
+    """現價在漲跌停價上：limit_up／limit_down，其餘空字串。
+    來源有漲跌停價（奇摩）就用來源的；沒有（官方收盤檔、MIS）用參考價 ±10% 依升降單位算。"""
+    close, reference = float(row.get("close") or 0.0), float(row.get("prev_close") or 0.0)
+    if close <= 0 or reference <= 0:
+        return ""
+    down, up = float(row.get("limit_down") or 0.0), float(row.get("limit_up") or 0.0)
+    if down <= 0 or up <= 0:
+        down, up = tools.limit_prices(reference)
+    return "limit_up" if close >= up - 0.005 else "limit_down" if close <= down + 0.005 else ""
 
 
 def _fugle_fallback(rows: List[Dict[str, Any]], market: str, deadline: float) -> int:
@@ -656,7 +686,7 @@ def contribution(market: str, live: bool, top: int = 5, *, deadline: Optional[fl
     直接用 TWSE / TPEx 官方「最新交易日完整收盤快照」的 close + change 做分解。
     這可避免「指數已是今天、個股卻仍停在上一交易日」造成整張貢獻榜失真。
     """
-    if tools.closed_quotes_only():
+    if not tools.stock_live_quotes():
         live = False
     if market not in INDEX_OF:
         raise ValueError(f"unsupported market: {market}")
@@ -696,9 +726,9 @@ def contribution(market: str, live: bool, top: int = 5, *, deadline: Optional[fl
         if not data_date:
             data_date = index_date
         if data_date and index_date and data_date != index_date:
-            raise tools.ToolDataError(
+            raise OfficialClosePending(
                 f"{index_name} 最新交易日為 {index_date}，但全市場收盤資料只到 {data_date}；"
-                f"今日收盤檔通常 15:00 後才發布，稍後再查才會是今天的貢獻榜"
+                f"今日官方收盤檔還沒發布，稍後再查才會是今天的貢獻榜"
             )
 
         # 官方快照至少應覆蓋數百檔；太小視為端點尚未完整更新。
@@ -799,7 +829,7 @@ def contribution(market: str, live: bool, top: int = 5, *, deadline: Optional[fl
             raise tools.ToolDataError(f"{index_name} 有 {len(unpriced)} 檔成分股查無任何價格，無法正確換算貢獻點數")
         if close_cap_coverage < 95.0:
             raise tools.ToolDataError(f"{index_name} 今天取得收盤價的成分股只占市值 {close_cap_coverage:.1f}%，"
-                                      f"資料不足以計算貢獻榜；今日收盤檔通常 15:00 後才發布")
+                                      f"資料不足以計算貢獻榜；今日官方收盤檔還沒發布")
         factor = float(now_index) / current_total_value
         weight_base = current_total_value
         live_used = 0
@@ -821,19 +851,44 @@ def contribution(market: str, live: bool, top: int = 5, *, deadline: Optional[fl
                 row["stock_name"] = names.get(row["stock_code"], row["stock_code"])
 
     else:
-        # 盤中沿用 v16 的「本地昨收 + MIS 批次即時價」；這次修正重點只在盤後資料完整性。
-        changes = local_market_cache.latest_changes(codes)
+        # 11-03 Log：原本只收「本地底庫有日K」的成分股，測試版不同步行情，加權 1,000 多檔只剩 670 檔；
+        # 缺的股票連市值都沒算進分母，換算係數被放大，每檔貢獻點數都偏大。
+        # 改成所有成分股都進來：先整批抓奇摩，昨收以報價來源為準（今天還沒成交的也有昨收），本地日K只當備援。
+        deadline = deadline or (time.monotonic() + LIVE_BUDGET_SECONDS)
+        eligible = [c for c in codes if float(market_components[c].get("shares") or 0.0) > 0]
+        changes = local_market_cache.latest_changes(eligible)
+
+        def local_value(code: str) -> float:
+            return float(tools._num((changes.get(code) or {}).get("close")) or 0.0) * float(market_components[code]["shares"])
+
+        # 依昨日市值由大到小抓（本地沒有日K的排最後），時間不夠時先保住權值股
+        eligible.sort(key=lambda c: -local_value(c))
+        eligible = eligible[:LIVE_MAX_TWSE if market == "twse" else LIVE_MAX_TPEX]
+        benchmark: Dict[str, Any] = {}
+        try:
+            _, benchmark = _fetch_mis_batch(market, eligible[:1], deadline)      # 指數昨收與現值先拿，整批抓完可能到時限
+        except Exception as exc:
+            print(f"⚠️ {index_name} MIS 指數基準略過｜{tools.err_text(exc)}", flush=True)
+        yahoo: Dict[str, Dict[str, Any]] = {}
+        yahoo_prev: Dict[str, float] = {}
+        try:
+            import yahoo_quotes
+            yahoo = yahoo_quotes.prime(eligible, max(0.5, deadline - time.monotonic()), {c: market for c in eligible}) or {}
+            yahoo_prev = yahoo_quotes.prev_closes(eligible)
+        except Exception as exc:
+            print(f"⚠️ {index_name} 奇摩整批報價略過｜{tools.err_text(exc)}", flush=True)
+
         total_prev_value = 0.0
-        for code in codes:
-            quote = changes.get(code) or {}
-            last_close = tools._num(quote.get("close"))
-            if not last_close:
-                continue
+        unpriced: List[str] = []
+        for code in eligible:
             comp = market_components[code]
-            shares = float(comp.get("shares") or 0.0)
-            if shares <= 0:
+            shares = float(comp["shares"])
+            local = changes.get(code) or {}
+            prev_close = float(tools._num((yahoo.get(code) or {}).get("prev")) or yahoo_prev.get(code)
+                               or tools._num(local.get("close")) or 0.0)
+            if prev_close <= 0:
+                unpriced.append(code)
                 continue
-            prev_close = float(last_close)
             prev_value = prev_close * shares
             rows.append({
                 "stock_code": code,
@@ -845,38 +900,31 @@ def contribution(market: str, live: bool, top: int = 5, *, deadline: Optional[fl
                 "change_pct": 0.0,
                 "shares": shares,
                 "prev_value": prev_value,
-                "quote_date": str(quote.get("date") or ""),
+                "quote_date": str(local.get("date") or ""),
                 "live_quote": False,
-                "price_source": "local_prev_close",
+                "price_source": "yahoo_prev_close" if code in yahoo or code in yahoo_prev else "local_prev_close",
             })
             total_prev_value += prev_value
         if not rows or total_prev_value <= 0:
-            raise tools.ToolDataError("本地底庫資料不足，無法計算盤中指數貢獻")
+            raise tools.ToolDataError("成分股昨收資料不足，無法計算盤中指數貢獻")
 
         live_used = 0
         top_safe = bottom_safe = False
         unseen_bound = 0.0
-        deadline = deadline or (time.monotonic() + LIVE_BUDGET_SECONDS)
-        ranked = sorted(rows, key=lambda r: -r["prev_value"])
-        max_candidates = LIVE_MAX_TWSE if market == "twse" else LIVE_MAX_TPEX
-        ranked = ranked[:max_candidates]
-        benchmark: Dict[str, Any] = {}
+        missing_quotes: List[str] = []
 
-        for batch_start in range(0, len(ranked), LIVE_BATCH_SIZE):
-            if time.monotonic() >= deadline:
-                break
-            batch = ranked[batch_start:batch_start + LIVE_BATCH_SIZE]
+        # 這裡只是套用已抓好的報價，不看時限：時間到了也要把抓到的算完（MIS 過時限會直接回空）
+        for batch_start in range(0, len(rows), LIVE_BATCH_SIZE):
+            batch = rows[batch_start:batch_start + LIVE_BATCH_SIZE]
             requested = [r["stock_code"] for r in batch]
             try:
-                quotes, batch_benchmark = _fetch_mis_batch(market, requested, deadline)
+                quotes, batch_benchmark = _live_stock_quotes(market, requested, deadline, yahoo)
             except Exception as exc:
-                print(f"⚠️ {index_name} MIS 批次報價失敗｜{tools.err_text(exc)}", flush=True)
+                print(f"⚠️ {index_name} 批次報價失敗｜{tools.err_text(exc)}", flush=True)
                 quotes, batch_benchmark = {}, {}
             if batch_benchmark:
                 benchmark = batch_benchmark
-            missing = [c for c in requested if c not in quotes]
-            if missing:
-                print(f"⚠️ {index_name} MIS batch requested={len(requested)} returned={len(quotes)} missing={','.join(missing[:12])}", flush=True)
+            missing_quotes += [c for c in requested if c not in quotes]
             for row in batch:
                 item = quotes.get(row["stock_code"])
                 if not item:
@@ -884,28 +932,34 @@ def contribution(market: str, live: bool, top: int = 5, *, deadline: Optional[fl
                 current = tools._num(item.get("close"))
                 if not current or current <= 0:
                     continue
+                # 11-02：昨收以報價來源為準。收盤後本地底庫已有今天的 K 棒，「最新收盤」就是今天，
+                # 拿它當昨收會讓每檔都沒漲沒跌（貢獻榜又是空的）；除權息的參考價也要跟來源一致。
+                source_prev = tools._num(item.get("prev_close"))
+                if source_prev and source_prev > 0:
+                    new_value = float(source_prev) * row["shares"]
+                    total_prev_value += new_value - row["prev_value"]
+                    row["prev_close"], row["prev_value"] = float(source_prev), new_value
                 row["close"] = float(current)
+                row["limit_up"], row["limit_down"] = tools._num(item.get("limit_up")), tools._num(item.get("limit_down"))
                 row["price_change"] = float(current) - row["prev_close"]
                 row["change_pct"] = row["price_change"] / row["prev_close"] * 100.0
                 row["live_quote"] = True
-                row["price_source"] = "TWSE-MIS"
+                row["price_source"] = str(item.get("source") or "TWSE-MIS")
                 live_used += 1
 
-            if benchmark.get("prev"):
-                prev_index = float(benchmark["prev"])
-                now_index = float(benchmark.get("current") or benchmark["prev"])
-                data_date = tools.taipei_now().strftime("%Y-%m-%d")
-            elif prev_index is None:
-                prev_index, now_index, data_date = _index_prev_close(index_code)
+        if benchmark.get("prev"):
+            prev_index = float(benchmark["prev"])
+            now_index = float(benchmark.get("current") or benchmark["prev"])
+            data_date = tools.taipei_now().strftime("%Y-%m-%d")
+        elif prev_index is None:
+            prev_index, now_index, data_date = _index_prev_close(index_code)
 
-            if prev_index:
-                factor_tmp = float(prev_index) / total_prev_value
-                for row in rows:
-                    row["weight_pct"] = row["prev_value"] / total_prev_value * 100.0
-                    row["points"] = row["price_change"] * row["shares"] * factor_tmp
-                top_safe, bottom_safe, unseen_bound = _rank_safety(rows, float(prev_index), top)
-                if top_safe and bottom_safe:
-                    break
+        if prev_index:
+            factor_tmp = float(prev_index) / total_prev_value
+            for row in rows:
+                row["weight_pct"] = row["prev_value"] / total_prev_value * 100.0
+                row["points"] = row["price_change"] * row["shares"] * factor_tmp
+            top_safe, bottom_safe, unseen_bound = _rank_safety(rows, float(prev_index), top)
 
         if live_used == 0 and time.monotonic() < deadline:
             live_used = _fugle_fallback(rows, market, deadline)
@@ -931,18 +985,25 @@ def contribution(market: str, live: bool, top: int = 5, *, deadline: Optional[fl
             row["close"] = round(float(row["close"]), 2)
             if not row.get("stock_name") or row.get("stock_name") == row["stock_code"]:
                 row["stock_name"] = names.get(row["stock_code"], row["stock_code"])
+        local_prev = sum(1 for r in rows if r.get("price_source") == "local_prev_close")
+        live_note = (f"母體={len(codes)}｜有昨收={len(rows)}（本地日K補 {local_prev}）｜"
+                     f"查無昨收={len(unpriced)}{'：' + ','.join(unpriced[:12]) if unpriced else ''}｜"
+                     f"有即時價={live_used}｜沒有即時價={len(missing_quotes)}"
+                     f"{'（' + ','.join(missing_quotes[:12]) + '…）' if missing_quotes else ''}")
 
     evaluated = [r for r in rows if r.get("live_quote")] if live else list(rows)
     positives = sorted((r for r in evaluated if r["points"] > 0), key=lambda r: -r["points"])
     negatives = sorted((r for r in evaluated if r["points"] < 0), key=lambda r: r["points"])
     top_rows = positives[:top]
     bottom_rows = negatives[:top]
-    keep = ("stock_code", "stock_name", "points", "change_pct", "close", "weight_pct")
+    for row in top_rows + bottom_rows:
+        row["limit_state"] = _limit_state(row)
+    keep = ("stock_code", "stock_name", "points", "change_pct", "close", "weight_pct", "limit_state")
 
     positive_total = sum(r["points"] for r in positives)
     negative_total = abs(sum(r["points"] for r in negatives))
-    top_lift = sum(r["points"] for r in top_rows)
-    top_drag = sum(r["points"] for r in bottom_rows)
+    top_lift = sum(r["points"] for r in positives[:SUMMARY_TOP])
+    top_drag = sum(r["points"] for r in negatives[:SUMMARY_TOP])
     positive_share = (top_lift / positive_total * 100.0) if positive_total > 0 else None
     negative_share = (abs(top_drag) / negative_total * 100.0) if negative_total > 0 else None
 
@@ -958,6 +1019,10 @@ def contribution(market: str, live: bool, top: int = 5, *, deadline: Optional[fl
     estimated_points = round(sum(r["points"] for r in evaluated), 2)
     index_points = round((float(now_index) - float(prev_index)), 2) if now_index is not None and prev_index is not None else None
     residual = round(index_points - estimated_points, 2) if index_points is not None else None
+    if live:
+        # 11-03：盤中也留對帳 Log；殘差大＝母體或股數有缺，點數會一起失真
+        print(f"📊 {index_name} 盤中貢獻｜{live_note}｜指數={index_points if index_points is not None else '-'}"
+              f"｜個股合計={estimated_points:+.2f}｜殘差={residual if residual is not None else '-'}", flush=True)
 
     focus_share = positive_share if (index_points or 0) >= 0 else negative_share
     concentration = _concentration_label(focus_share)
@@ -986,7 +1051,7 @@ def contribution(market: str, live: bool, top: int = 5, *, deadline: Optional[fl
         if len(rows) < max(50, int(len(codes) * 0.7)):
             raise tools.ToolDataError(
                 f"{index_name} 今天只取得 {len(rows)}/{len(codes)} 檔收盤價，資料不足以計算貢獻榜；"
-                f"今日收盤檔通常 15:00 後才發布"
+                f"今日官方收盤檔還沒發布"
             )
         # 防呆：如果個股分解與官方指數相差到離譜，不回傳一張看起來很正式的錯圖。
         # 正常仍可能因停牌保留市值/成分異動/基值事件有小幅殘差，所以只擋極端異常。
@@ -1028,18 +1093,29 @@ def contribution(market: str, live: bool, top: int = 5, *, deadline: Optional[fl
     }
 
 
-def report(live: Optional[bool] = None, top: int = 5) -> Dict[str, Any]:
-    """加權與櫃買一起計算；盤中共享一個總時間預算，避免連線慢時拖垮問答。"""
-    if tools.closed_quotes_only():
+def report(live: Optional[bool] = None, top: int = 5, market: str = "") -> Dict[str, Any]:
+    """加權與櫃買一起計算（market 指定就只算那一個）；盤中共享一個總時間預算，避免連線慢時拖垮問答。"""
+    if not tools.stock_live_quotes():
         live = False
     if live is None:
         now = tools.taipei_now()
         live = now.weekday() < 5 and 9 * 60 <= now.hour * 60 + now.minute <= 13 * 60 + 35
     reasons: List[str] = []
     out: Dict[str, Any] = {"basis": "盤中估算" if live else "收盤精算", "markets": []}
-    overall_deadline = time.monotonic() + LIVE_BUDGET_SECONDS if live else None
-    markets_order = ("twse", "tpex")
-    for idx, market in enumerate(markets_order):
+    markets_order = (market,) if market in INDEX_OF else ("twse", "tpex")
+    overall_deadline = time.monotonic() + LIVE_BUDGET_SECONDS * len(markets_order) if live else None
+    can_estimate = tools.stock_live_quotes() and not live and PENDING_CLOSE_ESTIMATE
+    official_pending = False
+
+    def pending_estimate(name: str) -> Dict[str, Any]:
+        row = contribution(name, live=True, top=top, deadline=time.monotonic() + LIVE_BUDGET_SECONDS)
+        row["basis"] = "收盤暫定估算"
+        row["concentration"] = str(row.get("concentration") or "").replace("盤中估算", "收盤暫定")
+        row["pending_official_close"] = True
+        print(f"ℹ️ {INDEX_OF[name][1]} 官方收盤檔未發布，改用即時報價估算今天的貢獻", flush=True)
+        return row
+
+    for idx, name in enumerate(markets_order):
         # 平分「剩餘」時間，保證加權不會把整個 budget 吃光而讓櫃買沒有即時榜單。
         if live and overall_deadline is not None:
             now_mono = time.monotonic()
@@ -1049,26 +1125,26 @@ def report(live: Optional[bool] = None, top: int = 5) -> Dict[str, Any]:
         else:
             market_deadline = None
         try:
-            out["markets"].append(contribution(market, live=bool(live), top=top, deadline=market_deadline))
+            # 11-02 Log：加權已確認官方檔沒更新，櫃買還下載 40 秒才發現一樣不能用，AI 就沒時間寫了 → 直接估算
+            out["markets"].append(pending_estimate(name) if official_pending
+                                  else contribution(name, live=bool(live), top=top, deadline=market_deadline))
         except Exception as exc:
             # 已收盤、但交易所當天的全市場收盤檔還沒發布時，改用即時報價估算今天的貢獻，
             # 而不是回頭拿前一個交易日的榜（那會變成昨天的答案）。
-            if not tools.closed_quotes_only() and not live and PENDING_CLOSE_ESTIMATE:
+            if can_estimate and not official_pending:
+                official_pending = isinstance(exc, OfficialClosePending)
                 try:
-                    row = contribution(market, live=True, top=top,
-                                       deadline=time.monotonic() + LIVE_BUDGET_SECONDS)
-                    row["basis"] = "收盤暫定・僅計市值前段"
-                    row["pending_official_close"] = True
-                    out["markets"].append(row)
-                    print(f"ℹ️ {INDEX_OF[market][1]} 官方收盤檔未發布，改用即時報價估算今天的貢獻", flush=True)
+                    out["markets"].append(pending_estimate(name))
                     continue
                 except Exception as retry_exc:
                     exc = retry_exc
             reasons.append(str(exc))
-            print(f"⚠️ {INDEX_OF[market][1]} 貢獻點數略過：{type(exc).__name__}: {exc}", flush=True)
+            print(f"⚠️ {INDEX_OF[name][1]} 貢獻點數略過：{type(exc).__name__}: {exc}", flush=True)
     if not out["markets"]:
         # 把真正的原因帶給使用者（多半是「今天的收盤檔還沒發布」），不要只說算不出來。
         raise tools.ToolDataError(reasons[0] if reasons else "目前無法計算指數貢獻點數")
+    if any(m.get("pending_official_close") for m in out["markets"]):
+        out["basis"] = "收盤暫定估算"
 
     twse = next((m for m in out["markets"] if m.get("market") == "twse"), None)
     tpex = next((m for m in out["markets"] if m.get("market") == "tpex"), None)
@@ -1089,6 +1165,8 @@ def report(live: Optional[bool] = None, top: int = 5) -> Dict[str, Any]:
         "依交易所發行量加權公式計算：收盤後直接讀 TWSE / TPEx 官方全市場收盤快照的收盤價與漲跌價差，"
         "再以官方收盤指數與完整成分母體總發行市值換算每檔貢獻點數；"
         "櫃買優先使用官方公開成分股名冊，TAIEX 依官方編製要點與免費公開資料建立母體。"
-        "此版本停用即時行情；官方收盤資料未發布時不以即時報價估算。"
+        + ("官方收盤資料未發布前，改用即時報價估算所有成分股（市值涵蓋率寫在圖上），並標示收盤暫定。" if can_estimate
+           # 正式版 /ask 沒開即時（11-03 先只給 /ace 管理員）：官方檔還沒出來就請使用者稍後再查
+           else "此題只用收盤資料；官方收盤資料未發布時不以即時報價估算。")
     )
     return out

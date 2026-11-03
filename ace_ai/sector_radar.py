@@ -38,30 +38,95 @@ MIS_BENCHMARKS = {"t00.tw": "加權指數", "o00.tw": "櫃買指數"}
 MIS_TIMEOUT = max(3.0, tools._env_float("DISCORD_AI_RADAR_TIMEOUT", 8.0))
 _STATE_PREFIX = "radar_snap:"
 
+# 10-24：MIS 常回 HTML／空資料的對策——所有 MIS 請求走 mis_get() 單一出口：
+# 同一時間只送一個、兩次間隔 MIS_GAP 秒；每條連線先開 index.jsp 取得 cookie；
+# 參數帶毫秒時間戳；失敗分成 blocked／html／timeout／conn／http 五類寫 Log；被擋（403/429/HTML）就冷卻 MIS_COOLDOWN 秒。
+MIS_INDEX_URL = "https://mis.twse.com.tw/stock/index.jsp"
+MIS_GAP = max(0.0, tools._env_float("DISCORD_AI_MIS_GAP", 0.5))
+MIS_COOLDOWN = max(10.0, tools._env_float("DISCORD_AI_MIS_COOLDOWN", 90.0))
+MIS_WARM_TTL = 600.0
+_MIS_GATE = threading.Lock()
+_MIS_NEXT = [0.0]
+_MIS_COOL_UNTIL = [0.0]
+_MIS_WARMED: Dict[int, float] = {}
+
+
+class MisError(RuntimeError):
+    """MIS 請求失敗；kind＝cooldown／blocked／html／timeout／conn／http。"""
+
+    def __init__(self, kind: str, detail: str = ""):
+        super().__init__(f"MIS {kind}" + (f"：{detail}" if detail else ""))
+        self.kind = kind
+
+
+def mis_cooling() -> bool:
+    return time.monotonic() < _MIS_COOL_UNTIL[0]
+
+
+def _mis_cool(reason: str) -> None:
+    _MIS_COOL_UNTIL[0] = time.monotonic() + MIS_COOLDOWN
+    print(f"⚠️ MIS 疑似被擋（{reason}），暫停 {MIS_COOLDOWN:.0f} 秒", flush=True)
+
+
+def mis_get(session, params: Dict[str, Any]) -> Dict[str, Any]:
+    """MIS getStockInfo 的單一出口；成功回 JSON dict，失敗丟 MisError。"""
+    if mis_cooling():
+        raise MisError("cooldown")
+    import requests
+    with _MIS_GATE:
+        wait = _MIS_NEXT[0] - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
+        try:
+            if (isinstance(session, requests.Session)        # 只對真正的連線取 cookie（測試替身不動）
+                    and time.monotonic() - _MIS_WARMED.get(id(session), -1e9) > MIS_WARM_TTL):
+                try:
+                    session.get(MIS_INDEX_URL, headers={"User-Agent": MIS_HEADERS["User-Agent"]}, timeout=(4, MIS_TIMEOUT))
+                    _MIS_WARMED[id(session)] = time.monotonic()
+                except Exception as exc:          # 取 cookie 失敗不擋正式請求，只記一筆
+                    print(f"⚠️ MIS 取 cookie 失敗｜{tools.err_text(exc)}", flush=True)
+            started, status = time.perf_counter(), 0
+            try:
+                response = session.get(MIS_URL, params={**params, "json": "1", "delay": "0", "_": int(time.time() * 1000)},
+                                       headers=MIS_HEADERS, timeout=(4, MIS_TIMEOUT))
+                status = int(response.status_code)
+            except requests.exceptions.Timeout as exc:
+                raise MisError("timeout", tools.err_text(exc, 80)) from exc
+            except Exception as exc:
+                raise MisError("conn", tools.err_text(exc, 80)) from exc
+            finally:
+                try:
+                    tools.record_api_event("TWSE-MIS", status=status, latency=time.perf_counter() - started)
+                except Exception:
+                    pass
+            if status in (403, 429):
+                _mis_cool(f"HTTP {status}")
+                raise MisError("blocked", f"HTTP {status}")
+            if status >= 400:
+                raise MisError("http", f"HTTP {status}")
+            try:
+                payload = response.json()
+            except ValueError as exc:
+                _mis_cool("回傳不是 JSON")
+                raise MisError("html", str(getattr(response, "text", "") or "")[:60].replace("\n", " ")) from exc
+            if not isinstance(payload, dict):
+                raise MisError("html", "JSON 格式不符")
+            return payload
+        finally:
+            _MIS_NEXT[0] = time.monotonic() + MIS_GAP
+
 
 def fetch_sector_quotes() -> Dict[str, Any]:
     """證交所 MIS 即時類股指數：一次請求拿完，回傳 {rows, benchmarks, time}。"""
-    if tools.closed_quotes_only():
+    if not tools.stock_live_quotes():
         return {"rows": [], "benchmarks": {}, "time": ""}
     channels = "|".join(MIS_CHANNELS + ["tse_t00.tw", "otc_o00.tw"])
-    started = time.perf_counter()
-    status = 0
     try:
-        try:
-            session = tools.core().get_thread_session()
-        except Exception:   # 主程式還沒載入時（離線測試）就用一般連線
-            import requests
-            session = requests
-        response = session.get(MIS_URL, params={"ex_ch": channels, "json": "1", "delay": "0"},
-                               headers=MIS_HEADERS, timeout=(4, MIS_TIMEOUT))
-        status = int(response.status_code)
-        response.raise_for_status()
-        payload = response.json() or {}
-    finally:
-        try:
-            tools.record_api_event("TWSE-MIS", status=status, latency=time.perf_counter() - started)
-        except Exception:
-            pass
+        session = tools.core().get_thread_session()
+    except Exception:   # 主程式還沒載入時（離線測試）就用一般連線
+        import requests
+        session = requests
+    payload = mis_get(session, {"ex_ch": channels})
     rows, benchmarks, stamp = [], {}, ""
     market_turnover: Optional[float] = None
     for item in payload.get("msgArray") or []:
@@ -128,7 +193,7 @@ def _minutes(now=None) -> int:
 
 def session_open(now=None) -> bool:
     now = now or _now()
-    return not tools.closed_quotes_only() and now.weekday() < 5 and 9 * 60 <= _minutes(now) <= 13 * 60 + 35
+    return tools.stock_live_quotes() and now.weekday() < 5 and 9 * 60 <= _minutes(now) <= 13 * 60 + 35
 
 
 def ready_for_query(now=None) -> bool:
@@ -157,7 +222,7 @@ def tick(force: bool = False) -> Dict[str, Any]:
 
 
 def _tick(force: bool) -> Dict[str, Any]:
-    if tools.closed_quotes_only():
+    if not tools.stock_live_quotes():
         return {"saved": False, "reason": "即時行情已停用"}
     now = _now()
     if not force and not session_open(now):
@@ -272,7 +337,7 @@ def _baseline(snaps: List[Dict[str, Any]], latest_minutes: int) -> Tuple[Optiona
 
 def deltas(now=None) -> Dict[str, Any]:
     """L1 主結果：每個類股的現在漲幅、基準漲幅、Δ30m、名次與分位數。"""
-    if tools.closed_quotes_only():
+    if not tools.stock_live_quotes():
         return {"available": False, "reason": "即時行情已停用", "phase": phase(now)}
     now = now or _now()
     day = now.strftime("%Y-%m-%d")
@@ -418,10 +483,11 @@ def detect_intent(text: str) -> Optional[Dict[str, str]]:
 # ============================================================
 
 LEADER_TOP = 5                      # v1.4：每族群領漲／領跌 TOP5（不硬湊反方向）
-MEMBER_WORKERS = 4                  # MIS 批次並行數（循序打 13 批要 10 秒以上）
+# 10-24：MIS 並行容易被擋，改為依序送出（mis_get 本身也有全域閘門），時限放寬到 20 秒
+MEMBER_WORKERS = max(1, tools._env_int("DISCORD_AI_MIS_WORKERS", 1))
 MEMBER_BATCH = 50                   # 每個 MIS 請求帶幾檔
 MEMBER_RETRY_BATCH = 10             # 缺漏代號的重試批量
-MEMBER_DEADLINE = 12.0              # 整次成員報價的時間上限（秒），不能拖住 Discord 回覆
+MEMBER_DEADLINE = max(5.0, tools._env_float("DISCORD_AI_MIS_DEADLINE", 20.0))   # 整次成員報價的時間上限（秒）
 MIN_COVERAGE = 0.80                 # 報價完整率低於此值不下判讀
 SMALL_SECTOR = 10                   # 成分股少於此數，卡片註明檔數
 BROAD_MIN, SPLIT_MIN, GAP_MIN = 0.60, 0.50, 0.80
@@ -489,7 +555,30 @@ def _thread_session():
 
 _HTTP_LOCK = threading.Lock()
 _HTTP_SENT = [0]                     # 成員報價實際送出的 HTTP 次數（全域、thread-safe）
-_BATCH_STATS: Dict[str, set] = {"unknown": set(), "today": set(), "no_trade": set(), "conn_error": set()}   # 本輪彙總（用代號去重，重試不重算）
+# 本輪彙總（用代號去重，重試不重算）；conn_error 收 MisError.kind，empty 收「回了 JSON 但沒有任何報價」的批次
+_BATCH_STATS: Dict[str, set] = {"unknown": set(), "today": set(), "no_trade": set(), "conn_error": set(), "empty": set(),
+                                "z_ok": set(), "pz_only": set(), "quote_only": set(), "no_price": set()}
+# 10-28 蒐證：少數代表股保存連續幾次 MIS 原始欄位（不增加請求，只從既有回應挑出來印 Log）
+SAMPLE_CODES = {c.strip() for c in str(os.getenv("DISCORD_AI_MIS_SAMPLE_CODES",
+                "2330,2317,2454,2382,3017,2603,2881,1301,6669,3231")).split(",") if c.strip()}
+SAMPLE_PER_DAY = max(0, tools._env_int("DISCORD_AI_MIS_SAMPLE_PER_DAY", 5))
+SAMPLE_FIELDS = ("c", "ch", "ex", "n", "d", "t", "tlong", "z", "pz", "y", "o", "h", "l", "v", "tv", "a", "b", "f", "g", "u", "w")
+_SAMPLE_COUNT: Dict[Tuple[str, str], int] = {}
+
+
+def _log_raw_sample(item: Dict[str, Any], source: str, sent_at: float) -> None:
+    code = str(item.get("c") or "")
+    if code not in SAMPLE_CODES or SAMPLE_PER_DAY <= 0:
+        return
+    key = (tools.taipei_now().strftime("%Y-%m-%d"), code)
+    with _HTTP_LOCK:
+        count = _SAMPLE_COUNT.get(key, 0)
+        if count >= SAMPLE_PER_DAY:
+            return
+        _SAMPLE_COUNT[key] = count + 1
+    raw = {k: item.get(k) for k in SAMPLE_FIELDS if k in item}
+    print(f"🧾 MIS 原始樣本｜{code}｜第 {count + 1} 次｜請求 {time.strftime('%H:%M:%S', time.localtime(sent_at))}"
+          f"｜price_source={source}｜{json.dumps(raw, ensure_ascii=False)}", flush=True)
 
 
 def _fetch_batch_scoped(request_id: str, codes: List[str]) -> Dict[str, Dict[str, Any]]:
@@ -499,7 +588,7 @@ def _fetch_batch_scoped(request_id: str, codes: List[str]) -> Dict[str, Dict[str
 
 
 def _fetch_batch(session, codes: List[str]) -> Dict[str, Dict[str, Any]]:
-    if tools.closed_quotes_only():
+    if not tools.stock_live_quotes():
         return {}
     session = session or _thread_session()               # 並行時傳 None，各執行緒用自己的 session
     try:
@@ -517,53 +606,73 @@ def _fetch_batch(session, codes: List[str]) -> Dict[str, Dict[str, Any]]:
         _BATCH_STATS["unknown"].update(c for c in codes if c not in channels)
     if not channels:
         return {}  # 市場別未知時不猜上市；交給覆蓋率檢查處理
-    with _HTTP_LOCK:
-        _HTTP_SENT[0] += 1
-    began, status, items = time.perf_counter(), 0, []
-    try:
-        response = session.get(MIS_URL, params={"ex_ch": "|".join(channels.values()),
-                                                "json": "1", "delay": "0"},
-                               headers=MIS_HEADERS, timeout=(4, MIS_TIMEOUT))
-        status = int(response.status_code)
-        response.raise_for_status()
-        items = (response.json() or {}).get("msgArray") or []
-    except Exception as exc:
-        print(f"⚠️ MIS 成員報價批次失敗｜{len(codes)} 檔｜{tools.err_text(exc)}", flush=True)
+    if not mis_cooling():
         with _HTTP_LOCK:
-            _BATCH_STATS["conn_error"].add(type(exc).__name__)
-    finally:
-        try:
-            tools.record_api_event("TWSE-MIS", status=status, latency=time.perf_counter() - began)
-        except Exception:
-            pass
+            _HTTP_SENT[0] += 1
+    items = []
+    sent_at = time.time()
+    try:
+        items = mis_get(session, {"ex_ch": "|".join(channels.values())}).get("msgArray") or []
+        if not items:
+            with _HTTP_LOCK:
+                _BATCH_STATS["empty"].add(codes[0])           # 以批次第一檔代表該批
+    except MisError as exc:
+        if exc.kind != "cooldown":
+            print(f"⚠️ MIS 成員報價批次失敗｜{len(codes)} 檔｜{exc}", flush=True)
+        with _HTTP_LOCK:
+            _BATCH_STATS["conn_error"].add(exc.kind)
     out: Dict[str, Dict[str, Any]] = {}
     today, no_trade = set(), set()
+    kinds: Dict[str, set] = {"z_ok": set(), "pz_only": set(), "quote_only": set(), "no_price": set()}
     for item in items:
         code = str(item.get("c") or "")
         channel = channels.get(code)
         if not channel or (item.get("ch") and item["ch"] != f"{code}.tw") \
                 or (item.get("ex") and item["ex"] != channel.split("_", 1)[0]):
             continue
-        price, previous = _mis_price(item), _num_field(item, "y")
+        # 10-28 審核：先讀 z／pz，再看五檔。以前先要求「z 或五檔」有價才往下，只有 pz 的報價整檔被丟掉。
+        z_price, pz_price = _num_field(item, "z"), _num_field(item, "pz")
+        quote_mid, previous = _mis_price(item), _num_field(item, "y")
+        source = "z" if z_price > 0 else "pz_only" if pz_price > 0 else "quote_only" if quote_mid > 0 else "no_price"
+        _log_raw_sample(item, source, sent_at)
         is_today = tools.mis_item_is_today(item)
         if is_today:
             today.add(code)
-            if price > 0 and _num_field(item, "z") <= 0:     # 沒有成交價、用五檔中價估算
+            kinds["z_ok" if source == "z" else source].add(code)
+            if source != "z" and quote_mid > 0:          # 族群雷達沿用：沒有 z 時用五檔中價估算
                 no_trade.add(code)
+        # 族群雷達的 price：z → 五檔中價 → pz（估算用，不代表成交）
+        price = quote_mid or pz_price
         if code and price > 0 and previous > 0 and is_today:
             lots = _num_field(item, "v")                  # MIS 累計成交量（張）
+            # 10-28 審核：族群排行只把 z 當「已核實成交價」；pz 的語義與成交時間還沒核實，另存成候選，不直接當最新成交
+            trade_price = z_price if z_price > 0 else 0.0
             out[code] = {"name": str(item.get("n") or code), "price": price, "prev": previous,
                          "change_pct": round((price / previous - 1) * 100, 2),
-                         "value": lots * 1000 * price}     # 成交金額近似值（MIS 沒有逐檔成交金額）
+                         "value": lots * 1000 * price,     # 成交金額近似值（MIS 沒有逐檔成交金額）
+                         # 10-24：今日族群排行用（漲停鎖住／打開、離今日高點）；MIS 給「-」時為 0
+                         "high": _num_field(item, "h"), "low": _num_field(item, "l"), "open": _num_field(item, "o"),
+                         "limit_up": _num_field(item, "u"), "limit_down": _num_field(item, "w"),
+                         "traded": _num_field(item, "z") > 0,
+                         "lots": lots,                     # 10-25：族群排行 v2 算近 5 分量（累計張數相減）
+                         "trade_price": trade_price,       # 10-28：只有 z（已核實成交價）；0＝未知
+                         "pz_price": pz_price,             # 10-28：候選價格，語義待核實，排行不直接用
+                         # 10-28：最佳買一／賣一（族群排行盤中估值用；只有一檔價差且近 1 分鐘有成交才用中間價）
+                         "bid": _first_level(item.get("b")), "ask": _first_level(item.get("a")),
+                         "price_source": source,
+                         "trade_time": str(item.get("t") or ""), "exchange_date": str(item.get("d") or "")}
     with _HTTP_LOCK:
         _BATCH_STATS["today"].update(today)
         _BATCH_STATS["no_trade"].update(no_trade)
+        for key, codes_ in kinds.items():
+            _BATCH_STATS[key].update(codes_)
     return out
 
 
-def _fetch_stock_quotes(codes: List[str]) -> Dict[str, Dict[str, Any]]:
-    """批次報價＋完整率驗證：缺的用小批重試一次，仍缺就記下來（不猜、不補）。"""
-    if tools.closed_quotes_only():
+def _fetch_stock_quotes(codes: List[str], deadline_seconds: Optional[float] = None) -> Dict[str, Dict[str, Any]]:
+    """批次報價＋完整率驗證：缺的用小批重試一次，仍缺就記下來（不猜、不補）。
+    deadline_seconds：整次時限（預設 MEMBER_DEADLINE）；背景取樣不趕時間，可以給長一點，一次抓齊。"""
+    if not tools.stock_live_quotes():
         return {}
     try:
         session = tools.core().get_thread_session()
@@ -572,7 +681,7 @@ def _fetch_stock_quotes(codes: List[str]) -> Dict[str, Dict[str, Any]]:
         session = requests
     out: Dict[str, Dict[str, Any]] = {}
     began = time.perf_counter()
-    deadline = began + MEMBER_DEADLINE
+    deadline = began + (deadline_seconds or MEMBER_DEADLINE)
     with _HTTP_LOCK:
         sent_before = _HTTP_SENT[0]
         for bucket in _BATCH_STATS.values():
@@ -607,16 +716,24 @@ def _fetch_stock_quotes(codes: List[str]) -> Dict[str, Dict[str, Any]]:
         sent = _HTTP_SENT[0] - sent_before     # 同時有其他查詢在抓時會一起算進來，屬上限值
         unknown, today = len(_BATCH_STATS["unknown"]), len(_BATCH_STATS["today"])
         no_trade = len(_BATCH_STATS["no_trade"])
+        errors, empty = sorted(_BATCH_STATS["conn_error"]), len(_BATCH_STATS["empty"])
+        # 最終去重：同一檔在重試中拿到 z 就算 z，不和前一次的分類重複計
+        z_ok = _BATCH_STATS["z_ok"]
+        pz_only = _BATCH_STATS["pz_only"] - z_ok
+        quote_only = _BATCH_STATS["quote_only"] - z_ok - pz_only
+        no_price = _BATCH_STATS["no_price"] - z_ok - pz_only - quote_only
+        kinds_text = f"z可用={len(z_ok)}｜只有pz={len(pz_only)}｜只有五檔={len(quote_only)}｜都沒有={len(no_price)}"
     print(f"📡 MIS 成員報價｜requested={len(codes)}｜returned={len(out)}｜missing={len(missing)}"
-          f"｜市場別不明={unknown}｜中價估算={no_trade}/{today}（MIS 無成交價）"
-          f"｜http_calls={sent}（{len(batches)} 批＋重試）｜{time.perf_counter() - began:.1f}s"
+          f"｜市場別不明={unknown}｜同日行情={today}｜{kinds_text}"
+          + (f"｜錯誤類型={'/'.join(errors)}" if errors else "") + (f"｜空回應批次={empty}" if empty else "")
+          + f"｜http_calls={sent}（{len(batches)} 批＋重試）｜{time.perf_counter() - began:.1f}s"
           + (f"｜{','.join(missing[:15])}" if missing else ""), flush=True)
     return out
 
 
 def _quotes_for(codes: List[str]) -> Dict[str, Dict[str, Any]]:
     """同一個 5 分鐘桶內共用報價（背景 tick 與查詢都走這裡）；只補抓還沒有的代號。"""
-    if tools.closed_quotes_only():
+    if not tools.stock_live_quotes():
         return {}
     bucket = _quote_bucket()
     with _QUOTE_LOCK:                                    # 同時查詢時等同一份結果（single-flight）
@@ -1021,8 +1138,8 @@ def _panel(section: str, data: Dict[str, Any], rows: List[Dict[str, Any]], membe
         "name": _title(section, data, tier), "mode": "market_momentum", "comparison_date": "",
         "title_suffix": "",                 # 不加「漲幅排行」：轉強／轉弱卡是依 Δ 排序
         "stamp_text": stamp, "stamp_live": live,
-        "footer_text": ("股市艾斯  /  盤中漲幅為暫定值，收盤前會變動" if live
-                        else "股市艾斯  /  類股指數為當日最後一張盤中快照"),
+        "footer_text": ("股市艾斯  /  盤中漲幅為暫定值，收盤前會變動・僅供研究參考，非買賣建議" if live
+                        else "股市艾斯  /  類股指數為當日最後一張盤中快照・僅供研究參考，非買賣建議"),
         "rows": items[:3], "others": [],
         "coverage_note": "", "liquidity_note": note,
         "live_time": str(data.get("time", "")),
@@ -1080,7 +1197,7 @@ def answer(direction: str = "both", scope: str = "all", now=None, view: str = "a
     主要族群的強勢區剔除集中拉抬（另列「集中型異動」）；小型族群不剔除，直接標出來。
     direction 目前只保留介面。
     """
-    if tools.closed_quotes_only():
+    if not tools.stock_live_quotes():
         return {"text": "即時族群雷達已停用；可改查最近收盤資料的族群排行。", "panels": [], "title": "族群雷達"}
     # v1.4：初期只看大族群（≥20 檔），「小型／主要族群雷達」都回同一份；問小型／主要時文字先講清楚
     notice = "目前族群雷達暫以官方成分股 ≥20 檔的大族群為主。" if scope in ("small", "main") else ""

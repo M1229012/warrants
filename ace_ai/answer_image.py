@@ -264,12 +264,31 @@ def body_blocks(text: str) -> list[Block]:
             lines = wrap(title, 29, CONTENT - 80, True)
             blocks.append(Block('heading', lines, len(lines) * 42 + 22))
             raw = heading.group(3).strip()
+        if raw and _is_comment_note(raw) and _preview():
+            print(f"📝 圖卡註解（只記 Log）｜{raw}", flush=True)
+            continue
         if raw:
             small = raw.startswith(('資料時間', '※', '資料來源', '⚠️', '🧡'))
             size, line_height = (23, 36) if small else (29, 45)
             lines = wrap(raw, size, CONTENT - 80)
             blocks.append(Block('note' if small else 'text', lines, len(lines) * line_height + 10))
     return blocks
+
+
+def _preview() -> bool:
+    """11-03：測試版移植的圖卡改動（圖上不放註解、AI 欄位防線、深綠字）先只給 /ace 管理員本人。"""
+    try:
+        import warrant_ai_tools as tools
+        return tools.ace_preview()
+    except Exception:
+        return False
+
+
+def _is_comment_note(text: str) -> bool:
+    """11-02 使用者：「※」開頭的註解使用者不需要知道，只寫 Log。延續上一題、操作提示（含「重新開始」）要留著。
+    帶資料或聲明的註解（資料日期、筆數、週精選聲明）在來源標 keep。"""
+    text = str(text or '')
+    return text.startswith('※') and '重新開始' not in text
 
 
 def text_at(draw, xy, text, size=29, fill=INK, bold=False):
@@ -2433,10 +2452,9 @@ def sector_card(draw, y: float, data: dict, dry: bool) -> int:
     else:
         stamp = f"{_sector_date(data.get('comparison_date'))} 收盤" if data.get('comparison_date') else ''
         stamp_bg, stamp_ink = TILE_BG, MUTED
-    disclaimer = '※ 排名僅供研究與觀察參考，不代表未來表現，亦非買賣建議。'
-    note = str(data.get('liquidity_note') or '')
-    if note:
-        disclaimer = f"{note}　｜　{disclaimer}"
+    # 11-02 使用者（測試版 11-03 移植；族群目前只有管理員看得到）：範圍與條件說明只寫 Log，圖上不放；非買賣建議的提醒放在頁尾
+    if not dry and data.get('liquidity_note'):
+        print(f"📝 族群圖卡註解（只記 Log）｜{data['liquidity_note']}", flush=True)
     if not dry:
         draw.rectangle((px, y + h + 6, px + 5, y + h + 38), fill=ACCENT)
         text_at(draw, (px + 18, y + h), title, 32, INK, True)
@@ -2444,8 +2462,7 @@ def sector_card(draw, y: float, data: dict, dry: bool) -> int:
             sw = font(19, True).getlength(stamp) + 30
             draw.rounded_rectangle((x1 - SECTOR_PAD - sw, y + h + 2, x1 - SECTOR_PAD, y + h + 38), radius=18, fill=stamp_bg)
             draw.text((x1 - SECTOR_PAD - sw / 2, y + h + 20), stamp, font=font(19, True), fill=stamp_ink, anchor='mm')
-        text_at(draw, (px, y + h + 58), disclaimer, 18, MUTED)
-    h += 56 + 38
+    h += 62
     # 不另畫「Top5 一覽」橫條：前三名卡片＋其他名次表已經列出同樣的分數，重複又拉長圖片
     if not rows:
         if not dry:
@@ -2532,9 +2549,694 @@ def catalog_card(draw, y: float, data: dict, dry: bool) -> int:
         h += rows * (chip_h + gap_y) + 20
     return int(h + 8)
 
+# ============================================================
+# 10-24 今日族群排行 TOP5（新版）：和 AI 解讀卡／分點卡同一套風格——
+# 金色短條＋大標題、白底卡片、名次與族群名大字、漲跌用深紅／深綠粗體，不用彩色色塊。
+# ============================================================
+GR_BODY = 24
+GR_LINE = 38
+# 10-24：TOP5 已經是最強／最弱，不再標「強勢／偏弱」；只留資料提醒（小樣本、試行）
+GROUP_CARD_STYLE = os.getenv('DISCORD_AI_GROUP_CARD_STYLE', 'v3').strip().lower() or 'v3'   # 10-25 使用者確認 v3 範例圖
+
+
+def _gr_tag(row: dict) -> str:
+    return '・'.join((['小樣本'] if row.get('small') else []) + (['試行'] if row.get('trial') else []))
+
+
+def _signed_ink(value) -> str:
+    v = _finite(value)
+    return UP_TEXT if (v or 0) > 0 else DOWN_TEXT if (v or 0) < 0 else MUTED
+
+
+GR_BADGE_PAD = 8      # 10-25：鎖漲停／鎖跌停色塊左右留白
+
+
+def _gr_piece_w(text: str, color, bold: bool, size: int) -> float:
+    w = font(size, bold).getlength(text)
+    return w + GR_BADGE_PAD * 2 if isinstance(color, tuple) else w
+
+
+def _gr_flow(units: list, width: float, size: int) -> list:
+    """一組（例如「股名 +3.2%」）不拆開換行；回傳每行 [(x偏移, 文字, 顏色, 粗體)]。
+    顏色是 ('badge', 底色) 時畫成色塊白字（見 _gr_draw_line）。"""
+    lines, cur, cx = [], [], 0.0
+    for unit in units:
+        w = sum(_gr_piece_w(text, color, bold, size) for text, color, bold in unit)
+        if cur and cx + w > width:
+            lines.append(cur)
+            cur, cx = [], 0.0
+        for text, color, bold in unit:
+            cur.append((cx, text, color, bold))
+            cx += _gr_piece_w(text, color, bold, size)
+    if cur:
+        lines.append(cur)
+    return lines
+
+
+def _gr_draw_line(draw, x: float, y: float, line: list, size: int) -> None:
+    for ox, text, color, bold in line:
+        if isinstance(color, tuple):
+            w = font(size, bold).getlength(text)
+            draw.rounded_rectangle((x + ox, y - 7, x + ox + w + GR_BADGE_PAD * 2, y + size + 3), radius=8, fill=color[1])
+            draw.text((x + ox + GR_BADGE_PAD, y + size / 2 - 2), text, font=font(size, bold), fill='white', anchor='lm')
+        else:
+            text_at(draw, (x + ox, y), text, size, color, bold)
+
+
+def _group_row(draw, x: float, y: float, width: float, row: dict, leader_label: str, dry: bool) -> int:
+    right = x + width
+    rank_w, pad = 64, 22
+    nx, inner = x + rank_w, width - rank_w
+    avg = _finite(row.get('avg'))
+    value = f'{avg:+.2f}%' if avg is not None else '—'
+    value_w = font(46, True).getlength(value)
+    tag = _gr_tag(row)
+    tag_w = font(22, True).getlength(tag)
+    name, name_size = fit(str(row.get('name') or ''), 32, inner - value_w - tag_w - 56, True, 24)
+    med, rel = _finite(row.get('median')), _finite(row.get('rel'))
+    stats = [[('中位 ', MUTED, False), (f'{med:+.2f}%' if med is not None else '—', _signed_ink(med), True)],
+             [('　上漲 ', MUTED, False), (f"{row.get('up', 0)}/{row.get('valid', 0)} 檔", INK, True)]]
+    if rel is not None:
+        stats.append([('　比基準 ', MUTED, False), (f'{rel:+.2f}', _signed_ink(rel), True)])
+    leaders = [[(leader_label + '　', MUTED, False)]]
+    leaders += [[(str(n) + ' ', INK, False), (f'{p:+.2f}%', _signed_ink(p), True), ('　', INK, False)]
+                for n, p in row.get('leaders') or []]
+    stat_lines = _gr_flow(stats, inner, GR_BODY)
+    leader_lines = _gr_flow(leaders, inner, GR_BODY) if row.get('leaders') else []
+    meta = f"有效 {row.get('valid', 0)}／通過流動性 {row.get('liquid', 0)}／成分 {row.get('members', 0)} 檔"
+    height = pad + 56 + (len(stat_lines) + len(leader_lines)) * GR_LINE + 30 + pad
+    if dry:
+        return int(height)
+    rank = int(row.get('rank') or 0)
+    if rank > 1:
+        draw.line((x, y, right, y), fill=LINE, width=2)
+    cy = y + pad
+    draw.text((x + 6, cy + 24), str(rank), font=font(36, True), fill=ACCENT if rank == 1 else INK, anchor='lm')
+    text_at(draw, (nx, cy + 4), name, name_size, INK, True)
+    if tag:
+        text_at(draw, (nx + font(name_size, True).getlength(name) + 16, cy + 13), tag, 22, MUTED, True)
+    draw.text((right, cy + 26), value, font=font(46, True), fill=_signed_ink(avg), anchor='rm')
+    ly = cy + 60
+    for line in stat_lines + leader_lines:
+        for ox, text, color, bold in line:
+            text_at(draw, (nx + ox, ly), text, GR_BODY, color, bold)
+        ly += GR_LINE
+    text_at(draw, (nx, ly + 2), meta, 20, MUTED)
+    return int(height)
+
+
+def _leader_units(row: dict, leader_label: str, size_hint: int = GR_BODY) -> list:
+    units = [[(leader_label + '　', MUTED, False)]]
+    units += [[(str(n) + ' ', INK, False), (f'{p:+.2f}%', _signed_ink(p), True), ('　', INK, False)]
+              for n, p in row.get('leaders') or []]
+    return units
+
+
+def _group_table(draw, x: float, y: float, width: float, rows: list, leader_label: str, dry: bool) -> int:
+    """樣式 B：表格。一列一個族群，數字欄對齊；族群名下方一行領漲（跌）股。"""
+    right = x + width
+    c_avg, c_med, c_up = x + width * 0.66, x + width * 0.82, right       # 各欄右緣
+    head_h, pad, body = 46, 18, 22
+    total = head_h
+    if not dry:
+        draw.rounded_rectangle((x, y, right, y + head_h - 6), radius=10, fill=TILE_BG)
+        for label, lx, anchor in (('名次', x + 16, 'lm'), ('族群', x + 76, 'lm'), ('平均漲跌', c_avg, 'rm'),
+                                  ('中位', c_med, 'rm'), ('上漲家數', c_up - 10, 'rm')):
+            draw.text((lx, y + (head_h - 6) / 2), label, font=font(20), fill=MUTED, anchor=anchor)
+    for row in rows:
+        name_w = c_avg - 190 - (x + 76)
+        tag = _gr_tag(row)
+        name, size = fit(str(row.get('name') or ''), 30, name_w - (font(19, True).getlength(tag) + 12 if tag else 0), True, 22)
+        leaders = _gr_flow(_leader_units(row, leader_label), right - (x + 76), body)
+        h = pad + 42 + len(leaders) * 34 + pad
+        if not dry:
+            ry = y + total
+            if row is not rows[0]:
+                draw.line((x, ry, right, ry), fill=LINE, width=2)
+            rank = int(row.get('rank') or 0)
+            mid = ry + pad + 20
+            draw.text((x + 34, mid), str(rank), font=font(32, True), fill=ACCENT if rank == 1 else INK, anchor='mm')
+            draw.text((x + 76, mid), name, font=font(size, True), fill=INK, anchor='lm')
+            if tag:
+                draw.text((x + 76 + font(size, True).getlength(name) + 12, mid + 2), tag, font=font(19, True), fill=MUTED, anchor='lm')
+            avg, med = _finite(row.get('avg')), _finite(row.get('median'))
+            draw.text((c_avg, mid), f'{avg:+.2f}%' if avg is not None else '—', font=font(34, True), fill=_signed_ink(avg), anchor='rm')
+            draw.text((c_med, mid), f'{med:+.2f}%' if med is not None else '—', font=font(26, True), fill=_signed_ink(med), anchor='rm')
+            draw.text((c_up - 10, mid), f"{row.get('up', 0)}/{row.get('valid', 0)}", font=font(26, True), fill=INK, anchor='rm')
+            ly = ry + pad + 46
+            for line in leaders:
+                for ox, text, color, bold in line:
+                    text_at(draw, (x + 76 + ox, ly), text, body, color, bold)
+                ly += 34
+        total += h
+    return int(total + 6)
+
+
+def _group_bar_row(draw, x: float, y: float, width: float, row: dict, leader_label: str, max_abs: float, dry: bool) -> int:
+    """樣式 C：長條。名稱＋大字漲跌，下方一條依漲跌幅比例的長條，再一行中位／上漲／領漲。"""
+    right, pad, rank_w = x + width, 20, 60
+    nx, inner = x + rank_w, width - rank_w
+    avg = _finite(row.get('avg'))
+    value = f'{avg:+.2f}%' if avg is not None else '—'
+    tag = _gr_tag(row)
+    name, size = fit(str(row.get('name') or ''), 32, inner - font(44, True).getlength(value) - 60
+                     - (font(20, True).getlength(tag) + 14 if tag else 0), True, 24)
+    med = _finite(row.get('median'))
+    units = [[('中位 ', MUTED, False), (f'{med:+.2f}%' if med is not None else '—', _signed_ink(med), True)],
+             [('　上漲 ', MUTED, False), (f"{row.get('up', 0)}/{row.get('valid', 0)} 檔", INK, True), ('　', INK, False)]]
+    units += _leader_units(row, leader_label)
+    lines = _gr_flow(units, inner, 23)
+    h = pad + 50 + 16 + 14 + len(lines) * 34 + pad
+    if dry:
+        return int(h)
+    rank = int(row.get('rank') or 0)
+    if rank > 1:
+        draw.line((x, y, right, y), fill=LINE, width=2)
+    cy = y + pad
+    draw.text((x + 6, cy + 24), str(rank), font=font(36, True), fill=ACCENT if rank == 1 else INK, anchor='lm')
+    draw.text((nx, cy + 24), name, font=font(size, True), fill=INK, anchor='lm')
+    if tag:
+        draw.text((nx + font(size, True).getlength(name) + 14, cy + 26), tag, font=font(20, True), fill=MUTED, anchor='lm')
+    draw.text((right, cy + 24), value, font=font(44, True), fill=_signed_ink(avg), anchor='rm')
+    by = cy + 58
+    draw.rounded_rectangle((nx, by, right, by + 14), radius=7, fill=GRID)
+    filled = inner * min(1.0, abs(avg or 0.0) / max(max_abs, 1e-9))
+    if filled > 14:
+        draw.rounded_rectangle((nx, by, nx + filled, by + 14), radius=7, fill=_signed_ink(avg))
+    ly = by + 14 + 14
+    for line in lines:
+        for ox, text, color, bold in line:
+            text_at(draw, (nx + ox, ly), text, 23, color, bold)
+        ly += 34
+    return int(h)
+
+
+_GR_STATE = {'locked_up': ('鎖漲停', UP_TEXT), 'opened_up': ('漲停打開', MUTED), 'limit_up': ('漲停', UP_TEXT),
+             'locked_down': ('鎖跌停', DOWN_TEXT), 'opened_down': ('跌停打開', MUTED), 'limit_down': ('跌停', DOWN_TEXT)}
+
+
+def _gr_metrics(row: dict, data: dict) -> list:
+    """(名稱, 數值, 顏色)。盤中：上漲家數、漲（跌）停鎖住／打開、離今日高（低）點、成交額已達日均；
+    收盤：上漲家數、漲（跌）停家數、量能倍數、近 5 日。沒有資料的項目不顯示。"""
+    out = [('上漲家數', f"{row.get('up', 0)}/{row.get('valid', 0)} 檔", INK)]
+    limit_label = str(data.get('limit_label') or '漲停')
+    heat = _finite(row.get('heat'))
+    if data.get('live') and row.get('live_fields'):
+        out.append((limit_label, f"鎖 {int(row.get('locked') or 0)}・開 {int(row.get('opened') or 0)}", INK))
+        extreme = _finite(row.get('from_extreme'))
+        if extreme is not None:
+            out.append((str(data.get('extreme_label') or '離今日高點'), f'{extreme:+.2f}%', _signed_ink(extreme)))
+        if heat is not None:
+            out.append(('已達日均', f'{heat * 100:.0f}%', INK))
+        return out
+    out.append((limit_label, f"{int(row.get('limit') or 0)} 檔", INK))
+    if heat is not None:
+        out.append(('量能', f'{heat:.1f} 倍', INK))
+    d5 = _finite(row.get('d5'))
+    if d5 is not None:
+        out.append(('近 5 日', f'{d5:+.2f}%', _signed_ink(d5)))
+    return out
+
+
+GR_HEAD, GR_TAIL = 3, 2      # 每個族群一律列：領漲（跌）3 檔＋落後（抗跌）2 檔
+
+
+def _lead_lag_units(row: dict, data: dict) -> list:
+    """「領漲 A +9.97% 鎖　B …｜落後 D +0.3%　E …」；鎖漲停／漲停打開用小字標在漲幅後面。"""
+    stocks = list(row.get('stocks') or []) or [(n, p, '', None) for n, p in row.get('leaders') or []]
+    head = stocks[:GR_HEAD]
+    tail = [s for s in stocks[-GR_TAIL:] if s not in head] if len(stocks) > GR_HEAD else []
+
+    def unit(s):
+        tag, ink = _GR_STATE.get(str(s[2] or ''), ('', MUTED))
+        parts = [(str(s[0]) + ' ', INK, False), (f'{s[1]:+.2f}%', _signed_ink(s[1]), True)]
+        if tag:
+            parts.append((' ' + tag, ink, False))
+        parts.append(('　', INK, False))
+        return parts
+
+    units = [[(str(data.get('leader_label') or '領漲') + ' ', MUTED, False)]] + [unit(s) for s in head]
+    if tail:
+        units.append([('｜ ' + str(data.get('lag_label') or '落後') + ' ', MUTED, False)])
+        units += [unit(s) for s in tail]
+    return units
+
+
+def _gr_hero(draw, x: float, y: float, width: float, row: dict, data: dict, dry: bool) -> int:
+    """第 1 名重點區：米色底、大字名稱與漲跌、四格數據、領漲（跌）股。"""
+    right, pad = x + width, 28
+    avg = _finite(row.get('avg'))
+    value = f'{avg:+.2f}%' if avg is not None else '—'
+    tag = _gr_tag(row)
+    name, size = fit(str(row.get('name') or ''), 42, width - pad * 2 - font(58, True).getlength(value) - 40
+                     - (font(22, True).getlength(tag) + 14 if tag else 0), True, 28)
+    metrics = _gr_metrics(row, data)
+    gap = 14
+    tile_w = (width - pad * 2 - gap * (len(metrics) - 1)) / len(metrics)
+    leaders = _gr_flow(_lead_lag_units(row, data), width - pad * 2, GR_BODY)
+    h = pad + 40 + 64 + 104 + 18 + len(leaders) * GR_LINE + pad - 8
+    if dry:
+        return int(h)
+    draw.rounded_rectangle((x, y, right, y + h), radius=18, fill=ACCENT_BG)
+    cy = y + pad
+    text_at(draw, (x + pad, cy), '第 1 名', 22, ACCENT, True)
+    draw.text((x + pad, cy + 74), name, font=font(size, True), fill=INK, anchor='ls')
+    if tag:
+        draw.text((x + pad + font(size, True).getlength(name) + 14, cy + 72), tag, font=font(22, True), fill=MUTED, anchor='ls')
+    draw.text((right - pad, cy + 76), value, font=font(58, True), fill=_signed_ink(avg), anchor='rs')
+    ty = cy + 104
+    for i, (label, val, color) in enumerate(metrics):
+        tx = x + pad + i * (tile_w + gap)
+        draw.rounded_rectangle((tx, ty, tx + tile_w, ty + 92), radius=12, fill='white')
+        text_at(draw, (tx + 18, ty + 12), label, 20, MUTED)
+        v, vs = fit(val, 32, tile_w - 36, True, 22)
+        text_at(draw, (tx + 18, ty + 42), v, vs, color, True)
+    ly = ty + 92 + 18
+    for line in leaders:
+        for ox, text, color, bold in line:
+            text_at(draw, (x + pad + ox, ly), text, GR_BODY, color, bold)
+        ly += GR_LINE
+    return int(h)
+
+
+def _gr_compact(draw, x: float, y: float, width: float, row: dict, data: dict, dry: bool) -> int:
+    """第 2～5 名精簡列：名次＋名稱＋漲跌，下一行上漲家數／量能／近 5 日／領漲第一檔。"""
+    right, pad, rank_w = x + width, 18, 56
+    nx, inner = x + rank_w, width - rank_w
+    avg = _finite(row.get('avg'))
+    value = f'{avg:+.2f}%' if avg is not None else '—'
+    tag = _gr_tag(row)
+    name, size = fit(str(row.get('name') or ''), 30, inner - font(38, True).getlength(value) - 40
+                     - (font(20, True).getlength(tag) + 12 if tag else 0), True, 22)
+    units = [[(label + ' ', MUTED, False), (val, color, True), ('　', INK, False)]
+             for label, val, color in _gr_metrics(row, data)
+             if data.get('live') or label != str(data.get('limit_label') or '漲停')]
+    lines = _gr_flow(units, inner, 22)
+    # 下一行：和第 1 名同樣列領漲（跌）3 檔＋落後（抗跌）2 檔，方便找同族群補漲（補跌）
+    lines += _gr_flow(_lead_lag_units(row, data), inner, 22)
+    h = pad + 46 + len(lines) * 34 + pad
+    if dry:
+        return int(h)
+    draw.line((x, y, right, y), fill=LINE, width=2)
+    cy = y + pad + 20
+    draw.text((x + 6, cy), str(row.get('rank', '')), font=font(32, True), fill=INK, anchor='lm')
+    draw.text((nx, cy), name, font=font(size, True), fill=INK, anchor='lm')
+    if tag:
+        draw.text((nx + font(size, True).getlength(name) + 12, cy + 2), tag, font=font(20, True), fill=MUTED, anchor='lm')
+    draw.text((right, cy), value, font=font(38, True), fill=_signed_ink(avg), anchor='rm')
+    ly = y + pad + 48
+    for line in lines:
+        for ox, text, color, bold in line:
+            text_at(draw, (nx + ox, ly), text, 22, color, bold)
+        ly += 34
+    return int(h)
+
+
+def _gr_grid(draw, x: float, y: float, width: float, rows: list, data: dict, dry: bool) -> int:
+    """第 2～5 名兩欄小卡。"""
+    gap, card_h = 18, 214
+    col = (width - gap) / 2
+    total = 0
+    for i, row in enumerate(rows):
+        r, c = divmod(i, 2)
+        cx, cy = x + c * (col + gap), y + r * (card_h + gap)
+        total = (r + 1) * (card_h + gap)
+        if dry:
+            continue
+        draw.rounded_rectangle((cx, cy, cx + col, cy + card_h), radius=16, fill=TILE_BG)
+        tag = _gr_tag(row)
+        text_at(draw, (cx + 22, cy + 18), f"第 {row.get('rank', '')} 名" + (f'・{tag}' if tag else ''), 20, MUTED, True)
+        name, size = fit(str(row.get('name') or ''), 30, col - 44, True, 22)
+        text_at(draw, (cx + 22, cy + 48), name, size, INK, True)
+        avg = _finite(row.get('avg'))
+        text_at(draw, (cx + 22, cy + 92), f'{avg:+.2f}%' if avg is not None else '—', 40, _signed_ink(avg), True)
+        stats = [f"{label} {val}" for label, val, _ in _gr_metrics(row, data)
+                 if label in ('上漲家數', '量能')]
+        text_at(draw, (cx + 22, cy + 148), '　'.join(stats), 21, MUTED)
+        leaders = list(row.get('leaders') or [])[:1]
+        if leaders:
+            n, p = leaders[0]
+            label = str(data.get('leader_label') or '領漲') + f' {n} '
+            text_at(draw, (cx + 22, cy + 178), label, 21, INK)
+            text_at(draw, (cx + 22 + font(21).getlength(label), cy + 178), f'{p:+.2f}%', 21, _signed_ink(p), True)
+    return int(total)
+
+
+def _gr_heat_table(draw, x: float, y: float, width: float, rows: list, data: dict, dry: bool) -> int:
+    """數據表：平均｜上漲｜漲停｜量能｜近 5 日，一眼比較「漲得廣不廣、量有沒有跟、是不是連續」。"""
+    right = x + width
+    cols = [('平均漲跌', 0.47), ('上漲', 0.59), (str(data.get('limit_label') or '漲停'), 0.69),
+            ('量能', 0.81), ('近 5 日', 1.0)]
+    edges = [x + width * r for _, r in cols]
+    head_h, pad, body = 46, 16, 21
+    total = head_h
+    if not dry:
+        draw.rounded_rectangle((x, y, right, y + head_h - 6), radius=10, fill=TILE_BG)
+        draw.text((x + 16, y + 20), '族群', font=font(20), fill=MUTED, anchor='lm')
+        for (label, _), ex in zip(cols, edges):
+            draw.text((ex - 12, y + 20), label, font=font(20), fill=MUTED, anchor='rm')
+    for row in rows:
+        # 領漲（跌）行放在族群名下方，寬度停在「平均漲跌」欄左側，不和數字欄重疊（放不下就換行）
+        leaders = _gr_flow(_leader_units(row, str(data.get('leader_label') or '領漲')),
+                           edges[0] - (x + 60) - font(32, True).getlength('+00.00%') - 24, body)
+        h = pad + 40 + len(leaders) * 32 + pad
+        if not dry:
+            ry = y + total
+            if row is not rows[0]:
+                draw.line((x, ry, right, ry), fill=LINE, width=2)
+            mid = ry + pad + 20
+            rank = int(row.get('rank') or 0)
+            draw.text((x + 18, mid), str(rank), font=font(30, True), fill=ACCENT if rank == 1 else INK, anchor='lm')
+            tag = _gr_tag(row)
+            name, size = fit(str(row.get('name') or '') + (f'（{tag}）' if tag else ''), 28, edges[0] - x - 220, True, 20)
+            draw.text((x + 60, mid), name, font=font(size, True), fill=INK, anchor='lm')
+            avg, heat, d5 = _finite(row.get('avg')), _finite(row.get('heat')), _finite(row.get('d5'))
+            values = [(f'{avg:+.2f}%' if avg is not None else '—', _signed_ink(avg), 32),
+                      (f"{row.get('up', 0)}/{row.get('valid', 0)}", INK, 25),
+                      (str(int(row.get('limit') or 0)), INK, 25),
+                      (f'{heat:.1f}倍' if heat is not None else '—', INK, 25),
+                      (f'{d5:+.1f}%' if d5 is not None else '—', _signed_ink(d5), 25)]
+            for (text, color, sz), ex in zip(values, edges):
+                draw.text((ex - 12, mid), text, font=font(sz, True), fill=color, anchor='rm')
+            ly = ry + pad + 44
+            for line in leaders:
+                for ox, text, color, bold in line:
+                    text_at(draw, (x + 60 + ox, ly), text, body, color, bold)
+                ly += 32
+        total += h
+    return int(total + 6)
+
+
+# ------------------------------------------------------------
+# 10-25 v3：每個族群同一種列——名次／名稱／大字漲跌；上漲家數・比大盤・近5分；
+# 領漲（跌）3 檔、落後（抗跌）2 檔；灰字一行中位數・離高（低）點・量能。鎖漲停紅底白字、鎖跌停綠底白字。
+# ------------------------------------------------------------
+GR3_LINE = 42
+_GR3_BADGE = {'locked_up': UP_TEXT, 'limit_up': UP_TEXT, 'locked_down': DOWN_TEXT, 'limit_down': DOWN_TEXT}
+
+
+def _gr3_stock_units(label: str, stocks: list) -> list:
+    units = [[(label + ' ', MUTED, False)]]
+    for s in stocks:
+        name, pct, state = str(s[0]), _finite(s[1]) or 0.0, str(s[2] or '')
+        code = str(s[4]) if len(s) > 4 and s[4] and str(s[4]) != name else ''
+        badge = _GR3_BADGE.get(state)
+        units.append(([(code + ' ', MUTED, False)] if code else [])
+                     + [(name + ' ', INK, False), (f'{pct:+.2f}%', ('badge', badge) if badge else _signed_ink(pct), True),
+                        ('　', INK, False)])
+    return units
+
+
+def _gr3_lines(row: dict, data: dict, inner: float) -> tuple:
+    """回傳 (摘要行, 領漲行, 落後行, 灰字)。"""
+    weak = data.get('direction') == 'weak'
+    sync = bool(data.get('sync_info'))
+    up, valid = int(row.get('up', 0) or 0), int(row.get('valid', 0) or 0)
+    ratio = f"（{up / valid * 100:.0f}%）" if sync and valid else ''
+    stats = [[('上漲 ', MUTED, False), (f"{up}/{valid}{ratio}", INK, True), ('　', INK, False)]]
+    rel = _finite(row.get('rel'))
+    med = _finite(row.get('median'))
+    if sync and med is not None:
+        # 這一行放上漲比例＋中位數＋平均，看整群是否同步（平均高、中位數低＝漲勢集中在少數幾檔）
+        stats.append([('中位數 ', MUTED, False), (f'{med:+.2f}%', _signed_ink(med), True), ('　', INK, False)])
+        avg = _finite(row.get('avg'))
+        if avg is not None and _finite(row.get('score')) is not None:
+            # 10-30：主數字改成排序值，平均移到這裡（主數字放平均時，第 1 名 -7.52%、第 2 名 -7.63% 看起來像排錯）
+            stats.append([('平均 ', MUTED, False), (f'{avg:+.2f}%', _signed_ink(avg), True), ('　', INK, False)])
+    elif rel is not None:
+        stats.append([('比股票池 ', MUTED, False), (f'{rel:+.2f}%', _signed_ink(rel), True), ('　', INK, False)])
+    if data.get('live'):
+        m5 = _finite(row.get('m5'))
+        stats.append([('近5分 ', MUTED, False), (f'{m5:+.2f}%', _signed_ink(m5), True) if m5 is not None
+                      else ('累積中', MUTED, True)])
+    stocks = list(row.get('stocks') or []) or [(n, p, '', None) for n, p in row.get('leaders') or []]
+    head = stocks[:GR_HEAD]
+    tail = [s for s in stocks[-GR_TAIL:] if s not in head] if len(stocks) > GR_HEAD else []
+    lead = _gr_flow(_gr3_stock_units(str(data.get('leader_label') or '領漲'), head), inner, GR_BODY) if head else []
+    lag = _gr_flow(_gr3_stock_units(str(data.get('lag_label') or '落後'), tail), inner, GR_BODY) if tail else []
+    if sync:
+        # 10-27 審核正名：比較對象是追蹤股票池（不是加權指數）→「比股票池」；10-30：這個值是平均 − 股票池平均，主數字改排序值後要寫明。
+        # 10-28：有效／有量／成分＝有已核實成交價／通過流動性股票池／名單候選檔數（已扣 excluded）。
+        # 「有效 4／有量 4」是報價完整、只是有量股少；「有效 4／有量 12」才是報價不足，兩種要看得出差別。
+        liquid = row.get("liquid")
+        counts = f"有效 {valid}／" + (f"有量 {int(liquid)}／" if liquid is not None else "") \
+            + f"成分 {int(row.get('members') or valid)} 檔"
+        meta = [f'平均比股票池 {rel:+.2f}%' if rel is not None else '', counts]
+    else:
+        meta = [f'中位數 {med:+.2f}%' if med is not None else '']
+    heat = _finite(row.get('heat'))
+    if data.get('live'):
+        extreme = _finite(row.get('from_extreme'))
+        if extreme is not None and row.get('live_fields'):
+            meta.append(f"{data.get('extreme_label') or ('離低點' if weak else '離高點')} {extreme:+.2f}%")
+        if heat is not None:
+            meta.append(f'估計成交額達日均 {heat * 100:.0f}%')
+    else:
+        if heat is not None:
+            meta.append(f'量能 {heat:.1f} 倍')
+        d5 = _finite(row.get('d5'))
+        if d5 is not None:
+            meta.append(f'近5日 {d5:+.2f}%')
+    return _gr_flow(stats, inner, GR_BODY), lead, lag, '｜'.join(m for m in meta if m)
+
+
+def _gr_main_value(row: dict):
+    """10-30：族群列右上主數字＝排序值（名次依這個排）；舊資料沒有排序值才用平均。"""
+    score = _finite(row.get('score'))
+    return score if score is not None else _finite(row.get('avg'))
+
+
+def _gr_rank_width(rank: int, size: int) -> float:
+    """名次欄寬：平常 60；單一族群的名次可能到三位數（113），要再放寬才不會壓到族群名稱。"""
+    return max(60.0, 4 + font(size, True).getlength(str(rank)) + 14)
+
+
+def _gr_v3_row(draw, x: float, y: float, width: float, row: dict, data: dict, dry: bool) -> int:
+    right, pad, rank_w = x + width, 20, _gr_rank_width(int(row.get('rank') or 0), 34)
+    nx, inner = x + rank_w, width - rank_w
+    main = _gr_main_value(row)
+    value = f'{main:+.2f}%' if main is not None else '—'
+    tag = _gr_tag(row)
+    tag_ink = WARN_INK if row.get('label') == '漲勢不均' else MUTED
+    if row.get('label') == '漲勢不均':
+        tag = '・'.join(t for t in ('漲勢不均', tag) if t)
+    name, size = fit(str(row.get('name') or ''), 32, inner - font(44, True).getlength(value) - 40
+                     - (font(21, True).getlength(tag) + 14 if tag else 0), True, 24)
+    stats, lead, lag, meta = _gr3_lines(row, data, inner)
+    body = len(stats) + len(lead) + len(lag)
+    h = pad + 52 + body * GR3_LINE + (30 if meta else 0) + pad
+    if dry:
+        return int(h)
+    rank = int(row.get('rank') or 0)
+    weak = data.get('direction') == 'weak'
+    if rank == 1:
+        draw.rounded_rectangle((x - 14, y + 6, right + 14, y + h - 6), radius=14, fill=DOWN_BG if weak else ACCENT_BG)
+    else:
+        draw.line((x, y, right, y), fill=LINE, width=2)
+    cy = y + pad
+    draw.text((x + 4, cy + 22), str(rank), font=font(34, True),
+              fill=(DOWN_TEXT if weak else ACCENT) if rank == 1 else INK, anchor='lm')
+    text_at(draw, (nx, cy), name, size, INK, True)
+    if tag:
+        text_at(draw, (nx + font(size, True).getlength(name) + 14, cy + 9), tag, 21, tag_ink, True)
+    draw.text((right, cy + 22), value, font=font(44, True), fill=_signed_ink(main), anchor='rm')
+    ly = cy + 52
+    for line in stats + lead + lag:
+        _gr_draw_line(draw, nx, ly, line, GR_BODY)
+        ly += GR3_LINE
+    if meta:
+        text_at(draw, (nx, ly), meta, 20, MUTED)
+    return int(h)
+
+
+GR_COMPACT_H = 64
+
+
+def _gr_v3_compact(draw, x: float, y: float, width: float, row: dict, data: dict, dry: bool) -> int:
+    """10-29 大類子族群排行：第 4 名以後每群一行（名次、名稱、上漲家數、排序值）。12 群全詳細圖太長。"""
+    if dry:
+        return GR_COMPACT_H
+    right, rank_w = x + width, _gr_rank_width(int(row.get('rank') or 0), 28)
+    main = _gr_main_value(row)
+    value = f'{main:+.2f}%' if main is not None else '—'
+    up, valid = int(row.get('up', 0) or 0), int(row.get('valid', 0) or 0)
+    stats = f"上漲 {up}/{valid}" + (f"（{up / valid * 100:.0f}%）" if valid else '')
+    tag = _gr_tag(row)
+    value_w = font(32, True).getlength(value)
+    stats_w = font(22).getlength(stats)
+    cy = y + GR_COMPACT_H / 2
+    draw.line((x, y, right, y), fill=LINE, width=2)
+    draw.text((x + 4, cy), str(int(row.get('rank') or 0)), font=font(28, True), fill=INK, anchor='lm')
+    name, size = fit(str(row.get('name') or ''), 28, width - rank_w - value_w - stats_w - 80
+                     - (font(19, True).getlength(tag) + 12 if tag else 0), True, 22)
+    draw.text((x + rank_w, cy), name, font=font(size, True), fill=INK, anchor='lm')
+    if tag:
+        draw.text((x + rank_w + font(size, True).getlength(name) + 12, cy + 2), tag, font=font(19, True), fill=MUTED, anchor='lm')
+    draw.text((right - value_w - 36, cy), stats, font=font(22), fill=MUTED, anchor='rm')
+    draw.text((right, cy), value, font=font(32, True), fill=_signed_ink(main), anchor='rm')
+    return GR_COMPACT_H
+
+
+def _gr_banner(draw, x: float, y: float, width: float, text: str, warn: bool, dry: bool) -> int:
+    lines = wrap(text, 22, width - 40)
+    h = len(lines) * 34 + 24
+    if not dry:
+        draw.rounded_rectangle((x, y, x + width, y + h), radius=12, fill=WARN_BG if warn else TILE_BG)
+        for i, line in enumerate(lines):
+            draw.text((x + 20, y + 12 + i * 34 + 17), line, font=font(22, True), fill=WARN_INK if warn else MUTED, anchor='lm')
+    return h + 16
+
+
+def _gr_head(draw, y: float, px: float, width: float, data: dict, dry: bool) -> int:
+    """金色短條＋標題、右側時間。回傳占用高度（含上方留白）。"""
+    right, h = px + width, 34
+    stamp = str(data.get('stamp') or '')
+    title, title_size = fit(str(data.get('title') or ''), 36, width - font(21).getlength(stamp) - 60, True, 26)
+    if not dry:
+        draw.rectangle((px, y + h + 8, px + 6, y + h + 44), fill=ACCENT)
+        text_at(draw, (px + 20, y + h), title, title_size, INK, True)
+        if stamp:
+            draw.text((right, y + h + 26), stamp, font=font(21), fill=MUTED, anchor='rm')
+    return h + 70
+
+
+FOLLOW_BAR_W, FOLLOW_BAR_GAP, FOLLOW_BAR_H = 16, 6, 40
+
+
+def _follow_block(draw, x: float, y: float, width: float, item: dict, first: bool, dry: bool) -> int:
+    """一檔跟漲觀察：代號 名稱 現價 今日｜族群 狀態；比族群中位・近5分・跑贏族群；近5分量・量增＋三根量柱。"""
+    right, pad = x + width, 20
+    h = pad + 46 + 38 + 46 + pad
+    if dry:
+        return h
+    if not first:
+        draw.line((x, y, right, y), fill=LINE, width=2)
+    cy = y + pad
+    state = str(item.get('state') or '')
+    group = str(item.get('group') or '')
+    state_w = font(24, True).getlength(state)
+    group_w = font(20).getlength(group)
+    draw.text((right, cy + 20), state, font=font(24, True), fill=ACCENT if state == '跟漲觀察' else MUTED, anchor='rm')
+    draw.text((right - state_w - 16, cy + 22), group, font=font(20), fill=MUTED, anchor='rm')
+    code = str(item.get('code') or '')
+    text_at(draw, (x, cy + 2), code + ' ', 26, MUTED)
+    nx = x + font(26).getlength(code + ' ')
+    name, size = fit(str(item.get('name') or code), 32, right - state_w - group_w - 40 - nx - 300, True, 24)
+    text_at(draw, (nx, cy), name, size, INK, True)
+    price, day = _finite(item.get('price')), _finite(item.get('day'))
+    _gr_draw_line(draw, nx + font(size, True).getlength(name) + 16, cy + 9, _gr_flow([[
+        ('現價 ', MUTED, False), (f'{price:,.2f}'.rstrip('0').rstrip('.') if price is not None else '—', INK, True),
+        ('　今日 ', MUTED, False), (f'{day:+.2f}%' if day is not None else '—', _signed_ink(day), True)]], 10_000, 23)[0], 23)
+    ly = cy + 52
+    pct = lambda key: (f"{_finite(item.get(key)):+.2f}%" if _finite(item.get(key)) is not None else '—', _signed_ink(item.get(key)), True)
+    _gr_draw_line(draw, x, ly, _gr_flow([[('比族群中位 ', MUTED, False), pct('lag'), ('　近5分 ', MUTED, False), pct('m5'),
+                                          ('　跑贏族群 ', MUTED, False), pct('beat')]], 10_000, 23)[0], 23)
+    ly += 40
+    ratio = _finite(item.get('ratio'))
+    value5 = str(item.get('value5_text') or '')
+    vol_line = _gr_flow([[('近5分量 ', MUTED, False), (f"{int(item.get('vol5') or 0):,} 張", INK, True),
+                          *([(f'（{value5}）', MUTED, False)] if value5 else []),
+                          ('　量增 ', MUTED, False), (f'{ratio:.1f} 倍' if ratio is not None else '不足',
+                                                     INK if ratio is not None else MUTED, True), ('　', INK, False)]], 10_000, 23)[0]
+    _gr_draw_line(draw, x, ly + 6, vol_line, 23)
+    bx = x + vol_line[-1][0] + font(23).getlength('　') + 6
+    bars = [max(0.0, _finite(v) or 0.0) for v in (item.get('bars') or [])]
+    top = max(bars) if bars and max(bars) > 0 else 1.0
+    for i, v in enumerate(bars):
+        bh = max(3.0, FOLLOW_BAR_H * v / top)
+        x0 = bx + i * (FOLLOW_BAR_W + FOLLOW_BAR_GAP)
+        draw.rectangle((x0, ly + FOLLOW_BAR_H - bh, x0 + FOLLOW_BAR_W, ly + FOLLOW_BAR_H),
+                       fill=ACCENT if i == len(bars) - 1 else '#C9CED6')
+    return h
+
+
+def follow_card(draw, y: float, data: dict, dry: bool) -> int:
+    """強勢族群・跟漲觀察（盤中強榜才有）；資料累積中／過期／無候選時只放一行狀態。"""
+    px, width = MARGIN + SECTOR_PAD, CONTENT - SECTOR_PAD * 2
+    h = _gr_head(draw, y, px, width, data, dry)
+    banner = str(data.get('banner') or '')
+    if banner:
+        h += _gr_banner(draw, px, y + h, width, banner, data.get('mode') != 'empty', dry)
+    items = list(data.get('items') or [])
+    for i, item in enumerate(items):
+        h += _follow_block(draw, px, y + h, width, item, i == 0, dry)
+    return int(h + (10 if items else 8))
+
+
+def group_rank_card(draw, y: float, data: dict, dry: bool) -> int:
+    """今日最強／最弱族群 TOP5；data['style']（或 DISCORD_AI_GROUP_CARD_STYLE）＝
+    list／table／bars／hero（第 1 名重點＋精簡列）／grid（第 1 名重點＋兩欄小卡）／heat（數據表）。"""
+    style = str(data.get('style') or GROUP_CARD_STYLE)
+    px, width = MARGIN + SECTOR_PAD, CONTENT - SECTOR_PAD * 2
+    right = px + width
+    if style == 'v3':
+        h = _gr_head(draw, y, px, width, data, dry)
+        if data.get('banner'):
+            h += _gr_banner(draw, px, y + h, width, str(data['banner']), True, dry)
+        rows = data.get('rows') or []
+        if not rows:
+            if not dry:
+                text_at(draw, (px, y + h + 10), '目前沒有足夠的同日資料可以排名，請稍後再試。', GR_BODY, MUTED)
+            h += 60
+        # 10-29：大類子族群排行（detail_top＝3）只有前幾名畫完整，其餘一行；一般 TOP5 不受影響
+        detail = int(data.get('detail_top') or 0) or len(rows)
+        for i, row in enumerate(rows):
+            h += (_gr_v3_row if i < detail else _gr_v3_compact)(draw, px, y + h, width, row, data, dry)
+        return int(h + 16)
+    h = 34
+    stamp = str(data.get('stamp') or '')
+    title, title_size = fit(str(data.get('title') or ''), 36, width - font(22).getlength(stamp) - 60, True, 26)
+    if not dry:
+        draw.rectangle((px, y + h + 8, px + 6, y + h + 44), fill=ACCENT)
+        text_at(draw, (px + 20, y + h), title, title_size, INK, True)
+        if stamp:
+            draw.text((right, y + h + 26), stamp, font=font(22), fill=MUTED, anchor='rm')
+    h += 64
+    sub = wrap(str(data.get('subtitle') or ''), 21, width)
+    if not dry:
+        for i, line in enumerate(sub):
+            text_at(draw, (px, y + h + i * 32), line, 21, MUTED)
+    h += len(sub) * 32 + 8
+    rows = data.get('rows') or []
+    if not rows:
+        if not dry:
+            text_at(draw, (px, y + h + 10), '目前沒有足夠的同日資料可以排名，請稍後再試。', GR_BODY, MUTED)
+        h += 60
+    leader_label = str(data.get('leader_label') or '領漲')
+    if rows and style in ('hero', 'grid'):
+        h += 6 + _gr_hero(draw, px, y + h + 6, width, rows[0], data, dry) + 18
+        if style == 'grid':
+            h += _gr_grid(draw, px, y + h, width, rows[1:], data, dry)
+        else:
+            for row in rows[1:]:
+                h += _gr_compact(draw, px, y + h, width, row, data, dry)
+    elif rows and style == 'heat':
+        h += _gr_heat_table(draw, px, y + h + 6, width, rows, data, dry) + 6
+    elif rows and style == 'table':
+        h += _group_table(draw, px, y + h + 6, width, rows, leader_label, dry) + 6
+    elif rows and style == 'bars':
+        max_abs = max(abs(_finite(r.get('avg')) or 0.0) for r in rows)
+        for row in rows:
+            h += _group_bar_row(draw, px, y + h, width, row, leader_label, max_abs, dry)
+    else:
+        for row in rows:
+            h += _group_row(draw, px, y + h, width, row, leader_label, dry)
+    note = wrap(str(data.get('note') or ''), 19, width)
+    if not dry:
+        draw.line((px, y + h, right, y + h), fill=LINE, width=2)
+        for i, line in enumerate(note):
+            text_at(draw, (px, y + h + 16 + i * 29), line, 19, MUTED)
+    h += 16 + len(note) * 29 + 24
+    return int(h)
+
+
 def _sector_block(draw, y: float, panel: dict, dry: bool) -> int:
     """先量高度、畫白底卡片，再畫內容（避免底色蓋掉文字）。"""
-    if panel.get('sector'):
+    if panel.get('sector_groups'):
+        fn, data = group_rank_card, panel['sector_groups']
+    elif panel.get('sector_follow'):
+        fn, data = follow_card, panel['sector_follow']
+    elif panel.get('sector'):
         fn, data = sector_card, panel['sector']
     elif panel.get('sector_members'):
         fn, data = members_card, panel['sector_members']
@@ -2620,8 +3322,18 @@ def _contrib_rows(items: list, positive: bool) -> list[dict]:
     return rows
 
 
+CONTRIB_LIST_MAX = 10
+
+
 def contribution_card(draw, y: float, data: dict, dry: bool) -> int:
-    """單一市場指數貢獻：拉升 TOP5／拖累 TOP5，直接顯示漲跌、權重與貢獻點數。"""
+    """11-03：/ace 管理員預覽用新版（股價、漲跌停底色、前 10，測試版 11-02 定案）；/ask 維持舊版，下放時再一起換。"""
+    if data.get('price_columns'):
+        return _contribution_card_v2(draw, y, data, dry)
+    return _contribution_card_v1(draw, y, data, dry)
+
+
+def _contribution_card_v1(draw, y: float, data: dict, dry: bool) -> int:
+    """單一市場指數貢獻（/ask 舊版）：拉升 TOP5／拖累 TOP5，直接顯示漲跌、權重與貢獻點數。"""
     top = _contrib_rows(data.get('top'), True)[:5]
     bottom = _contrib_rows(data.get('bottom'), False)[:5]
     lines = max(len(top), len(bottom), 1)
@@ -2692,6 +3404,101 @@ def contribution_card(draw, y: float, data: dict, dry: bool) -> int:
             weight = _finite(item.get('weight_pct'))
             if weight is not None:
                 draw.text((cx + half - 112, mid), f'{weight:.2f}%', font=font(17), fill=MUTED, anchor='rm')
+            value = _finite(item.get('points')) or 0.0
+            draw.text((cx + half - 10, mid), f'{value:+.2f}', font=font(21, True), fill=color, anchor='rm')
+            draw.line((cx, ry + CONTRIB_ROW_H, cx + half, ry + CONTRIB_ROW_H), fill=LINE)
+            ry += CONTRIB_ROW_H
+        if not items:
+            draw.text((cx + 12, ry + CONTRIB_ROW_H / 2), '目前沒有可列出的成分股',
+                      font=font(19), fill=MUTED, anchor='lm')
+    return height
+
+
+def _contribution_card_v2(draw, y: float, data: dict, dry: bool) -> int:
+    """單一市場指數貢獻：拉升榜／拖累榜（11-02 起各列前 10），直接顯示股價、漲跌（漲跌停紅綠底）與貢獻點數。"""
+    top = _contrib_rows(data.get('top'), True)[:CONTRIB_LIST_MAX]
+    bottom = _contrib_rows(data.get('bottom'), False)[:CONTRIB_LIST_MAX]
+    lines = max(len(top), len(bottom), 1)
+    summary_h = 48
+    height = int(96 + summary_h + CONTRIB_HEAD_H + lines * CONTRIB_ROW_H + 28)
+    if dry:
+        return height
+
+    x0, x1 = MARGIN, WIDTH - MARGIN
+    draw.rounded_rectangle((x0, y, x1, y + height), radius=20, fill='white', outline=LINE)
+    ix, right = x0 + 36, x1 - 36
+    draw.rectangle((ix, y + 30, ix + 5, y + 58), fill=ACCENT)
+
+    points = _finite(data.get('index_points'))
+    title = f"{data.get('index_name', '')}"
+    text_at(draw, (ix + 16, y + 26), title, 26, INK, True)
+    tx = ix + 16 + font(26, True).getlength(title) + 14
+    color = UP_TEXT if (points or 0) > 0 else DOWN_TEXT if (points or 0) < 0 else MUTED
+    index_now = _finite(data.get('index_now'))
+    if index_now is not None:
+        now_text = f'{index_now:,.2f}'
+        draw.text((tx, y + 44), now_text, font=font(30, True), fill=color, anchor='lm')
+        tx += font(30, True).getlength(now_text) + 18
+    if points is not None:
+        draw.text((tx, y + 44), f'{points:+.2f} 點', font=font(30, True), fill=color, anchor='lm')
+
+    note = str(data.get('basis') or '')
+    coverage = _finite(data.get('market_cap_coverage_pct'))
+    if coverage is not None and (str(data.get('basis') or '').startswith('盤中') or coverage < 99.9):
+        note += f"｜市值涵蓋 {coverage:.1f}%"
+    draw.text((right, y + 44), note, font=font(19), fill=MUTED, anchor='rm')
+
+    # 集中度摘要：真正回答「是不是只靠少數權值股拉指數」。
+    sy = y + 78
+    draw.rounded_rectangle((ix, sy, right, sy + summary_h - 8), radius=9, fill=TILE_BG)
+    lift = _finite(data.get('top5_lift_points'))
+    drag = _finite(data.get('top5_drag_points'))
+    share = _finite(data.get('top5_positive_share_pct'))
+    concentration = str(data.get('concentration') or '')
+    summary = []
+    if lift is not None:
+        summary.append(f"拉升TOP5 {lift:+.2f}點")
+    if drag is not None:
+        summary.append(f"拖累TOP5 {drag:+.2f}點")
+    if share is not None:
+        summary.append(f"占已涵蓋正貢獻 {share:.0f}%")
+    if concentration:
+        summary.append(concentration)
+    text, size = fit('　｜　'.join(summary) if summary else '盤中貢獻資料整理中', 19, right - ix - 24)
+    draw.text((ix + 12, sy + (summary_h - 8) / 2), text, font=font(size, True), fill=INK, anchor='lm')
+
+    half = (right - ix - 40) / 2
+    table_y = sy + summary_h
+    for column, (items, label, color) in enumerate(((top, f'拉升指數 TOP{len(top) or CONTRIB_LIST_MAX}', UP), (bottom, f'拖累指數 TOP{len(bottom) or CONTRIB_LIST_MAX}', DOWN_TEXT))):
+        cx = ix + column * (half + 40)
+        draw.rounded_rectangle((cx, table_y, cx + half, table_y + CONTRIB_HEAD_H), radius=8, fill=TILE_BG)
+        draw.text((cx + 12, table_y + CONTRIB_HEAD_H / 2), label, font=font(19, True), fill=color, anchor='lm')
+        # 右側欄名，讓會員知道不是單純漲跌幅排行。
+        draw.text((cx + half - 205, table_y + CONTRIB_HEAD_H / 2), '股價', font=font(15), fill=MUTED, anchor='rm')
+        draw.text((cx + half - 112, table_y + CONTRIB_HEAD_H / 2), '漲跌', font=font(15), fill=MUTED, anchor='rm')
+        draw.text((cx + half - 10, table_y + CONTRIB_HEAD_H / 2), '貢獻點數', font=font(15), fill=MUTED, anchor='rm')
+
+        ry = table_y + CONTRIB_HEAD_H
+        for item in items:
+            mid = ry + CONTRIB_ROW_H / 2
+            name = _display_name(item.get('stock_name'))
+            text, size = fit(f"{name}  {item.get('stock_code', '')}", 20, half - 300)
+            draw.text((cx + 12, mid), text, font=font(size), fill=INK, anchor='lm')
+            price = _finite(item.get('close'))
+            if price is not None:
+                draw.text((cx + half - 205, mid), price_text(price), font=font(17), fill=INK, anchor='rm')
+            change = _finite(item.get('change_pct'))
+            if change is not None:
+                change_label = f'{change:+.2f}%'
+                badge = _GR3_BADGE.get(str(item.get('limit_state') or ''))
+                if badge:                                # 漲跌停：和族群排行同一種紅底／綠底白字
+                    pw = font(17, True).getlength(change_label)
+                    draw.rounded_rectangle((cx + half - 112 - pw - GR_BADGE_PAD, mid - 14, cx + half - 112 + GR_BADGE_PAD, mid + 14),
+                                           radius=8, fill=badge)
+                    draw.text((cx + half - 112, mid), change_label, font=font(17, True), fill='white', anchor='rm')
+                else:
+                    draw.text((cx + half - 112, mid), change_label, font=font(17),
+                              fill=UP if change > 0 else DOWN_TEXT if change < 0 else MUTED, anchor='rm')
             value = _finite(item.get('points')) or 0.0
             draw.text((cx + half - 10, mid), f'{value:+.2f}', font=font(21, True), fill=color, anchor='rm')
             draw.line((cx, ry + CONTRIB_ROW_H, cx + half, ry + CONTRIB_ROW_H), fill=LINE)
@@ -2781,7 +3588,7 @@ def ai_card(draw, y: float, data: dict, dry: bool) -> int:
         return 46
 
     if data.get('why'):
-        cy += section('為什麼這樣看')
+        cy += section(data.get('why_title') or '為什麼這樣看')       # 10-28：族群解讀改標「族群解讀」
         cy += _para(pen, ix0, cy, data['why'], 29, INK, width) + 16
     scenarios = [s for s in data.get('scenarios') or [] if s.get('text')][:2]
     if scenarios:
@@ -2799,11 +3606,12 @@ def ai_card(draw, y: float, data: dict, dry: bool) -> int:
             _para(pen, bx + 22, cy + 60, item['text'], 27, INK, col - 44)
         cy += box_h + 18
     if data.get('summary'):
-        label_w = font(24, True).getlength('一句話總結') + 36
+        label = data.get('summary_label') or '一句話總結'      # 10-28：族群解讀改標「觀察重點」
+        label_w = font(24, True).getlength(label) + 36
         h = _para(None, 0, 0, data['summary'], 29, INK, width - label_w - 24, True) + 30
         if pen:
             draw.rounded_rectangle((ix0, cy, ix1, cy + h), radius=12, fill=ACCENT_BG)
-            text_at(draw, (ix0 + 20, cy + 16), '一句話總結', 24, ACCENT, True)
+            text_at(draw, (ix0 + 20, cy + 16), label, 24, ACCENT, True)
         _para(pen, ix0 + label_w, cy + 15, data['summary'], 29, INK, width - label_w - 24, True)
         cy += h + 16
     if data.get('footer'):
@@ -3145,7 +3953,8 @@ def _branch_section(draw, x0: float, x1: float, y: float, section: dict, dry: bo
                         text_at(draw, (tx + 16, ty + 10 + j * 26), line, lsize, MUTED)
                     vy = ty + 12 + len(labels) * 26
                     raw = str(chunk[i].get('value', '')).strip()        # tone=signed：正紅負綠（台股慣例）
-                    color = ((UP if raw.startswith('+') else DOWN if raw.startswith('-') else INK)
+                    # 11-02（測試版，正式版先給 /ace 管理員）：負值的綠字和型態圖股價同一個深綠
+                    color = ((UP if raw.startswith('+') else (DOWN_TEXT if _preview() else DOWN) if raw.startswith('-') else INK)
                              if chunk[i].get('tone') == 'signed' else INK)
                     for j, line in enumerate(values):
                         text_at(draw, (tx + 16, vy + j * 34), line, vsize, color, True)
@@ -3393,6 +4202,10 @@ def _branch_section(draw, x0: float, x1: float, y: float, section: dict, dry: bo
             draw.text((x0 + w / 2, y + 18), section['text'], font=font(20, True), fill=WARN_INK, anchor='mm')
         return 50
     if kind == 'note':
+        if _is_comment_note(section.get('text', '')) and not section.get('keep') and _preview():
+            if not dry:
+                print(f"📝 圖卡註解（只記 Log）｜{section.get('text', '')}", flush=True)
+            return 0
         lines = wrap(section.get('text', ''), 20, width, False)
         if not dry:
             for i, line in enumerate(lines):
@@ -3563,7 +4376,8 @@ def _is_article_panel(panel: dict) -> bool:
 
 
 def _is_sector_panel(panel: dict) -> bool:
-    return bool((panel or {}).get('sector') or (panel or {}).get('sector_members') or (panel or {}).get('sector_catalog'))
+    return bool((panel or {}).get('sector') or (panel or {}).get('sector_members') or (panel or {}).get('sector_catalog')
+                or (panel or {}).get('sector_groups') or (panel or {}).get('sector_follow'))
 
 
 BRAND_LOGO_ASSET = Path(__file__).with_name('assets') / 'brand_logo.png'
@@ -3676,6 +4490,9 @@ _NOTE_PREFIX = ('資料時間', '※', '資料來源', '⚠️', '🧡', '(', '�
 def _brief_ai(data: dict) -> dict:
     """AI 解讀卡最多 2 個理由、2 個情境（圖上已有的數字不再長篇重述）。"""
     data = dict(data or {})
+    if _preview():
+        import ai_text_guard
+        data = ai_text_guard.clean_card(data)        # 11-02（測試版）：資料欄位名稱不可出現在圖上；正式版先給 /ace 管理員
     for key in ('why', 'scenarios'):
         if isinstance(data.get(key), list):
             data[key] = data[key][:2]
@@ -3860,14 +4677,19 @@ def render_answer(question: str, answer: str, panels: list[dict] | None = None,
     if article_panels or weekly_text_panels:
         footer = '股市艾斯  /  日 K 為收盤資料，非盤中即時行情'
     elif sector_panels:
-        live = any((p.get('sector') or {}).get('live_time') for p in sector_panels)
+        live = any((p.get('sector') or {}).get('live_time') or (p.get('sector_groups') or {}).get('live')
+                   for p in sector_panels)
         footer = '股市艾斯  /  盤中漲幅為暫定值，收盤前會變動' if live else '股市艾斯  /  族群排行依日 K 收盤資料計算'
+        if any(p.get('sector_groups') for p in sector_panels):      # 10-25 v3：註解移到 Log，圖上只留一行免責
+            footer = '盤中快照・僅供研究參考，非買賣建議' if live else '收盤資料・僅供研究參考，非買賣建議'
         custom = next(((p.get('sector') or {}).get('footer_text') for p in sector_panels
                        if (p.get('sector') or {}).get('footer_text')), '')
         footer = custom or footer
     elif contribution_panels:
         live = any(str((p.get('contribution') or {}).get('basis') or '').startswith('盤中') for p in contribution_panels)
+        pending = any((p.get('contribution') or {}).get('pending_official_close') for p in contribution_panels)
         footer = ('股市艾斯  /  指數貢獻為盤中估算，收盤前會變動' if live
+                  else '股市艾斯  /  指數貢獻為收盤暫定估算，官方收盤檔發布後會更新' if pending
                   else '股市艾斯  /  指數貢獻依收盤資料計算')
     else:
         footer = price_footer(panels) if panels else '股市艾斯  /  AI 資料整理'

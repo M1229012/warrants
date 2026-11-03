@@ -117,7 +117,11 @@ def question_scope(question):
 def user_response_prompt(prompt, purpose, schema=None):
     if purpose not in USER_TEXT_PURPOSES:
         return prompt  # 分類、理由對照、OCR 不寫笑話。
-    for rules in (RESPONSE_LANGUAGE_RULES, NATURAL_ANALYSIS_RULES, ALL_TOPIC_RESPONSE_RULES):
+    import ai_text_guard
+    import warrant_ai_tools
+    # 11-02（測試版 11-03 移植）：AI 不可寫出資料欄位名稱；先給 /ace 管理員
+    guard = (ai_text_guard.PROMPT_RULE.strip(),) if warrant_ai_tools.ace_preview() else ()
+    for rules in (RESPONSE_LANGUAGE_RULES, NATURAL_ANALYSIS_RULES, ALL_TOPIC_RESPONSE_RULES) + guard:
         if rules not in prompt:
             prompt += '\n\n' + rules
     question = _QUESTION.get()

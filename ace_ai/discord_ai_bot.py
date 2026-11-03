@@ -1153,7 +1153,7 @@ def branch_stock_events_card(data: Dict[str, Any], numbers: Optional[Dict[str, i
         {"type": "tiles", "items": tiles[:3]},
         {"type": "tiles", "items": tiles[3:]},
         {"type": "rows", "items": rows},
-        {"type": "note", "text": "※ " + ("列出此分點在這檔股票的所有 A～E 事件（新到舊）" if total <= len(events)
+        {"type": "note", "keep": True, "text": "※ " + ("列出此分點在這檔股票的所有 A～E 事件（新到舊）" if total <= len(events)
                                           else f"共 {total} 筆，列出最近 {len(events)} 筆（新到舊）")
                                  + (f"；K 線涵蓋近 {chart_bars} 個交易日" if chart_bars else "") + "，圈號＝K 線上的標記編號。"
                                  + "報酬只計此分點×此股票回測表的已出清有效樣本，採簡單平均，非分點所有股票績效或實際帳戶報酬。"}]}
@@ -1310,7 +1310,7 @@ def branch_store_window_sections(d: Dict[str, Any]) -> List[Dict[str, Any]]:
     if table:
         sections.append({"type": "table", "columns": ["標的", "買進", "賣出", "剩餘張數", "剩餘%"],
                          "rows": table, "signed": ("買進", "賣出"), "accent": ("剩餘張數", "剩餘%")})
-    sections.append({"type": "note", "text": f"※ 賣出為市值（含損益）；剩餘以 FIFO 張數計算。資料至 {str(d.get('store_date', '')).replace('-', '/')}，"
+    sections.append({"type": "note", "keep": True, "text": f"※ 賣出為市值（含損益）；剩餘以 FIFO 張數計算。資料至 {str(d.get('store_date', '')).replace('-', '/')}，"
                                              "之後以 Sheet 補。"})
     return sections
 
@@ -1368,7 +1368,7 @@ def branch_store_warrant_sections(d: Dict[str, Any]) -> List[Dict[str, Any]]:
         tail += f"{'、'.join(d['store_missing'][:3])} 張數依事件表。"
     if d.get("near_expiry_holdings"):
         tail += f"快到期仍持有：{'、'.join(x.split(' ')[0] for x in d['near_expiry_holdings'][:3])}。"
-    sections.append({"type": "note", "text": f"※ 只列 A～E 事件的權證；天期、價內外、槓桿為現在數值，槓桿以歷史波動率估算；估算報酬＝依標的漲跌與時間推算的理論值，非權證實際成交價。{tail}"})
+    sections.append({"type": "note", "keep": True, "text": f"※ 只列 A～E 事件的權證；天期、價內外、槓桿為現在數值，槓桿以歷史波動率估算；估算報酬＝依標的漲跌與時間推算的理論值，非權證實際成交價。{tail}"})
     return sections
 
 
@@ -1592,7 +1592,10 @@ class QueryRouter:
         if not parsed.branches and _BREADTH_RE.search(parsed.original) and not (parsed.stocks and "index" not in parsed.intents):
             # 盤面廣度：指數漲跌 vs 多數個股，不需要任何個股資料。
             plan = QueryPlan(route="rule_breadth", need_final_llm=True)
-            plan.add("get_index_contribution")
+            if tools.ace_preview():    # 11-03：/ace 管理員一題只算問到的市場（全部成分股才來得及）；/ask 照舊兩個都算
+                plan.add("get_index_contribution", market=_contribution_market(parsed.original))
+            else:
+                plan.add("get_index_contribution")
             plan.add("get_market_breadth")
             if "futures" in parsed.intents:
                 plan.add("get_futures_positions")
@@ -2044,6 +2047,11 @@ _DAILY_RE = re.compile(r"PerDay|per day|daily|RequestsPerDay", re.IGNORECASE)
 _MISSING_MODEL_RE = re.compile(r"\b404\b|NOT_FOUND|is not found|no longer available", re.IGNORECASE)
 _BAD_KEY_RE = re.compile(r"API_KEY_INVALID|API key not valid|PERMISSION_DENIED|\b403\b", re.IGNORECASE)
 _RATE_LIMIT_KEYWORDS = ("429", "RESOURCE_EXHAUSTED", "quota", "rate limit", "exceeded")
+# 11-02 Log（測試版 11-03 移植）：同模型金鑰 1 兩秒回、金鑰 2 連 4 次 504，每輪到它就白等 10 秒。連續逾時的金鑰先跳過
+GEMINI_KEY_TIMEOUT_LIMIT = 2
+GEMINI_KEY_TIMEOUT_COOLDOWN = max(60, tools._env_int("DISCORD_AI_GEMINI_KEY_TIMEOUT_COOLDOWN", 300))
+# 這題自己的時間或次數用完（還沒打到 API，或不是金鑰的問題），不能算到金鑰頭上
+_LOCAL_WAIT_RE = re.compile(r"Gemini 執行名額|Gemini 等名額|整題")
 
 
 def _model_limits(model: str) -> Tuple[int, int]:
@@ -2079,6 +2087,7 @@ class GeminiQuota:
         self._model_down: Dict[str, float] = {}               # 模型塞車暫停到何時
         self._disabled: set = set()                           # 找不到的模型（設定錯誤）
         self._bad_keys: Dict[int, float] = {}                 # 金鑰無效
+        self._key_timeouts: Dict[Tuple[int, str], int] = {}   # (金鑰, 模型) 連續逾時次數；成功才歸零
         self._rr = 0
 
     def _load_day(self) -> None:
@@ -2161,7 +2170,7 @@ class GeminiQuota:
         return max(0.0, 1.0 - used / capacity)
 
     def note_error(self, key: int, model: str, error: str) -> str:
-        """依錯誤種類調整狀態，回傳 overloaded／daily／minute／missing_model／bad_key／other。"""
+        """依錯誤種類調整狀態，回傳 overloaded／daily／minute／timeout／local_wait／missing_model／bad_key／other。"""
         with self._lock:
             now = time.monotonic()
             if _MISSING_MODEL_RE.search(error):
@@ -2170,8 +2179,15 @@ class GeminiQuota:
             if _BAD_KEY_RE.search(error):
                 self._bad_keys[key] = now + 3600
                 return "bad_key"
-            if _DEADLINE_RE.search(error):
-                return "timeout"          # 不冷卻，直接換下一把金鑰／模型
+            if _LOCAL_WAIT_RE.search(error):
+                return "local_wait"
+            if _DEADLINE_RE.search(error) or _TIMEOUT_RE.search(error):
+                # 偶爾一次不冷卻；同一把連續逾時才暫停。暫停後次數不歸零，恢復後再逾時一次就馬上再停
+                count = self._key_timeouts[(key, model)] = self._key_timeouts.get((key, model), 0) + 1
+                if count >= GEMINI_KEY_TIMEOUT_LIMIT:
+                    self._blocked[(key, model)] = now + GEMINI_KEY_TIMEOUT_COOLDOWN
+                    print(f"⚠️ Gemini 金鑰 {key + 1}｜{model}｜連續逾時 {count} 次，暫停 {GEMINI_KEY_TIMEOUT_COOLDOWN} 秒", flush=True)
+                return "timeout"
             if _RATE_RE.search(error):
                 if _DAILY_RE.search(error):
                     self._blocked[(key, model)] = float("inf")
@@ -2187,6 +2203,11 @@ class GeminiQuota:
         """重試成功＝塞車已過，解除模型暫停，下一題不必再走備援。"""
         with self._lock:
             self._model_down.pop(model, None)
+
+    def note_key_ok(self, key: int, model: str) -> None:
+        """這把金鑰回得來：連續逾時次數歸零。"""
+        with self._lock:
+            self._key_timeouts.pop((key, model), None)
 
     def rows(self, n_keys: int) -> List[Dict[str, Any]]:
         """「/ace 用量」圖卡用：每個模型今日已用、上限、剩餘％、可用金鑰、狀態。"""
@@ -2394,6 +2415,7 @@ class GeminiGateway:
             if not self.quota.model_ready(model):
                 continue
             overload_retried = False
+            model_timeouts = 0
             for key in self.quota.key_order(model, len(keys)):
                 left = (deadline - time.monotonic()) if deadline else None
                 if (left is not None and left < GEMINI_MIN_CALL_SECONDS) or attempts >= GEMINI_MAX_ATTEMPTS or _question_calls_exhausted():
@@ -2429,9 +2451,15 @@ class GeminiGateway:
                         overload_retried = True    # 主模型塞車多半一下就過：等一下換金鑰再試一次，省下備援額度
                         time.sleep(GEMINI_OVERLOAD_RETRY_WAIT)
                         continue
-                    if kind in ("overloaded", "missing_model", "timeout") or _TIMEOUT_RE.search(last_error):
-                        break          # 整個模型的問題（含單次逾時）：換金鑰沒用，直接換下一個模型
+                    if kind in ("overloaded", "missing_model", "local_wait"):
+                        break          # 整個模型的問題或這題沒時間了：換金鑰沒用，直接換下一個模型
+                    if kind == "timeout":
+                        # 11-02（測試版 11-03 移植）：逾時先換金鑰同模型再試一次；兩把都逾時才算模型塞車、換備援模型
+                        model_timeouts += 1
+                        if model_timeouts >= 2:
+                            break
                     continue
+                self.quota.note_key_ok(key, model)
                 if overload_retried:
                     self.quota.note_ok(model)
                 text = str(getattr(response, "text", "") or "").strip()
@@ -3006,6 +3034,8 @@ FINAL_FOCUS_RULES = ("【先回答重點】payload.question_focus 是使用者�
 
 
 FINAL_BREADTH_RULES = ("【盤面結構】沒有 get_index_contribution 時，第一句就要說「今天的指數貢獻榜要 15:00 後才有」，不可以拿漲幅排名或前一個交易日的資料當成今天的貢獻榜。回答『今天是不是都在拉權值股／誰在拉大盤／誰拖累指數』時，必須先看 get_index_contribution，不可只看漲跌幅。先直接回答結論，再分別列加權與櫃買的拉升 TOP5、拖累 TOP5；每檔優先引用 points（貢獻點數）、weight_pct（指數權重）與 change_pct（漲跌幅）。top5_positive_share_pct／top5_negative_share_pct 是前五大貢獻占已涵蓋正／負貢獻的比例，可用來說明集中度；concentration 是規則式集中度結論。盤中一定說明 basis=盤中估算、market_cap_coverage_pct（市值涵蓋率）與收盤前仍會變動；若 top5_positive_certified／top5_negative_certified 為 false，不可把榜單講成交易所最終完整排名。get_market_breadth 只用來補充加權與櫃買差異、上漲比率與中小型股是否跟上，不可取代貢獻點數。不要預測未來指數點位，也不要給買賣建議。")
+# 11-02 使用者（測試版 11-03 移植）：全部成分股、點名寫貢獻點數、只寫問到的市場；先給 /ace 管理員
+FINAL_BREADTH_RULES_PREVIEW = ("【盤面結構】沒有 get_index_contribution 時，第一句就要說「今天的指數貢獻榜要等官方收盤檔發布後才有」，不可以拿漲幅排名或前一個交易日的資料當成今天的貢獻榜。有 get_index_contribution 就直接回答哪些股票在撐或拖累，要依貢獻點數判斷（權重×漲跌），不可只看漲跌幅；漲最多的不一定撐最多，權重大的小漲小跌影響可能更大。basis 是收盤暫定時說明是估算、官方檔發布後會更新，不要再說貢獻榜還沒有。回答『今天是不是都在拉權值股／誰在拉大盤／誰拖累指數』時，必須先看 get_index_contribution，不可只看漲跌幅。先直接回答結論，再寫資料裡有的市場（只有加權就只寫加權，不要提櫃買沒資料）。top、bottom 是所有成分股依貢獻點數排出的拉升榜與拖累榜；點名個股一定要寫貢獻點數，例如「鴻海貢獻 +12.3 點（權重 3.1%、漲 2.0%）」，用 points（貢獻點數）、weight_pct（指數權重）與 change_pct（漲跌幅）。大盤下跌時，要點出逆勢上漲、對指數有正貢獻的股票，包含權重不大的。top5_positive_share_pct／top5_negative_share_pct 是前五大貢獻占已涵蓋正／負貢獻的比例，可用來說明集中度；concentration 是規則式集中度結論。盤中一定說明 basis=盤中估算、market_cap_coverage_pct（市值涵蓋率）與收盤前仍會變動；若 top5_positive_certified／top5_negative_certified 為 false，不可把榜單講成交易所最終完整排名。get_market_breadth 只用來補充加權與櫃買差異、上漲比率與中小型股是否跟上，不可取代貢獻點數。不要預測未來指數點位，也不要給買賣建議。")
 
 
 FINAL_INDEX_COMPARE_RULES = ("【加權 vs 櫃買】圖上已經有兩邊的 K 線、均線與型態分數比較表，文字只寫結論：第一句直接回答哪一邊比較強"
@@ -3161,7 +3191,7 @@ def build_final_prompt(payload: Dict[str, Any]) -> str:
     if "get_sheet_stock_chips" in names:
         sections.append(FINAL_CHIPS_RULES)
     if "get_market_breadth" in names:
-        sections.append(FINAL_BREADTH_RULES)
+        sections.append(FINAL_BREADTH_RULES_PREVIEW if tools.ace_preview() else FINAL_BREADTH_RULES)
     if "get_futures_positions" in names:
         sections.append(FINAL_FUTURES_RULES)
     if "get_top_warrant_buy_stocks" in names:
@@ -3855,7 +3885,9 @@ def _breadth_panel(data: Dict[str, Any]) -> Dict[str, Any]:
     return {"sector": {"name": title, "mode": "market_momentum",
                        "comparison_date": "", "rows": rows, "others": others,
                        "coverage_note": "", "liquidity_note": note,
-                       "live_time": str(data.get("time") or "")}}
+                       # 11-02（測試版，正式版先給 /ace 管理員）：收盤後不能寫「盤中 13:33｜收盤前會變動」
+                       **({"stamp_text": "今日收盤"} if tools.ace_preview() and not live
+                          else {"live_time": str(data.get("time") or "")})}}
 
 
 def format_index_contribution(data: Dict[str, Any]) -> str:
@@ -3879,7 +3911,7 @@ def format_index_contribution(data: Dict[str, Any]) -> str:
             if items:
                 lines.append(label + "：" + "、".join(
                     f"{x['stock_name']}({x['stock_code']}) {x['points']:+.2f}點 / 權重{x.get('weight_pct', 0):.2f}% / {x.get('change_pct', 0):+.2f}%"
-                    for x in items[:5]))
+                    for x in items))       # 11-03：/ace 預覽列前 10，全部給 AI（/ask 本來就只有 5 檔）
             else:
                 lines.append(label + "：目前沒有可列出的成分股")
     lines.append("※ 盤中為官方即時報價估算；收盤後改用交易所全市場收盤快照計算，缺價成分股以最近收盤計入市值、不計貢獻。")
@@ -4604,6 +4636,38 @@ def strip_command_prefix(question: str) -> str:
 # 句子同時出現「大盤層級的對象」與「廣度／貢獻的問法」時，一律走盤面結構，不進族群解析。
 _MARKET_SCOPE_RE = re.compile(r"大盤|加權|櫃買|指數|盤面|盤感|權值|市場")
 _BREADTH_RE = re.compile(r"盤感|盤面|市場廣度|廣度|權值股|權值|只有大型股|大盤漲.{0,6}個股|個股沒跟上|普漲|齊漲|拉指數|撐盤|貢獻|拉抬|誰在拉|誰拉|誰讓大盤|加.{0,4}點|扣.{0,4}點|拉升|拖累|漲的都是|指數失真|多數個股|中小型股|內資|盤勢結構")
+
+
+def _contribution_market(question: str) -> str:
+    """問櫃買就算櫃買；同時問兩個才都算（回空字串）；其餘都是問大盤＝加權。
+    11-02（測試版 11-03 移植，先給 /ace 管理員）：所有成分股都要算，一題只算問到的市場才來得及。"""
+    tpex = bool(re.search(r"櫃買|上櫃|OTC", str(question or ""), re.I))
+    twse = bool(re.search(r"大盤|加權|台股|上市", str(question or "")))
+    return "" if tpex and twse else "tpex" if tpex else "twse"
+
+
+def _market_structure_panels(question: str, contribution: Optional[Dict[str, Any]], breadth: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """盤面結構的圖卡（/ace 管理員預覽）：指數貢獻榜＋權值股漲跌。"""
+    markets = list((contribution or {}).get("markets") or [])
+    want = _contribution_market(question)
+    if want:
+        markets = [m for m in markets if m.get("market") == want]
+    # 11-02：一檔都列不出來的貢獻卡（全部 +0.00 點）不放，那不是答案
+    panels: List[Dict[str, Any]] = [{"contribution": m} for m in markets if m.get("top") or m.get("bottom")]
+    # 11-02 使用者：撐大盤要看權重×漲跌，不是只看漲幅。貢獻榜有資料就只放它；
+    # 漲幅排行卡只在貢獻榜出不來時補位，明確問點數時也不補（那不是答案）。
+    points_question = bool(re.search(r"點|貢獻|拉抬|拉指數|撐盤|誰在拉|誰拉|拖累", question))
+    if not panels and breadth and not points_question and (breadth.get("heavyweights") or breadth.get("strongest") or breadth.get("weakest")):
+        panels.append(_breadth_panel(breadth))
+    return panels
+
+
+def _is_market_rank_target(target: Any) -> bool:
+    """AI 需求表的排行對象是大盤（不是某個族群）。"""
+    return bool((_MARKET_SCOPE_RE.search(str(target)) or re.search(r"台股|TAIEX|TPEX", str(target), re.I))
+                and not re.search(r"族群|類股|產業|題材", str(target)))
+
+
 ASK_MARK_MODE = (os.getenv("DISCORD_AI_ASK_MARK_MODE", "event").strip().lower() or "event")
 INTENT_FALLBACK_ENABLE = tools._env_int("DISCORD_AI_INTENT_FALLBACK", 1)
 MEMORY_RESET_WORDS = ("重新開始", "清除記憶", "換個話題", "忘記上一題")
@@ -5216,14 +5280,14 @@ def quota_exempt_ids() -> Set[str]:
 # 各檔案「這一批」才有的函式：少了代表那個檔案沒有一起上傳（還是舊版）
 REQUIRED_MODULE_API = {
     "local_market_cache": ("accumulate_state", "recent_states", "stock_market", "stock_markets", "bars_fingerprint",
-                           "save_market_sessions", "market_sessions_between", "market_close_status"),
+                           "save_market_sessions", "market_sessions_between", "market_close_status", "liquidity_before"),
     "request_runtime": ("state", "new_state", "check_budget", "reserve_call", "scope", "CLOCK", "_LOCK"),
     "price_adjustment": ("adjust_shares", "event_from_row"),
     "corporate_action_sources": ("twse_events",),
     "discord_access": ("_CHIP_WORD_RE", "require_sector"),
     "warrant_ai_tools": ("get_market_institutional", "prefetch_sheet_tables", "_reserve_fugle_slot", "check_sheet_version", "err_text",
-                         "chart_marks_for_stock"),
-    "answer_image": ("wrap_cell", "observed_mark_layout", "CHIP_LAYOUT_VERSION", "public_ma_condition"),
+                         "chart_marks_for_stock", "stock_live_quotes", "ace_preview", "set_ace_preview"),
+    "answer_image": ("wrap_cell", "observed_mark_layout", "CHIP_LAYOUT_VERSION", "public_ma_condition", "group_rank_card", "follow_card"),
     "chip_event_backtest": ("event_marks", "branch_card", "VERSION"),
     "moneydj_spot_cost": ("costs", "period_avg"),
     "weekly_pick": ("layout_card", "verify_layout"),
@@ -5233,7 +5297,14 @@ REQUIRED_MODULE_API = {
     "spot_chip": ("_official_trading_dates", "remember_history", "prefetch_history", "ensure_year"),
     "kline_patterns": ("detect", "names", "ai_pattern_facts", "user_triangle", "LAST_TRI_INFO"),
     "log_switch": ("enabled", "parse_command", "set_many", "status_text"),
-    "sector_analysis": ("live_group_ranking",),
+    "sector_analysis": ("live_group_ranking", "market_request_from_ai"),
+    # 11-03 測試版移植（族群排行、新族群名單、貢獻榜新版）：新檔案要一起上傳
+    "sector_match": ("member_only", "member_groups", "match_parent"),
+    "member_sector_rank": ("answer", "rank", "late_ai_scope", "card_lines"),
+    "member_sector_tape": ("run_loop", "sample"),
+    "yahoo_quotes": ("prime", "prev_closes", "stock_quote"),
+    "ai_text_guard": ("clean_card", "PROMPT_RULE"),
+    "index_contribution": ("report", "OfficialClosePending"),
     "market_scan": ("value_liquid_codes", "EXCLUDED_NAMES"),
 }
 
@@ -5471,7 +5542,7 @@ def my_quota_card(policy: Optional["QuotaPolicy"], user: str, roles: Sequence[st
             items.append({"label": "一般提問（不含 AI）", "value": f"剩 {st['plain_left']} 題"})
         note = "※ AI 解讀用完仍可以繼續提問，只是回答不附 AI 解讀"
     return {"branch": title, "tags": ["艾斯 AI"], "label": f"{QUOTA_RESET_LABEL}恢復",
-            "sections": [{"type": "stats", "items": items}, {"type": "note", "text": note}]}
+            "sections": [{"type": "stats", "items": items}, {"type": "note", "keep": True, "text": note}]}
 
 
 def my_quota_text(policy: Optional["QuotaPolicy"], user: str, roles: Sequence[str], unlimited: bool) -> str:
@@ -5846,6 +5917,8 @@ class AceQueryEngine:
         key = "|".join(['技術70現股30融資管理員v19扣抵明日價位_籌碼v11_解讀v4',compact, ",".join(c for c, _ in parsed.stocks), str(parsed.cost_price or ""), ",".join(parsed.branches),
                         "chip=" + parsed.chip,
                         "sector=" + str(sector.get("name") or sector.get("industry") or "") + ":" + str(sector.get("mode") or "")])
+        if tools.ace_preview():
+            key += "|測試版移植預覽v1"        # 11-03：/ace 管理員的新功能回答不沿用移植前的舊快取
         key = self._access_cache_key(key)
         hit, cached = self._cached_answer(key, partitioned=True)
         if hit:
@@ -6317,12 +6390,15 @@ class AceQueryEngine:
     def answer(self, question: str, context_key: str = "", on_queue: Optional[Callable[[int], None]] = None,
                is_admin: bool = False, admin_mode: bool = False, access=None, image=None) -> AnswerResult:
         # /ask always stays closed, including requests from administrators.
+        # 11-03：測試版移植的新功能（今日族群排行、新族群名單、新版貢獻榜、奇摩今天這一根…）先只給 /ace 管理員本人
+        # （preview）；「/ace 測試 general」是模擬會員，allowed 為 False，看到的和 /ask 一樣。
         allowed = bool(access.admin_mode) if access is not None else bool(is_admin and admin_mode)
         own_clock = getattr(_QUESTION_CLOCK, "state", None) is None
         if own_clock:       # 10-08：整題期限從收到問題就開始（排隊、解析、工具、AI、圖卡都在內）
             _QUESTION_CLOCK.state = __import__("request_runtime").state() or __import__("request_runtime").new_state(QUESTION_DEADLINE_SECONDS)
         try:
-            with __import__("request_runtime").scope(_QUESTION_CLOCK.state), stock_banter.question_scope(question), tools.quote_policy(admin_live=allowed):
+            with __import__("request_runtime").scope(_QUESTION_CLOCK.state), stock_banter.question_scope(question), \
+                    tools.quote_policy(admin_live=allowed, stock_live=allowed, preview=allowed):
                 return self._answer_with_quote_policy(question, context_key, on_queue,
                                                       is_admin, admin_mode, access, image)
         finally:
@@ -6752,7 +6828,7 @@ class AceQueryEngine:
                     {"label": "平均／最慢耗時", "value": f"{info['avg_elapsed']}s／{info['slowest']}s"},
                     {"label": "會員額度模式", "value": mode},
                     {"label": "尖峰時段", "value": str(info.get("busiest_hour") or "-")}]},
-            ] + [{"type": "note", "text": "※ " + l.replace("**", "")} for l in cost]
+            ] + [{"type": "note", "keep": True, "text": "※ " + l.replace("**", "")} for l in cost]
             card = {"branch": "艾斯 AI 用量", "tags": ["管理員"], "label": info["day"], "sections": sections}
             api_text = "、".join(f"{k} {v}" for k, v in (info.get("api_counts") or {}).items()) or "-"
             text = (f"**用量｜{info['day']}**" + chr(10) +
@@ -7205,6 +7281,10 @@ class AceQueryEngine:
         prompt = ("你是台股問句的需求解析器，只輸出 JSON，不要回答問題。讀完整句，列出使用者真正要回答的每一項需求。\n"
                   "type：pattern＝走勢型態技術面、chips＝分點籌碼主力權證、news＝新聞消息、price＝只問股價、institutional＝三大法人、"
                   "futures＝台指期、cost＝自己的成本持股、compare＝比較、members＝族群成分股、rank＝排行、other＝其他。\n"
+                  # 11-02（測試版 11-03 移植，先給 /ace 管理員）：撐大盤／拖累大盤的白話問法靠 AI 讀整句，不補關鍵字
+                  + ("問哪些股票影響大盤、指數，是問股票排行，type 用 rank、targets 寫大盤，不是 pattern；"
+                     "白話也算，只要是在問誰撐住、帶領、拉抬、領漲、拖累、拉低、壓著、扛著大盤，或大盤今天靠誰、被誰拖、誰害的、誰最有貢獻。\n"
+                     if tools.ace_preview() else "") +
                   "問句有指定權證分點（券商分點名稱）時，依使用者要的內容改用分點類型，targets 放分點名稱（有股票也放股票）："
                   "branch_warrants＝這個分點買了哪些權證、權證明細／權證買賣明細／清單／代號、剩餘天數、槓桿、價內外、估算報酬；"
                   "branch_events＝這個分點的 A～E 事件、什麼時候進場或出場（不是要列權證）；branch_position＝這個分點部位還在嗎、持有或出清；"
@@ -7296,11 +7376,21 @@ class AceQueryEngine:
         """Authoritative per-target plan: never infer extra needs from the raw question again."""
         items = getattr(parsed, "needs_items", [])
         drop = getattr(parsed, "needs_excluded", set())
+        sector = parsed.sector or parsed.sector_context
+        # 11-02 Log（測試版 11-03 移植，先給 /ace 管理員）：「今天哪些股票撐大盤」AI 判斷是問大盤的排行，
+        # 名冊卻把「撐大盤」當成查不到的族群，硬轉型態後整題出錯。大盤的排行走盤面結構（權值股、指數貢獻點數）；
+        # 真的查不到的族群維持原本「查不到」的回覆。
+        if (tools.ace_preview() and "sector" not in drop and (not sector or sector.get("mode") == "unsupported")
+                and any(n.get("type") == "rank" and _is_market_rank_target(t) for n in items for t in n.get("targets") or [])):
+            parsed.sector = parsed.sector_context = None
+            plan = QueryPlan(route="rule_breadth", need_final_llm=True)
+            plan.add("get_index_contribution", market=_contribution_market(getattr(parsed, "original", "")))
+            plan.add("get_market_breadth")
+            return plan
         if "sector" not in drop and any(n.get("type") in ("members", "rank") for n in items):
-            sector = parsed.sector or parsed.sector_context
             if sector:
                 parsed.sector = dict(sector)
-                if parsed.sector.get("mode") != "belongs":
+                if parsed.sector.get("mode") not in ("belongs", "unsupported"):
                     parsed.sector["mode"] = "technical" if any(n.get("type") == "rank" for n in items) else "members"
                 nonsector = {c: v - {"sector"} for c, v in per_stock.items()}
                 if not any(nonsector.values()):
@@ -7540,6 +7630,10 @@ class AceQueryEngine:
                   "（pattern＝走勢／型態／技術面／能不能追／會不會跌、institutional＝外資投信自營商法人、futures＝台指期未平倉、"
                   "cost＝使用者講自己的成本、套牢、賠錢、還值得持有嗎、要不要賣、回本或進場理由；沒有成本數字也可選cost。股票諧音、玩笑、火箭、帶我飛、豁達等投資口語，若是在問這檔的好壞或走勢，選pattern，不能因為是玩笑就選none。無關股市的聊天仍選none。news＝消息題材新聞、price＝只問價格漲跌、chips＝分點籌碼主力、"
                   "compare＝比較兩檔、members＝族群成分股、rank＝排行、warrant_list＝問某分點（券商）買了哪些權證／權證代號）；"
+                  # 10-27（測試版 11-03 移植）：新族群名單只在 /ace 管理員（或族群下放後）用，問全市場族群不靠固定問法
+                  + ("問整個市場哪些族群／題材／產業／類股最強、最弱、在漲、在跌、資金跑去哪、誰在噴、為什麼漲跌，"
+                     "選 subject=sector、action=rank、target 空字串（沒有指定某個族群）；問特定族群就把族群名稱寫在 target；"
+                     if sector_match.member_only() else "") +
                   "target 寫問題裡提到的股票名稱或代號、或族群名稱，沒有就填空字串；"
                   "branch 寫問題裡提到的券商分點名稱（可能是簡稱，例如美好、元大南屯），沒有就填空字串。\n問題：" + question)
         result = self.gateway.generate(prompt, purpose="intent", schema=schema, temperature=0.0)
@@ -7571,6 +7665,13 @@ class AceQueryEngine:
             parsed.stocks = [("TAIEX", tools.INDEX_CODES["TAIEX"])]
             parsed.intents = set(parsed.intents) | {"index"}
             return self.router.plan(parsed, stats)
+        if subject == "sector" and sector_match.member_only():
+            # 10-27（測試版 11-03 移植）：沒指定族群（或只寫「族群」「題材」這種泛稱）＝全市場族群排行／清單，不靠固定問法
+            market = sector_analysis.market_request_from_ai(question, action, target)
+            if market:
+                parsed.sector = market
+                parsed.intents = set(parsed.intents) | {"sector"}
+                return QueryPlan(route="rule_sector")
         if subject == "sector" and target:
             hit = sector_match.match(target)
             if hit:
@@ -7710,7 +7811,16 @@ class AceQueryEngine:
 
         if plan.route == "rule_sector":
             access_policy.require_sector(self._access())
-            return self._answer_sector(parsed.sector, started)
+            if (parsed.sector or {}).get("mode") == "unsupported" and parsed.sector.get("ai_retry"):
+                # 10-27（測試版 11-03 移植）：規則看出在問族群但讀不懂 → 先讓 AI 讀整句（白話問法），AI 也判斷不了才回「查不到」
+                fallback = dict(parsed.sector)
+                retry = self._classify_fallback(question, parsed, stats)
+                if retry is None or retry.route != "rule_sector" or (parsed.sector or {}).get("mode") == "unsupported":
+                    parsed.sector = fallback
+                else:
+                    self.log(f"🧭 族群問句改由 AI 判斷｜{parsed.sector.get('mode')}｜{parsed.sector.get('name')}")
+            # 10-27：族群排行要靠原句判斷最強／最弱（之前沒帶問句，「族群最弱」被當成最強）
+            return self._answer_sector(dict(parsed.sector, question=parsed.sector.get("question") or question), started)
 
         pre_results: List[tools.ToolResult] = []
         if plan.route == "rule_top_warrant":
@@ -7748,7 +7858,9 @@ class AceQueryEngine:
                 self.log(f"完整點位：K 線拉長到 {lookback} 根（涵蓋 {chart_branch} 在 {codes[0]} 的事件，最多回推 180 天）")
             except Exception as exc:   # 查不到事件就維持 70 根，不影響回答
                 self.log(f"完整點位略過：{type(exc).__name__}: {exc}")
-        chart_codes = chart_codes_for_plan(plan, codes)
+        # 11-02（測試版，正式版先給 /ace 管理員）：盤面結構問的是哪些股票，貢獻榜和權值股才是答案；不放大盤 K 線
+        chart_codes = ([] if plan.route == "rule_breadth" and tools.ace_preview()
+                       else chart_codes_for_plan(plan, codes))
         self.log(f"K 線排程｜預期股票={','.join(chart_codes) or '無（依需求）'}")
         for c in chart_codes:
             kwargs = {"stock_code": c, "mark_mode": mark_mode, "flow_source": "sheet"}
@@ -7902,21 +8014,24 @@ class AceQueryEngine:
             self._request_local.chart_levels = {str(p["stock_code"]): (p.get("scorecard") or p.get("key_levels") or {})
                                                 for p in panels if p.get("stock_code") and p.get("bars")}
         contribution = next((r.data for r in results if r.name == "get_index_contribution" and r.ok), None)
-        markets = list((contribution or {}).get("markets") or [])
-        # 問大盤就只給加權、問櫃買就只給櫃買；沒指定才兩個都給，不要拿另一個市場充數。
-        want = "tpex" if re.search(r"櫃買|上櫃|OTC", question, re.I) else (
-            "twse" if re.search(r"大盤|加權|台股", question) else "")
-        if want:
-            markets = [m for m in markets if m.get("market") == want]
-        for market in markets:
-            panels.append({"contribution": market})
         breadth = next((r.data for r in results if r.name == "get_market_breadth" and r.ok), None)
-        # 問「誰在拉／拖累指數」時，貢獻點數卡片已直接回答問題；
-        # breadth 仍提供給 AI 做市場廣度補充，但不要再塞一張「權值股漲跌幅排行」混淆主題。
-        # 問「加幾點／貢獻」時，貢獻榜出不來就不要用漲幅排行卡充數（那不是答案）。
-        points_question = bool(re.search(r"點|貢獻|拉抬|拉指數|撐盤", question))
-        if breadth and not markets and not points_question and (breadth.get("strongest") or breadth.get("weakest")):
-            panels.append(_breadth_panel(breadth))
+        if tools.ace_preview():
+            panels.extend(_market_structure_panels(question, contribution, breadth))   # 11-03：測試版 11-02 版本，先給 /ace 管理員
+        else:
+            markets = list((contribution or {}).get("markets") or [])
+            # 問大盤就只給加權、問櫃買就只給櫃買；沒指定才兩個都給，不要拿另一個市場充數。
+            want = "tpex" if re.search(r"櫃買|上櫃|OTC", question, re.I) else (
+                "twse" if re.search(r"大盤|加權|台股", question) else "")
+            if want:
+                markets = [m for m in markets if m.get("market") == want]
+            for market in markets:
+                panels.append({"contribution": market})
+            # 問「誰在拉／拖累指數」時，貢獻點數卡片已直接回答問題；
+            # breadth 仍提供給 AI 做市場廣度補充，但不要再塞一張「權值股漲跌幅排行」混淆主題。
+            # 問「加幾點／貢獻」時，貢獻榜出不來就不要用漲幅排行卡充數（那不是答案）。
+            points_question = bool(re.search(r"點|貢獻|拉抬|拉指數|撐盤", question))
+            if breadth and not markets and not points_question and (breadth.get("strongest") or breadth.get("weakest")):
+                panels.append(_breadth_panel(breadth))
         comparison = None
         if plan.route == "rule_index_compare":
             comparison = build_index_comparison(results)
@@ -8048,7 +8163,21 @@ class AceQueryEngine:
             # 一次只核對這檔股票，防止其他成分股的數字通過核對。
             return not facts.check(f"**{row['stock_name']}（{row['stock_code']}）**\n{explanation}")
 
-        result = sector_analysis.answer(request, self.gateway, validate)
+        member_only = sector_match.member_only()
+        if member_only and request.get("mode") == "technical":
+            request = dict(request, mode="overview")
+        # 11-02（測試版 11-03 移植）：今日排行類先出圖，新聞和 AI 背景做完再更新原圖；今日 AI 次數用完就照舊（不寫 AI）
+        local = getattr(self, "_request_local", None)
+        import member_sector_rank
+        deferrable = (local is not None and member_only and getattr(_AI_GATE, "allowed", True)
+                      and request.get("mode") in ("market_momentum", "parent_rank", "group_today"))
+        with (member_sector_rank.late_ai_scope() if deferrable else contextlib.nullcontext({})) as late:
+            result = sector_analysis.answer(request, self.gateway, validate)
+        if late.get("future"):
+            _AI_GATE.used = True                 # 背景執行緒的 Gemini 不會記到這題，這裡先算一次
+            local.late_ai = dict(sector=True, future=late["future"], base_panels=late["base_panels"],
+                                 expires=time.monotonic() + 300, results=[], targets=[])
+            self.log("族群 AI 解讀改背景寫｜先出圖，完成後更新原圖｜最長再等300秒")
         if request.get("matched_by"):
             # 會員講別名（TGV、CCL…）或模糊比對：卡片說明列與文字都註明對應到哪個族群
             result["text"] = f"（{request['matched_by']}）\n" + str(result.get("text") or "")
@@ -8462,11 +8591,28 @@ class AceQueryEngine:
     def _bind_late_cache(self, result, key, eligible=True):
         job=result.late_ai
         access=self._access()
-        if job and eligible and not (access and access.simulation) and all(r.ok for r in job['results']) and not any(p.get('error') for p in result.panels or []):
+        if job and not job.get('sector') and eligible and not (access and access.simulation) and all(r.ok for r in job['results']) and not any(p.get('error') for p in result.panels or []):
             job['targets'].append((key,self.config.answer_cache_seconds))
+
+    def _finish_late_sector(self, original, raw):
+        """族群排行背景 AI 寫完（測試版 11-03 移植）：AI 有寫就加上解讀卡；沒寫成也要換圖，把「撰寫中」提示拿掉。今日行情會變，不存快取。"""
+        job=original.late_ai
+        import member_sector_rank
+        card,used=raw.get('card'),raw.get('used') or {}
+        panels=[dict(p) for p in job['base_panels']]
+        text=original.text
+        if card:
+            panels.append({'ai_card':card})
+            text='\n'.join([text]+member_sector_rank.card_lines(card))
+        return replace(original,text=text,panels=panels,late_ai=None,cacheable=False,
+            input_tokens=original.input_tokens+int(used.get('input_tokens',0)),
+            output_tokens=original.output_tokens+int(used.get('output_tokens',0)),
+            total_tokens=original.total_tokens+int(used.get('total_tokens',0)))
 
     def finish_late_ai(self, original, raw):
         job=original.late_ai
+        if job and job.get('sector'):
+            return self._finish_late_sector(original,raw) if time.monotonic()<job['expires'] else None
         if not job or not raw.ok or time.monotonic()>=job['expires']:
             return None
         with job['lock']:
@@ -8781,7 +8927,8 @@ def schedule_late_ai_image(engine, original, target, make_files, no_mentions):
 
 
 PUBLIC_ANSWER_ROUTES = frozenset(("planner", "answer_cache"))
-PUBLIC_ADMIN_ROUTES = frozenset(("admin_kline_debug",))
+# 11-02（測試版 11-03 移植）：/ace 問族群雷達（哪些族群正在轉強）和 /ask 一樣公開
+PUBLIC_ADMIN_ROUTES = frozenset(("admin_kline_debug", "admin_radar"))
 # /ace 管理指令字眼：含內部狀態、路徑、快取、筆數、log 的回覆一開始就 ephemeral defer。
 _ADMIN_PRIVATE_RE = re.compile(r"錯誤|ERROR|狀態|用量|使用量|USAGE|底庫|名冊|維護|DEBUG|LOG|日誌|快取|CACHE|草稿|說明|HELP|指令", re.IGNORECASE)
 
@@ -9293,6 +9440,21 @@ TODAY_SYNC_LAST_MINUTE = 21 * 60          # 21:00 後當天不再重試（休市
 INTRADAY_SAMPLE_SECONDS = 300             # 盤中量能基準籃子取樣間隔
 
 
+def _sector_tape_gate() -> bool:
+    """族群排行快照要不要拍（測試版 11-03 移植）：盤中一律拍（10-27 使用者要求開盤就自動抓，不等有人問）。
+    背景執行緒用管理員報價權限判斷。"""
+    with tools.quote_policy(admin_live=True):
+        now = tools.taipei_now()
+        if not sector_radar.session_open(now):
+            return False
+    # 10-27 審核：官方交易日曆確認今天休市（元旦、颱風假已公告等）就不取樣；日曆沒涵蓋今天時照平日判斷
+    try:
+        day = now.strftime("%Y-%m-%d")
+        return local_market_cache.market_sessions_between(day, day) != []
+    except Exception:
+        return True
+
+
 def _intraday_sampling_loop(stop: threading.Event) -> None:
     # 管理員雷達需要背景快照；/ask 在入口與資料工具仍禁止即時行情。
     with tools.quote_policy(admin_live=True):
@@ -9696,6 +9858,10 @@ def run_discord_bot(config: BotConfig) -> None:
                 threading.Thread(target=_market_maintenance_loop, args=(usage_stop,), name="ace-market-base", daemon=True).start()
                 threading.Thread(target=_intraday_sampling_loop, args=(usage_stop,), name="ace-intraday-sample", daemon=True).start()
                 threading.Thread(target=_tpex_institutional_loop, args=(usage_stop,), name="ace-tpex-inst", daemon=True).start()
+            # 10-27 族群排行快照獨立一條執行緒（測試版 11-03 移植）：盤中每 60 秒一張（奇摩整批，近 5 分、跟漲觀察要靠累積）
+            import member_sector_tape
+            threading.Thread(target=member_sector_tape.run_loop, args=(usage_stop, _sector_tape_gate),
+                             name="ace-sector-tape", daemon=True).start()
         print(
             f"✅ 艾斯 AI 已上線：{client.user}｜指令 /{config.slash_command_name}（一般）＋/{config.admin_command_name}（管理員）" + (f" 與 {config.command_prefix}" if config.prefix_command_enabled else "") + "｜"
             f"允許使用者 {'不限' if config.allow_all_users else str(len(config.allowed_user_ids)) + ' 人'}｜限制頻道 {len(config.allowed_channel_ids) or '不限'}｜"
@@ -9780,6 +9946,9 @@ def run_discord_bot(config: BotConfig) -> None:
             return
         demo = bool(access.simulation)
         statistics_access[0] = access
+        # 11-03：畫圖、背景補 AI 也在這個 Task 的 context 裡（asyncio.to_thread 會帶過去），
+        # 測試版移植的圖卡改動只在 /ace 管理員本人（不含「/ace 測試 …」模擬）出現
+        tools.set_ace_preview(access.admin_mode)
         if demo and access.entitlement.general and not access.entitlement.admin:
             # 10-14：模擬會員（測試 general／warrant／both）也照會員頻道限制；真實身分是管理員也一樣擋
             blocked = member_channel_block(config, None, getattr(interaction, "channel", None), False)
@@ -10015,7 +10184,7 @@ def run_discord_bot(config: BotConfig) -> None:
             card = my_quota_card(engine._quota_policy, str(target.id), roles, unlimited=str(target.id) in quota_exempt_ids(),
                                  title=f"{name} 的額度")
             mode = QUOTA_MODE_LABELS.get(engine._quota_policy.mode, engine._quota_policy.mode)
-            card["sections"].append({"type": "note", "text": f"※ 目前模式：{mode}（Gemini 主模型剩 {engine._gemini_remaining_ratio():.0%}）"})
+            card["sections"].append({"type": "note", "keep": True, "text": f"※ 目前模式：{mode}（Gemini 主模型剩 {engine._gemini_remaining_ratio():.0%}）"})
             panels = [{"branch_card": card, "hide_text": True}]
         await interaction_image(interaction, "額度管理", text, panels, ephemeral=True)
 
