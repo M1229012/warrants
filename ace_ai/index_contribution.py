@@ -907,6 +907,9 @@ def contribution(market: str, live: bool, top: int = 5, *, deadline: Optional[fl
             total_prev_value += prev_value
         if not rows or total_prev_value <= 0:
             raise tools.ToolDataError("成分股昨收資料不足，無法計算盤中指數貢獻")
+        # 11-03 程式碼檢查：查無昨收的股票不在分母裡，市值未知就無法估計少了多少；和收盤路徑同一個門檻，太多就不出榜
+        if len(unpriced) > max(3, int(len(eligible) * 0.01)):
+            raise tools.ToolDataError(f"{index_name} 有 {len(unpriced)} 檔成分股查無昨收，無法正確換算貢獻點數")
 
         live_used = 0
         top_safe = bottom_safe = False
@@ -1016,13 +1019,18 @@ def contribution(market: str, live: bool, top: int = 5, *, deadline: Optional[fl
         # 同時另回 component_price_coverage_pct 讓 log 看檔數覆蓋。
         market_cap_coverage = close_cap_coverage if rows else 0.0
 
+    # 11-03 程式碼檢查：查無任何價格的成分股不在分母裡、市值也不知道 → 涵蓋率無法確認，不能寫成 100%
+    coverage_pct = None if unpriced else round(market_cap_coverage, 1)
     estimated_points = round(sum(r["points"] for r in evaluated), 2)
     index_points = round((float(now_index) - float(prev_index)), 2) if now_index is not None and prev_index is not None else None
     residual = round(index_points - estimated_points, 2) if index_points is not None else None
+    # 11-03 程式碼檢查：盤中也核對個股合計和指數漲跌（收盤路徑差太多會拒絕）；盤中報價時間不一，只提醒、不擋
+    residual_warning = bool(live and residual is not None and abs(residual) > max(25.0, abs(index_points or 0.0) * 0.20))
     if live:
         # 11-03：盤中也留對帳 Log；殘差大＝母體或股數有缺，點數會一起失真
         print(f"📊 {index_name} 盤中貢獻｜{live_note}｜指數={index_points if index_points is not None else '-'}"
-              f"｜個股合計={estimated_points:+.2f}｜殘差={residual if residual is not None else '-'}", flush=True)
+              f"｜個股合計={estimated_points:+.2f}｜殘差={residual if residual is not None else '-'}"
+              + ("｜⚠️ 殘差偏大，圖上與 AI 會註明估算可能偏差" if residual_warning else ""), flush=True)
 
     focus_share = positive_share if (index_points or 0) >= 0 else negative_share
     concentration = _concentration_label(focus_share)
@@ -1076,7 +1084,9 @@ def contribution(market: str, live: bool, top: int = 5, *, deadline: Optional[fl
         "components_evaluated": len(evaluated),
         "component_price_coverage_pct": round(len(rows) / len(codes) * 100.0, 1) if codes else 0.0,
         "live_quotes": live_used,
-        "market_cap_coverage_pct": round(market_cap_coverage, 1),
+        "market_cap_coverage_pct": coverage_pct,
+        "unpriced_components": len(unpriced),       # 查無任何價格、沒算進分母的成分股檔數
+        "residual_warning": residual_warning,       # 盤中個股合計和指數漲跌差太多（只提醒）
         "top5_lift_points": round(top_lift, 2),
         "top5_drag_points": round(top_drag, 2),
         "top5_positive_share_pct": round(positive_share, 1) if positive_share is not None else None,

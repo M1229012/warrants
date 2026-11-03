@@ -136,15 +136,11 @@ def prev_closes(codes: List[str]) -> Dict[str, float]:
 
 def stock_quote(code: str, market: str = "") -> Dict[str, Any]:
     """單一檔的今天報價（只有今天這一根）。族群排行每分鐘的快照也會存進來，有新的就不再打奇摩；
-    族群快照正在抓就等它抓完再看，減少被擋的機會。抓不到回空 dict。"""
+    族群快照正在抓時，等它的期間這檔一抓好就直接用（fetch 裡處理）。整次最多 SINGLE_DEADLINE 秒，抓不到回空 dict。
+    11-03 程式碼檢查：原本先等鎖最多 20 秒、fetch 裡又無時限再等一次，單檔 6 秒的預算擋不住。"""
     quote = _fresh(code)
     if quote:
         return quote
-    if _LOCK.acquire(timeout=DEFAULT_DEADLINE):
-        _LOCK.release()
-        quote = _fresh(code)
-        if quote:
-            return quote
     return fetch([code], SINGLE_DEADLINE, {code: market}).get(code) or {}
 
 
@@ -162,24 +158,48 @@ def fetch(codes: List[str], deadline_seconds: Optional[float] = None,
     symbols = {f"{c}.{'TW' if markets.get(c) == 'twse' else 'TWO'}": c
                for c in codes if markets.get(c) in ("twse", "tpex")}
     today = tools.taipei_now().strftime("%Y-%m-%d")
-    names = list(symbols)
     out: Dict[str, Dict[str, Any]] = {}
     errors = calls = 0
     began = time.perf_counter()
     deadline = began + (deadline_seconds or DEFAULT_DEADLINE)
-    with _LOCK:                                      # 單執行緒，不並行打
+    since = time.monotonic()
+    wanted = list(symbols.values())
+
+    def ready() -> Dict[str, Dict[str, Any]]:
+        """等鎖期間別人（族群快照）剛抓好的：直接用，不重打。只認等待開始之後存的，舊的快取不算。"""
+        return {c: hit[1] for c, hit in ((c, _QUOTES.get(c)) for c in wanted) if hit and hit[0] >= since}
+
+    # 11-03 程式碼檢查：等鎖也算在這次時限內（原本 with _LOCK 沒有時限，背景整批抓 6～8 秒會把題目時間吃掉）
+    while not _LOCK.acquire(timeout=min(0.2, max(0.0, deadline - time.perf_counter()))):
+        got = ready()
+        if len(got) == len(wanted):
+            return got
+        if time.perf_counter() >= deadline:
+            print(f"⚠️ Yahoo 成員報價｜等前一批抓完超過時限，這次先不抓｜{len(codes)} 檔（已取得 {len(got)} 檔）", flush=True)
+            return got
+    try:                                             # 單執行緒，不並行打
+        out.update(ready())
+        names = [s for s, c in symbols.items() if c not in out]
         for start in range(0, len(names), BATCH):
-            if time.perf_counter() > deadline or not enabled():
+            left = deadline - time.perf_counter()
+            if left <= 0.3 or not enabled():
                 break
             batch = names[start:start + BATCH]
-            calls += 1
             gap = _LAST_CALL[0] + GAP_SECONDS - time.monotonic()      # 單檔連續查時也要間隔，不要連打
+            if gap >= left:
+                break
             if gap > 0:
                 time.sleep(gap)
+                left = deadline - time.perf_counter()     # 11-03 複查：間隔睡完再算一次，剩不夠就不打
+                if left <= 0.3:
+                    break
+            calls += 1
             _LAST_CALL[0] = time.monotonic()
             try:
+                # HTTP 逾時不超過這次剩下的時間（原本固定 10 秒，單檔預算只有 6 秒；11-03 複查：拿掉 0.5 秒下限）。
+                # requests 的 timeout 是「多久沒收到資料」，不是整段下載的總時限；一批 50 檔的回應很小，實務上不會差太多
                 resp = requests.get(URL + urllib.parse.quote(",".join(batch)), headers=HEADERS,
-                                    timeout=TIMEOUT_SECONDS)
+                                    timeout=min(TIMEOUT_SECONDS, max(0.01, deadline - time.perf_counter())))
                 if resp.status_code in (403, 429):
                     _cool_down(f"HTTP {resp.status_code}")
                     break
@@ -199,6 +219,8 @@ def fetch(codes: List[str], deadline_seconds: Optional[float] = None,
                 if errors >= MAX_ERRORS:
                     _cool_down(f"連續 {errors} 批失敗")
                     break
+    finally:
+        _LOCK.release()
     ages = source_ages(out, tools.taipei_now().timestamp())
     age_text = (f"｜來源成交時間 中位 {ages[len(ages) // 2]:.0f}s、超過 180s {sum(a > 180 for a in ages)} 檔" if ages else "")
     print(f"📡 Yahoo 成員報價｜requested={len(codes)}｜returned={len(out)}｜市場別不明={len(codes) - len(symbols)}"
