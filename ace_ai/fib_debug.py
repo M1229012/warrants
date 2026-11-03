@@ -55,7 +55,14 @@ def load_panel(code: str) -> dict[str, Any]:
         panel["fib_debug"]["flags"].append(note)
     live = live_bar(code, last_closed)
     if live:
-        panel["fib_debug"]["live_bar"] = live     # 只畫在圖上；上面的錨點、價位、ATR 都是 build_panel 用正式收盤 K 算好的
+        data = panel["fib_debug"]
+        data["live_bar"] = live     # 只畫在圖上；上面的錨點、價位、ATR 都是 build_panel 用正式收盤 K 算好的
+        # 11-03 使用者：盤中已經跌到 0.618 附近就要看得到 0.786（正式收盤還沒到也標；只畫線，不交給 AI）
+        deep = fib_levels.live_deep_retrace(data, live["Close"])
+        if deep:
+            data["levels"].append(deep)
+            data["summary"].append(f"次要參考（今天盤中 {live['Close']:.2f} 已到 0.618 附近或之下才標，只畫在圖上、不交給 AI）："
+                                   f"{deep['label']} {deep['price']:.2f}")
     return panel
 
 

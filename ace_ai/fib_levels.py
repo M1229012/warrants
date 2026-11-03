@@ -166,6 +166,31 @@ def ai_reference(res: Dict[str, Any]) -> Dict[str, Any]:
     return {k: v for k, v in out.items() if v not in ([], "", None)}
 
 
+def deep_retrace_due(hi: float, amp: float, price: float, atr: float) -> bool:
+    """11-03：價格到 0.618 附近（0.5 ATR 內）或跌破才標 0.786；DEEP_RETRACE 設 0＝不標。"""
+    return bool(DEEP_RETRACE) and price <= hi - amp * RETRACE[-1] + TEST_ATR * atr
+
+
+def live_deep_retrace(res: Dict[str, Any], price: float) -> Optional[Dict[str, Any]]:
+    """11-03 使用者：正式收盤還沒到 0.618、盤中已經跌到時，驗證圖也要標 0.786 觀察（加權 11-03 盤中跌破 0.618）。
+    只給驗證圖畫線：不改價位區、不交給 AI；已經依正式收盤標過就不重複。沒有上漲主段、價格還沒到就回 None。"""
+    sel = res.get("selected")
+    if not sel or sel["dir"] <= 0 or any(lv.get("secondary") for lv in res.get("levels") or []):
+        return None
+    hi, amp, atr = sel["b"]["price"], sel["amp"], res["atr"]
+    if not deep_retrace_due(hi, amp, price, atr):
+        return None
+    level = hi - amp * DEEP_RETRACE
+    a, b, bars = sel["a"], sel["b"], res["bars"]
+    span = (f"（大波段 {bars[a['idx']]['date'][5:]}～{bars[b['idx']]['date'][5:]}）"
+            if a["idx"] < res["display_start"] else "")
+    return {"label": f"回撤 {DEEP_RETRACE:g}（次要，盤中價觸發）{span}", "tag": f"回撤{DEEP_RETRACE:g}次要",
+            "kind": "retrace", "ratio": DEEP_RETRACE, "price": float(level), "secondary": True,
+            "above": level > res["close"], "confluence": [], "tight": [],
+            "watch": abs(level - res["close"]) <= TEST_ATR * atr, "tentative": bool(sel.get("provisional")),
+            "conditional": False, "ai": False, "area": None}
+
+
 def _area_text(area: Dict[str, Any]) -> str:
     if len(area["members"]) == 1:
         x = area["members"][0]
@@ -345,7 +370,7 @@ def _compute(frame: pd.DataFrame, events: Optional[Dict[str, Any]], lookback: in
                                "price": hi - amp * r})
             # 11-03 使用者（加權跌到 0.618 下方 0.14 ATR）：0.618 守不住時下一個參考是 0.786，否則中間空到前低。
             # 只在收盤已在 0.618 附近（0.5 ATR 內）或之下才出現；次要價位，只畫在圖上觀察、不交給 AI
-            if DEEP_RETRACE and close <= hi - amp * RETRACE[-1] + TEST_ATR * ref:   # DEEP_RETRACE 設 0＝不標
+            if deep_retrace_due(hi, amp, close, ref):
                 levels.append({"label": f"回撤 {DEEP_RETRACE:g}（次要）{span}", "tag": f"回撤{DEEP_RETRACE:g}次要",
                                "kind": "retrace", "ratio": DEEP_RETRACE, "price": hi - amp * DEEP_RETRACE, "secondary": True})
             levels.append({"label": "前波高點 B", "kind": "prior", "ratio": 1.0, "price": hi})
