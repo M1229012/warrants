@@ -48,11 +48,37 @@ def find_codes(q: str, example: str, limit: int = 10) -> list[str]:
 def load_panel(code: str) -> dict[str, Any]:
     """僅管理員路由呼叫；行情入口與型態驗證相同（只用正式收盤 K），前面再接約一年日K看大結構。"""
     code, name, frame, events = kline_debug.load_closed(code)
+    last_closed = f"{pd.Timestamp(frame.index[-1]):%Y-%m-%d}"
     frame, note = extend_history(code, frame, events)
     panel = build_panel(frame, events, code, name)
     if note:
         panel["fib_debug"]["flags"].append(note)
+    live = live_bar(code, last_closed)
+    if live:
+        panel["fib_debug"]["live_bar"] = live     # 只畫在圖上；上面的錨點、價位、ATR 都是 build_panel 用正式收盤 K 算好的
     return panel
+
+
+def live_bar(code: str, last_closed: str) -> dict[str, Any] | None:
+    """11-03 使用者：驗證圖要看得到盤中 K 棒，但費波不拿它計算。
+    和 load_closed 同一份價格資料（_load_price_bundle 有快取，不另外打 API）；只有今天還沒正式收盤時才有這一根。"""
+    import warrant_ai_tools as tools
+    try:
+        bundle = tools._load_price_bundle(code)
+    except Exception as exc:
+        print(f"⚠️ 費波驗證：盤中 K 棒略過｜{code}｜{tools.err_text(exc)}", flush=True)
+        return None
+    info, df = bundle.get("intraday") or {}, bundle.get("df")
+    if not info or info.get("is_close_confirmed") or df is None or df.empty:
+        return None
+    day = f"{pd.Timestamp(df.index[-1]):%Y-%m-%d}"
+    if day <= last_closed:
+        return None
+    row = df.iloc[-1]
+    volume = row.get("Volume")
+    return {"date": day, "Open": float(row["Open"]), "High": float(row["High"]), "Low": float(row["Low"]),
+            "Close": float(row["Close"]), "Volume": float(volume) if pd.notna(volume) else 0.0,
+            "time": str(info.get("time") or "")[:5], "is_live": bool(info.get("is_live"))}
 
 
 def ai_reference(code: str) -> dict[str, Any]:
@@ -153,9 +179,10 @@ def render(data: dict) -> Image.Image:
     text(margin, 202, "實線＝交給 AI｜點線＝錨點未確認｜長短線＝突破後條件目標｜虛線＝不交給 AI｜灰點小轉折、黑圈大轉折", 21, muted)
 
     left, right, top, bottom = 115, 1215, 255, 755
-    step = (right - left) / max(1, len(visible))
+    live = data.get("live_bar")      # 11-03：盤中 K 棒接在最後一根正式收盤 K 後面，只顯示、不計算（空心畫法）
+    step = (right - left) / max(1, len(visible) + (1 if live else 0))
     px = lambda i: left + (i - start + 0.5) * step
-    prices = [b[k] for b in visible for k in ("Low", "High")]
+    prices = [b[k] for b in visible + ([live] if live else []) for k in ("Low", "High")]
     # 10-28：只顯示近段時，交給 AI／現價附近的價位一定入圖；其餘離圖太遠的只列在下方表格，不把 K 線壓扁
     prices += [lv["price"] for lv in levels if lv["ai"] or lv.get("watch") or min(prices) <= lv["price"] <= max(prices)]
     low, high = min(prices), max(prices)
@@ -190,8 +217,14 @@ def render(data: dict) -> Image.Image:
         draw.line((xx, py(bar["High"]), xx, py(bar["Low"])), fill=color, width=2)
         y1, y2 = sorted((py(bar["Open"]), py(bar["Close"])))
         draw.rectangle((xx - half, y1, xx + half, max(y1 + 2, y2)), fill=color)
+    if live:
+        color = "#DB4949" if live["Close"] >= live["Open"] else "#23997E"
+        xx, half = px(end + 1), max(1.5, min(7, step * 0.30))
+        draw.line((xx, py(live["High"]), xx, py(live["Low"])), fill=color, width=2)
+        y1, y2 = sorted((py(live["Open"]), py(live["Close"])))
+        draw.rectangle((xx - half, y1, xx + half, max(y1 + 2, y2)), fill="#FFFFFF", outline=color, width=2)
 
-    x0 = px(max(start, sel["a"]["idx"])) if sel else left
+    x0 =px(max(start, sel["a"]["idx"])) if sel else left
     for lv in levels:
         yy, color = py(lv["price"]), KIND_COLOR[lv["kind"]]
         x1 = left if lv["kind"] == "support" else x0   # 下跌支撐來自更早的結構，整條畫滿才看得到
@@ -248,6 +281,9 @@ def render(data: dict) -> Image.Image:
              "color": KIND_COLOR[lv["kind"]],
              "bold": lv["ai"]} for lv in levels]
     tags.append({"y": py(data["close"]), "text": f"收盤｜{data['close']:.2f}", "color": ink, "bold": True})
+    if live:
+        tags.append({"y": py(live["Close"]), "text": f"{'盤中' if live['is_live'] else '盤後'}{live['time']}｜{live['Close']:.2f}",
+                     "color": muted, "bold": False})
     _spread(tags, 25, top - 10, bottom)
     for tag in tags:
         if abs(tag["ly"] - tag["y"]) > 2:
@@ -257,15 +293,25 @@ def render(data: dict) -> Image.Image:
     tick_gap = max(1, math.ceil(len(visible) / 9))
     for i in range(start, end + 1, tick_gap):
         text(px(i) - 24, 779, bars[i]["date"][5:], 19, muted)
-    max_vol = max([max(0, b["Volume"]) for b in visible] + [1.0])
+    max_vol = max([max(0, b["Volume"]) for b in visible + ([live] if live else [])] + [1.0])
     text(margin, 817, "成交量", 20, muted)
     for i in range(start, end + 1):
         bar = bars[i]
         xx, hh = px(i), max(0, bar["Volume"]) / max_vol * 83
         draw.rectangle((xx - step * 0.28, 935 - hh, xx + step * 0.28, 935), fill="#DB4949" if bar["Close"] >= bar["Open"] else "#23997E")
+    if live:
+        xx, hh = px(end + 1), max(0, live["Volume"]) / max_vol * 83
+        draw.rectangle((xx - step * 0.28, 935 - hh, xx + step * 0.28, 935), fill="#FFFFFF",
+                       outline="#DB4949" if live["Close"] >= live["Open"] else "#23997E", width=2)
     draw.line((margin, 955, width - margin, 955), fill=grid, width=2)
 
     y = 980
+    if live:
+        state = f"盤中 {live['time']}" if live["is_live"] else f"盤後暫定 {live['time']}"
+        for line in wrap(f"最右邊空心 K 棒是今天（{live['date'][5:]}）{state}的價格，只顯示、不加入計算；"
+                         f"錨點、ATR、費波價位都以 {bars[end]['date'][5:]} 正式收盤計算，收盤後才會更新。", 23, width - 2 * margin):
+            text(margin, y, line, 23, muted)
+            y += 33
     for value in data.get("summary") or []:
         for line in wrap(value, 23, width - 2 * margin):
             text(margin, y, line, 23)
