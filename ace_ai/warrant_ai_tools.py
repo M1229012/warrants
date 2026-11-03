@@ -92,7 +92,7 @@ DAYTRADE_MAX_HOLD_DAYS = _env_int("DISCORD_AI_DAYTRADE_MAX_HOLD_DAYS", 2)
 SHEET_CHIPS_MIN_SELL_AMOUNT = _env_float("DISCORD_AI_SHEET_CHIPS_MIN_SELL_AMOUNT", 100_000.0)
 SMALL_SAMPLE_EVENTS = _env_int("DISCORD_AI_SMALL_SAMPLE_EVENTS", 10)
 SHEET_QUERY_MAX_ROWS = 100
-NEWS_MAX_ITEMS = _env_int("DISCORD_AI_NEWS_MAX_ITEMS", 15)          # 10-20：8→15，AI 參考更多新聞（圖上不列清單）
+NEWS_MAX_ITEMS = _env_int("DISCORD_AI_NEWS_MAX_ITEMS", 15)          # 10-20（測試版移植）：8→15，AI 參考更多新聞
 NEWS_SUMMARY_MAX_CHARS = 160
 # 新聞：鉅亨網新聞搜尋 API（用股票代號查，含內文）優先，再補既有六來源標題。
 # 不再抓一般新聞網站原文：Google News 連結解碼會卡住，大量解析網頁也曾讓 Discord 心跳逾時斷線。
@@ -1621,24 +1621,39 @@ def closed_quotes_only():
     return not (_ADMIN_LIVE_QUOTES.get() and INTRADAY_ENABLE)
 
 
-# 11-02 使用者：所有題目（/ask、/ace）都要即時，AI 也照這個寫。免費來源（Yahoo、證交所 MIS）全部開放；
-# closed_quotes_only 維持只有 /ace 為 False，富果不開放給 /ask，也不換快取區（背景預讀的工作表才接得上）。
+# 11-03（測試版 11-02 移植）：奇摩、MIS 的「今天這一根」。測試版所有題目都開；正式版先只給 /ace 管理員（stock_live 跟 preview 一起開），
+# /ask 維持收盤資料，等管理員測完再下放。
 _STOCK_LIVE_QUOTES = contextvars.ContextVar("ace_stock_live_quotes", default=False)
+# 11-03：測試版移植過來的新功能（今日族群排行、新族群名單、新版貢獻榜、AI 欄位防線…）只在 /ace 管理員本人查詢時打開。
+# 「/ace 測試 general」是模擬會員，不算；背景工作也不算。
+_ACE_PREVIEW = contextvars.ContextVar("ace_preview_features", default=False)
 
 
 def stock_live_quotes():
     return bool(not closed_quotes_only() or (INTRADAY_ENABLE and _STOCK_LIVE_QUOTES.get()))
 
 
+def ace_preview() -> bool:
+    return bool(_ACE_PREVIEW.get())
+
+
+def set_ace_preview(on: bool) -> None:
+    """Discord 入口在確認身分後設定（同一個 asyncio Task 之後畫圖、補圖都看得到）；Task 結束就跟著消失。"""
+    _ACE_PREVIEW.set(bool(on))
+
+
 @contextmanager
-def quote_policy(*, admin_live=False, stock_live=False):
+def quote_policy(*, admin_live=False, stock_live=False, preview=None):
     token = _ADMIN_LIVE_QUOTES.set(bool(admin_live))
     stock_token = _STOCK_LIVE_QUOTES.set(bool(stock_live))
+    preview_token = _ACE_PREVIEW.set(bool(preview)) if preview is not None else None    # 沒指定就沿用外層
     try:
         yield
     finally:
         _ADMIN_LIVE_QUOTES.reset(token)
         _STOCK_LIVE_QUOTES.reset(stock_token)
+        if preview_token is not None:
+            _ACE_PREVIEW.reset(preview_token)
 
 
 TTL_INTRADAY_SECONDS = _env_int("DISCORD_AI_TTL_INTRADAY_SECONDS", 60)
@@ -1820,9 +1835,10 @@ def _yahoo_stock_quote(code: str, market: str = "") -> Dict[str, Any]:
 
 
 def _live_stock_quote(code: str, market: str = "") -> Dict[str, Any]:
-    """今天這一根：先奇摩；富果吃額度，預設不備援（DISCORD_AI_LIVE_FUGLE_FALLBACK=1 才開）。都沒有就維持最近收盤。"""
+    """今天這一根：先奇摩；奇摩沒有才用富果。測試版富果預設不備援（DISCORD_AI_LIVE_FUGLE_FALLBACK=1 才開），
+    正式版 /ace 原本就用富果，奇摩抓不到時仍退回富果，不讓管理員少了今天這一根。"""
     quote = _yahoo_stock_quote(code, market)
-    if quote or not LIVE_FUGLE_FALLBACK:
+    if quote or not (LIVE_FUGLE_FALLBACK or not closed_quotes_only()):
         return quote
     with quote_policy(admin_live=True, stock_live=True):
         return fetch_fugle_quote(code)
@@ -2090,7 +2106,7 @@ def fetch_fugle_index_quote(code: str) -> Dict[str, Any]:
 
 
 def fetch_index_quote(code: str) -> Dict[str, Any]:
-    """指數盤中報價：先用富果（和個股同一個來源），失敗才用證交所 MIS。/ask 不動富果，直接用 MIS。"""
+    """指數盤中報價：先用富果（和個股同一個來源），失敗才用證交所 MIS。只開即時、沒開富果的題目直接用 MIS。"""
     if closed_quotes_only():
         return fetch_mis_index_quote(code) if stock_live_quotes() else {}
     if FUGLE_API_KEYS or FUGLE_API_KEY:
@@ -2103,7 +2119,7 @@ def fetch_index_quote(code: str) -> Dict[str, Any]:
 
 def mis_item_is_today(item: Dict[str, Any], now: Optional[datetime] = None) -> bool:
     """MIS 每筆報價的 d（YYYYMMDD）要是今天；帶了日期但不是今天＝前一交易日資料。
-    10-27 審核：沒帶日期＝無法證明是今天的資料，不當成今天（原本直接放行）。"""
+    10-27 審核（測試版 11-03 移植）：沒帶日期＝無法證明是今天的資料，不當成今天（原本直接放行）。"""
     day = str((item or {}).get("d") or "").strip()
     if not day:
         return False
@@ -2181,13 +2197,6 @@ def _append_index_intraday(code: str, frame: pd.DataFrame) -> Tuple[pd.DataFrame
     return merged, info
 
 
-def _price_cache_prefix() -> str:
-    """背景只有收盤 K；/ask 有今天那一根，要和同一個快取區的純收盤版本分開存。"""
-    if current_api_priority() == "background":
-        return "price_closed_"
-    return "price_live_" if closed_quotes_only() and stock_live_quotes() else "price_"
-
-
 def _load_index_bundle(code: str) -> Dict[str, Any]:
     kf = core()
 
@@ -2212,6 +2221,13 @@ def _load_index_bundle(code: str) -> Dict[str, Any]:
     ttl = TTL_INTRADAY_SECONDS if INTRADAY_ENABLE and intraday_session_now() else TTL_PRICE_SECONDS
     prefix = _price_cache_prefix()
     return _cached(prefix + code, ttl, build)
+
+
+def _price_cache_prefix() -> str:
+    """背景只有收盤 K；只開即時、沒開富果的題目有今天那一根，要和同一個快取區的純收盤版本分開存。"""
+    if current_api_priority() == "background":
+        return "price_closed_"
+    return "price_live_" if closed_quotes_only() and stock_live_quotes() else "price_"
 
 
 FUTURES_ID = os.getenv("DISCORD_AI_FUTURES_ID", "TX").strip() or "TX"
@@ -2559,6 +2575,7 @@ def _load_price_bundle(stock_code: str, spot_history_mode: bool = False) -> Dict
     def build() -> Dict[str, Any]:
         daily_df, market, daily_source = daily() if getattr(_LOCAL_ONLY, "on", False) else _cached(f"price_daily_{code}_{source_stamp(code)}", TTL_PRICE_SECONDS, daily)
         if spot_history_mode:
+            # 10-20（測試版移植）：分點回測要一年價格；問過的股票另存一年日K（spot_history），和近期日K合併
             import spot_history
             archived = spot_history.load_prices(code)
             if archived is not None and not archived.empty:
@@ -2595,7 +2612,7 @@ def _load_price_bundle(stock_code: str, spot_history_mode: bool = False) -> Dict
                 # 有證據的缺口（全市場確認休市，或所屬市場收盤快照完整卻沒有這檔＝確定沒成交）才照常分析並標註。
                 _ACCEPTED_GAPS[code] = (today, tuple(gaps))
                 shown = "、".join(gaps) if len(gaps) <= 3 else f"{gaps[0]} 等 {len(gaps)} 天"
-                if __import__("log_switch").enabled("datawarn"):   # 10-11：平常不印，需要時開「休市提示」
+                if __import__("log_switch").enabled("datawarn"):   # 10-20：平常不印，需要時開「休市紀錄」（同測試版）
                     print(f"⚠️ {code} 日K {shown} 已確認為休市、該股無成交或暫停交易，照常分析", flush=True)
         # 底庫與日K快取保持原始價，只在分析入口還原一次。
         import price_adjustment
@@ -3016,7 +3033,7 @@ def analyze_ma_deduction(df: pd.DataFrame, periods: Sequence[int] = (5, 10, 20, 
             "change_dir": path[first_change - 1] if first_change else "",
             "first_down_day": next((i for i, x in enumerate(path, 1) if x == "下彎"), None),
             "rise_price_tomorrow": _num(tick_above(rise_at)),
-            # 失敗值＝明天要扣掉的價格：上揚均線收盤低於它才轉彎；比跌停價還低＝跌停也續揚（扣抵條件強，不等於價格守得住）
+            # 失敗值＝明天要扣掉的價格：上揚均線收盤低於它才轉彎；比跌停價還低＝跌停也續揚（強支撐）
             # 失敗值＝方向翻轉的門檻：上揚均線收盤要「高於」它才續揚；下彎均線收盤要「低於」它才續彎
             "fail_price": _num(rise_at if now == "上揚" else fall_at if now == "下彎" else deductions[0]),
             "limit_proof": ("跌停也續揚" if now == "上揚" and limit_prices(close)[0] > rise_at
@@ -3175,40 +3192,14 @@ def _kline_patterns(df: pd.DataFrame, code: str = "", provisional_today: bool = 
     try:
         import kline_patterns
         events = get_corporate_actions(code) if code else None
-        result = kline_patterns.detect(df, events, provisional_today, include_debug=True, state_key=f"tri_state_{code}" if code else "")
+        result = kline_patterns.detect(df, events, provisional_today, state_key=f"tri_state_{code}" if code else "")   # 10-08：三入口共用跨日三角存檔（沒有存檔＝同一套冷重播）
+        # 與管理員驗證圖同一個 detect 結果；舊通道/楔形/箱型不再替三角提供證據。
         clean_frame = df.dropna(subset=["Open", "High", "Low", "Close"]).sort_index()
-        out = kline_patterns.ai_pattern_facts(result, data_date=_fmt_date(clean_frame.index[-1]) if not clean_frame.empty else "",
-                                              day=len(clean_frame) - 1)
-        import member_pattern
-        basis = member_pattern.price_basis(result, df, events)
-        if basis:
-            if basis["adjusted"]:
-                basis["ma_deduction"] = analyze_ma_deduction(result["debug"]["frame"])
-            out["member_basis"] = basis
-        if result.get("triangle"):
-            import member_pattern
-            out["member_view"] = member_pattern.geometry(result, source_frame=df, events=events)
-            if out.get("triangle"):
-                out["triangle"]["first_break"] = result["triangle"].get("first_break")
-        return out
+        date = _fmt_date(clean_frame.index[-1]) if not clean_frame.empty else ""
+        return kline_patterns.ai_pattern_facts(result, data_date=date, day=len(clean_frame) - 1)
     except Exception as exc:                       # 型態判斷失敗不影響其他技術資料
         print(f"⚠️ K 線型態判斷略過｜{err_text(exc)}", flush=True)
         return {"triangle_validation": {"status": "unavailable"}, "triangle": None}
-
-
-FIB_REFERENCE = os.getenv("DISCORD_AI_FIB_REFERENCE", "1") != "0"   # 10-29 測試版：技術面附費波參考價
-
-
-def _fib_reference(code: str) -> Dict[str, Any]:
-    """10-29（測試版）：費波參考價給問型態的 AI 說明目標價、壓力支撐；失敗不影響其他技術資料。"""
-    if not FIB_REFERENCE or code in INDEX_CODES or getattr(_LOCAL_ONLY, "on", False):   # 離線批次（族群總覽等）不另抓一年日K
-        return {}
-    try:
-        import fib_debug
-        return fib_debug.ai_reference(code)
-    except Exception as exc:
-        print(f"⚠️ 費波參考價略過｜{code}｜{err_text(exc)}", flush=True)
-        return {}
 
 
 def _drawdown_facts(df: pd.DataFrame) -> Dict[str, Any]:
@@ -3303,7 +3294,6 @@ def get_technical_analysis(stock_code: str) -> Dict[str, Any]:
         "bollinger": analyze_bollinger(df),
         "ma_kline_signals": safe_signal(kf.get_ma_kline_signals),
         "kline_patterns": _kline_patterns(df, code, bool(use_live and (intraday.get("is_live") or intraday.get("post_close_provisional")))),
-        "fib_reference": _fib_reference(code),   # 只用正式收盤 K；Bot 只在問型態時交給 AI（payload.fib_reference）
         # 給 AI 看近期走勢：近 10 日 K 棒（日期 開 高 低 收）＋均線近 3 日（看均線往上／往下彎）
         "drawdown": _drawdown_facts(df),
         "recent_bars_10": [[_fmt_date(i)[5:], _num(r.get("Open")), _num(r.get("High")), _num(r.get("Low")), _num(r.get("Close"))]
@@ -5795,7 +5785,6 @@ def _warrant_detail_from_store(canonical: str, requested: int, days: int, stock_
             p = None
         if p is not None:
             buy_sh, _, buy_amt, _, _ = _window_sums(p, s, e)
-
             p = dict(p, stock=stock, name=p["name"] or info["name"],
                      stock_name=p["stock_name"] or stock_name_map.get(stock, ""))
         else:
@@ -6840,6 +6829,15 @@ def _mis_quotes(channels: List[str]) -> List[Dict[str, Any]]:
     return rows
 
 
+def _heavyweight_quotes(codes: List[str]) -> Dict[str, Dict[str, Any]]:
+    try:
+        import yahoo_quotes
+        return yahoo_quotes.prime(codes, HEAVYWEIGHT_BUDGET_SECONDS)     # 11-03：直接用 prime 回傳的，重讀可能剛好過期
+    except Exception as exc:
+        print(f"⚠️ 盤面廣度：權值股批次報價失敗，改逐檔｜{err_text(exc)}", flush=True)
+        return {}
+
+
 def _breadth_verdict(data: Dict[str, Any]) -> str:
     """回答「是不是只有權值股在動」：先比權值股 vs 其他股票，抓不到權值股時退回加權 vs 櫃買。"""
     heavy = data.get("heavyweight_median_pct")
@@ -6863,15 +6861,6 @@ def _breadth_verdict(data: Dict[str, Any]) -> str:
     if gap <= -0.5:
         return f"權值股反而弱於{label}（差距 {gap:+.2f} 個百分點），資金偏向中小型股"
     return f"權值股和{label}表現接近（差距 {gap:+.2f} 個百分點），盤面沒有明顯偏食"
-
-
-def _heavyweight_quotes(codes: List[str]) -> Dict[str, Dict[str, Any]]:
-    try:
-        import yahoo_quotes
-        return yahoo_quotes.prime(codes, HEAVYWEIGHT_BUDGET_SECONDS)     # 11-03：直接用 prime 回傳的，重讀可能剛好過期
-    except Exception as exc:
-        print(f"⚠️ 盤面廣度：權值股批次報價失敗，改逐檔｜{err_text(exc)}", flush=True)
-        return {}
 
 
 def get_market_breadth() -> Dict[str, Any]:
@@ -6905,7 +6894,7 @@ def get_market_breadth() -> Dict[str, Any]:
                     sectors.append({"name": label, "change_pct": row["change_pct"]})
         except Exception as exc:
             print(f"⚠️ 盤面廣度取指數失敗：{err_text(exc)}", flush=True)
-        # 11-02 Log：逐檔載入整份個股資料，6 秒只拿到 1 檔。改成奇摩一個請求整批抓，奇摩沒回的才逐檔補。
+        # 11-02 Log（測試版 11-03 移植）：逐檔載入整份個股資料，6 秒只拿到 1 檔。改成奇摩一個請求整批抓，奇摩沒回的才逐檔補。
         heavy: List[Dict[str, Any]] = []
         heavy_codes = HEAVYWEIGHT_CODES[:HEAVYWEIGHT_LIMIT]
         quotes = _heavyweight_quotes(heavy_codes)
@@ -7008,10 +6997,16 @@ def get_market_breadth() -> Dict[str, Any]:
     return result
 
 
-def get_index_contribution(top: int = 10, market: str = "") -> Dict[str, Any]:
-    """加權與櫃買的指數貢獻點數：誰把指數拉上去、誰把它拖下來（權重 × 漲跌）。market 指定就只算那個市場。"""
+def get_index_contribution(top: int = 0, market: str = "") -> Dict[str, Any]:
+    """加權與櫃買的指數貢獻點數：誰把指數拉上去、誰把它拖下來（權重 × 漲跌）。market 指定就只算那個市場。
+    11-03：/ace 管理員預覽列前 10（測試版 11-02 定案）；/ask 維持前 5，等下放時再一起改。"""
     import index_contribution
-    return index_contribution.report(top=max(3, int(top or 10)), market=str(market or ""))
+    preview = ace_preview()
+    out = index_contribution.report(top=max(3, int(top or (10 if preview else 5))), market=str(market or ""))
+    if preview:
+        for row in out.get("markets") or []:
+            row["price_columns"] = True       # 圖卡用新版（股價、漲跌停底色），answer_image.contribution_card
+    return out
 
 
 # K 線圖大約 3 個月；三大法人柱狀圖要蓋滿整張 K 線，所以抓的天數比統計用的 20 日多。
