@@ -19,17 +19,91 @@ KIND_COLOR = {"retrace": "#1478B5", "prior": "#C76C00", "extend": "#8044B8", "bo
               "support": "#B4232C"}
 
 
+_FIB_WORD = re.compile(r"費波|斐波|費氏|費布|fibo|黃金切割", re.IGNORECASE)
+_NEGATED = re.compile(r"不要|不用|別幫|不需要")
+
+
+def mentions_fib(question: str) -> bool:
+    q = str(question or "")
+    return bool(_FIB_WORD.search(q)) and not _NEGATED.search(q)
+
+
 def is_request(question: str) -> bool:
+    """11-03：「幫我驗證一下台指期的費波」這種白話也算——有費波字眼、句子裡有「驗證」就是驗證圖（不必連在一起）。"""
     q = str(question or "").strip()
-    return not re.search(r"不要|不用|別幫|不需要", q) and bool(_COMMAND.search(q))
+    return not _NEGATED.search(q) and bool(_COMMAND.search(q) or (_FIB_WORD.search(q) and "驗證" in q))
 
 
-def parse_codes(question: str, limit: int = 10) -> list[str]:
-    """「費波驗證 2330」或一次多檔「費波驗證 2344 1608」，依輸入順序、最多 limit 檔；沒有代號時比對股名。"""
+def rule_codes(question: str, limit: int = 10) -> list[str]:
+    """不用 AI 就看得出的標的：台指期名稱、股票代號、股名；看不出回空清單。"""
+    import taifex_futures
+    q = str(question or "")
+    out = []
+    if taifex_futures.is_futures(q):   # 11-03：台指期＝台指期近月自己算（不是加權現貨）
+        out.append(taifex_futures.CODE)
+        q = taifex_futures._CODE_RE.sub(" ", q)
+    try:
+        out += find_codes(q, "費波驗證 2330", limit - len(out))
+    except ValueError as exc:
+        if "最多" in str(exc):
+            raise
+    return out
+
+
+_TARGET_SCHEMA = {"type": "object", "properties": {"targets": {"type": "array", "items": {"type": "object", "properties": {
+    "kind": {"type": "string", "enum": ["futures", "taiex", "tpex", "stock", "none"]}, "stock": {"type": "string"}},
+    "required": ["kind", "stock"]}}}, "required": ["targets"]}
+
+
+def ai_codes(question: str, ask_ai, limit: int = 10) -> list[str]:
+    """11-03 使用者：任何白話都要能用（「夜盤的費波位置」）→ 規則看不出標的時讓 AI 讀整句，不補關鍵字。
+    ask_ai(prompt, schema) 回 dict 或 None。"""
+    import taifex_futures
+    prompt = ("你是台股問句解析器，只輸出 JSON，不要回答問題。使用者想看費波南西（費波）價位，讀完整句判斷要看哪些標的，依句中順序列出：\n"
+              "futures＝台指期（台股期貨、期指；日盤、夜盤、大台、小台、微台都算）；taiex＝加權指數（大盤、現貨）；"
+              "tpex＝櫃買指數；stock＝個股，stock 欄寫代號或名稱；其餘 stock 欄留空；看不出標的寫 none。\n問題：" + question)
+    out = ask_ai(prompt, _TARGET_SCHEMA) or {}
+    codes = []
+    fixed = {"futures": taifex_futures.CODE, "taiex": "TAIEX", "tpex": "TPEX"}
+    for item in out.get("targets") or []:
+        kind = str(item.get("kind") or "")
+        if kind in fixed:
+            codes.append(fixed[kind])
+        elif kind == "stock" and str(item.get("stock") or "").strip():
+            try:
+                codes += find_codes(str(item["stock"]), "費波驗證 2330", limit)
+            except ValueError:
+                continue
+    return list(dict.fromkeys(codes))[:limit]
+
+
+def parse_codes(question: str, limit: int = 10, ask_ai=None) -> list[str]:
+    """「費波驗證 2330」或一次多檔「費波驗證 2344 1608」，依輸入順序、最多 limit 檔；沒有代號時比對股名。
+    規則看不出標的、又有 ask_ai 時，讓 AI 讀整句（夜盤、期貨…白話問法）。"""
     q = str(question or "").strip()
     if not is_request(q):
         raise ValueError("請說：費波驗證 2330（一次最多10檔）")
-    return find_codes(q, "費波驗證 2330", limit)
+    codes = rule_codes(q, limit)
+    if not codes and ask_ai is not None:
+        codes = ai_codes(q, ask_ai, limit)
+    if not codes:
+        raise ValueError("請指定股票，例如：費波驗證 2330、費波驗證 台指期")
+    return codes
+
+
+def futures_request(question: str, ask_ai) -> list[str]:
+    """11-03：沒說「驗證」的白話（「台指期費波在哪」「夜盤費波位置」）——標的是台指期才走驗證圖，回代號清單；
+    個股、大盤照舊走一般回答（回空清單）。句子裡有股票代號或股名就不問 AI。"""
+    if not mentions_fib(question) or is_request(question):
+        return []
+    import taifex_futures
+    try:
+        codes = rule_codes(question)
+        if not codes and ask_ai is not None:
+            codes = ai_codes(question, ask_ai)
+    except ValueError:       # 一次超過 10 檔等：不是這條路，交給後面的流程回覆
+        return []
+    return codes if taifex_futures.CODE in codes else []
 
 
 def find_codes(q: str, example: str, limit: int = 10) -> list[str]:
@@ -47,23 +121,49 @@ def find_codes(q: str, example: str, limit: int = 10) -> list[str]:
 
 def load_panel(code: str) -> dict[str, Any]:
     """僅管理員路由呼叫；行情入口與型態驗證相同（只用正式收盤 K），前面再接約一年日K看大結構。"""
+    import taifex_futures
+    if code == taifex_futures.CODE:
+        return futures_panel()
     code, name, frame, events = kline_debug.load_closed(code)
     last_closed = f"{pd.Timestamp(frame.index[-1]):%Y-%m-%d}"
     frame, note = extend_history(code, frame, events)
     panel = build_panel(frame, events, code, name)
     if note:
         panel["fib_debug"]["flags"].append(note)
-    live = live_bar(code, last_closed)
-    if live:
-        data = panel["fib_debug"]
-        data["live_bar"] = live     # 只畫在圖上；上面的錨點、價位、ATR 都是 build_panel 用正式收盤 K 算好的
-        # 11-03 使用者：盤中已經跌到 0.618 附近就要看得到 0.786（正式收盤還沒到也標；只畫線，不交給 AI）
-        deep = fib_levels.live_deep_retrace(data, live["Close"])
-        if deep:
-            data["levels"].append(deep)
-            data["summary"].append(f"次要參考（今天盤中 {live['Close']:.2f} 已到 0.618 附近或之下才標，只畫在圖上、不交給 AI）："
-                                   f"{deep['label']} {deep['price']:.2f}")
+    attach_live(panel["fib_debug"], live_bar(code, last_closed))
     return panel
+
+
+def futures_panel() -> dict[str, Any]:
+    """11-03 使用者：台指期獨立一張——用台指期近月連續日 K（前一晚夜盤＋當天日盤）自己找錨點、算價位，
+    和加權現貨的費波不混用（有正逆價差）；最右邊那根是奇摩即時價（日盤或夜盤），只顯示、不計算。"""
+    import taifex_futures
+    frame = taifex_futures.daily_frame()
+    panel = build_panel(frame, None, taifex_futures.CODE, taifex_futures.NAME)
+    data = panel["fib_debug"]
+    data["flags"].append("台指期近月連續：每天一根＝前一晚夜盤＋當天日盤；換月不還原價差"
+                         + (f"（最近換月 {frame.attrs['rolls'][-1][5:]}）" if frame.attrs.get("rolls") else ""))
+    attach_live(data, taifex_futures.live_bar(frame))
+    return panel
+
+
+def attach_live(data: dict[str, Any], live: dict[str, Any] | None) -> None:
+    """最右邊那根只畫在圖上；錨點、價位、ATR 都是 build_panel 用正式收盤 K 算好的。"""
+    if not live:
+        return
+    data["live_bar"] = live
+    # 11-03 使用者：盤中已經跌到 0.618 附近就要看得到 0.786（正式收盤還沒到也標；只畫線，不交給 AI）
+    deep = fib_levels.live_deep_retrace(data, live["Close"])
+    if deep:
+        data["levels"].append(deep)
+        data["summary"].append(f"次要參考（{_live_state(live)} {live['Close']:.2f} 已到 0.618 附近或之下才標，只畫在圖上、不交給 AI）："
+                               f"{deep['label']} {deep['price']:.2f}")
+
+
+def _live_state(live: dict[str, Any]) -> str:
+    """股票：盤中／盤後暫定；台指期：日盤／夜盤（加成交時間）。"""
+    label = live.get("label") or ("盤中" if live.get("is_live") else "盤後暫定")
+    return f"{label} {live.get('time') or ''}".strip()
 
 
 def live_bar(code: str, last_closed: str) -> dict[str, Any] | None:
@@ -291,7 +391,8 @@ def render(data: dict) -> Image.Image:
              "bold": lv["ai"]} for lv in levels]
     tags.append({"y": py(data["close"]), "text": f"收盤｜{data['close']:.2f}", "color": ink, "bold": True})
     if live:
-        tags.append({"y": py(live["Close"]), "text": f"{'盤中' if live['is_live'] else '盤後'}{live['time']}｜{live['Close']:.2f}",
+        tags.append({"y": py(live["Close"]), "text": f"{live.get('label') or ('盤中' if live['is_live'] else '盤後')}{live['time']}"
+                                                     f"｜{live['Close']:.2f}",
                      "color": muted, "bold": False})
     _spread(tags, 25, top - 10, bottom)
     for tag in tags:
@@ -316,8 +417,9 @@ def render(data: dict) -> Image.Image:
 
     y = 980
     if live:
-        state = f"盤中 {live['time']}" if live["is_live"] else f"盤後暫定 {live['time']}"
-        for line in wrap(f"最右邊那根 K 棒是今天（{live['date'][5:]}）{state}的價格，只顯示、不加入計算；"
+        state = _live_state(live)
+        night = "（含前一晚夜盤）" if live.get("with_night") else ""
+        for line in wrap(f"最右邊那根 K 棒是 {live['date'][5:]} 交易日{state}的價格{night}，只顯示、不加入計算；"
                          f"錨點、ATR、費波價位都以 {bars[end]['date'][5:]} 正式收盤計算，收盤後才會更新。", 23, width - 2 * margin):
             text(margin, y, line, 23, muted)
             y += 33

@@ -742,7 +742,8 @@ ADMIN_HELP_GROUPS = (
                   "熱門股票今日／近7天", "大家都問什麼類型的問題", "統計診斷")),
     ("額度（/額度 指令）", ("贈送 AI 次數", "設定身分組每日 AI 次數", "清除身分組每日設定", "查詢某人／身分組額度")),
     ("型態驗證", ("型態驗證 2330（趨勢線、錨點、轉折確認日）", "型態驗證 2344 1608 2421（一次最多 10 檔，公開）", "圖片型態驗證（attachment 附股票清單截圖，最多 10 檔）")),
-    ("費波驗證（測試版）", ("費波驗證 2330（大波段錨點、回撤／延伸價位、共振）", "費波驗證 2344 1608（一次最多 10 檔，公開）")),
+    ("費波驗證（測試版）", ("費波驗證 2330（大波段錨點、回撤／延伸價位、共振）", "費波驗證 2344 1608（一次最多 10 檔，公開）",
+                          "費波驗證 台指期（近月日盤＋夜盤自己算；最右邊一根是奇摩即時，只顯示）")),
     ("CDP 驗證（測試版）", ("CDP驗證 2330（逐日五價、觸及與收回統計）", "CDP驗證 2344 1608（一次最多 10 檔，公開）")),
     ("本週精選", ("本週精選排名", "3006 幫我生成週精選文字", "這版確認，生成圖片")),
     ("草稿", ("直接說修改需求", "還原上一版", "目前草稿")),
@@ -6142,6 +6143,13 @@ class AceQueryEngine:
                 speed_text = str(exc)
             return AnswerResult(speed_text, 'admin_spot_speed', 0, time.perf_counter()-started,
                                 as_text=True, cacheable=False)
+        # 11-03 使用者：台指期費波任何白話都要能用（「夜盤的費波位置」「台指期費波在哪」，沒說驗證也算）；
+        # 只有管理員本人、而且標的是台指期才走驗證圖——個股、大盤沒說驗證照舊走一般回答
+        if is_admin and admin_mode and access is not None and access.admin_mode and not access.simulation:
+            futures_codes = fib_debug.futures_request(question, self._ask_json)
+            if futures_codes:
+                return self._answer_level_debug(question, started, module=fib_debug, label="費波驗證", route="admin_fib",
+                                                is_admin=is_admin, admin_mode=admin_mode, codes=futures_codes)
         # 10-27 測試版：費波／CDP 驗證排在型態驗證前（「費波型態驗證」不能被型態驗證吃掉）
         for module, label, route in ((fib_debug, "費波驗證", "admin_fib"), (cdp_debug, "CDP 驗證", "admin_cdp")):
             if module.is_request(question):
@@ -7174,15 +7182,29 @@ class AceQueryEngine:
         first.followups = list(first.followups) + results[1:]
         return first
 
+    def _ask_json(self, prompt: str, schema: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """讀題用的 AI（回 JSON）；失敗回 None，由呼叫端改用規則或請使用者講清楚。"""
+        result = self.gateway.generate(prompt, purpose="intent", schema=schema, temperature=0.0)
+        if not result.ok:
+            return None
+        try:
+            out = json.loads(result.text)
+        except (ValueError, TypeError):
+            return None
+        self.log(f"🧭 AI 讀題｜{json.dumps(out, ensure_ascii=False)[:200]}")
+        return out if isinstance(out, dict) else None
+
     def _answer_level_debug(self, question: str, started: float, *, module, label: str, route: str,
-                            is_admin: bool, admin_mode: bool) -> AnswerResult:
-        """10-27 測試版：費波／CDP 驗證圖，權限與可見性比照型態驗證；價位全部來自程式同次計算，不用 AI。"""
+                            is_admin: bool, admin_mode: bool, codes: Optional[List[str]] = None) -> AnswerResult:
+        """10-27 測試版：費波／CDP 驗證圖，權限與可見性比照型態驗證；價位全部來自程式同次計算，不用 AI。
+        11-03：費波驗證的標的規則看不出來時（夜盤、期貨等白話），讓 AI 讀整句；價位計算仍然不用 AI。"""
         access = self._access()
         if not (is_admin and admin_mode and access is not None and access.admin_mode and not access.simulation):
             return AnswerResult(text=f"{label}僅限管理員透過 /ace 使用。", route=route + "_denied",
                                 gemini_calls=0, elapsed=time.perf_counter()-started, as_text=True)
         try:
-            codes = module.parse_codes(question)
+            codes = codes or (module.parse_codes(question, ask_ai=self._ask_json) if module is fib_debug
+                              else module.parse_codes(question))
         except Exception as exc:
             return AnswerResult(text=f"{label}未完成：" + tools.err_text(exc), route=route + "_error",
                                 gemini_calls=0, elapsed=time.perf_counter()-started, cacheable=False, as_text=True)
