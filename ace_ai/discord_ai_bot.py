@@ -3186,7 +3186,7 @@ FINAL_FOCUS_RULES = ("【先回答重點】payload.question_focus 是使用者�
                      "重點需要的資料若失敗或沒有，第一句就說明取不到，不可改寫成一般技術面來帶過。")
 
 
-FINAL_BREADTH_RULES = ("【盤面結構】沒有 get_index_contribution 時，第一句就要說「今天的指數貢獻榜要等官方收盤檔發布後才有」，不可以拿漲幅排名或前一個交易日的資料當成今天的貢獻榜。有 get_index_contribution 就直接回答哪些股票在撐或拖累，要依貢獻點數判斷（權重×漲跌），不可只看漲跌幅；漲最多的不一定撐最多，權重大的小漲小跌影響可能更大。basis 是收盤暫定時說明是估算、官方檔發布後會更新，不要再說貢獻榜還沒有。回答『今天是不是都在拉權值股／誰在拉大盤／誰拖累指數』時，必須先看 get_index_contribution，不可只看漲跌幅。先直接回答結論，再寫資料裡有的市場（只有加權就只寫加權，不要提櫃買沒資料）。top、bottom 是所有成分股依貢獻點數排出的拉升榜與拖累榜；點名個股一定要寫貢獻點數，例如「鴻海貢獻 +12.3 點（權重 3.1%、漲 2.0%）」，用 points（貢獻點數）、weight_pct（指數權重）與 change_pct（漲跌幅）。大盤下跌時，要點出逆勢上漲、對指數有正貢獻的股票，包含權重不大的。top5_positive_share_pct／top5_negative_share_pct 是前五大貢獻占已涵蓋正／負貢獻的比例，可用來說明集中度；concentration 是規則式集中度結論。盤中一定說明 basis=盤中估算、market_cap_coverage_pct（市值涵蓋率）與收盤前仍會變動；若 top5_positive_certified／top5_negative_certified 為 false，不可把榜單講成交易所最終完整排名。get_market_breadth 只用來補充加權與櫃買差異、上漲比率與中小型股是否跟上，不可取代貢獻點數。不要預測未來指數點位，也不要給買賣建議。")
+FINAL_BREADTH_RULES = ("【盤面結構】沒有 get_index_contribution 時，第一句就要說「今天的指數貢獻榜要等官方收盤檔發布後才有」，不可以拿漲幅排名或前一個交易日的資料當成今天的貢獻榜。有 get_index_contribution 就直接回答哪些股票在撐或拖累，要依貢獻點數判斷（權重×漲跌），不可只看漲跌幅；漲最多的不一定撐最多，權重大的小漲小跌影響可能更大。basis 是收盤暫定時說明是估算、官方檔發布後會更新，不要再說貢獻榜還沒有。回答『今天是不是都在拉權值股／誰在拉大盤／誰拖累指數』時，必須先看 get_index_contribution，不可只看漲跌幅。先直接回答結論，再寫資料裡有的市場（只有加權就只寫加權，不要提櫃買沒資料）。top、bottom 是所有成分股依貢獻點數排出的拉升榜與拖累榜；點名個股一定要寫貢獻點數，例如「鴻海貢獻 +12.3 點（權重 3.1%、漲 2.0%）」，用 points（貢獻點數）、weight_pct（指數權重）與 change_pct（漲跌幅）。大盤下跌時，要點出逆勢上漲、對指數有正貢獻的股票，包含權重不大的。top5_positive_share_pct／top5_negative_share_pct 是前五大貢獻占已涵蓋正／負貢獻的比例，可用來說明集中度；concentration 是規則式集中度結論。盤中一定說明 basis=盤中估算、market_cap_coverage_pct（市值涵蓋率）與收盤前仍會變動；若 top5_positive_certified／top5_negative_certified 為 false，不可把榜單講成交易所最終完整排名。unpriced_components 大於 0（有成分股查無價格，市值涵蓋率無法確認）或 residual_warning 為 true（個股合計和指數漲跌差較多）時，要說明這份榜單是估算、可能有偏差，不可說成精確結果。get_market_breadth 只用來補充加權與櫃買差異、上漲比率與中小型股是否跟上，不可取代貢獻點數。不要預測未來指數點位，也不要給買賣建議。")
 
 
 FINAL_INDEX_COMPARE_RULES = ("【加權 vs 櫃買】圖上已經有兩邊的 K 線、均線與型態分數比較表，文字只寫結論：第一句直接回答哪一邊比較強"
@@ -4265,6 +4265,10 @@ def format_index_contribution(data: Dict[str, Any]) -> str:
         coverage = market.get("market_cap_coverage_pct")
         if coverage is not None and (str(market.get("basis") or "").startswith("盤中") or coverage < 99.9):
             head += f"｜市值涵蓋 {coverage:.1f}%"
+        if int(market.get("unpriced_components") or 0):     # 11-03：查無價格的成分股不在分母，涵蓋率無法確認
+            head += f"｜查無價格 {int(market['unpriced_components'])} 檔（涵蓋率無法確認）"
+        if market.get("residual_warning"):
+            head += f"｜個股合計與指數差 {market.get('residual_points')} 點（估算可能偏差）"
         lines.append(f"**{head}**")
         pos_share = market.get("top5_positive_share_pct")
         if pos_share is not None:

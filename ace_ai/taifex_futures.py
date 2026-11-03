@@ -98,21 +98,67 @@ def daily_frame() -> pd.DataFrame:
     return tools._cached(f"taifex_daily_{tools.taipei_now():%Y-%m-%d-%H}", DAY_TTL, lambda: continuous(_fetch_rows()))
 
 
-def _next_weekday(day: date) -> date:
+HOLIDAY_URL = "https://openapi.twse.com.tw/v1/holidaySchedule/holidaySchedule"
+
+
+def closed_days() -> set:
+    """11-03 程式碼檢查：平日休市（國定假日、補假、春節前後只辦結算）也不是交易日。
+    證交所 OpenAPI 年度休市表（期貨跟現貨同一套）：名稱有「交易日」的是開始／最後交易日（有開市），其餘都是休市。
+    抓不到就回空集合（退回只跳週末）。"""
+    import requests
+
+    def fetch() -> list:
+        resp = requests.get(HOLIDAY_URL, headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"}, timeout=8)
+        resp.raise_for_status()
+        out = []
+        for row in resp.json() or []:
+            text = re.sub(r"\D", "", str(row.get("Date") or ""))
+            if "交易日" in str(row.get("Name") or "") or len(text) != 7:
+                continue
+            out.append(f"{int(text[:3]) + 1911:04d}-{text[3:5]}-{text[5:7]}")
+        return out
+
+    try:
+        return set(tools._cached(f"twse_holidays_{tools.taipei_now():%Y-%m-%d}", 86400, fetch) or [])
+    except Exception as exc:
+        print(f"⚠️ 休市表讀取失敗，交易日只跳過週末｜{tools.err_text(exc)}", flush=True)
+        return set()
+
+
+FIXED_CLOSED = ("01-01",)       # 元旦每年固定休市（休市表還沒涵蓋新年度時也不會算成交易日）
+
+
+def _is_trading(day: date, closed: set) -> bool:
+    return day.weekday() < 5 and day.isoformat() not in closed and day.strftime("%m-%d") not in FIXED_CLOSED
+
+
+def calendar_note(day: str, closed: set) -> str:
+    """11-03 複查：休市表只涵蓋它發布的年度（目前只有 115 年）。推算出的交易日不在表的年度內，就註明是平日推算，
+    不默默當成已確認的交易日。表的年度＝表裡日期的年份。"""
+    if not closed:
+        return "休市表讀取失敗，交易日以平日推算"
+    if str(day)[:4] not in {d[:4] for d in closed}:
+        return f"休市表還沒涵蓋 {str(day)[:4]} 年，交易日以平日推算"
+    return ""
+
+
+def _next_trading_day(day: date, closed: set) -> date:
     day += timedelta(days=1)
-    while day.weekday() >= 5:
+    while not _is_trading(day, closed):
         day += timedelta(days=1)
     return day
 
 
-def session_of(moment: datetime) -> tuple[str, str]:
-    """成交時間 → (所屬交易日, 日盤／夜盤)。15:00 後的夜盤屬於下一個交易日；凌晨 05:00 前是前一晚夜盤的延續。"""
+def session_of(moment: datetime, closed: Optional[set] = None) -> tuple[str, str]:
+    """成交時間 → (所屬交易日, 日盤／夜盤)。15:00 後的夜盤屬於下一個交易日；凌晨 05:00 前是前一晚夜盤的延續。
+    「下一個交易日」跳過週末和休市日（closed＝休市日 ISO 字串集合；沒給就讀證交所休市表）。"""
+    closed = closed_days() if closed is None else closed
     minutes = moment.hour * 60 + moment.minute
     day = moment.date()
     if minutes >= 15 * 60:
-        return _next_weekday(day).isoformat(), "夜盤"
+        return _next_trading_day(day, closed).isoformat(), "夜盤"
     if minutes <= 5 * 60:
-        return (day if day.weekday() < 5 else _next_weekday(day)).isoformat(), "夜盤"
+        return (day if _is_trading(day, closed) else _next_trading_day(day, closed)).isoformat(), "夜盤"
     return day.isoformat(), "日盤"
 
 
@@ -154,7 +200,8 @@ def live_bar(frame: pd.DataFrame) -> Optional[Dict[str, Any]]:
     quote = yahoo_quote()
     if not quote:
         return None
-    day, session = session_of(quote["moment"])
+    closed = closed_days()
+    day, session = session_of(quote["moment"], closed)
     if day <= f"{pd.Timestamp(frame.index[-1]):%Y-%m-%d}":
         return None
     price = quote["price"]
@@ -167,4 +214,4 @@ def live_bar(frame: pd.DataFrame) -> Optional[Dict[str, Any]]:
         open_, high, low, volume = night["open"], max(high, night["high"]), min(low, night["low"]), volume + night["volume"]
     return {"date": day, "Open": float(open_), "High": float(high), "Low": float(low), "Close": float(price),
             "Volume": float(volume), "time": quote["moment"].strftime("%H:%M"), "is_live": True, "label": session,
-            "with_night": bool(night)}
+            "with_night": bool(night), "calendar_note": calendar_note(day, closed)}

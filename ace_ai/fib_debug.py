@@ -47,6 +47,10 @@ def rule_codes(question: str, limit: int = 10) -> list[str]:
     except ValueError as exc:
         if "最多" in str(exc):
             raise
+    except Exception as exc:
+        # 11-03 程式碼檢查：股票名稱表暫時抓不到（官方、FinMind 都失敗）時，已認出的台指期、代號照用，不讓整題失敗
+        import warrant_ai_tools as tools
+        print(f"⚠️ 費波驗證：股名比對略過｜{tools.err_text(exc)}", flush=True)
     return out
 
 
@@ -72,7 +76,7 @@ def ai_codes(question: str, ask_ai, limit: int = 10) -> list[str]:
         elif kind == "stock" and str(item.get("stock") or "").strip():
             try:
                 codes += find_codes(str(item["stock"]), "費波驗證 2330", limit)
-            except ValueError:
+            except Exception:    # 對不到這檔或名稱表暫時抓不到：其他標的照用
                 continue
     return list(dict.fromkeys(codes))[:limit]
 
@@ -101,7 +105,7 @@ def futures_request(question: str, ask_ai) -> list[str]:
         codes = rule_codes(question)
         if not codes and ask_ai is not None:
             codes = ai_codes(question, ask_ai)
-    except ValueError:       # 一次超過 10 檔等：不是這條路，交給後面的流程回覆
+    except Exception:        # 一次超過 10 檔、AI 讀題失敗等：不是這條路，交給後面的流程回覆
         return []
     return codes if taifex_futures.CODE in codes else []
 
@@ -419,7 +423,8 @@ def render(data: dict) -> Image.Image:
     if live:
         state = _live_state(live)
         night = "（含前一晚夜盤）" if live.get("with_night") else ""
-        for line in wrap(f"最右邊那根 K 棒是 {live['date'][5:]} 交易日{state}的價格{night}，只顯示、不加入計算；"
+        calendar = f"（{live['calendar_note']}）" if live.get("calendar_note") else ""   # 11-03 複查：交易日沒法用休市表確認時照實寫
+        for line in wrap(f"最右邊那根 K 棒是 {live['date'][5:]} 交易日{calendar}{state}的價格{night}，只顯示、不加入計算；"
                          f"錨點、ATR、費波價位都以 {bars[end]['date'][5:]} 正式收盤計算，收盤後才會更新。", 23, width - 2 * margin):
             text(margin, y, line, 23, muted)
             y += 33

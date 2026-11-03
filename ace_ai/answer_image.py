@@ -3449,6 +3449,15 @@ def contribution_card(draw, y: float, data: dict, dry: bool) -> int:
         summary.append(f"占已涵蓋正貢獻 {share:.0f}%")
     if concentration:
         summary.append(concentration)
+    # 11-03 程式碼檢查：有成分股查無價格（涵蓋率無法確認）、個股合計和指數差太多，都要讓人看得到是估算
+    # 摘要太長時尾巴會被截掉，提醒放最前面
+    warn = []
+    if int(data.get('unpriced_components') or 0):
+        warn.append(f"另有 {int(data['unpriced_components'])} 檔查無價格，涵蓋率無法確認")
+    residual = _finite(data.get('residual_points'))
+    if data.get('residual_warning') and residual is not None:
+        warn.append(f"個股合計與指數差 {residual:+.2f} 點，估算可能偏差")
+    summary = warn + summary
     text, size = fit('　｜　'.join(summary) if summary else '盤中貢獻資料整理中', 19, right - ix - 24)
     draw.text((ix + 12, sy + (summary_h - 8) / 2), text, font=font(size, True), fill=INK, anchor='lm')
 
