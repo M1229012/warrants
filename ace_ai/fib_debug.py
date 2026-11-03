@@ -179,7 +179,7 @@ def render(data: dict) -> Image.Image:
     text(margin, 202, "實線＝交給 AI｜點線＝錨點未確認｜長短線＝突破後條件目標｜虛線＝不交給 AI｜灰點小轉折、黑圈大轉折", 21, muted)
 
     left, right, top, bottom = 115, 1215, 255, 755
-    live = data.get("live_bar")      # 11-03：盤中 K 棒接在最後一根正式收盤 K 後面，只顯示、不計算（空心畫法）
+    live = data.get("live_bar")      # 11-03：盤中 K 棒接在最後一根正式收盤 K 後面，只顯示、不計算
     step = (right - left) / max(1, len(visible) + (1 if live else 0))
     px = lambda i: left + (i - start + 0.5) * step
     prices = [b[k] for b in visible + ([live] if live else []) for k in ("Low", "High")]
@@ -217,12 +217,12 @@ def render(data: dict) -> Image.Image:
         draw.line((xx, py(bar["High"]), xx, py(bar["Low"])), fill=color, width=2)
         y1, y2 = sorted((py(bar["Open"]), py(bar["Close"])))
         draw.rectangle((xx - half, y1, xx + half, max(y1 + 2, y2)), fill=color)
-    if live:
+    if live:   # 11-03 使用者：空心看不清楚 → 和其他 K 棒一樣實心；盤中與否看右側標籤和圖下說明
         color = "#DB4949" if live["Close"] >= live["Open"] else "#23997E"
         xx, half = px(end + 1), max(1.5, min(7, step * 0.30))
         draw.line((xx, py(live["High"]), xx, py(live["Low"])), fill=color, width=2)
         y1, y2 = sorted((py(live["Open"]), py(live["Close"])))
-        draw.rectangle((xx - half, y1, xx + half, max(y1 + 2, y2)), fill="#FFFFFF", outline=color, width=2)
+        draw.rectangle((xx - half, y1, xx + half, max(y1 + 2, y2)), fill=color)
 
     x0 =px(max(start, sel["a"]["idx"])) if sel else left
     for lv in levels:
@@ -299,16 +299,16 @@ def render(data: dict) -> Image.Image:
         bar = bars[i]
         xx, hh = px(i), max(0, bar["Volume"]) / max_vol * 83
         draw.rectangle((xx - step * 0.28, 935 - hh, xx + step * 0.28, 935), fill="#DB4949" if bar["Close"] >= bar["Open"] else "#23997E")
-    if live:
-        xx, hh = px(end + 1), max(0, live["Volume"]) / max_vol * 83
-        draw.rectangle((xx - step * 0.28, 935 - hh, xx + step * 0.28, 935), fill="#FFFFFF",
-                       outline="#DB4949" if live["Close"] >= live["Open"] else "#23997E", width=2)
+    if live and live["Volume"] > 0:   # 指數沒有成交量，不畫
+        xx, hh = px(end + 1), live["Volume"] / max_vol * 83
+        draw.rectangle((xx - step * 0.28, 935 - hh, xx + step * 0.28, 935),
+                       fill="#DB4949" if live["Close"] >= live["Open"] else "#23997E")
     draw.line((margin, 955, width - margin, 955), fill=grid, width=2)
 
     y = 980
     if live:
         state = f"盤中 {live['time']}" if live["is_live"] else f"盤後暫定 {live['time']}"
-        for line in wrap(f"最右邊空心 K 棒是今天（{live['date'][5:]}）{state}的價格，只顯示、不加入計算；"
+        for line in wrap(f"最右邊那根 K 棒是今天（{live['date'][5:]}）{state}的價格，只顯示、不加入計算；"
                          f"錨點、ATR、費波價位都以 {bars[end]['date'][5:]} 正式收盤計算，收盤後才會更新。", 23, width - 2 * margin):
             text(margin, y, line, 23, muted)
             y += 33
