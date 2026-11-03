@@ -1960,6 +1960,9 @@ def _price_source_base(bundle: Dict[str, Any]) -> str:
 # ============================================================
 
 INDEX_CODES = {"TAIEX": "加權指數", "TPEX": "櫃買指數"}
+# 11-03（測試版）：台指期型態頁。價格走 taifex_futures.price_bundle（近月連續日 K＋奇摩即時），不在股票名冊；
+# 沒有公司行動、分點、個股法人，成交量單位是口
+FUTURES_CODES = {"TXF": "台指期"}       # 名稱用 AI 會寫的「台指期」，事實核對才認得是在講這檔
 INDEX_FINMIND_ID = {"TAIEX": "TAIEX", "TPEX": "TPEx"}
 _INDEX_ALIASES = (
     ("TAIEX", ("大盤", "加權指數", "加權", "台股指數", "台股大盤", "集中市場", "TAIEX", "台積電權值")),
@@ -2280,8 +2283,45 @@ def get_futures_positions(days: int = 10) -> Dict[str, Any]:
         "futures_id": FUTURES_ID, "data_date": latest.strftime("%Y/%m/%d"),
         "previous_date": previous.strftime("%Y/%m/%d") if previous is not None else "",
         "investors": investors,
+        "foreign_summary": foreign_oi_summary(rows),
         "definition_note": "未平倉口數含現貨避險部位，不能單獨當作多空訊號；僅供參考",
     }
+
+
+def _oi_change_text(change: float, net: float) -> str:
+    """淨部位變化用口語寫：目前淨空時，淨部位變小＝淨空增加；目前淨多時，變大＝淨多增加。"""
+    if change == 0:
+        return "持平"
+    side = "淨空" if net < 0 else "淨多"
+    grow = change < 0 if net < 0 else change > 0
+    return f"{side}{'增加' if grow else '減少'} {abs(int(change)):,} 口"
+
+
+def foreign_oi_summary(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """11-03 使用者：台指期解讀要多說明外資空單——程式先算好給 AI（給 AI 的逐日只剩 5 天，趨勢不能讓 AI 自己算）：
+    目前淨部位、較前一日、近 5 個交易日、同方向連續幾天、近 N 日（副圖同一段）淨空最多／最少在哪。"""
+    nets = [(r["date"], float(r["foreign"])) for r in rows if r.get("foreign") is not None]
+    if len(nets) < 2:
+        return {}
+    last = nets[-1][1]
+    diffs = [b - a for (_, a), (_, b) in zip(nets, nets[1:])]
+    streak = 0
+    for d in reversed(diffs):
+        if d != 0 and (d > 0) == (diffs[-1] > 0):
+            streak += 1
+        else:
+            break
+    base5 = nets[-6][1] if len(nets) >= 6 else nets[0][1]
+    low, high = min(nets, key=lambda x: x[1]), max(nets, key=lambda x: x[1])
+    side = "淨空" if last < 0 else "淨多"
+    out = {"外資淨部位": f"{side} {abs(int(last)):,} 口", "資料日": nets[-1][0],
+           "較前一日": _oi_change_text(diffs[-1], last),
+           "近5個交易日": _oi_change_text(last - base5, last),
+           f"近{len(nets)}日淨空最多": f"{abs(int(low[1])):,} 口（{low[0][5:]}）" if low[1] < 0 else "這段期間沒有淨空",
+           f"近{len(nets)}日淨部位最偏多": f"{'淨多' if high[1] >= 0 else '淨空'} {abs(int(high[1])):,} 口（{high[0][5:]}）"}
+    if streak >= 2 and diffs[-1] != 0:
+        out["連續"] = f"{_oi_change_text(diffs[-1], last).split(' ')[0]}連續 {streak} 天"
+    return out
 
 
 RETAIL_FUTURES = (("MTX", "小台"), ("TMF", "微台"))
@@ -2497,6 +2537,9 @@ def _load_price_bundle(stock_code: str, spot_history_mode: bool = False) -> Dict
     kf = core()
     if str(stock_code or "").strip().upper() in INDEX_CODES:
         return _load_index_bundle(str(stock_code).strip().upper())
+    if str(stock_code or "").strip().upper() in FUTURES_CODES:
+        import taifex_futures
+        return taifex_futures.price_bundle()
     code = kf._normalize_stock_name_code_key(stock_code)
 
     import request_runtime
@@ -2705,6 +2748,8 @@ def _stock_identity(stock_code: str) -> Tuple[str, str]:
     raw = str(stock_code or "").strip().upper()
     if raw in INDEX_CODES:
         return raw, INDEX_CODES[raw]
+    if raw in FUTURES_CODES:
+        return raw, FUTURES_CODES[raw]
     code = core()._normalize_stock_name_code_key(stock_code)
     if not code:
         raise ToolDataError("股票代號不可為空")
@@ -2766,7 +2811,7 @@ def _volume_trend(df: pd.DataFrame) -> Dict[str, Any]:
 
 def _intraday_volume_estimate(code: str, bundle: Dict[str, Any], live: bool, suspect: bool) -> Dict[str, Any]:
     """盤中用時段量能分布估今日全日量，並和昨日、5 日均量、20 日均量比較。"""
-    if not live or suspect:
+    if not live or suspect or code in FUTURES_CODES:   # 台指期有日盤＋夜盤，個股的時段分布不適用
         return {}
     try:
         import intraday_volume
@@ -2799,6 +2844,7 @@ def get_stock_overview(stock_code: str) -> Dict[str, Any]:
     mv20 = _num(latest.get("MV20"), 4)
     live = bool((bundle.get("intraday") or {}).get("is_live"))
     suspect = bool((bundle.get("intraday") or {}).get("volume_suspect"))
+    unit = 1 if code in FUTURES_CODES else 1000     # 股數→張；台指期本來就是口
     if live or suspect:
         # 盤中累計量不和全日均量比較；可疑量能也不計算量比。
         ratio5 = ratio20 = None
@@ -2822,15 +2868,16 @@ def get_stock_overview(stock_code: str) -> Dict[str, Any]:
         "prev_close": prev_close,
         "change": change,
         "change_pct": _pct(close, prev_close),
-        "volume_lots": _num(volume / 1000, 0) if volume is not None else None,
-        "mv5_lots": _num(mv5 / 1000, 0) if mv5 is not None else None,
-        "mv20_lots": _num(mv20 / 1000, 0) if mv20 is not None else None,
+        "volume_lots": _num(volume / unit, 0) if volume is not None else None,
+        "mv5_lots": _num(mv5 / unit, 0) if mv5 is not None else None,
+        "mv20_lots": _num(mv20 / unit, 0) if mv20 is not None else None,
         "volume_ratio_vs_mv5": ratio5,
         "volume_ratio_vs_mv20": ratio20,
         "volume_trend": _volume_trend(closed_frame(bundle)) if not suspect else {},
         "intraday_volume_estimate": _intraday_volume_estimate(code, bundle, live, suspect),
         "volume_status": "盤中累計量（尚未收盤）" if live else ("量能資料可疑，不判讀" if suspect else "收盤成交量"),
-        "volume_unit_note": "成交量與均量單位為張；量比＝當日量 ÷ 均量；盤中改用時段分布估算全日量",
+        "volume_unit_note": ("成交量與均量單位為口（台指期近月，日K＝前一晚夜盤＋當天日盤）；量比＝當日量 ÷ 均量" if code in FUTURES_CODES
+                             else "成交量與均量單位為張；量比＝當日量 ÷ 均量；盤中改用時段分布估算全日量"),
     }
 
 
@@ -3174,7 +3221,7 @@ def _recover_corporate_reference(code, actions):
 def _kline_patterns(df: pd.DataFrame, code: str = "", provisional_today: bool = False) -> Dict[str, Any]:
     try:
         import kline_patterns
-        events = get_corporate_actions(code) if code else None
+        events = get_corporate_actions(code) if code and code not in FUTURES_CODES else None   # 台指期沒有除權息
         result = kline_patterns.detect(df, events, provisional_today, include_debug=True, state_key=f"tri_state_{code}" if code else "")
         clean_frame = df.dropna(subset=["Open", "High", "Low", "Close"]).sort_index()
         out = kline_patterns.ai_pattern_facts(result, data_date=_fmt_date(clean_frame.index[-1]) if not clean_frame.empty else "",
@@ -3205,7 +3252,7 @@ def _fib_reference(code: str) -> Dict[str, Any]:
         return {}
     try:
         import fib_debug
-        return fib_debug.ai_reference(code)
+        return fib_debug.ai_reference(code)    # 11-03：台指期（TXF）用近月連續日 K，fib_debug 自己分流
     except Exception as exc:
         print(f"⚠️ 費波參考價略過｜{code}｜{err_text(exc)}", flush=True)
         return {}
@@ -6175,7 +6222,7 @@ def chart_marks_for_stock(stock_code: str, dates: List[str], branch_name: str = 
     否則只標「勝率統計總勝率 ≥ 高勝率門檻」的追蹤分點與精選五分點（本週精選也一樣）。
     買進＝A～E 事件日；出清／減碼＝該事件的 FIFO 出清日、減碼日（落在圖表區間內才標）。
     """
-    if str(stock_code or "").strip().upper() in INDEX_CODES:
+    if str(stock_code or "").strip().upper() in INDEX_CODES or str(stock_code or "").strip().upper() in FUTURES_CODES:
         return {"mode": "flow", "source": "index", "events": []}
     kf = core()
     if not dates:
@@ -6733,7 +6780,8 @@ def get_cost_position_context(stock_code: str, cost_price: float) -> Dict[str, A
 def get_chart_panel(stock_code: str, branch_name: str = "", with_marks: bool = True, mark_mode: str = "event", flow_source: str = "sheet", allow_moneydj_fallback: bool = False, lookback: int = 0) -> Dict[str, Any]:
     """Only Python OHLC data enters the chart; never parse prices from AI text."""
     kf = core()
-    code = kf._normalize_stock_name_code_key(stock_code)
+    futures = str(stock_code or "").strip().upper() in FUTURES_CODES
+    code = str(stock_code).strip().upper() if futures else kf._normalize_stock_name_code_key(stock_code)
     bundle = _load_price_bundle(code)
     df = bundle["df"].copy().sort_index()
     df = df[~df.index.duplicated(keep="last")]
@@ -6759,7 +6807,7 @@ def get_chart_panel(stock_code: str, branch_name: str = "", with_marks: bool = T
             key: _num(row.get(key), 6) for key in chart_columns
         }})
     try:
-        name = resolve_stock_name(code)
+        name = FUTURES_CODES[code] if futures else resolve_stock_name(code)
     except Exception:
         name = ""
     previous = df["Close"].iloc[-2] if len(df) > 1 else None
@@ -6789,7 +6837,8 @@ def get_chart_panel(stock_code: str, branch_name: str = "", with_marks: bool = T
             "volume_profile": profile, "marks": marks, "intraday": bundle.get("intraday") or {},
             "price_basis_note": price_source_note(bundle),
             "bollinger": analyze_bollinger(closed_frame(bundle)),
-            "change_pct": float((df["Close"].iloc[-1] / previous - 1) * 100) if previous else None}
+            "change_pct": float((df["Close"].iloc[-1] / previous - 1) * 100) if previous else None,
+            **({"volume_unit": "口"} if futures else {})}
 
 
 

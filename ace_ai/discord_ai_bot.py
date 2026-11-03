@@ -406,6 +406,7 @@ class ParsedQuestion:
     unknown_terms: List[str] = field(default_factory=list)   # 沒有對到股票／分點的剩餘字（反問「找不到 X」用）
     branch_leftover: List[str] = field(default_factory=list) # 權證／籌碼題沒對到分點的剩餘字（交給 AI 讀整句判斷）
     warrant_list: bool = False                               # AI 判斷：要列出分點買了哪些權證
+    preset_plan: Optional["QueryPlan"] = None                # 11-03：費波／台指期型態頁，標的與工具由入口決定
 
     def summary(self) -> Dict[str, Any]:
         return {
@@ -668,6 +669,7 @@ class QueryPlan:
     needs: Optional[Dict[str, Any]] = None   # 10-08：需求表（要回答什麼、排除什麼、對象），送進最後提示
     brief_quote: bool = False                # 10-16：只問數字＋簡短 AI 看法
     brief_pattern: Set[str] = field(default_factory=set)   # 10-20：圖照出完整型態圖，但這些股票問的不是型態（AI 型態 1～2 句）
+    fib_page: bool = False                   # 11-03（測試版）：費波型態頁——價格框／價位條改標費波價位
 
     def add(self, name: str, **kwargs: Any) -> None:
         call = ToolCall(name, {k: v for k, v in kwargs.items() if v not in (None, "")})
@@ -735,6 +737,7 @@ HELP_GROUPS = (
     ("三大法人", ("2330外資最近買超多少", "2330三大法人今天買賣超")),
     ("族群大盤", ("AI伺服器族群誰型態最好", "哪些族群正在轉強", "大盤今天量縮嗎")),
     ("新聞", ("2330最近有什麼新聞",)),
+    ("費波／台指期（測試版）", ("2330 費波", "台指期費波在哪", "台指期現在如何", "夜盤怎麼看")),
     ("額度", ("我的額度",)),
 )
 ADMIN_HELP_GROUPS = (
@@ -1817,7 +1820,7 @@ class QueryRouter:
             plan.add("get_stock_overview", stock_code=code)
             plan.add("get_technical_analysis", stock_code=code)
             plan.add("get_volume_profile", stock_code=code)
-            if code not in tools.INDEX_CODES:
+            if code not in tools.INDEX_CODES and code not in tools.FUTURES_CODES:   # 11-03：追問台指期（記憶）也不查個股法人
                 plan.add("get_institutional_flow", stock_code=code, days=70)
             if parsed.cost_price is not None:
                 plan.add("get_cost_position_context", stock_code=code, cost_price=parsed.cost_price)
@@ -3100,6 +3103,28 @@ FINAL_FIB_RULES = ("【費波參考目標（測試版；優先於規則 3「不�
     "- 不寫比例計算過程、錨點日期或 A、B、C 代號；用「參考」「可能」，不說一定會到、會漲到，不給買賣指令。\n"
     "- 使用者問目標價、滿足點時，就用這一句回答，不要說不提供目標價。沒有 fib_reference 的股票完全不提費波。")
 
+FINAL_FIB_PAGE_RULES = ("【費波型態頁（測試版；優先於規則 3「不給目標價」）】使用者問的是費波南西。圖上右側價格框與價位條是費波價位，"
+    "watch_plan 的支撐、壓力也已經是同一份費波價位；完整清單在 get_fib_levels（說明＝這段波段是上漲後拉回、創高延伸還是下跌後反彈）：\n"
+    "- answer 一句直接回答：目前價格落在哪兩個費波價位之間、最關鍵的一個費波價位（守住或站上代表什麼）。\n"
+    "- why 依 get_fib_levels.說明 講這段波段的狀態，再講下方最近的費波支撐與上方最近的費波壓力。圖上價位條是比例在前、價格在後"
+    "（get_fib_levels 的「圖上標示」，watch_plan 的名稱也是它），文字照這個寫法：比例接價位，第一次提到時補一個字說明性質"
+    "（例「0.618 回撤 2,333」「1.618 延伸 2,847」，性質看「名稱」）；前波高點、前低、整理區照名稱寫。價位照 watch_plan 規則寫。有「條件」的價位一定寫成條件（例「若站上前波高點，延伸目標約 X」）；有「次要」的 0.786 要說是 0.618 守不住時的下一個參考；"
+    "有「註記」要說依目前高低點試算、之後可能調整；有「可信度」要說只是區間量測。\n"
+    "- 均線、量能最多一句帶過；不寫比例計算過程、錨點日期或 A、B、C 代號；用「參考」「可能」，不說一定會到，不給買賣指令。\n"
+    "- get_fib_levels 有「狀態」（沒有可用的費波波段）時，直接說目前沒有明確的費波波段、圖上是一般關鍵價位，再照 watch_plan 回答。")
+
+FINAL_TXF_RULES = ("【台指期型態頁（測試版）】TXF＝台指期近月連續日 K：每根＝前一晚夜盤＋當天日盤（開盤用夜盤開盤、收盤用日盤收盤），"
+    "換月不還原價差；成交量單位是口，不是張；稱呼一律用「台指期」，不寫 TXF。\n"
+    "- get_stock_overview:TXF 的 intraday.session 是「夜盤」：最右邊那根是今晚夜盤（屬於下一個交易日）、還在交易中；"
+    "使用者問夜盤時，answer 先說夜盤目前價位與相對 intraday.last_close（最近一個交易日收盤）的漲跌（用 change_vs_last_close、change_pct_vs_last_close），"
+    "再說靠近哪個支撐或壓力；不可說成已收盤，也不可說成今天日盤的走勢。\n"
+    "- intraday.session 是「日盤」：那根含前一晚夜盤＋今天日盤到目前，盤中暫定、收盤前會變動。沒有 intraday：最後一根是已收盤的日 K。\n"
+    "- 外資空單要多說明（11-03 使用者；優先於【台指期未平倉】只講前一日變化的限制）：why 用一段 2～3 句講外資台指期未平倉，數字只用 get_futures_positions.foreign_summary："
+    "目前淨空（或淨多）幾口、較前一日與近 5 個交易日是淨空增加還是減少（有「連續」就說連續幾天）、和近期淨空最多的水位比是偏高還是偏低；"
+    "有 get_retail_futures 可再用一句對照散戶多空比。這段最後要說未平倉含現貨避險、不能單獨當多空訊號；"
+    "不可說外資看空所以會跌，也不推論明天漲跌。scenarios 可以有一個用外資空單續增或回補當觀察條件。\n"
+    "- 加權指數現貨和台指期有價差，不可把兩者的價位混用。")
+
 
 _SPOT_TECH_KEEP = ("stock_code", "stock_name", "data_date", "signal_status", "close", "change_pct", "ma_alignment",
                    "kline_patterns", "triangle_validation", "volume_trend", "drawdown")
@@ -3341,6 +3366,10 @@ def build_final_prompt(payload: Dict[str, Any]) -> str:
                             "不展開上下緣價位、碰線次數與事件日期；沒有三角就不提。篇幅以使用者所問的內容為主。")
     if payload.get("fib_reference"):
         sections.append(FINAL_FIB_RULES)
+    if payload.get("fib_page"):
+        sections.append(FINAL_FIB_PAGE_RULES)
+    if any(str(k).endswith(":TXF") for k in (payload.get("tool_results") or {})):
+        sections.append(FINAL_TXF_RULES)
     if "get_recent_news" in names:
         sections.append(FINAL_NEWS_RULES)
     if "get_sheet_stock_chips" in names:
@@ -6147,13 +6176,8 @@ class AceQueryEngine:
                 speed_text = str(exc)
             return AnswerResult(speed_text, 'admin_spot_speed', 0, time.perf_counter()-started,
                                 as_text=True, cacheable=False)
-        # 11-03 使用者：台指期費波任何白話都要能用（「夜盤的費波位置」「台指期費波在哪」，沒說驗證也算）；
-        # 只有管理員本人、而且標的是台指期才走驗證圖——個股、大盤沒說驗證照舊走一般回答
-        if is_admin and admin_mode and access is not None and access.admin_mode and not access.simulation:
-            futures_codes = fib_debug.futures_request(question, self._ask_json)
-            if futures_codes:
-                return self._answer_level_debug(question, started, module=fib_debug, label="費波驗證", route="admin_fib",
-                                                is_admin=is_admin, admin_mode=admin_mode, codes=futures_codes)
+        # 11-03 使用者：沒說驗證的費波（「台指期費波在哪」「2330 費波」）改出費波型態頁（_answer_general_impl 判斷），
+        # 管理員驗證圖只有說「驗證」才出
         # 10-27 測試版：費波／CDP 驗證排在型態驗證前（「費波型態驗證」不能被型態驗證吃掉）
         for module, label, route in ((fib_debug, "費波驗證", "admin_fib"), (cdp_debug, "CDP 驗證", "admin_cdp")):
             if module.is_request(question):
@@ -6312,6 +6336,12 @@ class AceQueryEngine:
                                               warrant_branch=bool(parsed.branches or parsed.branch_candidates),
                                               # 只有真的追問（沿用上一題的股票／分點）才沿用上一題的籌碼類型
                                               remembered=getattr(remembered, "chip_context", "") if remembered and note else "")
+        try:
+            page = self._target_page(question)
+        except ValueError as exc:
+            return AnswerResult(text=str(exc), route="clarify", gemini_calls=0, elapsed=time.perf_counter() - started, as_text=True)
+        if page is not None:
+            self._apply_target_page(parsed, *page)
         access_policy.require_question(access, question, tools.get_cached_known_branches(), parsed)
         for _code,_name in parsed.stocks:
             if _code not in tools.INDEX_CODES:
@@ -7197,6 +7227,50 @@ class AceQueryEngine:
             return None
         self.log(f"🧭 AI 讀題｜{json.dumps(out, ensure_ascii=False)[:200]}")
         return out if isinstance(out, dict) else None
+
+    def _target_page(self, question: str) -> Optional[Tuple[List[str], bool]]:
+        """11-03 使用者（測試版，/testask、/testace 都可以）：回 (代號清單, 是否費波頁)，不是這兩種頁面回 None。
+        - 沒說「驗證」的費波問句（「2330 費波」「台指期費波在哪」）→ 費波型態頁：型態頁的價格框改標費波價位，下面一樣有 AI 解讀；
+          「費波驗證」照舊是管理員驗證圖（_answer_impl 先攔）。
+        - 問台指期／夜盤本身走勢（「現在夜盤如何」「台指期如何」）→ 台指期型態頁；任何白話都可以，由 AI 讀整句判斷，
+          問法人未平倉照舊走未平倉卡。一次超過 2 檔丟 ValueError（訊息直接回給使用者）。"""
+        import taifex_futures
+        if fib_debug.mentions_fib(question):
+            if fib_debug.is_request(question):
+                return None
+            codes = fib_debug.page_codes(question, self._ask_json)
+            return (codes, True) if codes else None
+        if taifex_futures.wants_trend(question, self._ask_json):
+            return [taifex_futures.CODE], False
+        return None
+
+    def _apply_target_page(self, parsed: ParsedQuestion, codes: List[str], fib: bool) -> None:
+        """費波／台指期型態頁：標的與工具固定（台指期不在股票名冊，規則路由認不得），之後和型態頁同一條路
+        （K 線、價格框、AI 解讀、事實核對、快取、排隊）。台指期附三大法人未平倉（副圖）與散戶多空比。"""
+        import taifex_futures
+        stocks = []
+        for code in codes:
+            try:
+                stocks.append(tools._stock_identity(code))
+            except Exception:
+                stocks.append((code, ""))
+        plan = QueryPlan(route="rule_pattern", need_final_llm=True, fib_page=fib)
+        for code, _ in stocks:
+            plan.add("get_stock_overview", stock_code=code)
+            plan.add("get_technical_analysis", stock_code=code)
+            plan.add("get_volume_profile", stock_code=code)
+            if code == taifex_futures.CODE:
+                plan.add("get_futures_positions")
+                plan.add("get_retail_futures")
+            elif code not in tools.INDEX_CODES:
+                plan.add("get_institutional_flow", stock_code=code, days=70)
+        futures = any(code == taifex_futures.CODE for code, _ in stocks)
+        parsed.stocks, parsed.branches, parsed.stock_candidates, parsed.branch_candidates = stocks, [], [], []
+        parsed.sector = parsed.sector_context = None
+        parsed.chip, parsed.spot_branch, parsed.spot_combo = "", "", False
+        parsed.intents = {"technical"} | ({"futures"} if futures else set())
+        parsed.preset_plan = plan
+        self.log(f"🧭 {'費波型態頁' if fib else '台指期型態頁'}｜{','.join(c for c, _ in stocks)}")
 
     def _answer_level_debug(self, question: str, started: float, *, module, label: str, route: str,
                             is_admin: bool, admin_mode: bool, codes: Optional[List[str]] = None) -> AnswerResult:
@@ -8291,14 +8365,17 @@ class AceQueryEngine:
                 return AnswerResult(text="目前無法解析問題所需的基本資料，請稍後再試。", route="error", gemini_calls=0, elapsed=time.perf_counter() - started)
         parsed.access = self._access()
         self.log(f"解析結果：{json.dumps(parsed.summary(), ensure_ascii=False)}")
-        split = self._split_by_clause(question, parsed, started)
+        page_plan = getattr(parsed, "preset_plan", None)     # 11-03：費波／台指期型態頁，不拆題、不走規則路由與需求表
+        split = None if page_plan is not None else self._split_by_clause(question, parsed, started)
         if split is not None:
             return split
         stocks_only = [c for c, _ in parsed.stocks if c not in tools.INDEX_CODES]
         if stocks_only and re.search(r"融資.*(?:回測|事件|報酬|勝率)|(?:回測|事件).*融資", question):
             parsed.intents.add("technical")
         market_inst = market_institutional_wanted(parsed)
-        if market_inst and not (parsed.stocks and pattern_asked(parsed)):
+        if page_plan is not None:
+            plan = copy.deepcopy(page_plan)
+        elif market_inst and not (parsed.stocks and pattern_asked(parsed)):
             # 「外資今天買超多少」「今天三大法人買賣超」：全市場（上市）三大法人；只問數字不呼叫 AI
             plan = QueryPlan(route="rule_market_institutional",
                              need_final_llm=bool(_INSTITUTIONAL_ANALYSIS_RE.search(question) or "analysis" in parsed.intents))
@@ -8327,7 +8404,9 @@ class AceQueryEngine:
                     plan.tool_calls = [c for c in plan.tool_calls if c.name != "get_futures_positions"]
         needs_table: Optional[Dict[str, Any]] = None
         preset = getattr(parsed, "needs_preset", None)    # 10-20：拆題的子題沿用已拆好的需求表
-        if (preset is not None or needs_semantic(parsed)) and plan.route not in ("clarify",):
+        if page_plan is not None:
+            pass
+        elif (preset is not None or needs_semantic(parsed)) and plan.route not in ("clarify",):
             # 10-08：自然問句交給 AI 整句解析需求表（取代下方分類呼叫），逐檔依需求重建工具清單
             needs_table = copy.deepcopy(preset) if preset is not None else self._parse_needs(question, parsed, stats)
             if needs_table is not None:
@@ -8543,7 +8622,8 @@ class AceQueryEngine:
                 flow = market_flow
                 panel["institutional_unit"] = "億"
                 panel["institutional_day"] = _day_label(flow.get("data_date"))
-            if (flow is None and futures_data and panel.get("stock_code") == "TAIEX" and panel.get("bars")
+            # 11-03：台指期型態頁的副圖也是三大法人未平倉（和大盤問期貨同一張副圖）
+            if (flow is None and futures_data and panel.get("stock_code") in ("TAIEX", "TXF") and panel.get("bars")
                     and (plan.route == "rule_futures" or "futures" in parsed.intents)):
                 focus = futures_focus(question)
                 dates = {bar["date"] for bar in panel["bars"]}
@@ -8583,13 +8663,17 @@ class AceQueryEngine:
                     if not view.get("visible"):
                         self.log(f"{code} 三角疊線未通過｜{view.get('notice')}｜{json.dumps(view.get('diagnostic') or {}, ensure_ascii=False, default=str)}")
                 panel["key_levels"] = member_pattern.levels_card(panel, technical, tools.key_price_levels, tools.NEAR_ZONE_RATIO)
+                if plan.fib_page:
+                    self._use_fib_levels(panel, code, results)
                 if parsed.cost_price is not None:
                     panel["key_levels"]["cost_price"] = parsed.cost_price
                 panel["disable_compare"] = not member_pattern.comparing(plan)
                 # 10-15：籌碼題（現股／權證／兩種一起、型態＋籌碼）不顯示型態評分；海盜型態照舊
                 chip_question = bool(getattr(parsed, "spot_combo", False) or getattr(parsed, "chip", "") in ("spot", "warrant", "combined"))
                 # 10-20：問的不是型態（新聞、法人、還有機會嗎…）的型態頁不放評分卡（與正式版一致）
+                # 11-03：費波型態頁不放評分卡（評分卡的價位會蓋掉費波價格框）；台指期不評分（評分是照個股設計的）
                 if (TEST_SHOW_SCORECARD and not chip_question and not compare_page and code not in plan.brief_pattern
+                        and not plan.fib_page and code not in tools.FUTURES_CODES
                         and (not view or member_pattern.wants_score(parsed, plan, code))) or _pirate_pattern_request.get():
                     # 10-08：正式版還有評分卡，測試版先照正式版顯示，方便比對評分修正；整飾板拿掉時設 0
                     card = self._pattern_scorecard(code, results, parsed.cost_price)
@@ -9034,6 +9118,22 @@ class AceQueryEngine:
                 self.log(f"權證分點觀察｜{data['stock_code']}｜" + "、".join(b["branch"] for b in data["branches"])
                          + f"｜{time.perf_counter() - started:.2f}s")
 
+    def _use_fib_levels(self, panel: Dict[str, Any], code: str, results: List[tools.ToolResult]) -> None:
+        """11-03 使用者：費波型態頁——價格框與價位條改標費波價位（和費波驗證圖同一份計算）；觀察重點（watch_plan）
+        用圖上那份價位，所以 AI 的支撐壓力也跟著是費波。費波價位另外交給 AI（get_fib_levels），事實核對才對得上。
+        算不出來就保留一般關鍵價位。"""
+        try:
+            card, data = fib_debug.page_levels(code, float(panel["bars"][-1]["Close"]))
+        except Exception as exc:
+            self.log(f"費波型態頁｜{code} 費波價位略過，保留一般關鍵價位｜{tools.err_text(exc)}")
+            return
+        results.append(tools.ToolResult("get_fib_levels", True, data))
+        if not (card["supports_below_close"] or card["resistances_above_close"]):
+            self.log(f"費波型態頁｜{code} {data.get('狀態') or '沒有費波價位'}｜保留一般關鍵價位")
+            return
+        panel["key_levels"] = dict(card, ma_deduction=(panel.get("key_levels") or {}).get("ma_deduction") or {})
+        self.log(f"費波型態頁｜{code}｜壓力 {len(card['resistances_above_close'])}｜支撐 {len(card['supports_below_close'])}")
+
     def _attach_chart_levels(self, panels: List[Dict[str, Any]], results: Sequence[tools.ToolResult],
                              cost_price: Optional[float]) -> None:
         """10-20：非型態題（「中鋼還有機會嗎」「光寶科壓力大概多少」）沒有型態評分卡 → 關鍵價位仍標在 K 線上
@@ -9296,7 +9396,9 @@ class AceQueryEngine:
         if plans:
             payload["watch_plan"] = plans
             self.log("觀察重點｜" + "｜".join(f"{c} {v['方向']}" + ("（止穩觀察）" if v.get("止穩觀察") else "") for c, v in plans.items()))
-        if payload["pattern_focus"] and not payload.get("brief_quote"):
+        if plan.fib_page:
+            payload["fib_page"] = True       # 11-03：費波型態頁（觀察重點的支撐壓力已是費波價位，不再另附 fib_reference）
+        elif payload["pattern_focus"] and not payload.get("brief_quote"):
             # 10-29（測試版）：問型態才附費波參考目標；在 watch_plan 之後算，和觀察重點的價位去重（同一檔只有一份支撐壓力）
             fibs, why_not = fib_for_ai(results, plans, skip=set(payload.get("brief_pattern") or []),
                                        limit=1 if payload.get("compare_page") else 2)

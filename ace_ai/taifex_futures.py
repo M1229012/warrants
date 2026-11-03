@@ -7,8 +7,9 @@
 只收日盤已經有資料的交易日；日盤還沒出來的那天只把夜盤記在 attrs["pending_night"]，給即時 K 棒拼接用。
 
 即時：奇摩股市批次報價 WTX&（台指期近一，exchangeDataDelayedBy＝0），日盤與夜盤同一個代號；
-13:45 收盤後到 15:00 夜盤開始前沒有成交價。只用來畫最右邊那根，不加入任何計算。
-已知限制：國定假日沒有排除（交易日用平日推算）；期交所日盤資料發布到 FinMind 之前，當天那根只看得到夜盤＋即時報價。
+13:45 收盤後到 15:00 夜盤開始前沒有成交價。費波驗證圖只用來畫最右邊那根，不加入任何計算。
+11-03 台指期型態頁（price_bundle）：和個股型態頁一樣，即時那根當盤中暫定 K 棒（均線、型態跟著變，最終以收盤為準）。
+已知限制：期交所日盤資料發布到 FinMind 之前，當天那根只看得到夜盤＋即時報價。
 """
 from __future__ import annotations
 
@@ -33,6 +34,30 @@ _CODE_RE = re.compile(r"台指期|台指|期指|(?<![A-Za-z])TXF?(?![A-Za-z])", 
 
 def is_futures(text: str) -> bool:
     return bool(_CODE_RE.search(str(text or "")))
+
+
+# 只用來決定「要不要請 AI 讀整句」：句子有提到期貨、夜盤才多花一次 AI；是不是問台指期走勢由 AI 判斷
+_MENTION_RE = re.compile(r"台指|期指|期貨|夜盤|日盤|大台|小台|微台|(?<![A-Za-z])TXF?(?![A-Za-z])", re.IGNORECASE)
+_KIND_SCHEMA = {"type": "object", "properties": {"kind": {"type": "string", "enum": ["trend", "positions", "other"]}},
+                "required": ["kind"]}
+
+
+def wants_trend(question: str, ask_ai) -> bool:
+    """11-03 使用者：「現在夜盤如何」「台指期如何」要出台指期型態頁＋AI 解讀，任何白話都可以 → 讓 AI 讀整句，不補關鍵字。
+    trend＝問台指期本身（日盤、夜盤）走勢；positions＝法人／散戶未平倉口數（照舊出未平倉卡）；other＝其他（照舊）。
+    ask_ai(prompt, schema) 回 dict 或 None；讀題失敗就照舊。"""
+    q = str(question or "")
+    if ask_ai is None or not _MENTION_RE.search(q):
+        return False
+    prompt = ("你是台股問句解析器，只輸出 JSON，不要回答問題。使用者的問題提到期貨或夜盤，讀完整句判斷他要看什麼：\n"
+              "trend＝台指期本身的走勢、型態、現在怎樣、支撐壓力、會不會漲跌（日盤、夜盤、大台、小台都算）；\n"
+              "positions＝三大法人、外資、散戶的期貨未平倉、多單空單口數、多空比；\n"
+              "other＝其他（個股期貨、選擇權、加權指數現貨、美股夜盤、和台指期無關的問題）。\n問題：" + q)
+    try:
+        out = ask_ai(prompt, _KIND_SCHEMA) or {}
+    except Exception:
+        return False
+    return str(out.get("kind") or "") == "trend"
 
 
 def _fetch_rows() -> pd.DataFrame:
@@ -149,6 +174,13 @@ def _next_trading_day(day: date, closed: set) -> date:
     return day
 
 
+def _prev_trading_day(day: date, closed: set) -> date:
+    day -= timedelta(days=1)
+    while not _is_trading(day, closed):
+        day -= timedelta(days=1)
+    return day
+
+
 def session_of(moment: datetime, closed: Optional[set] = None) -> tuple[str, str]:
     """成交時間 → (所屬交易日, 日盤／夜盤)。15:00 後的夜盤屬於下一個交易日；凌晨 05:00 前是前一晚夜盤的延續。
     「下一個交易日」跳過週末和休市日（closed＝休市日 ISO 字串集合；沒給就讀證交所休市表）。"""
@@ -215,3 +247,39 @@ def live_bar(frame: pd.DataFrame) -> Optional[Dict[str, Any]]:
     return {"date": day, "Open": float(open_), "High": float(high), "Low": float(low), "Close": float(price),
             "Volume": float(volume), "time": quote["moment"].strftime("%H:%M"), "is_live": True, "label": session,
             "with_night": bool(night), "calendar_note": calendar_note(day, closed)}
+
+
+_COLUMNS = ["Open", "High", "Low", "Close", "Volume"]
+
+
+def price_bundle() -> Dict[str, Any]:
+    """11-03 台指期型態頁：和個股 _load_price_bundle 同一種格式，get_technical_analysis／get_volume_profile／
+    get_stock_overview／get_chart_panel 直接沿用。closed_df＝近月連續日 K；奇摩即時那根（日盤或夜盤）接在後面當盤中暫定，
+    均量沿用前一日（盤中累計量不算進均量，和個股、指數一樣）。成交量單位是口。"""
+    kf = tools.core()
+    frame = daily_frame()
+    closed = kf.calculate_indicators(frame[_COLUMNS].copy())
+    closed["Close_prev"] = closed["Close"].shift(1)
+    base = {"df": closed, "closed_df": closed, "market": "futures", "intraday": {}, "data_gaps": [],
+            "daily_source": "台指期近月日K（前一晚夜盤＋當天日盤；換月不還原價差）"}
+    live = live_bar(frame)
+    if not live:
+        return base
+    prev = _prev_trading_day(date.fromisoformat(live["date"]), closed_days()).isoformat()
+    if f"{pd.Timestamp(frame.index[-1]):%Y-%m-%d}" < prev:
+        # 前一個交易日的日K還沒發布到 FinMind（例：晚上夜盤時當天日盤還沒出來）：硬接即時那根會少一天、均線跟著錯 → 先不接
+        return dict(base, daily_source=base["daily_source"] + f"；{prev[5:]} 日K尚未發布，{live['label']}即時價先不接")
+    merged = pd.concat([frame[_COLUMNS], pd.DataFrame([{k: live[k] for k in _COLUMNS}], index=[pd.Timestamp(live["date"])])])
+    df = kf.calculate_indicators(merged)
+    df["Close_prev"] = df["Close"].shift(1)
+    for column in ("MV5", "MV20"):
+        if column in df.columns and len(df) > 1:
+            df.iloc[-1, df.columns.get_loc(column)] = df[column].iloc[-2]
+    last_close = float(frame["Close"].iloc[-1])
+    # 夜盤問題要回答「夜盤現在比日盤收盤漲跌多少」：程式先算好給 AI（事實核對才對得上，不讓 AI 自己算）
+    intraday = {"is_live": True, "date": live["date"], "time": live["time"], "session": live["label"],
+                "price": live["Close"], "with_night": live["with_night"], "calendar_note": live["calendar_note"],
+                "last_close": last_close, "last_close_date": f"{pd.Timestamp(frame.index[-1]):%Y-%m-%d}",
+                "change_vs_last_close": round(live["Close"] - last_close, 2),
+                "change_pct_vs_last_close": round((live["Close"] / last_close - 1) * 100, 2) if last_close else None}
+    return dict(base, df=df, intraday=intraday)

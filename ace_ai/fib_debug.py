@@ -95,21 +95,6 @@ def parse_codes(question: str, limit: int = 10, ask_ai=None) -> list[str]:
     return codes
 
 
-def futures_request(question: str, ask_ai) -> list[str]:
-    """11-03：沒說「驗證」的白話（「台指期費波在哪」「夜盤費波位置」）——標的是台指期才走驗證圖，回代號清單；
-    個股、大盤照舊走一般回答（回空清單）。句子裡有股票代號或股名就不問 AI。"""
-    if not mentions_fib(question) or is_request(question):
-        return []
-    import taifex_futures
-    try:
-        codes = rule_codes(question)
-        if not codes and ask_ai is not None:
-            codes = ai_codes(question, ask_ai)
-    except Exception:        # 一次超過 10 檔、AI 讀題失敗等：不是這條路，交給後面的流程回覆
-        return []
-    return codes if taifex_futures.CODE in codes else []
-
-
 def find_codes(q: str, example: str, limit: int = 10) -> list[str]:
     """代號依輸入順序去重；沒有代號時比對股名（費波驗證、CDP 驗證共用）。"""
     codes = list(dict.fromkeys(c.upper() for c in _CODE_RE.findall(q)))
@@ -194,9 +179,82 @@ def live_bar(code: str, last_closed: str) -> dict[str, Any] | None:
 
 def ai_reference(code: str) -> dict[str, Any]:
     """10-29（測試版）：問型態時給 AI 的費波參考價；與費波驗證圖同一份資料（正式收盤 K＋一年日K）與計算。"""
+    import taifex_futures
+    if code == taifex_futures.CODE:     # 11-03：台指期型態頁也給費波參考（近月連續日 K，正式收盤）
+        return fib_levels.ai_reference(fib_levels.compute(taifex_futures.daily_frame(), None))
     code, _, frame, events = kline_debug.load_closed(code)
     frame, _ = extend_history(code, frame, events)
     return fib_levels.ai_reference(fib_levels.compute(frame, events))
+
+
+PAGE_LIMIT = 2      # 費波型態頁和型態頁一樣，一次最多 2 檔（兩檔＝比較圖）
+
+
+def page_codes(question: str, ask_ai=None) -> list[str]:
+    """11-03 使用者：沒說「驗證」的費波問句（「2330 費波」「台指期費波在哪」「夜盤費波」）→ 費波型態頁的標的。
+    規則看得出來（代號、股名、台指期）就不問 AI；看不出來才讓 AI 讀整句。都看不出來回空清單（交給一般問答）。"""
+    try:
+        codes = rule_codes(question, PAGE_LIMIT)
+    except ValueError as exc:      # 規則就數到超過 2 檔
+        raise ValueError(f"費波型態頁一次最多 {PAGE_LIMIT} 檔，請分開問") from exc
+    if not codes and ask_ai is not None:
+        codes = ai_codes(question, ask_ai, PAGE_LIMIT + 1)
+    if len(codes) > PAGE_LIMIT:
+        raise ValueError(f"費波型態頁一次最多 {PAGE_LIMIT} 檔，請分開問")
+    return codes
+
+
+def _page_name(lv: dict) -> str:
+    """價格框／價位條上的名稱：短、看得懂是哪一種費波價位（比例、條件、次要）。"""
+    name = str(lv.get("tag") or lv["label"]).replace("前波高點 A", "前波高點").replace("前波高點 B", "前波高點").replace(" ", "")
+    name = name.replace("次要", "（次要）")
+    if lv.get("conditional") and "突破" not in name:
+        name += "（突破後）"
+    return name
+
+
+def _chart_name(lv: dict) -> str:
+    """11-03 使用者：K 線下方價位條直接寫費波比例（「0.382」接價格）。主波段回撤／反彈、延伸、大波段回撤寫比例；
+    前波高點、前低、整理區、等幅這類不是比例的照名稱。B 之後 C→B 的反彈（沒有 tag）和主波段比例會同名，保留「反彈」字樣。"""
+    tag = str(lv.get("tag") or "")
+    if lv.get("kind") == "extend" or (lv.get("kind") == "retrace" and tag) or tag.startswith("大段"):
+        return f"{lv['ratio']:g}"
+    return _page_name(lv)
+
+
+def page_levels(code: str, close: float) -> tuple[dict, dict]:
+    """11-03 使用者：費波型態頁——型態頁的價格框與價位條改標費波價位。和費波驗證圖同一份計算（load_panel：
+    正式收盤 K＋一年日K；台指期近月連續），close＝型態頁最後一根（盤中是即時價），只用來分上下方、算距離，不加入費波計算。
+    回傳（key_levels 卡, 交給 AI 的費波資料）。相距 0.15 ATR 內的價位只留一個，價格框不重疊。"""
+    data = load_panel(code)["fib_debug"]
+    if not data.get("selected"):
+        return ({"levels_only": True, "hide_score": True, "show_tracked_branches": False, "close": close, "stock_code": code,
+                 "resistances_above_close": [], "supports_below_close": []},
+                {"stock_code": code, "狀態": "沒有可用的費波波段，價位照一般型態頁"})
+    gap = 0.15 * float(data["atr"] or 0)
+    picked = []
+    for lv in sorted(data["levels"], key=lambda x: (x["price"], not x["ai"])):
+        if picked and abs(lv["price"] - picked[-1]["price"]) <= gap:
+            continue
+        picked.append(lv)
+    rows = [{"label": _chart_name(lv), "price": round(lv["price"], 2), "source": "fib",
+             "distance_from_close_pct": (lv["price"] / close - 1) * 100 if close else None} for lv in picked]
+    card = {"levels_only": True, "hide_score": True, "show_tracked_branches": False, "close": close, "stock_code": code,
+            "fib_page": True,
+            "resistances_above_close": sorted([r for r in rows if r["price"] > close], key=lambda r: r["price"]),
+            "supports_below_close": sorted([r for r in rows if r["price"] <= close], key=lambda r: -r["price"])}
+    ai = {"stock_code": code, "stock_name": data.get("stock_name", ""),
+          "說明": (data.get("summary") or [""])[0].split("｜", 1)[-1],
+          "計算基準": f"{data['bars'][data['last']]['date']} 正式收盤（盤中價不加入費波計算）",
+          "費波價位": [dict({"圖上標示": _chart_name(lv), "名稱": _page_name(lv), "價位": round(lv["price"], 2),
+                            "位置": "現價之上" if lv["price"] > close else "現價之下"},
+                           **({"條件": "突破前波高點後才成立"} if lv.get("conditional") else {}),
+                           **({"註記": "依目前高低點試算，確認前可能調整"} if lv.get("tentative") else {}),
+                           **({"次要": "已跌到 0.618 附近或之下才標，0.618 守不住時的下一個參考"} if lv.get("secondary") else {}))
+                      for lv in sorted(picked, key=lambda x: -x["price"])]}
+    if data["selected"].get("fallback"):
+        ai["可信度"] = "沒有合格費波主段，以下僅為區間量測"
+    return card, ai
 
 
 def extend_history(code: str, closed: pd.DataFrame, events: dict | None) -> tuple[pd.DataFrame, str]:
