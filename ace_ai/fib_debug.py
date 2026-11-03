@@ -184,7 +184,9 @@ def render(data: dict) -> Image.Image:
     px = lambda i: left + (i - start + 0.5) * step
     prices = [b[k] for b in visible + ([live] if live else []) for k in ("Low", "High")]
     # 10-28：只顯示近段時，交給 AI／現價附近的價位一定入圖；其餘離圖太遠的只列在下方表格，不把 K 線壓扁
-    prices += [lv["price"] for lv in levels if lv["ai"] or lv.get("watch") or min(prices) <= lv["price"] <= max(prices)]
+    # 11-03：0.618 跌到附近才標的次要 0.786 是要觀察的，也一定入圖
+    prices += [lv["price"] for lv in levels
+               if lv["ai"] or lv.get("watch") or lv.get("secondary") or min(prices) <= lv["price"] <= max(prices)]
     low, high = min(prices), max(prices)
     padding = max((high - low) * 0.06, abs(high) * 0.003, 0.01)
     low, high = low - padding, high + padding
@@ -362,7 +364,8 @@ def render(data: dict) -> Image.Image:
     level_rows = [([lv["label"], f"{lv['price']:.2f}",
                     "現價附近" if lv.get("watch") else "收盤之上" if lv["above"] else "收盤之下",
                     conf_text(lv),
-                    ("是（條件）" if lv.get("conditional") else "是（暫定）" if lv.get("tentative") else "是") if lv["ai"] else "否"],
+                    ("是（條件）" if lv.get("conditional") else "是（暫定）" if lv.get("tentative") else "是") if lv["ai"]
+                    else "否（次要）" if lv.get("secondary") else "否"],
                    ink if lv["ai"] else muted)
                   for lv in sorted(data.get("levels") or [], key=lambda x: -x["price"])]   # 表格列全部價位（含圖外的）
     table(f"費波價位｜緊密＝{params['tight_atr']:g} ATR 內、附近＝{params['conf_atr']:g} ATR 內｜相距 {params['zone_atr']:g} ATR 內併成一區",

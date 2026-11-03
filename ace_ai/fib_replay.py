@@ -162,6 +162,7 @@ def replay_code(code: str, df: pd.DataFrame, step: int = STEP, horizon: int = HO
                     "label": lv["label"], "kind": lv["kind"], "side": side, "ai": lv["ai"],
                     "tentative": lv["tentative"], "conditional": lv["conditional"], "watch": lv["watch"], "tight": bool(lv.get("tight")),
                     "confluence": bool(lv["confluence"]), "area_size": len(area["labels"]) if area else 1,
+                    "secondary": bool(lv.get("secondary")),
                     "atr": atr, "close": close}
             rows.append(dict(base, control=False, price=lv["price"], dist_atr=dist,
                              **outcome(h, l, c, t, lv["price"], side, atr, horizon, react_days)))
@@ -229,6 +230,7 @@ GROUPS = [
     ("整理區等幅", lambda r: r["kind"] == "box" and not r["watch"]),
     ("整理區上下緣", lambda r: r["kind"] == "box_edge" and not r["watch"]),
     ("下跌支撐（大段／前低／等幅）", lambda r: r["kind"] == "support" and not r["watch"]),
+    ("回撤 0.786（次要，11-03 起）", lambda r: r.get("secondary") and not r["watch"]),
     ("暫定（未確認錨點）", lambda r: r["tentative"] and not r["watch"]),
     ("錨點已確認", lambda r: not r["tentative"] and not r["watch"]),
     ("突破後條件目標", lambda r: r["conditional"] and not r["watch"]),

@@ -56,6 +56,7 @@ BOX_RECENT = int(_env("BOX_RECENT", 10))  # 整理區要在最近幾根內結束
 BREAKOUT = (1.382, 1.618, 2.0, 2.618)   # 越過波段端點、沒有 C 可用時，從低點起算的延伸倍數
 EXTEND_AI = int(_env("EXTEND_AI", 2))     # 創新高時收盤之上最近幾區延伸價位直接交給 AI（上方沒有結構可共振）
 SUPPORT_RETRACE = (0.618, 0.786, 1.0)   # 下跌低點未確認時：大波段回撤（只取收盤之下的）
+DEEP_RETRACE = 0.786                    # 11-03 使用者：收盤到 0.618 附近或跌破時，另標 0.786（次要，只畫在圖上、不交給 AI）
 DROP_PROJECT = (0.618, 1.0)             # 下跌低點未確認時：上一段大跌幅度從這次高點往下量
 SUPPORT_AI = int(_env("SUPPORT_AI", 2))   # 下跌低點未確認時，收盤之下最近幾區交給 AI
 ABOVE_AI = int(_env("ABOVE_AI", 2))       # 所有模式：收盤之上最多幾區交給 AI（2881：延伸一路給到 300）
@@ -158,7 +159,8 @@ def ai_reference(res: Dict[str, Any]) -> Dict[str, Any]:
            "目前壓力": [item(z) for z in ups if not z["conditional"]],
            "突破後條件目標": [item(z) for z in ups if z["conditional"]],
            "下方候選支撐": [item(z) for z in sorted([z for z in areas if not z["above"]], key=lambda z: -z["high"])],
-           "現價附近觀察": [{"依據": lv["label"], "價位": round(lv["price"], 2)} for lv in res["levels"] if lv["watch"]]}
+           "現價附近觀察": [{"依據": lv["label"], "價位": round(lv["price"], 2)} for lv in res["levels"]
+                         if lv["watch"] and not lv.get("secondary")]}
     if res["selected"].get("fallback"):
         out["可信度"] = "沒有合格費波主段，以下僅為區間量測"
     return {k: v for k, v in out.items() if v not in ([], "", None)}
@@ -341,6 +343,11 @@ def _compute(frame: pd.DataFrame, events: Optional[Dict[str, Any]], lookback: in
             for r in RETRACE:
                 levels.append({"label": f"回撤 {r:g}{span}", "tag": f"回撤{r:g}", "kind": "retrace", "ratio": r,
                                "price": hi - amp * r})
+            # 11-03 使用者（加權跌到 0.618 下方 0.14 ATR）：0.618 守不住時下一個參考是 0.786，否則中間空到前低。
+            # 只在收盤已在 0.618 附近（0.5 ATR 內）或之下才出現；次要價位，只畫在圖上觀察、不交給 AI
+            if DEEP_RETRACE and close <= hi - amp * RETRACE[-1] + TEST_ATR * ref:   # DEEP_RETRACE 設 0＝不標
+                levels.append({"label": f"回撤 {DEEP_RETRACE:g}（次要）{span}", "tag": f"回撤{DEEP_RETRACE:g}次要",
+                               "kind": "retrace", "ratio": DEEP_RETRACE, "price": hi - amp * DEEP_RETRACE, "secondary": True})
             levels.append({"label": "前波高點 B", "kind": "prior", "ratio": 1.0, "price": hi})
             if cpt and close < hi:   # 還在 B 之下：C→B 的反彈價位也是上方參考
                 for r in RETRACE:
@@ -435,14 +442,15 @@ def _compute(frame: pd.DataFrame, events: Optional[Dict[str, Any]], lookback: in
             # 10-28（2881）：收盤之下也要有候選支撐（整理區下緣、有結構共振的回撤），名額在合併成區後再限
             item.update(price=float(price), above=price > close, confluence=[t for t, _ in hits],
                         tight=[t for t, dist in hits if dist <= tight], watch=watch, tentative=bool(tentative),
-                        conditional=bool(item.get("conditional")),
-                        ai=bool(not watch and (basis or item["kind"] in ("prior", "box", "box_edge", "support"))))
+                        conditional=bool(item.get("conditional")), secondary=bool(item.get("secondary")),
+                        ai=bool(not item.get("secondary") and not watch
+                                and (basis or item["kind"] in ("prior", "box", "box_edge", "support"))))
         selected["zones"] = zones
         levels.sort(key=lambda x: x["price"])
 
         # 10-28：相近價位先合併成一區，名額以區計算（同一區兩種依據不是兩道防線）
         gap = ZONE_ATR * ref
-        for item in [x for x in levels if not x["watch"]]:
+        for item in [x for x in levels if not x["watch"] and not x["secondary"]]:   # 次要價位不進價位區，不占 AI 名額
             last_area = areas[-1] if areas else None
             if (last_area and item["price"] - last_area["members"][-1]["price"] <= gap and item["price"] - last_area["low"] <= 2 * gap
                     and (item["price"] > close) == (last_area["low"] > close)):   # 不跨過收盤
@@ -496,10 +504,14 @@ def _compute(frame: pd.DataFrame, events: Optional[Dict[str, Any]], lookback: in
         if later:
             summary.append(f"{prefix}突破後條件目標（尚未成立）：" + "、".join(_area_text(z) for z in later))
         summary.append(f"{prefix}下方候選支撐：" + ("、".join(_area_text(z) for z in downs) or "收盤之下沒有合格價位"))
-        near = [x for x in levels if x["watch"]]
+        near = [x for x in levels if x["watch"] and not x["secondary"]]
         if near:
             summary.append(f"現價附近的觀察價位（離收盤 ≤ {TEST_ATR:g} ATR，不列為目標，尚待確認支撐／壓力反應）："
                            + "、".join(f"{x['label']} {x['price']:.2f}" for x in near))
+        deep = [x for x in levels if x["secondary"]]
+        if deep:
+            summary.append("次要參考（收盤已到 0.618 附近或之下才標，只畫在圖上、不交給 AI）："
+                           + "、".join(f"{x['label']} {x['price']:.2f}" for x in deep))
     if widened:
         mode_text = f"最近 {NEAR_LOOKBACK} 根找不到可用波段，放寬到約一年；" + mode_text
     summary.insert(0, f"最新收盤 {close:.2f}｜{mode_text}")
