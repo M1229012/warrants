@@ -13,7 +13,8 @@
   證交所每日精確成分權重檔屬 Data E-Shop 商品，未取得該授權檔時不宣稱為官方公布權重。
 - 收盤後：使用本地全市場官方日 K，所有可辨識成分股都參與計算，不做前 N 大權值股截斷。
 - 盤中：先用奇摩批次報價把所有成分股抓完（依昨日市值由大到小），指數基準看 TWSE MIS；
-  11-02 起不因前幾名確定就提前停止，再小的成分股都要算。
+  11-02 起不因前幾名確定就提前停止，再小的成分股都要算。11-03 起昨收也以奇摩為準（本地日K只當備援），
+  本地沒有日K的成分股照樣算，分母才是完整的成分股市值。
   同時設總時間預算，連線慢時直接回傳目前已取得結果，不讓 Discord 問答卡死。
 - 奇摩整批沒回才用 MIS 補；若 MIS 也完全失敗，才退回原本少量 Fugle 單股即時報價；不逐檔掃全市場。
 
@@ -607,17 +608,13 @@ def _fetch_mis_batch(market: str, codes: List[str], deadline: float) -> Tuple[Di
         _MIS_LOCK.release()
 
 
-def _live_stock_quotes(market: str, codes: List[str], deadline: float) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
-    """盤中個股價用奇摩（contribution 開始前已整批抓好）。這批有回，沒回的股票就是今天沒成交，
+def _live_stock_quotes(market: str, codes: List[str], deadline: float,
+                       prefetched: Dict[str, Dict[str, Any]]) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
+    """盤中個股價用奇摩（contribution 開始前已整批抓好，prefetched）。這批有回，沒回的股票就是今天沒成交，
     不再逐批打 MIS；整批都沒回才用 MIS 補。"""
-    quotes: Dict[str, Dict[str, Any]] = {}
-    try:
-        import yahoo_quotes
-        quotes = {c: {"close": q["price"], "prev_close": q.get("prev"), "source": "奇摩",
-                      "limit_up": q.get("limit_up"), "limit_down": q.get("limit_down")}
-                  for c, q in yahoo_quotes.fresh_quotes(codes).items()}
-    except Exception as exc:
-        print(f"⚠️ {INDEX_OF[market][1]} 奇摩批次報價略過｜{tools.err_text(exc)}", flush=True)
+    quotes = {c: {"close": q["price"], "prev_close": q.get("prev"), "source": "奇摩",
+                  "limit_up": q.get("limit_up"), "limit_down": q.get("limit_down")}
+              for c, q in ((c, prefetched.get(c)) for c in codes) if q and q.get("price")}
     if quotes:
         return quotes, {}
     mis, benchmark = _fetch_mis_batch(market, codes, deadline)
@@ -854,19 +851,44 @@ def contribution(market: str, live: bool, top: int = 5, *, deadline: Optional[fl
                 row["stock_name"] = names.get(row["stock_code"], row["stock_code"])
 
     else:
-        # 盤中沿用 v16 的「本地昨收 + MIS 批次即時價」；這次修正重點只在盤後資料完整性。
-        changes = local_market_cache.latest_changes(codes)
+        # 11-03 Log：原本只收「本地底庫有日K」的成分股，測試版不同步行情，加權 1,000 多檔只剩 670 檔；
+        # 缺的股票連市值都沒算進分母，換算係數被放大，每檔貢獻點數都偏大。
+        # 改成所有成分股都進來：先整批抓奇摩，昨收以報價來源為準（今天還沒成交的也有昨收），本地日K只當備援。
+        deadline = deadline or (time.monotonic() + LIVE_BUDGET_SECONDS)
+        eligible = [c for c in codes if float(market_components[c].get("shares") or 0.0) > 0]
+        changes = local_market_cache.latest_changes(eligible)
+
+        def local_value(code: str) -> float:
+            return float(tools._num((changes.get(code) or {}).get("close")) or 0.0) * float(market_components[code]["shares"])
+
+        # 依昨日市值由大到小抓（本地沒有日K的排最後），時間不夠時先保住權值股
+        eligible.sort(key=lambda c: -local_value(c))
+        eligible = eligible[:LIVE_MAX_TWSE if market == "twse" else LIVE_MAX_TPEX]
+        benchmark: Dict[str, Any] = {}
+        try:
+            _, benchmark = _fetch_mis_batch(market, eligible[:1], deadline)      # 指數昨收與現值先拿，整批抓完可能到時限
+        except Exception as exc:
+            print(f"⚠️ {index_name} MIS 指數基準略過｜{tools.err_text(exc)}", flush=True)
+        yahoo: Dict[str, Dict[str, Any]] = {}
+        yahoo_prev: Dict[str, float] = {}
+        try:
+            import yahoo_quotes
+            yahoo = yahoo_quotes.prime(eligible, max(0.5, deadline - time.monotonic()), {c: market for c in eligible}) or {}
+            yahoo_prev = yahoo_quotes.prev_closes(eligible)
+        except Exception as exc:
+            print(f"⚠️ {index_name} 奇摩整批報價略過｜{tools.err_text(exc)}", flush=True)
+
         total_prev_value = 0.0
-        for code in codes:
-            quote = changes.get(code) or {}
-            last_close = tools._num(quote.get("close"))
-            if not last_close:
-                continue
+        unpriced: List[str] = []
+        for code in eligible:
             comp = market_components[code]
-            shares = float(comp.get("shares") or 0.0)
-            if shares <= 0:
+            shares = float(comp["shares"])
+            local = changes.get(code) or {}
+            prev_close = float(tools._num((yahoo.get(code) or {}).get("prev")) or yahoo_prev.get(code)
+                               or tools._num(local.get("close")) or 0.0)
+            if prev_close <= 0:
+                unpriced.append(code)
                 continue
-            prev_close = float(last_close)
             prev_value = prev_close * shares
             rows.append({
                 "stock_code": code,
@@ -878,47 +900,31 @@ def contribution(market: str, live: bool, top: int = 5, *, deadline: Optional[fl
                 "change_pct": 0.0,
                 "shares": shares,
                 "prev_value": prev_value,
-                "quote_date": str(quote.get("date") or ""),
+                "quote_date": str(local.get("date") or ""),
                 "live_quote": False,
-                "price_source": "local_prev_close",
+                "price_source": "yahoo_prev_close" if code in yahoo or code in yahoo_prev else "local_prev_close",
             })
             total_prev_value += prev_value
         if not rows or total_prev_value <= 0:
-            raise tools.ToolDataError("本地底庫資料不足，無法計算盤中指數貢獻")
+            raise tools.ToolDataError("成分股昨收資料不足，無法計算盤中指數貢獻")
 
         live_used = 0
         top_safe = bottom_safe = False
         unseen_bound = 0.0
-        deadline = deadline or (time.monotonic() + LIVE_BUDGET_SECONDS)
-        ranked = sorted(rows, key=lambda r: -r["prev_value"])
-        max_candidates = LIVE_MAX_TWSE if market == "twse" else LIVE_MAX_TPEX
-        ranked = ranked[:max_candidates]
-        benchmark: Dict[str, Any] = {}
-        ranked_codes = [r["stock_code"] for r in ranked]
-        try:
-            _, benchmark = _fetch_mis_batch(market, ranked_codes[:1], deadline)      # 指數昨收與現值先拿，整批抓完可能到時限
-        except Exception as exc:
-            print(f"⚠️ {index_name} MIS 指數基準略過｜{tools.err_text(exc)}", flush=True)
-        try:
-            import yahoo_quotes
-            yahoo_quotes.prime(ranked_codes, max(0.5, deadline - time.monotonic()), {c: market for c in ranked_codes})
-        except Exception as exc:
-            print(f"⚠️ {index_name} 奇摩整批報價略過｜{tools.err_text(exc)}", flush=True)
+        missing_quotes: List[str] = []
 
         # 這裡只是套用已抓好的報價，不看時限：時間到了也要把抓到的算完（MIS 過時限會直接回空）
-        for batch_start in range(0, len(ranked), LIVE_BATCH_SIZE):
-            batch = ranked[batch_start:batch_start + LIVE_BATCH_SIZE]
+        for batch_start in range(0, len(rows), LIVE_BATCH_SIZE):
+            batch = rows[batch_start:batch_start + LIVE_BATCH_SIZE]
             requested = [r["stock_code"] for r in batch]
             try:
-                quotes, batch_benchmark = _live_stock_quotes(market, requested, deadline)
+                quotes, batch_benchmark = _live_stock_quotes(market, requested, deadline, yahoo)
             except Exception as exc:
                 print(f"⚠️ {index_name} 批次報價失敗｜{tools.err_text(exc)}", flush=True)
                 quotes, batch_benchmark = {}, {}
             if batch_benchmark:
                 benchmark = batch_benchmark
-            missing = [c for c in requested if c not in quotes]
-            if missing:
-                print(f"⚠️ {index_name} 報價 batch requested={len(requested)} returned={len(quotes)} missing={','.join(missing[:12])}", flush=True)
+            missing_quotes += [c for c in requested if c not in quotes]
             for row in batch:
                 item = quotes.get(row["stock_code"])
                 if not item:
@@ -979,6 +985,11 @@ def contribution(market: str, live: bool, top: int = 5, *, deadline: Optional[fl
             row["close"] = round(float(row["close"]), 2)
             if not row.get("stock_name") or row.get("stock_name") == row["stock_code"]:
                 row["stock_name"] = names.get(row["stock_code"], row["stock_code"])
+        local_prev = sum(1 for r in rows if r.get("price_source") == "local_prev_close")
+        live_note = (f"母體={len(codes)}｜有昨收={len(rows)}（本地日K補 {local_prev}）｜"
+                     f"查無昨收={len(unpriced)}{'：' + ','.join(unpriced[:12]) if unpriced else ''}｜"
+                     f"有即時價={live_used}｜沒有即時價={len(missing_quotes)}"
+                     f"{'（' + ','.join(missing_quotes[:12]) + '…）' if missing_quotes else ''}")
 
     evaluated = [r for r in rows if r.get("live_quote")] if live else list(rows)
     positives = sorted((r for r in evaluated if r["points"] > 0), key=lambda r: -r["points"])
@@ -1008,6 +1019,10 @@ def contribution(market: str, live: bool, top: int = 5, *, deadline: Optional[fl
     estimated_points = round(sum(r["points"] for r in evaluated), 2)
     index_points = round((float(now_index) - float(prev_index)), 2) if now_index is not None and prev_index is not None else None
     residual = round(index_points - estimated_points, 2) if index_points is not None else None
+    if live:
+        # 11-03：盤中也留對帳 Log；殘差大＝母體或股數有缺，點數會一起失真
+        print(f"📊 {index_name} 盤中貢獻｜{live_note}｜指數={index_points if index_points is not None else '-'}"
+              f"｜個股合計={estimated_points:+.2f}｜殘差={residual if residual is not None else '-'}", flush=True)
 
     focus_share = positive_share if (index_points or 0) >= 0 else negative_share
     concentration = _concentration_label(focus_share)

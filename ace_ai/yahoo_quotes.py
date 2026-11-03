@@ -45,6 +45,7 @@ HEADERS = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
 _COOL_UNTIL = [0.0]
 _LOCK = threading.Lock()
 _QUOTES: Dict[str, Any] = {}     # {代號: (抓到的時間, 報價)}
+_PREV: Dict[str, Any] = {}       # {代號: (日期, 昨收)}；今天還沒成交的股票奇摩也有昨收（指數貢獻要算進分母）
 _LAST_CALL = [0.0]
 
 
@@ -112,16 +113,25 @@ def _fresh(code: str) -> Optional[Dict[str, Any]]:
 
 
 def prime(codes: List[str], deadline_seconds: Optional[float] = None,
-          known_markets: Optional[Dict[str, str]] = None) -> None:
-    """11-02：一題要好幾檔（族群總覽、大類型態、指數貢獻）先一次批次抓好，不要逐檔各打一次。"""
-    missing = [c for c in codes if not _fresh(c)]
+          known_markets: Optional[Dict[str, str]] = None) -> Dict[str, Dict[str, Any]]:
+    """11-02：一題要好幾檔（族群總覽、大類型態、指數貢獻）先一次批次抓好，不要逐檔各打一次。
+    11-03：回傳這次用到的報價。判斷「還新鮮」的那批若等整批抓完再用 fresh_quotes 重讀，可能剛好過期而整批不見。"""
+    out = fresh_quotes(codes)
+    missing = [c for c in codes if c not in out]
     if missing:
-        fetch(missing, deadline_seconds, known_markets)
+        out.update(fetch(missing, deadline_seconds, known_markets))
+    return out
 
 
 def fresh_quotes(codes: List[str]) -> Dict[str, Dict[str, Any]]:
     """還沒過期的報價（prime 之後取用）；沒有的代號不回傳。"""
     return {c: q for c, q in ((c, _fresh(c)) for c in codes) if q}
+
+
+def prev_closes(codes: List[str]) -> Dict[str, float]:
+    """今天抓過的昨收（含今天還沒成交的股票）；沒有的代號不回傳。"""
+    today = tools.taipei_now().strftime("%Y-%m-%d")
+    return {c: hit[1] for c, hit in ((c, _PREV.get(c)) for c in codes) if hit and hit[0] == today}
 
 
 def stock_quote(code: str, market: str = "") -> Dict[str, Any]:
@@ -176,6 +186,9 @@ def fetch(codes: List[str], deadline_seconds: Optional[float] = None,
                 resp.raise_for_status()
                 for item in resp.json() or []:
                     code = symbols.get(str(item.get("symbol") or ""))
+                    prev = _raw(item.get("regularMarketPreviousClose")) if code else 0.0
+                    if prev > 0:
+                        _PREV[code] = (today, prev)
                     quote = parse(item, today) if code else None
                     if quote:
                         out[code] = quote

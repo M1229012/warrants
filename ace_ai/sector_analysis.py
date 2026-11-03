@@ -135,8 +135,9 @@ def detect_request(question: str) -> Optional[Dict[str, str]]:
     # 族群清單放到最後判斷：句子裡不能有排行字眼，也不能還留著一個沒對到的族群名稱
     # （「火箭燃料族群有哪些股票」要回查不到，不是丟出整份清單）。
     catalog_residual = _residual(question, r"查詢|查看|可以查|可查|能查|清單|列表|分類|名冊|支援|列出|全部|所有|可以|詢|查|看|些|個|所")
+    # 11-03：「有那些族群」這裡少認「有那些」，掉到查不到。要名單的說法改用和成分股查詢同一套判斷（action_of）
     if (re.search(r"族群|類股|產業", text) and not catalog_residual
-            and re.search(r"清單|列表|分類|名冊|支援|可以查|可查|有哪些|有什麼", text)
+            and (action == "members" or re.search(r"清單|列表|分類|名冊|支援|可以查|可查|有哪些|有什麼", text))
             and not re.search(r"最強|最好|型態|排行|排名|漲", text)):
         return {"mode": "catalog", "industry": "", "name": "產業分類"}
 
@@ -661,12 +662,14 @@ def members_panel(data: Dict[str, Any]) -> Dict[str, Any]:
 def catalog_panel() -> Dict[str, Any]:
     """會員圖片只列細產業，避免概念題材/大產業全部塞進一張超長圖。"""
     if sector_match.MEMBER_ONLY:
+        # 11-03：10-27 族群重整後名單全部是自建（source=own），164 個全擠在「主題族群」一區，又長又看不出分類。
+        # 改成大類／其他產業／概念三區；大類底下的細項另外問（「半導體族群有哪些」）。
         groups = sector_match.member_groups()
-        themes = [n for n, g in groups.items() if g.get("source") == "own"]
-        others = [n for n, g in groups.items() if g.get("source") != "own"]
-        sections = [{"title": "主題族群", "items": themes}]
-        if others:
-            sections.append({"title": "產業／概念", "items": others})
+        parents = list(dict.fromkeys(g["parent"] for g in groups.values() if g.get("parent")))
+        industries = [n for n, g in groups.items() if g.get("kind") != "concept" and not g.get("parent")]
+        concepts = [n for n, g in groups.items() if g.get("kind") == "concept"]
+        sections = [{"title": title, "items": items}
+                    for title, items in (("大類", parents), ("其他產業", industries), ("概念", concepts)) if items]
         return {"sector_catalog": {"title": "可查詢的族群", "sections": sections}}
     industries = sector_roster.group_names("industry") if sector_roster.available() else []
     concepts = sector_roster.group_names("concept") if sector_roster.available() else []
@@ -1375,7 +1378,8 @@ def answer(request: Dict[str, str], gateway, validate) -> Dict[str, Any]:
     if mode in ("market_momentum", "market_technical"):
         return _market_radar_answer(mode, request, gateway, validate)
     if mode == "catalog":
-        return {"text": "", "calls": 0, "cacheable": True, "panels": [catalog_panel()]}
+        hint = "大類底下還有細項族群，可以再問「半導體族群有哪些」。" if sector_match.MEMBER_ONLY else ""
+        return {"text": hint, "calls": 0, "cacheable": True, "panels": [catalog_panel()]}
     if mode == "parent_members":
         return _parent_members_answer(request)
     if mode == "parent_pattern":

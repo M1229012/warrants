@@ -6868,8 +6868,7 @@ def _breadth_verdict(data: Dict[str, Any]) -> str:
 def _heavyweight_quotes(codes: List[str]) -> Dict[str, Dict[str, Any]]:
     try:
         import yahoo_quotes
-        yahoo_quotes.prime(codes, HEAVYWEIGHT_BUDGET_SECONDS)
-        return yahoo_quotes.fresh_quotes(codes)
+        return yahoo_quotes.prime(codes, HEAVYWEIGHT_BUDGET_SECONDS)     # 11-03：直接用 prime 回傳的，重讀可能剛好過期
     except Exception as exc:
         print(f"⚠️ 盤面廣度：權值股批次報價失敗，改逐檔｜{err_text(exc)}", flush=True)
         return {}
