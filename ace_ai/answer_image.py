@@ -697,8 +697,76 @@ def _retail_height(panel: dict) -> int:
     return RETAIL_BLOCK_H if (panel.get('retail') or {}).get('rows') and panel.get('bars') else 0
 
 
+# 11-05 使用者：大盤／櫃買融資改用 K 線下方副圖（柱＝每日增減、金線＝融資餘額，單位億元），比表格直觀；
+# 融資維持率（估算）寫在標題列；原本表格上的數字改由 AI 解讀說明
+MARGIN_BLOCK_H = INST_BLOCK_H
+
+
+def _margin_height(panel: dict) -> int:
+    panel = panel or {}
+    return MARGIN_BLOCK_H * len(panel.get('margin') or []) if panel.get('bars') else 0
+
+
+def draw_market_margin(draw, top: float, left: float, right: float, px, step: float, bars: list, margin: dict) -> None:
+    """和 K 線同一組日期：柱＝每日融資增減（紅＝增加、綠＝減少），金線＝融資餘額；餘額是存量，每天差不多大，所以柱畫增減、存量用線。"""
+    rows = {r['date']: r for r in margin.get('rows') or []}
+    levels = [(rows.get(bar['date']) or {}).get('margin_yi') for bar in bars]
+    changes = [(rows.get(bar['date']) or {}).get('change_yi') for bar in bars]
+    known = [v for v in levels if v is not None]
+    title = f"{margin.get('name', '大盤')}融資"
+    text_at(draw, (left, top + 6), title, 22, INK, True)
+    lx = left + font(22, True).getlength(title) + 28
+    draw.rectangle((lx, top + 12, lx + 8, top + 28), fill=UP)
+    draw.rectangle((lx + 8, top + 12, lx + 16, top + 28), fill=DOWN)
+    last_change = next((c for c in reversed(changes) if c is not None), None)
+    text = '每日增減' + (f' 最新 {last_change:+,.2f}億' if last_change is not None else '')
+    draw.text((lx + 22, top + 20), text, font=font(19), fill=INK, anchor='lm')
+    lx += 22 + font(19).getlength(text) + 22
+    if known:
+        draw.line((lx, top + 20, lx + 22, top + 20), fill=ACCENT, width=3)
+        text = f'融資餘額 {known[-1]:,.2f}億'
+        draw.text((lx + 30, top + 20), text, font=font(19, True), fill=INK, anchor='lm')
+        lx += 30 + font(19, True).getlength(text) + 22
+    pct = margin.get('maintenance_pct')
+    if pct:
+        text = f'維持率 {float(pct):.1f}%（估算）'
+        draw.text((lx, top + 20), text, font=font(19, True), fill=INK, anchor='lm')
+    ctop, cbottom = top + 48, top + MARGIN_BLOCK_H - 52
+    mid, half_h = (ctop + cbottom) / 2, (cbottom - ctop) / 2
+    ticks = _date_ticks(bars, step)
+    for i in ticks:
+        draw.line((px(i), ctop, px(i), cbottom), fill=GRID, width=1)
+    for sx in range(int(left), int(right), 12):
+        draw.line((sx, mid, min(sx + 6, right), mid), fill=LINE, width=1)
+    peak = max([abs(c) for c in changes if c is not None] + [0.01]) * 1.15
+    for i, change in enumerate(changes):
+        if not change:
+            continue
+        x, half = px(i), max(1, step * .34)
+        h = abs(change) / peak * half_h
+        draw.rectangle((x - half, mid - h if change > 0 else mid, x + half, mid if change > 0 else mid + h),
+                       fill=UP if change > 0 else DOWN)
+    if known:
+        lo, hi = min(known), max(known)
+        pad = max((hi - lo) * 0.12, abs(hi) * 0.005, 0.5)
+        lo, hi = lo - pad, hi + pad
+        ly = lambda v: cbottom - (v - lo) / (hi - lo) * (cbottom - ctop)
+        points = [(px(i), ly(v)) for i, v in enumerate(levels) if v is not None]
+        if len(points) > 1:
+            draw.line(points, fill=ACCENT, width=3)
+        ex, ey = points[-1]
+        draw.ellipse((ex - 5, ey - 5, ex + 5, ey + 5), fill=ACCENT)
+        text_at(draw, (right + 10, ctop - 8), f'{hi:,.0f}', 16, ACCENT)
+        text_at(draw, (right + 10, cbottom - 14), f'{lo:,.0f}', 16, ACCENT)
+    axis_y = cbottom + 4
+    draw.line((left, axis_y, right, axis_y), fill=LINE, width=1)
+    for i in ticks:
+        label_x = max(left + 26, min(px(i), right - 26))
+        draw.text((label_x, axis_y + 8), bars[i]['date'][5:], font=font(17), fill=MUTED, anchor='mt')
+
+
 def panel_height(panel: dict) -> int:
-    return (CHART_HEIGHT - (CAPTION_H - _caption_h(panel)) + _price_extra(panel) + sum(mark_lanes(panel)) + _inst_height(panel) + _retail_height(panel)
+    return (CHART_HEIGHT - (CAPTION_H - _caption_h(panel)) + _price_extra(panel) + sum(mark_lanes(panel)) + _inst_height(panel) + _retail_height(panel) + _margin_height(panel)
             + _level_legend_height(panel)
             + _flow_height(panel) + _trade_height(panel) + mark_legend(None, panel, 0, True))
 
@@ -1823,6 +1891,9 @@ def draw_chart(draw, y: int, panel: dict) -> None:
     if retail_h:
         draw_retail_ratio(draw, vbottom + 14 + inst_h, left, right, px, step, bars, panel['retail'])
     inst_h += retail_h
+    for margin in (panel.get('margin') or []) if _margin_height(panel) else []:   # 11-05：大盤／櫃買融資副圖
+        draw_market_margin(draw, vbottom + 14 + inst_h, left, right, px, step, bars, margin)
+        inst_h += MARGIN_BLOCK_H
     below = y + CHART_HEIGHT - (CAPTION_H - _caption_h(panel)) + extra + inst_h + legend_h
     if _flow_height(panel):
         draw_branch_flow(draw, below, left, right, px, step, bars, panel['branch_flow'])
