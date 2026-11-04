@@ -880,6 +880,7 @@ _TOOL_FAILURE_MESSAGES = {
     "get_futures_positions": "台指期未平倉資料取得失敗",
     "get_institutional_flow": "目前三大法人資料取得失敗",
     "get_market_institutional": "目前全市場三大法人資料取得失敗",
+    "get_market_margin": "目前大盤／櫃買融資資料取得失敗",
     "get_retail_futures": "目前散戶多空比資料取得失敗",
     "get_index_contribution": "指數貢獻點數：所有成分股依權重 × 漲跌排序的拉升榜與拖累榜（非漲幅排名）",
     "get_market_breadth": "盤面廣度資料取得失敗",
@@ -1994,6 +1995,9 @@ def _price_source_base(bundle: Dict[str, Any]) -> str:
 # ============================================================
 
 INDEX_CODES = {"TAIEX": "加權指數", "TPEX": "櫃買指數"}
+# 11-04（測試版 11-03 移植，/ask、/ace 都開放）：台指期型態頁。價格走 taifex_futures.price_bundle（近月連續日 K＋奇摩即時），
+# 不在股票名冊；沒有公司行動、分點、個股法人，成交量單位是口
+FUTURES_CODES = {"TXF": "台指期"}       # 名稱用 AI 會寫的「台指期」，事實核對才認得是在講這檔
 INDEX_FINMIND_ID = {"TAIEX": "TAIEX", "TPEX": "TPEx"}
 _INDEX_ALIASES = (
     ("TAIEX", ("大盤", "加權指數", "加權", "台股指數", "台股大盤", "集中市場", "TAIEX", "台積電權值")),
@@ -2315,7 +2319,44 @@ def get_futures_positions(days: int = 10) -> Dict[str, Any]:
         "previous_date": previous.strftime("%Y/%m/%d") if previous is not None else "",
         "investors": investors,
         "definition_note": "未平倉口數含現貨避險部位，不能單獨當作多空訊號；僅供參考",
+        "foreign_summary": foreign_oi_summary(rows),
     }
+
+
+def _oi_change_text(change: float, net: float) -> str:
+    """淨部位變化用口語寫：目前淨空時，淨部位變小＝淨空增加；目前淨多時，變大＝淨多增加。"""
+    if change == 0:
+        return "持平"
+    side = "淨空" if net < 0 else "淨多"
+    grow = change < 0 if net < 0 else change > 0
+    return f"{side}{'增加' if grow else '減少'} {abs(int(change)):,} 口"
+
+
+def foreign_oi_summary(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """11-04（測試版 11-03 移植）：台指期解讀要多說明外資空單——程式先算好給 AI（給 AI 的逐日只剩 5 天，趨勢不能讓 AI 自己算）：
+    目前淨部位、較前一日、近 5 個交易日、同方向連續幾天、近 N 日（副圖同一段）淨空最多／最少在哪。"""
+    nets = [(r["date"], float(r["foreign"])) for r in rows if r.get("foreign") is not None]
+    if len(nets) < 2:
+        return {}
+    last = nets[-1][1]
+    diffs = [b - a for (_, a), (_, b) in zip(nets, nets[1:])]
+    streak = 0
+    for d in reversed(diffs):
+        if d != 0 and (d > 0) == (diffs[-1] > 0):
+            streak += 1
+        else:
+            break
+    base5 = nets[-6][1] if len(nets) >= 6 else nets[0][1]
+    low, high = min(nets, key=lambda x: x[1]), max(nets, key=lambda x: x[1])
+    side = "淨空" if last < 0 else "淨多"
+    out = {"外資淨部位": f"{side} {abs(int(last)):,} 口", "資料日": nets[-1][0],
+           "較前一日": _oi_change_text(diffs[-1], last),
+           "近5個交易日": _oi_change_text(last - base5, last),
+           f"近{len(nets)}日淨空最多": f"{abs(int(low[1])):,} 口（{low[0][5:]}）" if low[1] < 0 else "這段期間沒有淨空",
+           f"近{len(nets)}日淨部位最偏多": f"{'淨多' if high[1] >= 0 else '淨空'} {abs(int(high[1])):,} 口（{high[0][5:]}）"}
+    if streak >= 2 and diffs[-1] != 0:
+        out["連續"] = f"{_oi_change_text(diffs[-1], last).split(' ')[0]}連續 {streak} 天"
+    return out
 
 
 RETAIL_FUTURES = (("MTX", "小台"), ("TMF", "微台"))
@@ -2531,6 +2572,9 @@ def _load_price_bundle(stock_code: str, spot_history_mode: bool = False) -> Dict
     kf = core()
     if str(stock_code or "").strip().upper() in INDEX_CODES:
         return _load_index_bundle(str(stock_code).strip().upper())
+    if str(stock_code or "").strip().upper() in FUTURES_CODES:
+        import taifex_futures
+        return taifex_futures.price_bundle()
     code = kf._normalize_stock_name_code_key(stock_code)
 
     import request_runtime
@@ -2740,6 +2784,8 @@ def _stock_identity(stock_code: str) -> Tuple[str, str]:
     raw = str(stock_code or "").strip().upper()
     if raw in INDEX_CODES:
         return raw, INDEX_CODES[raw]
+    if raw in FUTURES_CODES:
+        return raw, FUTURES_CODES[raw]
     code = core()._normalize_stock_name_code_key(stock_code)
     if not code:
         raise ToolDataError("股票代號不可為空")
@@ -2801,7 +2847,7 @@ def _volume_trend(df: pd.DataFrame) -> Dict[str, Any]:
 
 def _intraday_volume_estimate(code: str, bundle: Dict[str, Any], live: bool, suspect: bool) -> Dict[str, Any]:
     """盤中用時段量能分布估今日全日量，並和昨日、5 日均量、20 日均量比較。"""
-    if not live or suspect:
+    if not live or suspect or code in FUTURES_CODES:   # 台指期有日盤＋夜盤，個股的時段分布不適用
         return {}
     try:
         import intraday_volume
@@ -2834,6 +2880,7 @@ def get_stock_overview(stock_code: str) -> Dict[str, Any]:
     mv20 = _num(latest.get("MV20"), 4)
     live = bool((bundle.get("intraday") or {}).get("is_live"))
     suspect = bool((bundle.get("intraday") or {}).get("volume_suspect"))
+    unit = 1 if code in FUTURES_CODES else 1000     # 股數→張；台指期本來就是口
     if live or suspect:
         # 盤中累計量不和全日均量比較；可疑量能也不計算量比。
         ratio5 = ratio20 = None
@@ -2857,15 +2904,16 @@ def get_stock_overview(stock_code: str) -> Dict[str, Any]:
         "prev_close": prev_close,
         "change": change,
         "change_pct": _pct(close, prev_close),
-        "volume_lots": _num(volume / 1000, 0) if volume is not None else None,
-        "mv5_lots": _num(mv5 / 1000, 0) if mv5 is not None else None,
-        "mv20_lots": _num(mv20 / 1000, 0) if mv20 is not None else None,
+        "volume_lots": _num(volume / unit, 0) if volume is not None else None,
+        "mv5_lots": _num(mv5 / unit, 0) if mv5 is not None else None,
+        "mv20_lots": _num(mv20 / unit, 0) if mv20 is not None else None,
         "volume_ratio_vs_mv5": ratio5,
         "volume_ratio_vs_mv20": ratio20,
         "volume_trend": _volume_trend(closed_frame(bundle)) if not suspect else {},
         "intraday_volume_estimate": _intraday_volume_estimate(code, bundle, live, suspect),
         "volume_status": "盤中累計量（尚未收盤）" if live else ("量能資料可疑，不判讀" if suspect else "收盤成交量"),
-        "volume_unit_note": "成交量與均量單位為張；量比＝當日量 ÷ 均量；盤中改用時段分布估算全日量",
+        "volume_unit_note": ("成交量與均量單位為口（台指期近月，日K＝前一晚夜盤＋當天日盤）；量比＝當日量 ÷ 均量" if code in FUTURES_CODES
+                             else "成交量與均量單位為張；量比＝當日量 ÷ 均量；盤中改用時段分布估算全日量"),
     }
 
 
@@ -3209,7 +3257,7 @@ def _recover_corporate_reference(code, actions):
 def _kline_patterns(df: pd.DataFrame, code: str = "", provisional_today: bool = False) -> Dict[str, Any]:
     try:
         import kline_patterns
-        events = get_corporate_actions(code) if code else None
+        events = get_corporate_actions(code) if code and code not in FUTURES_CODES else None   # 台指期沒有除權息
         result = kline_patterns.detect(df, events, provisional_today, state_key=f"tri_state_{code}" if code else "")   # 10-08：三入口共用跨日三角存檔（沒有存檔＝同一套冷重播）
         # 與管理員驗證圖同一個 detect 結果；舊通道/楔形/箱型不再替三角提供證據。
         clean_frame = df.dropna(subset=["Open", "High", "Low", "Close"]).sort_index()
@@ -6199,7 +6247,7 @@ def chart_marks_for_stock(stock_code: str, dates: List[str], branch_name: str = 
     否則只標「勝率統計總勝率 ≥ 高勝率門檻」的追蹤分點與精選五分點（本週精選也一樣）。
     買進＝A～E 事件日；出清／減碼＝該事件的 FIFO 出清日、減碼日（落在圖表區間內才標）。
     """
-    if str(stock_code or "").strip().upper() in INDEX_CODES:
+    if str(stock_code or "").strip().upper() in INDEX_CODES or str(stock_code or "").strip().upper() in FUTURES_CODES:
         return {"mode": "flow", "source": "index", "events": []}
     kf = core()
     if not dates:
@@ -6757,7 +6805,8 @@ def get_cost_position_context(stock_code: str, cost_price: float) -> Dict[str, A
 def get_chart_panel(stock_code: str, branch_name: str = "", with_marks: bool = True, mark_mode: str = "event", flow_source: str = "sheet", allow_moneydj_fallback: bool = False, lookback: int = 0) -> Dict[str, Any]:
     """Only Python OHLC data enters the chart; never parse prices from AI text."""
     kf = core()
-    code = kf._normalize_stock_name_code_key(stock_code)
+    futures = str(stock_code or "").strip().upper() in FUTURES_CODES
+    code = str(stock_code).strip().upper() if futures else kf._normalize_stock_name_code_key(stock_code)
     bundle = _load_price_bundle(code)
     df = bundle["df"].copy().sort_index()
     df = df[~df.index.duplicated(keep="last")]
@@ -6783,7 +6832,7 @@ def get_chart_panel(stock_code: str, branch_name: str = "", with_marks: bool = T
             key: _num(row.get(key), 6) for key in chart_columns
         }})
     try:
-        name = resolve_stock_name(code)
+        name = FUTURES_CODES[code] if futures else resolve_stock_name(code)
     except Exception:
         name = ""
     previous = df["Close"].iloc[-2] if len(df) > 1 else None
@@ -6813,7 +6862,8 @@ def get_chart_panel(stock_code: str, branch_name: str = "", with_marks: bool = T
             "volume_profile": profile, "marks": marks, "intraday": bundle.get("intraday") or {},
             "price_basis_note": price_source_note(bundle),
             "bollinger": analyze_bollinger(closed_frame(bundle)),
-            "change_pct": float((df["Close"].iloc[-1] / previous - 1) * 100) if previous else None}
+            "change_pct": float((df["Close"].iloc[-1] / previous - 1) * 100) if previous else None,
+            **({"volume_unit": "口"} if futures else {})}
 
 
 
@@ -7289,6 +7339,126 @@ def _market_inst_summary(daily: Dict[str, Dict[str, float]], days: int, scope: s
     }
 
 
+# 11-04 使用者：大盤／櫃買融資（只抓市場合計，不抓個股；個股融資券仍只給管理員）。
+# 上市：FinMind 整體市場融資融券（免費，數字和證交所「信用交易統計」相同）；
+# 上櫃：櫃買中心每日融資融券餘額表的合計列（一次一天，存本地 kv「tpex_margin:日期」）。兩邊都是收盤後晚上才公布，盤中沒有今天的。
+TPEX_MARGIN_URL = "https://www.tpex.org.tw/www/zh-tw/margin/balance?date={date}&response=json"
+MARGIN_DAYS = 6                    # 最新一天＋近 5 個交易日的變化
+TPEX_MARGIN_QUERY_FETCH = 8        # 查詢時最多補幾天（含休市日）
+MARGIN_PUBLISH_HOUR = 21           # 晚上才公布：這之前不抓今天
+
+
+def _margin_num(value: Any) -> float:
+    try:
+        return float(str(value).replace(",", "").strip() or 0)
+    except ValueError:
+        return 0.0
+
+
+def _tpex_margin_fetch(day: datetime) -> Optional[Dict[str, float]]:
+    """抓上櫃一天的融資融券合計（融資金額億元、融資／融券張數，含前一日）；休市存 {}；還沒公布回 None。"""
+    kf = core()
+    url = TPEX_MARGIN_URL.format(date=day.strftime("%Y/%m/%d"))
+    session = kf.get_thread_session()
+    getter = getattr(kf, "_requests_get_with_aia_fallback", None)   # 海外連 TPEx 走 Cloudflare 缺中繼憑證：主程式依 AIA 補
+    started = time.perf_counter()
+    try:
+        kwargs = {"headers": {"User-Agent": "Mozilla/5.0 AceAI/1.0"}, "timeout": (4, 15)}
+        response = getter(session, url, **kwargs) if getter else session.get(url, **kwargs)
+        response.raise_for_status()
+        payload = response.json()
+        record_api_event("TPEx", status=200, latency=time.perf_counter() - started)
+    except Exception:
+        record_api_event("TPEx", status=500, latency=time.perf_counter() - started)
+        raise
+    summary = ((payload.get("tables") or [{}])[0] or {}).get("summary") or []
+    lots = next((r for r in summary if len(r) > 14 and "合計" in str(r[1])), None)
+    money = next((r for r in summary if len(r) > 6 and "融資金" in str(r[1])), None)
+    key = f"tpex_margin:{day.strftime('%Y-%m-%d')}"
+    if lots and money and _margin_num(money[6]) > 0:
+        out = {"margin_yi": round(_margin_num(money[6]) * 1000 / 1e8, 2), "margin_prev_yi": round(_margin_num(money[2]) * 1000 / 1e8, 2),
+               "margin_lots": _margin_num(lots[6]), "margin_lots_prev": _margin_num(lots[2]),
+               "short_lots": _margin_num(lots[14]), "short_lots_prev": _margin_num(lots[10])}
+        local_market_cache.set_state(key, out)
+        return out
+    if day.date() < taipei_now().date():
+        local_market_cache.set_state(key, {})           # 過去的日子沒資料＝休市，記下來不再抓
+    return None
+
+
+def _tpex_margin_daily(days: int) -> Dict[str, Dict[str, float]]:
+    daily: Dict[str, Dict[str, float]] = {}
+    budget = TPEX_MARGIN_QUERY_FETCH
+    now = taipei_now()
+    for day in _tpex_candidate_days(days):
+        if day.date() == now.date() and now.hour < MARGIN_PUBLISH_HOUR:
+            continue
+        key = day.strftime("%Y-%m-%d")
+        value = local_market_cache.get_state(f"tpex_margin:{key}")
+        if value is None and budget > 0:
+            budget -= 1
+            try:
+                value = _tpex_margin_fetch(day)
+            except Exception:
+                budget = 0                                  # 來源失敗：不再逐天重試，用已有的資料
+        if value:
+            daily[key] = value
+        if len(daily) >= days:
+            break
+    return daily
+
+
+def _twse_margin_daily(days: int) -> Dict[str, Dict[str, float]]:
+    kf = core()
+    end = taipei_now()
+    started = time.perf_counter()
+    try:
+        raw = kf._finmind_get_data("TaiwanStockTotalMarginPurchaseShortSale",
+                                   start_date=(end - timedelta(days=days * 2 + 10)).strftime("%Y-%m-%d"),
+                                   end_date=end.strftime("%Y-%m-%d"), allow_empty=False)
+        record_api_event("FinMindData", status=200, latency=time.perf_counter() - started)
+    except Exception as exc:
+        record_api_event("FinMindData", status=500, latency=time.perf_counter() - started)
+        raise ToolDataError("大盤融資資料暫時無法取得") from exc
+    fields = {"MarginPurchaseMoney": ("margin_yi", "margin_prev_yi", 1e8), "MarginPurchase": ("margin_lots", "margin_lots_prev", 1.0),
+              "ShortSale": ("short_lots", "short_lots_prev", 1.0)}
+    daily: Dict[str, Dict[str, float]] = {}
+    for row in (raw.to_dict("records") if raw is not None else []):
+        spec = fields.get(str(row.get("name") or ""))
+        day = str(row.get("date") or "")[:10]
+        if not spec or not day:
+            continue
+        now_key, prev_key, unit = spec
+        item = daily.setdefault(day, {})
+        item[now_key] = round(_margin_num(row.get("TodayBalance")) / unit, 2)
+        item[prev_key] = round(_margin_num(row.get("YesBalance")) / unit, 2)
+    return {d: v for d, v in daily.items() if v.get("margin_yi")}
+
+
+def get_market_margin(market: str = "twse", days: int = MARGIN_DAYS) -> Dict[str, Any]:
+    """大盤（上市）或櫃買（上櫃）融資融券餘額：融資金額（億元）、融資／融券張數，較前一日與近 5 個交易日變化。"""
+    tpex = str(market).lower() == "tpex"
+    daily = _tpex_margin_daily(days) if tpex else _twse_margin_daily(days)
+    if not daily:
+        raise ToolDataError(f"{'櫃買' if tpex else '大盤'}融資資料暫時無法取得")
+    dates = sorted(daily)[-days:]
+    rows = [{"date": d.replace("-", "/"), **{k: daily[d].get(k) for k in ("margin_yi", "margin_lots", "short_lots")}} for d in dates]
+    last = daily[dates[-1]]
+    change = lambda now, prev: round(now - prev, 2) if now is not None and prev else None
+    five = round(rows[-1]["margin_yi"] - rows[0]["margin_yi"], 2) if len(rows) >= 6 else None
+    return {
+        "market": "tpex" if tpex else "twse", "scope": "上櫃" if tpex else "上市（集中市場）", "index_name": "櫃買指數" if tpex else "加權指數",
+        "unit": "億元", "data_date": rows[-1]["date"],
+        "margin_balance_yi": last.get("margin_yi"), "margin_change_yi": change(last.get("margin_yi"), last.get("margin_prev_yi")),
+        "margin_change_5d_yi": five, "margin_lots": last.get("margin_lots"),
+        "margin_lots_change": change(last.get("margin_lots"), last.get("margin_lots_prev")),
+        "short_lots": last.get("short_lots"), "short_lots_change": change(last.get("short_lots"), last.get("short_lots_prev")),
+        "rows": rows,
+        "definition_note": f"交易所公布的{'上櫃' if tpex else '上市'}融資融券餘額（市場合計），收盤後晚上才公布、盤中沒有今天的；"
+                           "融資增加代表用借錢買股的部位變多，不等於一定看多或會漲",
+    }
+
+
 TOOL_REGISTRY: Dict[str, Callable[..., Dict[str, Any]]] = {
     "get_chart_panel": get_chart_panel,
     "get_sheet_stock_chips": get_sheet_stock_chips,
@@ -7301,6 +7471,7 @@ TOOL_REGISTRY: Dict[str, Callable[..., Dict[str, Any]]] = {
     "get_futures_positions": get_futures_positions,
     "get_institutional_flow": get_institutional_flow,
     "get_market_institutional": get_market_institutional,
+    "get_market_margin": get_market_margin,
     "get_retail_futures": get_retail_futures,
     "get_market_breadth": get_market_breadth,
     "get_index_contribution": get_index_contribution,
@@ -7322,6 +7493,7 @@ TOOL_REGISTRY: Dict[str, Callable[..., Dict[str, Any]]] = {
 _CANCELLABLE_TOOLS = {"get_warrant_branch", "get_high_winrate_branches_buying"}
 
 TOOL_DESCRIPTIONS: Dict[str, str] = {
+    "get_market_margin": "大盤（上市）或櫃買（上櫃）融資融券餘額：融資金額億元、融資／融券張數、較前一日與近 5 日變化，收盤後晚上公布（參數 market=twse／tpex）",
     "get_top_warrant_buy_stocks": "權證共識淨買超排行：讀「快取_TOP15共識淨買超」最新統計日期的名次（參數 limit）",
     "get_cost_position_context": "持股成本相對現價、均線、大量區、布林的位置與上下關鍵價位（參數 stock_code, cost_price）",
     "get_sheet_stock_chips": "個股權證籌碼（Google Sheet 優先）：回測追蹤分點近期 A~E 事件、部位狀態、減碼出清、勝率（參數 stock_code, days）",

@@ -1701,14 +1701,15 @@ def draw_chart(draw, y: int, panel: dict) -> None:
     draw.text((left, label_y), '成交量', font=font(22), fill=MUTED, anchor='lm')
     lx = left + font(22).getlength('成交量') + 18
     today_volume = _finite(last.get('Volume'))
+    unit, scale = ('口', 1) if panel.get('volume_unit') == '口' else ('張', 1000)   # 11-04 移植：台指期成交量本來就是口
     if today_volume is not None:
-        text = f'今日 {today_volume / 1000:,.0f} 張'
+        text = f'今日 {today_volume / scale:,.0f} {unit}'
         draw.text((lx, label_y), text, font=font(22, True), fill=INK, anchor='lm')
         lx += font(22, True).getlength(text) + 24
     for key, mv_color in MV_COLORS.items():
         value = _finite(last.get(key))
         draw.line((lx, label_y, lx + 20, label_y), fill=mv_color, width=3)
-        text = f"{key} {value / 1000:,.0f} 張" if value is not None else f'{key} —'
+        text = f"{key} {value / scale:,.0f} {unit}" if value is not None else f'{key} —'
         draw.text((lx + 28, label_y), text, font=font(21), fill=INK, anchor='lm')
         lx += 28 + font(21).getlength(text) + 24
     vtop, vbottom = bottom + 84, bottom + CHART_VOLUME_BLOCK
