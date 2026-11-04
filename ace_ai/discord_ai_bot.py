@@ -4884,6 +4884,8 @@ def build_data_time_line(results: Sequence[tools.ToolResult]) -> str:
 # 這些回答都有圖卡：K 線（股價、均線、布林、量）、型態評分卡、分點標註表、法人卡、權證摘要卡
 CARD_ROUTES = frozenset(("rule_pattern", "rule_index_compare", "rule_top_warrant", "rule_stock", "rule_institutional", "rule_futures",
                          "rule_market_institutional", "rule_branch_position", "rule_branch_stock"))
+# 11-04：也有圖卡（貢獻榜、盤面結構、族群卡）的路由；AI 失敗時同樣只留一句說明，不貼系統整理的文字
+AI_FAIL_SHORT_ROUTES = frozenset(("rule_breadth", "rule_sector"))
 # 圖上已經畫出來的資料：AI 不在時不必再用文字重打一次
 DRAWN_TOOLS = frozenset(("get_retail_futures", "get_stock_overview", "get_technical_analysis", "get_volume_profile", "get_pattern_scorecard",
                          "get_cost_position_context", "get_institutional_flow", "get_market_institutional",
@@ -9485,7 +9487,12 @@ class AceQueryEngine:
             elif result.rate_limited:
                 prefix = RATE_LIMIT_MESSAGE
             else:
-                prefix = "AI 解讀暫時無法使用" + ("；上方圖表與價位資料照常可參考。" if brief else "，以下先提供系統整理的資料。")
+                prefix = "AI 解讀暫時無法使用" + ("；上方圖表資料照常可參考。" if brief or plan.route in AI_FAIL_SHORT_ROUTES
+                                                   else "，以下先提供系統整理的資料。")
+            if brief or plan.route in AI_FAIL_SHORT_ROUTES:
+                # 11-04 使用者（「AI 無法解讀就直接說明，不要塞一堆無用的資訊在下面」）：有圖卡的題目只留一句說明，
+                # 不再把系統整理的文字（圖上已有的數字、榜單）貼在圖下面
+                return prefix, False
             return f"{prefix}\n\n{rule_answer}", False
         return AceQueryEngine._finish_compose(self, question, plan, results, payload, result, rule_answer)
 
