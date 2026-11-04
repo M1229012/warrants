@@ -188,6 +188,28 @@ def ai_reference(code: str) -> dict[str, Any]:
 
 
 PAGE_LIMIT = 2      # 費波型態頁和型態頁一樣，一次最多 2 檔（兩檔＝比較圖）
+_DIRECTION_SCHEMA = {"type": "object", "properties": {"direction": {"type": "string", "enum": ["up", "down", "both"]}},
+                     "required": ["direction"]}
+_PLAIN = re.compile(r"[\s\d,.，。、？?！!~～:：()（）]")
+FOCUS_TEXT = {"up": "往上（目標價、壓力、能漲到哪）", "down": "往下（支撐、可能止跌的位置、會跌到哪）"}
+
+
+def fib_direction(question: str, ask_ai=None) -> str:
+    """11-04 使用者：費波可以往上看（目標價、能漲到哪）也可以往下看（跌到哪、哪裡止跌），任何白話都要懂 →
+    讓 AI 讀整句判斷 up／down／both，不補關鍵字。只有代號＋費波、沒有別的字就不問 AI；讀題失敗回 both（上下都標，和以前一樣）。"""
+    q = str(question or "")
+    if ask_ai is None or not _PLAIN.sub("", _CODE_RE.sub("", _FIB_WORD.sub("", q))):
+        return "both"
+    prompt = ("你是台股問句解析器，只輸出 JSON，不要回答問題。使用者想看費波南西（費波）價位，讀完整句判斷他想看哪個方向：\n"
+              "up＝想看往上：目標價、能漲到哪、滿足點、上面壓力、反彈到哪、突破後看哪、解套價；\n"
+              "down＝想看往下：會跌到哪、哪裡止跌、底部在哪、下面支撐、回檔到哪、守不守得住；\n"
+              "both＝沒特別說方向，或上下都想看（只問標的、問費波在哪、問怎麼看）。\n問題：" + q)
+    try:
+        out = ask_ai(prompt, _DIRECTION_SCHEMA) or {}
+    except Exception:
+        return "both"
+    direction = str(out.get("direction") or "")
+    return direction if direction in FOCUS_TEXT else "both"
 
 
 def page_codes(question: str, ask_ai=None) -> list[str]:
@@ -214,35 +236,61 @@ def _page_name(lv: dict) -> str:
 
 
 def _chart_name(lv: dict) -> str:
-    """11-03 使用者：K 線下方價位條直接寫費波比例（「0.382」接價格）。主波段回撤／反彈、延伸、大波段回撤寫比例；
+    """11-03 使用者：K 線下方價位條直接寫費波比例（「0.382」接價格）。主波段回撤／反彈、延伸寫比例（大波段回撤寫「大段0.786」）；
     前波高點、前低、整理區、等幅這類不是比例的照名稱。B 之後 C→B 的反彈（沒有 tag）和主波段比例會同名，保留「反彈」字樣。"""
     tag = str(lv.get("tag") or "")
-    if lv.get("kind") == "extend" or (lv.get("kind") == "retrace" and tag) or tag.startswith("大段"):
+    if tag.startswith("大段"):
+        # 11-04 使用者（「0.786 怎麼在前低」）：大波段回撤是另一段波段的比例，只寫「0.786」會被看成這一段的 0.786
+        return tag
+    if lv.get("kind") == "extend" or (lv.get("kind") == "retrace" and tag):
         return f"{lv['ratio']:g}"
     return _page_name(lv)
 
 
-def page_levels(code: str, close: float) -> tuple[dict, dict]:
+def _page_rank(lv: dict) -> int:
+    """11-04：相距 0.15 ATR 內只標一個時誰優先：這一段的比例 > 前低、前波高點、整理區 > 大波段回撤、等幅。"""
+    tag, label = str(lv.get("tag") or ""), str(lv.get("label") or "")
+    if lv.get("kind") in ("retrace", "extend") and not tag.startswith("大段"):
+        return 0
+    if tag.startswith(("前低", "整理區")) or "前波高點" in label or "前波低點" in label:
+        return 1
+    return 2
+
+
+def page_levels(code: str, close: float, focus: str = "both") -> tuple[dict, dict]:
     """11-03 使用者：費波型態頁——型態頁的價格框與價位條改標費波價位。和費波驗證圖同一份計算（load_panel：
     正式收盤 K＋一年日K；台指期近月連續），close＝型態頁最後一根（盤中是即時價），只用來分上下方、算距離，不加入費波計算。
-    回傳（key_levels 卡, 交給 AI 的費波資料）。相距 0.15 ATR 內的價位只留一個，價格框不重疊。"""
+    回傳（key_levels 卡, 交給 AI 的費波資料）。相距 0.15 ATR 內的價位只留一個，價格框不重疊。
+    11-04：focus＝使用者想看的方向（fib_direction）：up 只留最近一個支撐、down 只留最近一個壓力（圖、觀察重點跟著變），
+    給 AI 的費波價位仍是完整清單。"""
     data = load_panel(code)["fib_debug"]
     if not data.get("selected"):
         return ({"levels_only": True, "hide_score": True, "show_tracked_branches": False, "close": close, "stock_code": code,
                  "resistances_above_close": [], "supports_below_close": []},
                 {"stock_code": code, "狀態": "沒有可用的費波波段，價位照一般型態頁"})
     gap = 0.15 * float(data["atr"] or 0)
-    picked = []
+    groups = []
     for lv in sorted(data["levels"], key=lambda x: (x["price"], not x["ai"])):
-        if picked and abs(lv["price"] - picked[-1]["price"]) <= gap:
-            continue
-        picked.append(lv)
+        if groups and abs(lv["price"] - groups[-1][0]["price"]) <= gap:
+            groups[-1].append(lv)
+        else:
+            groups.append([lv])
+    # 11-04：同一區只標一個，照 _page_rank 選（例：前低 322.74 和大段0.786 322.50 → 標前低）；同區其他的名稱交給 AI
+    picked, same = [], {}
+    for group in groups:
+        best = min(group, key=lambda x: (_page_rank(x), group.index(x)))
+        picked.append(best)
+        same[id(best)] = [_page_name(x) for x in group if x is not best]
     rows = [{"label": _chart_name(lv), "price": round(lv["price"], 2), "source": "fib",
              "distance_from_close_pct": (lv["price"] / close - 1) * 100 if close else None} for lv in picked]
     card = {"levels_only": True, "hide_score": True, "show_tracked_branches": False, "close": close, "stock_code": code,
             "fib_page": True,
             "resistances_above_close": sorted([r for r in rows if r["price"] > close], key=lambda r: r["price"]),
             "supports_below_close": sorted([r for r in rows if r["price"] <= close], key=lambda r: -r["price"])}
+    if focus in FOCUS_TEXT:
+        card["fib_focus"] = focus
+        other = "supports_below_close" if focus == "up" else "resistances_above_close"
+        card[other] = card[other][:1]          # 反方向只留最近一個，當風險／第一關
     ai = {"stock_code": code, "stock_name": data.get("stock_name", ""),
           "說明": (data.get("summary") or [""])[0].split("｜", 1)[-1],
           "計算基準": f"{data['bars'][data['last']]['date']} 正式收盤（盤中價不加入費波計算）",
@@ -250,10 +298,13 @@ def page_levels(code: str, close: float) -> tuple[dict, dict]:
                             "位置": "現價之上" if lv["price"] > close else "現價之下"},
                            **({"條件": "突破前波高點後才成立"} if lv.get("conditional") else {}),
                            **({"註記": "依目前高低點試算，確認前可能調整"} if lv.get("tentative") else {}),
-                           **({"次要": "已跌到 0.618 附近或之下才標，0.618 守不住時的下一個參考"} if lv.get("secondary") else {}))
+                           **({"次要": "已跌到 0.618 附近或之下才標，0.618 守不住時的下一個參考"} if lv.get("secondary") else {}),
+                           **({"同區還有": "、".join(same[id(lv)])} if same.get(id(lv)) else {}))
                       for lv in sorted(picked, key=lambda x: -x["price"])]}
     if data["selected"].get("fallback"):
         ai["可信度"] = "沒有合格費波主段，以下僅為區間量測"
+    if focus in FOCUS_TEXT:
+        ai["使用者想看"] = FOCUS_TEXT[focus]
     return card, ai
 
 
