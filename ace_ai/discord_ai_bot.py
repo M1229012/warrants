@@ -2543,6 +2543,7 @@ FINAL_BASE_PROMPT = """你是「艾斯助手｜喬巴」。你的回答要像熟
 FINAL_TECH_RULES = """技術面規則：
 - 訊號狀態分三種，不可混用：「收盤確認」＝signal_status、型態評分、布林與均線訊號（都用最後一根已收盤 K 棒）；「盤中暫時」＝intraday_observation.changes，一定要寫「盤中暫時…，尚待收盤確認」，不可說成已突破、已站穩；「資料不足」＝欄位為 null 或寫資料不足，要說「目前無法確認」，不可當成沒有訊號。
 - 盤中量能看 intraday_volume_estimate：以 vs_mv20_pct（對 20 日均量）為主要判讀，再補 vs_mv5_pct 與 vs_prev_day_pct；昨日本身可能是異常量，不可只跟昨日比。一律講明是估算、收盤前會變動，並照 confidence（初步／估算／可靠）調整語氣：「初步」時不要給肯定結論。沒有這個欄位就不拿盤中累計量和日均量比較；volume_suspect=true 不解讀量能。
+- 盤中 volume_trend 是截至昨收的量能，不含今天；今天量能只能看 intraday_volume_estimate，沒有就不評論今天量能，不可拿盤中累計量說量縮。
 - 布林依 bollinger 的 position、signals、width_trend、squeeze、band_walk、breakout 欄位判讀。影線穿越不等於收盤突破，壓縮不預測方向，觸軌不代表反轉。均線扣抵推算是「收盤維持不變」的條件推算，不是預測。"""
 
 FINAL_NEWS_RULES = """新聞規則：只能用 get_recent_news 的 title、summary、content、summary_points（「公司名:本公司…」是公司重大訊息，屬事實）。
@@ -6604,16 +6605,17 @@ class AceQueryEngine:
 
     def answer(self, question: str, context_key: str = "", on_queue: Optional[Callable[[int], None]] = None,
                is_admin: bool = False, admin_mode: bool = False, access=None, image=None) -> AnswerResult:
-        # /ask always stays closed, including requests from administrators.
-        # 11-03：測試版移植的新功能（今日族群排行、新族群名單、新版貢獻榜、奇摩今天這一根…）先只給 /ace 管理員本人
+        # 11-03：測試版移植的新功能（今日族群排行、新族群名單、新版貢獻榜…）先只給 /ace 管理員本人
         # （preview）；「/ace 測試 general」是模擬會員，allowed 為 False，看到的和 /ask 一樣。
+        # 11-04 使用者（「ASK 的部分也幫我改成抓 YAHOO 股價，AI 解讀依即時股價分析」）：/ask 也開「今天這一根」
+        # （stock_live：奇摩 → 證交所 MIS → 最近收盤），富果等其他即時來源（admin_live）仍只給 /ace 管理員。
         allowed = bool(access.admin_mode) if access is not None else bool(is_admin and admin_mode)
         own_clock = getattr(_QUESTION_CLOCK, "state", None) is None
         if own_clock:       # 10-08：整題期限從收到問題就開始（排隊、解析、工具、AI、圖卡都在內）
             _QUESTION_CLOCK.state = __import__("request_runtime").state() or __import__("request_runtime").new_state(QUESTION_DEADLINE_SECONDS)
         try:
             with __import__("request_runtime").scope(_QUESTION_CLOCK.state), stock_banter.question_scope(question), \
-                    tools.quote_policy(admin_live=allowed, stock_live=allowed, preview=allowed):
+                    tools.quote_policy(admin_live=allowed, stock_live=True, preview=allowed):
                 return self._answer_with_quote_policy(question, context_key, on_queue,
                                                       is_admin, admin_mode, access, image)
         finally:
