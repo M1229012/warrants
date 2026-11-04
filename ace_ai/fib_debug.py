@@ -203,7 +203,8 @@ def fib_direction(question: str, ask_ai=None) -> str:
     prompt = ("你是台股問句解析器，只輸出 JSON，不要回答問題。使用者想看費波南西（費波）價位，讀完整句判斷他想看哪個方向：\n"
               "up＝想看往上：目標價、能漲到哪、滿足點、上面壓力、反彈到哪、突破後看哪、解套價；\n"
               "down＝想看往下：會跌到哪、哪裡止跌、底部在哪、下面支撐、回檔到哪、守不守得住；\n"
-              "both＝沒特別說方向，或上下都想看（只問標的、問費波在哪、問怎麼看）。\n問題：" + q)
+              "both＝沒特別說方向，或上下都想看（只問標的、問費波在哪、問怎麼看）。\n"
+              "「如果止跌反彈、回升的話會到哪」是假設止跌之後往上看＝up；「會不會止跌、在哪止跌」才是 down。\n問題：" + q)
     try:
         out = ask_ai(prompt, _DIRECTION_SCHEMA) or {}
     except Exception:
@@ -269,8 +270,22 @@ def page_levels(code: str, close: float, focus: str = "both") -> tuple[dict, dic
                  "resistances_above_close": [], "supports_below_close": []},
                 {"stock_code": code, "狀態": "沒有可用的費波波段，價位照一般型態頁"})
     gap = 0.15 * float(data["atr"] or 0)
+    levels, drop = list(data["levels"]), _rebound_leg(data)
+    if drop:
+        # 11-04 使用者（「看反彈跟看下跌的費波不是應該從不同地方畫嗎」）：還在下跌、低點沒確認時，
+        # 下方照舊（上漲段回撤、前低、等幅＝會在哪止跌）；上方改用這段下跌量反彈（高點→目前低點），不是上漲段的回撤
+        hi, lo = drop["a"]["price"], drop["b"]["price"]
+        low_text, live = f"{drop['b']['date'][5:]} 低點 {lo:.2f}", data.get("live_bar") or {}
+        note = "依目前低點試算，低點確認前可能調整"
+        if live.get("Low") is not None and float(live["Low"]) < lo:
+            # 11-04 使用者：盤中問就是想看盤中 → 今天盤中破了低點就用盤中低點量反彈，說明「盤中推算，以收盤價為主」
+            lo = float(live["Low"])
+            low_text, note = f"{_live_state(live)} 低點 {lo:.2f}", "盤中推算，以收盤價為主"
+        levels = [lv for lv in levels if lv["price"] <= close] + [
+            {"label": f"反彈 {r:g}", "kind": "retrace", "ratio": r, "price": lo + (hi - lo) * r, "ai": True, "tentative": True,
+             "note": note} for r in fib_levels.RETRACE] + [{"label": "前波高點 B", "kind": "prior", "ratio": 1.0, "price": hi, "ai": True}]
     groups = []
-    for lv in sorted(data["levels"], key=lambda x: (x["price"], not x["ai"])):
+    for lv in sorted(levels, key=lambda x: (x["price"], not x["ai"])):
         if groups and abs(lv["price"] - groups[-1][0]["price"]) <= gap:
             groups[-1].append(lv)
         else:
@@ -297,15 +312,24 @@ def page_levels(code: str, close: float, focus: str = "both") -> tuple[dict, dic
           "費波價位": [dict({"圖上標示": _chart_name(lv), "名稱": _page_name(lv), "價位": round(lv["price"], 2),
                             "位置": "現價之上" if lv["price"] > close else "現價之下"},
                            **({"條件": "突破前波高點後才成立"} if lv.get("conditional") else {}),
-                           **({"註記": "依目前高低點試算，確認前可能調整"} if lv.get("tentative") else {}),
+                           **({"註記": lv.get("note") or "依目前高低點試算，確認前可能調整"} if lv.get("tentative") else {}),
                            **({"次要": "已跌到 0.618 附近或之下才標，0.618 守不住時的下一個參考"} if lv.get("secondary") else {}),
                            **({"同區還有": "、".join(same[id(lv)])} if same.get(id(lv)) else {}))
                       for lv in sorted(picked, key=lambda x: -x["price"])]}
     if data["selected"].get("fallback"):
         ai["可信度"] = "沒有合格費波主段，以下僅為區間量測"
+    if drop:
+        ai["反彈量測"] = (f"{drop['a']['date'][5:]} 高點 {drop['a']['price']:.2f} → {low_text}"
+                      f"；上方的「反彈」價位用這段下跌量（{note}）；下方支撐仍是前一段上漲的回撤與前低")
     if focus in FOCUS_TEXT:
         ai["使用者想看"] = FOCUS_TEXT[focus]
     return card, ai
+
+
+def _rebound_leg(data: dict) -> dict | None:
+    """11-04：還在下跌（mode＝falling）時那段還沒確認低點的下跌（fib_levels.compute 的 falling_leg：高點 a → 目前低點 b）；
+    其他模式回 None。"""
+    return data.get("falling_leg") if data.get("mode") == "falling" else None
 
 
 def extend_history(code: str, closed: pd.DataFrame, events: dict | None) -> tuple[pd.DataFrame, str]:
