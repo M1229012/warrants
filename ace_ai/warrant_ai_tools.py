@@ -880,6 +880,7 @@ _TOOL_FAILURE_MESSAGES = {
     "get_futures_positions": "台指期未平倉資料取得失敗",
     "get_institutional_flow": "目前三大法人資料取得失敗",
     "get_market_institutional": "目前全市場三大法人資料取得失敗",
+    "get_market_margin": "目前大盤／櫃買融資資料取得失敗",
     "get_retail_futures": "目前散戶多空比資料取得失敗",
     "get_index_contribution": "指數貢獻點數：所有成分股依權重 × 漲跌排序的拉升榜與拖累榜（非漲幅排名）",
     "get_market_breadth": "盤面廣度資料取得失敗",
@@ -7306,6 +7307,126 @@ def _market_inst_summary(daily: Dict[str, Dict[str, float]], days: int, scope: s
     }
 
 
+# 11-04 使用者：大盤／櫃買融資（只抓市場合計，不抓個股；個股融資券仍只給管理員）。
+# 上市：FinMind 整體市場融資融券（免費，數字和證交所「信用交易統計」相同）；
+# 上櫃：櫃買中心每日融資融券餘額表的合計列（一次一天，存本地 kv「tpex_margin:日期」）。兩邊都是收盤後晚上才公布，盤中沒有今天的。
+TPEX_MARGIN_URL = "https://www.tpex.org.tw/www/zh-tw/margin/balance?date={date}&response=json"
+MARGIN_DAYS = 6                    # 最新一天＋近 5 個交易日的變化
+TPEX_MARGIN_QUERY_FETCH = 8        # 查詢時最多補幾天（含休市日）
+MARGIN_PUBLISH_HOUR = 21           # 晚上才公布：這之前不抓今天
+
+
+def _margin_num(value: Any) -> float:
+    try:
+        return float(str(value).replace(",", "").strip() or 0)
+    except ValueError:
+        return 0.0
+
+
+def _tpex_margin_fetch(day: datetime) -> Optional[Dict[str, float]]:
+    """抓上櫃一天的融資融券合計（融資金額億元、融資／融券張數，含前一日）；休市存 {}；還沒公布回 None。"""
+    kf = core()
+    url = TPEX_MARGIN_URL.format(date=day.strftime("%Y/%m/%d"))
+    session = kf.get_thread_session()
+    getter = getattr(kf, "_requests_get_with_aia_fallback", None)   # 海外連 TPEx 走 Cloudflare 缺中繼憑證：主程式依 AIA 補
+    started = time.perf_counter()
+    try:
+        kwargs = {"headers": {"User-Agent": "Mozilla/5.0 AceAI/1.0"}, "timeout": (4, 15)}
+        response = getter(session, url, **kwargs) if getter else session.get(url, **kwargs)
+        response.raise_for_status()
+        payload = response.json()
+        record_api_event("TPEx", status=200, latency=time.perf_counter() - started)
+    except Exception:
+        record_api_event("TPEx", status=500, latency=time.perf_counter() - started)
+        raise
+    summary = ((payload.get("tables") or [{}])[0] or {}).get("summary") or []
+    lots = next((r for r in summary if len(r) > 14 and "合計" in str(r[1])), None)
+    money = next((r for r in summary if len(r) > 6 and "融資金" in str(r[1])), None)
+    key = f"tpex_margin:{day.strftime('%Y-%m-%d')}"
+    if lots and money and _margin_num(money[6]) > 0:
+        out = {"margin_yi": round(_margin_num(money[6]) * 1000 / 1e8, 2), "margin_prev_yi": round(_margin_num(money[2]) * 1000 / 1e8, 2),
+               "margin_lots": _margin_num(lots[6]), "margin_lots_prev": _margin_num(lots[2]),
+               "short_lots": _margin_num(lots[14]), "short_lots_prev": _margin_num(lots[10])}
+        local_market_cache.set_state(key, out)
+        return out
+    if day.date() < taipei_now().date():
+        local_market_cache.set_state(key, {})           # 過去的日子沒資料＝休市，記下來不再抓
+    return None
+
+
+def _tpex_margin_daily(days: int) -> Dict[str, Dict[str, float]]:
+    daily: Dict[str, Dict[str, float]] = {}
+    budget = TPEX_MARGIN_QUERY_FETCH
+    now = taipei_now()
+    for day in _tpex_candidate_days(days):
+        if day.date() == now.date() and now.hour < MARGIN_PUBLISH_HOUR:
+            continue
+        key = day.strftime("%Y-%m-%d")
+        value = local_market_cache.get_state(f"tpex_margin:{key}")
+        if value is None and budget > 0:
+            budget -= 1
+            try:
+                value = _tpex_margin_fetch(day)
+            except Exception:
+                budget = 0                                  # 來源失敗：不再逐天重試，用已有的資料
+        if value:
+            daily[key] = value
+        if len(daily) >= days:
+            break
+    return daily
+
+
+def _twse_margin_daily(days: int) -> Dict[str, Dict[str, float]]:
+    kf = core()
+    end = taipei_now()
+    started = time.perf_counter()
+    try:
+        raw = kf._finmind_get_data("TaiwanStockTotalMarginPurchaseShortSale",
+                                   start_date=(end - timedelta(days=days * 2 + 10)).strftime("%Y-%m-%d"),
+                                   end_date=end.strftime("%Y-%m-%d"), allow_empty=False)
+        record_api_event("FinMindData", status=200, latency=time.perf_counter() - started)
+    except Exception as exc:
+        record_api_event("FinMindData", status=500, latency=time.perf_counter() - started)
+        raise ToolDataError("大盤融資資料暫時無法取得") from exc
+    fields = {"MarginPurchaseMoney": ("margin_yi", "margin_prev_yi", 1e8), "MarginPurchase": ("margin_lots", "margin_lots_prev", 1.0),
+              "ShortSale": ("short_lots", "short_lots_prev", 1.0)}
+    daily: Dict[str, Dict[str, float]] = {}
+    for row in (raw.to_dict("records") if raw is not None else []):
+        spec = fields.get(str(row.get("name") or ""))
+        day = str(row.get("date") or "")[:10]
+        if not spec or not day:
+            continue
+        now_key, prev_key, unit = spec
+        item = daily.setdefault(day, {})
+        item[now_key] = round(_margin_num(row.get("TodayBalance")) / unit, 2)
+        item[prev_key] = round(_margin_num(row.get("YesBalance")) / unit, 2)
+    return {d: v for d, v in daily.items() if v.get("margin_yi")}
+
+
+def get_market_margin(market: str = "twse", days: int = MARGIN_DAYS) -> Dict[str, Any]:
+    """大盤（上市）或櫃買（上櫃）融資融券餘額：融資金額（億元）、融資／融券張數，較前一日與近 5 個交易日變化。"""
+    tpex = str(market).lower() == "tpex"
+    daily = _tpex_margin_daily(days) if tpex else _twse_margin_daily(days)
+    if not daily:
+        raise ToolDataError(f"{'櫃買' if tpex else '大盤'}融資資料暫時無法取得")
+    dates = sorted(daily)[-days:]
+    rows = [{"date": d.replace("-", "/"), **{k: daily[d].get(k) for k in ("margin_yi", "margin_lots", "short_lots")}} for d in dates]
+    last = daily[dates[-1]]
+    change = lambda now, prev: round(now - prev, 2) if now is not None and prev else None
+    five = round(rows[-1]["margin_yi"] - rows[0]["margin_yi"], 2) if len(rows) >= 6 else None
+    return {
+        "market": "tpex" if tpex else "twse", "scope": "上櫃" if tpex else "上市（集中市場）", "index_name": "櫃買指數" if tpex else "加權指數",
+        "unit": "億元", "data_date": rows[-1]["date"],
+        "margin_balance_yi": last.get("margin_yi"), "margin_change_yi": change(last.get("margin_yi"), last.get("margin_prev_yi")),
+        "margin_change_5d_yi": five, "margin_lots": last.get("margin_lots"),
+        "margin_lots_change": change(last.get("margin_lots"), last.get("margin_lots_prev")),
+        "short_lots": last.get("short_lots"), "short_lots_change": change(last.get("short_lots"), last.get("short_lots_prev")),
+        "rows": rows,
+        "definition_note": f"交易所公布的{'上櫃' if tpex else '上市'}融資融券餘額（市場合計），收盤後晚上才公布、盤中沒有今天的；"
+                           "融資增加代表用借錢買股的部位變多，不等於一定看多或會漲",
+    }
+
+
 TOOL_REGISTRY: Dict[str, Callable[..., Dict[str, Any]]] = {
     "get_chart_panel": get_chart_panel,
     "get_sheet_stock_chips": get_sheet_stock_chips,
@@ -7318,6 +7439,7 @@ TOOL_REGISTRY: Dict[str, Callable[..., Dict[str, Any]]] = {
     "get_futures_positions": get_futures_positions,
     "get_institutional_flow": get_institutional_flow,
     "get_market_institutional": get_market_institutional,
+    "get_market_margin": get_market_margin,
     "get_retail_futures": get_retail_futures,
     "get_market_breadth": get_market_breadth,
     "get_index_contribution": get_index_contribution,
@@ -7339,6 +7461,7 @@ TOOL_REGISTRY: Dict[str, Callable[..., Dict[str, Any]]] = {
 _CANCELLABLE_TOOLS = {"get_warrant_branch", "get_high_winrate_branches_buying"}
 
 TOOL_DESCRIPTIONS: Dict[str, str] = {
+    "get_market_margin": "大盤（上市）或櫃買（上櫃）融資融券餘額：融資金額億元、融資／融券張數、較前一日與近 5 日變化，收盤後晚上公布（參數 market=twse／tpex）",
     "get_top_warrant_buy_stocks": "權證共識淨買超排行：讀「快取_TOP15共識淨買超」最新統計日期的名次（參數 limit）",
     "get_cost_position_context": "持股成本相對現價、均線、大量區、布林的位置與上下關鍵價位（參數 stock_code, cost_price）",
     "get_sheet_stock_chips": "個股權證籌碼（Google Sheet 優先）：回測追蹤分點近期 A~E 事件、部位狀態、減碼出清、勝率（參數 stock_code, days）",

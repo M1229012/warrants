@@ -739,6 +739,7 @@ HELP_GROUPS = (
     ("族群大盤", ("AI伺服器族群誰型態最好", "哪些族群正在轉強", "大盤今天量縮嗎")),
     ("新聞", ("2330最近有什麼新聞",)),
     ("費波／台指期（測試版）", ("2330 費波", "台指期費波在哪", "台指期現在如何", "夜盤怎麼看")),
+    ("融資", ("大盤融資餘額", "櫃買融資")),        # 11-04：大盤／櫃買融資（正式版同批）
     ("額度", ("我的額度",)),
 )
 ADMIN_HELP_GROUPS = (
@@ -3113,24 +3114,24 @@ FINAL_FIB_RULES = ("【費波參考目標（測試版；優先於規則 3「不�
     "- 使用者問目標價、滿足點時，就用這一句回答，不要說不提供目標價。沒有 fib_reference 的股票完全不提費波。\n"
     f"- 「{FIB_OTHER}」（11-04）：讀使用者整句，意思是想看另一個方向才用這組（例：還在下跌卻問目標價、能漲到哪、反彈到哪；"
     "上漲中卻問會跌到哪、哪裡止跌、回檔到哪），這時費波句改寫那個方向（上方寫「費波參考目標約 X」、下方寫「若回檔，費波下方參考約 Z」）；"
-    "上下都問就各寫一句。沒問到就完全不用這組。")
+    "這時只寫那個方向，預設方向那組不寫。費波句永遠只寫一邊（11-04 使用者：上下都寫太亂），上下都問就照預設方向。沒問到就完全不用這組。")
 
 FINAL_FIB_PAGE_RULES = ("【費波型態頁（測試版；優先於規則 3「不給目標價」）】使用者問的是費波南西。圖上右側價格框與價位條是費波價位，"
     "watch_plan 的支撐、壓力也已經是同一份費波價位；完整清單在 get_fib_levels（說明＝這段波段是上漲後拉回、創高延伸還是下跌後反彈）：\n"
-    "- answer 一句直接回答：目前價格落在哪兩個費波價位之間、最關鍵的一個費波價位（守住或站上代表什麼）。\n"
-    "- why 依 get_fib_levels.說明 講這段波段的狀態，再講下方最近的費波支撐與上方最近的費波壓力。圖上價位條是比例在前、價格在後"
-    "（get_fib_levels 的「圖上標示」，watch_plan 的名稱也是它），文字照這個寫法：比例接價位，第一次提到時補一個字說明性質"
+    "- 這頁只看一邊（11-04 使用者：上下都講太亂），方向看 get_fib_levels.看的方向，圖上也只有這一邊：往下＝只講下方的費波支撐"
+    "（前一段上漲的回撤、前低、等幅），往上＝只講上方的費波壓力或目標（下跌段的反彈、前波高點、延伸）。"
+    "不可提另一邊的費波價位，也不要寫「介於 X 和 Y 之間」。\n"
+    "- answer 一句直接回答：往下＝依序可能在哪裡止跌（由近到遠最多 3 個）、最關鍵的是哪一個；往上＝依序看哪幾個壓力或目標"
+    "（由近到遠最多 3 個），有「條件」的寫成站上哪裡之後才看。\n"
+    "- why 依 get_fib_levels.說明 講目前趨勢，再講每一關的意義（往下：守住或跌破代表什麼、要看到什麼才算止穩；往上：站上或遇壓代表什麼）。"
+    "圖上價位條是比例在前、價格在後（get_fib_levels 的「圖上標示」，watch_plan 的名稱也是它），文字照這個寫法：比例接價位，第一次提到時補一個字說明性質"
     "（例「0.618 回撤 2,333」「1.618 延伸 2,847」，性質看「名稱」）；前波高點、前低、整理區照名稱寫。「大段0.786」是更早一段大波段的回撤，不是這一段的 0.786，要寫「大波段 0.786」。"
-    "有「同區還有」的價位最多補半句（例「前低 322.74，也接近大波段 0.786」），不另外當成一個價位。價位照 watch_plan 規則寫。有「條件」的價位一定寫成條件（例「若站上前波高點，延伸目標約 X」）；有「次要」的 0.786 要說是 0.618 守不住時的下一個參考；"
+    "有「同區還有」的價位最多補半句（例「前低 322.74，也接近大波段 0.786」），不另外當成一個價位。價位照 watch_plan 規則寫。有「次要」的 0.786 要說是 0.618 守不住時的下一個參考；"
     "有「註記」要說依目前高低點試算、之後可能調整；有「可信度」要說只是區間量測。\n"
+    "- scenarios 也只寫這一邊（往下例：守住 X／跌破 X 往下看 Y；往上例：站上 X 往上看 Y／遇壓拉回）。\n"
     "- 均線、量能最多一句帶過；不寫比例計算過程、錨點日期或 A、B、C 代號；用「參考」「可能」，不說一定會到，不給買賣指令。\n"
     "- get_fib_levels 有「狀態」（沒有可用的費波波段）時，直接說目前沒有明確的費波波段、圖上是一般關鍵價位，再照 watch_plan 回答。\n"
-    "- get_fib_levels 有「使用者想看」時（11-04）：往上＝answer 直接回答往上依序看哪幾個費波價位（由近到遠最多 3 個，"
-    "有「條件」的寫成站上哪裡之後才看），why 講每一關的意義，下方只用一句提最近的支撐當風險；"
-    "往下＝answer 直接回答往下依序可能在哪裡止跌（由近到遠最多 3 個），why 講每一關守住或跌破代表什麼、要看到什麼才算止穩，"
-    "上方只用一句提最近的壓力。scenarios 也照這個方向寫。沒有「使用者想看」就照上面上下都講。\n"
-    "- get_fib_levels 有「反彈量測」時（還在下跌）：上方的「反彈0.382／0.5／0.618」是用這段下跌（高點→目前低點）量的反彈價位，"
-    "下方支撐是前一段上漲的回撤與前低，兩者量的是不同波段；第一次提到反彈價位時說一次是從哪個高點量到目前低點，"
+    "- get_fib_levels 有「反彈量測」時：「反彈0.382／0.5／0.618」是用這段下跌（高點→目前低點）量的反彈價位；第一次提到時說一次是從哪個高點量到目前低點，"
     "再照「註記」補一句短說明就好（盤中用盤中低點量的寫「盤中推算，以收盤價為主」），不要多解釋。"
     "反彈量測裡的低點是這段下跌目前的最低點，寫「目前低點」，不可寫成「前低」（前低是費波價位裡名稱為「前低」的那個價位）。")
 
@@ -3394,6 +3395,8 @@ def build_final_prompt(payload: Dict[str, Any]) -> str:
         sections.append(FINAL_FIB_PAGE_RULES)
     if any(str(k).endswith(":TXF") for k in (payload.get("tool_results") or {})):
         sections.append(FINAL_TXF_RULES)
+    if "get_market_margin" in names:
+        sections.append(FINAL_MARGIN_RULES)
     if "get_recent_news" in names:
         sections.append(FINAL_NEWS_RULES)
     if "get_sheet_stock_chips" in names:
@@ -4822,6 +4825,7 @@ def format_market_institutional(data: Dict[str, Any]) -> str:
 
 
 FORMATTERS.update({
+    "get_market_margin": lambda data: format_market_margin(data),
     "get_market_institutional": format_market_institutional,
     "get_institutional_flow": format_institutional,
     "get_branch_event_window": format_branch_event_window,
@@ -4884,7 +4888,7 @@ def build_data_time_line(results: Sequence[tools.ToolResult]) -> str:
 
 # 這些回答都有圖卡：K 線（股價、均線、布林、量）、型態評分卡、分點標註表、法人卡、權證摘要卡
 CARD_ROUTES = frozenset(("rule_pattern", "rule_index_compare", "rule_top_warrant", "rule_stock", "rule_institutional", "rule_futures",
-                         "rule_market_institutional", "rule_branch_position", "rule_branch_stock"))
+                         "rule_market_institutional", "rule_branch_position", "rule_branch_stock", "rule_market_margin"))
 # 11-04：也有圖卡（貢獻榜、盤面結構、族群卡）的路由；AI 失敗時同樣只留一句說明，不貼系統整理的文字
 AI_FAIL_SHORT_ROUTES = frozenset(("rule_breadth", "rule_sector"))
 # 圖上已經畫出來的資料：AI 不在時不必再用文字重打一次
@@ -5210,6 +5214,8 @@ def required_tools(route: str, intents: Set[str], planned: Set[str]) -> Set[str]
         need = {"get_institutional_flow"}
     elif route == "rule_market_institutional":
         need = {"get_market_institutional"}
+    elif route == "rule_market_margin":
+        need = {"get_market_margin"}
     elif route == "rule_futures":
         need = {"get_futures_positions"}
     elif route.startswith("rule_branch") or route == "rule_winrate_rank":
@@ -5256,6 +5262,46 @@ def pattern_asked(parsed: "ParsedQuestion") -> bool:
 
 # 全市場三大法人：沒有指定個股（或只講大盤／台股）又問外資、投信、自營商
 _MARKET_INST_RE = re.compile(r"外資|投信|自營商|三大法人|法人")
+
+
+_MARGIN_RE = re.compile(r"融資|融券|券資比")
+_MARGIN_SCHEMA = {"type": "object", "properties": {"kind": {"type": "string", "enum": [
+    "market_twse", "market_tpex", "market_both", "stock", "other"]}}, "required": ["kind"]}
+_MARGIN_MARKET_FALLBACK_RE = re.compile(r"大盤|加權|櫃買|上市|上櫃|台股|整體|全市場|市場|OTC", re.I)
+FINAL_MARGIN_RULES = ("【大盤／櫃買融資（11-04）】get_market_margin 是交易所公布的市場融資融券合計（收盤後晚上才公布，盤中沒有今天的），"
+    "融資金額用億元、融資融券張數用張：講最新融資餘額、較前一日與近 5 個交易日增減（margin_change_5d_yi 是 null 就不提）。"
+    "融資增加＝用借錢買股的部位變多，常拿來看散戶追價或籌碼是否變亂；融資減少＝去槓桿或斷頭賣壓。不可說融資增加就會漲或會跌，也不給買賣建議。"
+    "data_date 不是今天時要說是哪一天的資料。使用者問的是融資時重點放在融資、指數走勢最多一句；問大盤型態時融資最多一句帶過。")
+
+
+def market_margin_card(items: Sequence[Dict[str, Any]], question: str = "") -> Dict[str, Any]:
+    """11-04 使用者：大盤／櫃買融資卡——每個市場一列：融資餘額（億元）、較前一日、近 5 日、融資張數、融券張數與變化。"""
+    sections: List[Dict[str, Any]] = [{"type": "badge", "text": f"資料日期 {items[0].get('data_date', '-')}｜融資金額單位億元（收盤後晚上公布）"}]
+    for data in items:
+        name = "櫃買（上櫃）" if data.get("market") == "tpex" else "大盤（上市）"
+        five = data.get("margin_change_5d_yi")
+        lots_chg, short_chg = data.get("margin_lots_change"), data.get("short_lots_change")
+        sections += [{"type": "heading", "text": f"{name}融資融券"},
+                     {"type": "stats", "items": [
+                         {"label": "融資餘額（億元）", "value": f"{float(data.get('margin_balance_yi') or 0):,.2f}"},
+                         {"label": "較前一日（億元）", "value": _signed_yi(data.get("margin_change_yi")), "tone": "signed"},
+                         {"label": "近 5 個交易日（億元）", "value": _signed_yi(five) if five is not None else "-", "tone": "signed"},
+                         {"label": "融資張數", "value": f"{float(data.get('margin_lots') or 0):,.0f} 張"
+                          + (f"（{lots_chg:+,.0f}）" if lots_chg is not None else "")},
+                         {"label": "融券張數", "value": f"{float(data.get('short_lots') or 0):,.0f} 張"},
+                         {"label": "融券較前一日", "value": f"{short_chg:+,.0f} 張" if short_chg is not None else "-", "tone": "signed"}]}]
+    sections.append({"type": "note", "text": "※ 融資增減只代表用借錢買股的部位變化，不等於一定看多或會漲；交易所收盤後晚上才公布，盤中沒有今天的。"})
+    title = "融資融券（上市＋上櫃）" if len(items) > 1 else ("櫃買融資融券" if items[0].get("market") == "tpex" else "大盤融資融券")
+    return {"branch": title, "tags": [], "label": "信用交易", "sections": sections}
+
+
+def format_market_margin(data: Dict[str, Any]) -> str:
+    """大盤／櫃買融資融券（AI 失敗或純文字時用）。"""
+    five = data.get("margin_change_5d_yi")
+    return (f"【{'櫃買（上櫃）' if data.get('market') == 'tpex' else '大盤（上市）'}融資融券】資料日期 {data.get('data_date', '-')}\n"
+            f"・融資餘額 {float(data.get('margin_balance_yi') or 0):,.2f} 億元｜較前一日 {_signed_yi(data.get('margin_change_yi'))} 億"
+            + (f"｜近 5 日 {_signed_yi(five)} 億" if five is not None else "")
+            + f"\n・融資 {float(data.get('margin_lots') or 0):,.0f} 張｜融券 {float(data.get('short_lots') or 0):,.0f} 張")
 
 
 def market_of(parsed: "ParsedQuestion") -> str:
@@ -5794,7 +5840,7 @@ REQUIRED_MODULE_API = {
     "price_adjustment": ("adjust_shares", "event_from_row"),
     "corporate_action_sources": ("twse_events",),
     "discord_access": ("_CHIP_WORD_RE", "require_sector"),
-    "warrant_ai_tools": ("get_market_institutional", "prefetch_sheet_tables", "_reserve_fugle_slot", "check_sheet_version", "err_text",
+    "warrant_ai_tools": ("get_market_institutional", "get_market_margin", "prefetch_sheet_tables", "_reserve_fugle_slot", "check_sheet_version", "err_text",
                          "chart_marks_for_stock"),
     "answer_image": ("wrap_cell", "observed_mark_layout", "CHIP_LAYOUT_VERSION", "public_ma_condition"),
     "chip_event_backtest": ("event_marks", "branch_card", "VERSION"),
@@ -6207,7 +6253,9 @@ class AceQueryEngine:
             return self._answer_weekly_manual_draft(question, context_key, started)
         access = self._access()
         margin_allowed =bool(access and access.admin_mode and not access.simulation)
-        if re.search(r'融資|融券|券資比', question) and not margin_allowed:
+        # 11-04 使用者：大盤／櫃買融資（市場合計）開放給所有人；個股融資券仍只限管理員
+        if (re.search(r'融資|融券|券資比', question) and not margin_allowed
+                and self._market_margin_kind(question) not in ("twse", "tpex", "both")):
             return AnswerResult('融資券資料目前僅供管理員使用 /ace 查詢；/ask 可查技術分析與現股籌碼資料。',
                                 'admin_only', 0, time.perf_counter()-started, as_text=True, cacheable=False)
         import spot_fetch_admin
@@ -6388,6 +6436,9 @@ class AceQueryEngine:
             return AnswerResult(text=str(exc), route="clarify", gemini_calls=0, elapsed=time.perf_counter() - started, as_text=True)
         if page is not None:
             self._apply_target_page(parsed, *page)
+        margin_kind = self._market_margin_kind(question)
+        if margin_kind in ("twse", "tpex", "both") and getattr(parsed, "preset_plan", None) is None:
+            self._apply_margin_page(parsed, margin_kind)      # 11-04：大盤／櫃買融資頁（所有人）
         access_policy.require_question(access, question, tools.get_cached_known_branches(), parsed)
         for _code,_name in parsed.stocks:
             if _code not in tools.INDEX_CODES:
@@ -7289,6 +7340,52 @@ class AceQueryEngine:
         if taifex_futures.wants_trend(question, self._ask_json):
             return [taifex_futures.CODE], False
         return None
+
+    def _market_margin_kind(self, question: str) -> str:
+        """11-04 使用者：問大盤／櫃買融資 → 'twse'／'tpex'／'both'；問個股融資 → 'stock'；沒提融資 → ''。
+        白話問法讓 AI 讀整句判斷（有股票代號直接算個股）；讀題失敗才看有沒有「大盤／櫃買／市場」這類字。同一句只問一次。"""
+        q = str(question or "")
+        if not _MARGIN_RE.search(q):
+            return ""
+        cache = self.__dict__.setdefault("_margin_kind_cache", {})
+        if q in cache:
+            return cache[q]
+        if re.search(r"(?<![0-9A-Za-z])\d{4,6}[A-Za-z]?(?![0-9A-Za-z])", q):
+            kind = "stock"
+        else:
+            prompt = ("你是台股問句解析器，只輸出 JSON，不要回答問題。使用者的問題提到融資或融券，讀完整句判斷他要看哪一種：\n"
+                      "market_twse＝大盤、加權、上市、集中市場、台股整體的融資融券；market_tpex＝櫃買、上櫃的融資融券；"
+                      "market_both＝上市和上櫃都要，或只說市場整體、沒分上市上櫃；stock＝某一檔股票或某個族群的融資融券；other＝其他。\n問題：" + q)
+            try:
+                out = self._ask_json(prompt, _MARGIN_SCHEMA)
+            except Exception:
+                out = None
+            kinds = {"market_twse": "twse", "market_tpex": "tpex", "market_both": "both", "stock": "stock"}
+            if out is not None:
+                kind = kinds.get(str(out.get("kind") or ""), "")
+            elif _MARGIN_MARKET_FALLBACK_RE.search(q):
+                kind = "tpex" if re.search(r"櫃買|上櫃|OTC", q, re.I) and not re.search(r"大盤|加權|上市", q) else "twse"
+            else:
+                kind = "stock"
+        if len(cache) > 200:
+            cache.clear()
+        cache[q] = kind
+        return kind
+
+    def _apply_margin_page(self, parsed: ParsedQuestion, kind: str) -> None:
+        """11-04 使用者：大盤／櫃買融資頁——指數 K 線＋融資卡＋AI 解讀（/ask、/ace 都可以）；標的與工具固定，不拆題、不走需求表。"""
+        markets = ("twse", "tpex") if kind == "both" else (kind,)
+        index = "TPEX" if kind == "tpex" else "TAIEX"
+        plan = QueryPlan(route="rule_market_margin", need_final_llm=True)
+        plan.add("get_stock_overview", stock_code=index)
+        for market in markets:
+            plan.add("get_market_margin", market=market)
+        parsed.stocks, parsed.branches, parsed.stock_candidates, parsed.branch_candidates = [(index, tools.INDEX_CODES[index])], [], [], []
+        parsed.sector = parsed.sector_context = None
+        parsed.chip = ""
+        parsed.intents = {"price"}
+        parsed.preset_plan = plan
+        self.log(f"🧭 大盤／櫃買融資頁｜{'、'.join(markets)}")
 
     def _apply_target_page(self, parsed: ParsedQuestion, codes: List[str], fib: bool) -> None:
         """費波／台指期型態頁：標的與工具固定（台指期不在股票名冊，規則路由認不得），之後和型態頁同一條路
@@ -8595,6 +8692,10 @@ class AceQueryEngine:
             # 10-20：大盤／櫃買型態頁預設附全市場三大法人（K 線下方副圖＋解讀一句）
             plan.add("get_market_institutional", market="tpex" if codes[0] == "TPEX" else "twse")
             self.log(f"大盤型態頁附三大法人｜{codes[0]}")
+        if (plan.route == "rule_pattern" and not compare_page and len(codes) == 1 and codes[0] in ("TAIEX", "TPEX")
+                and not any(c.name == "get_market_margin" for c in plan.tool_calls)):
+            # 11-04 使用者：大盤／櫃買型態頁的 AI 也拿到同市場融資（不另放卡，AI 最多一句）
+            plan.add("get_market_margin", market="tpex" if codes[0] == "TPEX" else "twse")
         planned_calls = list(plan.tool_calls)
         run_results = self._run_tools(planned_calls + chart_calls)
         combined = pre_results + run_results
@@ -8631,6 +8732,9 @@ class AceQueryEngine:
             if plan.route == "rule_market_institutional" or not has_chart:
                 panels.append({"branch_card": market_institutional_card(market_flow, question, with_chart=has_chart),
                                "hide_text": plan.route == "rule_market_institutional"})
+        margins = [r.data for r in results if r.ok and r.name == "get_market_margin"]
+        if margins and plan.route == "rule_market_margin":     # 11-04：大盤／櫃買融資卡（型態頁只給 AI，不另放卡）
+            panels.append({"branch_card": market_margin_card(margins, question), "hide_text": True})
         futures_data = next((r.data for r in results if r.ok and r.name == "get_futures_positions"), None)
         retail_data = next((r.data for r in results if r.ok and r.name == "get_retail_futures"), None)
         if futures_data and plan.route == "rule_futures":
