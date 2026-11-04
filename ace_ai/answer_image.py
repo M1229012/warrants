@@ -1285,6 +1285,19 @@ LEVEL_TAG_H = 32
 LEVEL_TAG_FONT = 20
 _TAG_COLORS = (('三角上緣', '#C76C00'), ('三角下緣', '#1478B5'), ('量區', '#0B7F6B'), ('布林', '#667085'))
 _TAG_SPARE = '#7A5AF8'
+# 11-04 移植（只給 /ace 管理員）：費波型態頁。右側框上行寫比例（0.618）、下行寫價格，K 線上畫同色虛線；
+# 和費波驗證圖同一套顏色（回撤／反彈藍、前波高點橘、延伸紫、整理區綠、下跌支撐紅）。只在費波頁（lead）套用。
+FIB_TAG_MAX = 4
+FIB_TAG_H = 48
+_FIB_TAG_COLORS = (('回撤', '#1478B5'), ('反彈', '#1478B5'), ('前波高點', '#C76C00'), ('延伸', '#8044B8'),
+                   ('整理區', '#2F855A'), ('前低', '#B4232C'), ('大段', '#B4232C'), ('等幅', '#B4232C'))
+
+
+def _ratio_color(label: str) -> str | None:
+    """費波型態頁的比例標籤（0.382、1.618）：1 以下回撤藍、以上延伸紫（和費波驗證圖一致）。"""
+    if re.fullmatch(r'\d+(?:\.\d+)?', str(label)):
+        return '#8044B8' if float(label) > 1 else '#1478B5'
+    return None
 
 
 def _levels_on_chart(card: dict | None) -> bool:
@@ -1339,12 +1352,13 @@ def _chart_levels(panel: dict) -> tuple[list[dict], list[dict]]:
     rows = [r for r in _level_rows(card) if r[0] in ('壓力', '支撐') and _finite(r[2]) is not None]
     by_gap = lambda r: abs(_finite(r[3])) if _finite(r[3]) is not None else 1e9
     items = []
+    lead = bool(card.get('fib_page'))     # 11-04 移植：費波型態頁價位條先寫比例（0.382）再接價格
     for kind in ('壓力', '支撐'):
         side = [r for r in rows if r[0] == kind]
         picked = [r for r in side if not _is_ma_level(r[1])] or ([min(side, key=by_gap)] if side else [])
         for _, label, price, pct in picked:
             items.append({'label': label, 'name': _level_display_name(str(label), panel), 'price': float(price),
-                          'pct': _finite(pct), 'kind': kind})
+                          'pct': _finite(pct), 'kind': kind, 'lead': lead})
     low, high = _price_range(panel['bars'])
     inside = [x for x in items if low <= x['price'] <= high]
     near = sorted(inside, key=lambda x: abs(x['pct']) if x['pct'] is not None else 1e9)
@@ -1356,12 +1370,14 @@ def _chart_levels(panel: dict) -> tuple[list[dict], list[dict]]:
     # 10-21（使用者定案）：價格框由程式固定選——最近壓力 1＋最近支撐 1，第三個看下一個支撐或壓力誰離收盤近
     tagged = [next(x for x in near if x['kind'] == kind) for kind in ('壓力', '支撐') if any(x['kind'] == kind for x in near)]
     tagged += [x for x in near if x not in tagged]
-    tagged = tagged[:LEVEL_TAG_MAX]
+    tagged = tagged[:FIB_TAG_MAX if lead else LEVEL_TAG_MAX]
     used = []
     for item in tagged:
-        color = next((c for word, c in _TAG_COLORS if word in item['label']), None) \
+        color = next((c for word, c in _TAG_COLORS + (_FIB_TAG_COLORS if lead else ()) if word in item['label']), None) \
+            or (_ratio_color(item['label']) if lead else None) \
             or MA_COLORS.get('MA20' if item['label'] == '布林中軌' else item['label'], ACCENT)
-        item['color'] = _TAG_SPARE if color in used else color
+        # 費波頁框裡寫了比例，同色不會混淆：回撤一律藍、延伸一律紫，不換備用色
+        item['color'] = _TAG_SPARE if color in used and not lead else color
         used.append(item['color'])
     tagged.sort(key=lambda x: -x['price'])
     rest = [x for x in items if x not in tagged]
@@ -1384,6 +1400,9 @@ _LEGEND_KIND_TINT = {'壓力': '#FDF1F1', '支撐': '#EEF8F5'}
 
 
 def _legend_item_w(item: dict) -> float:
+    if item.get('lead'):      # 費波型態頁：比例（23 級）在前、價格在後
+        return ((22 if item['marked'] else 0) + font(23).getlength(item['name']) + 8
+                + font(26, True).getlength(price_text(item['price'])))
     return ((22 if item['marked'] else 0) + font(26, True).getlength(price_text(item['price'])) + 8
             + font(21).getlength(item['name']))
 
@@ -1457,19 +1476,29 @@ def draw_level_legend(draw, x: float, y: float, width: float, panel: dict) -> No
                 draw.ellipse((cx, mid - 7, cx + 14, mid + 7), fill=value['color'])
                 cx += 22
             price = price_text(value['price'])
+            if value.get('lead'):
+                draw.text((cx, mid), value['name'], font=font(23), fill=INK, anchor='lm')
+                cx += font(23).getlength(value['name']) + 8
+                draw.text((cx, mid), price, font=font(26, True), fill=INK, anchor='lm')
+                continue
             draw.text((cx, mid), price, font=font(26, True), fill=INK, anchor='lm')
             cx += font(26, True).getlength(price) + 8
             draw.text((cx, mid), value['name'], font=font(21), fill=INK, anchor='lm')
+
+
+def _tag_height(tagged: list[dict]) -> float:
+    return FIB_TAG_H if any(t.get('lead') for t in tagged) else LEVEL_TAG_H
 
 
 def _tag_positions(tagged: list[dict], py, price_top: float, price_bottom: float) -> list[float]:
     """價格框的中心 y（由上往下）：照真正價位放，太近就往下錯開，超出價格區再整組推回。"""
     if not tagged:
         return []
-    half = LEVEL_TAG_H / 2
+    tag_h = _tag_height(tagged)
+    half = tag_h / 2
     pos: list[float] = []
     for true_y in sorted(py(t['price']) for t in tagged):
-        pos.append(max(true_y, pos[-1] + LEVEL_TAG_H + 6) if pos else true_y)
+        pos.append(max(true_y, pos[-1] + tag_h + 6) if pos else true_y)
     shift = max(0.0, pos[-1] + half - price_bottom)
     pos = [p - shift for p in pos]
     shift = max(0.0, price_top - (pos[0] - half))
@@ -1481,13 +1510,23 @@ def draw_level_tags(draw, tagged: list[dict], py, right: float, price_top: float
     if not tagged:
         return
     items = sorted(((py(t['price']), t) for t in tagged), key=lambda x: x[0])
-    half = LEVEL_TAG_H / 2
+    half = _tag_height(tagged) / 2
     pos = _tag_positions(tagged, py, price_top, price_bottom)
     for (true_y, item), label_y in zip(items, pos):
         color = item['color']
         draw.line((right + 2, true_y, right + 9, true_y), fill=color, width=2)
         draw.line((right + 9, true_y, right + 14, label_y), fill=color, width=1)
         text = price_text(item['price'])
+        if item.get('lead'):
+            # 費波型態頁：上行比例／名稱（0.618、前波高點），下行價格；欄寬約 104px，名稱太長就縮字不截斷
+            name, name_size = fit(str(item['name']), 18, 90, True, 12)
+            price_font = font(LEVEL_TAG_FONT if len(text) <= 8 else LEVEL_TAG_FONT - 3, True)
+            w = max(font(name_size, True).getlength(name), price_font.getlength(text)) + 14
+            draw.rounded_rectangle((right + 14, label_y - half, right + 14 + w, label_y + half), radius=6,
+                                   fill='white', outline=color, width=1)
+            draw.text((right + 14 + w / 2, label_y - 11), name, font=font(name_size, True), fill=color, anchor='mm')
+            draw.text((right + 14 + w / 2, label_y + 11), text, font=price_font, fill=INK, anchor='mm')
+            continue
         # 欄寬 118px：指數（47,058.30）這種 9 碼以上的長數字用 17 級字，數字不截斷、框不超出卡片
         text_font = font(LEVEL_TAG_FONT if len(text) <= 8 else LEVEL_TAG_FONT - 3, True)
         w = text_font.getlength(text) + 12
@@ -1565,10 +1604,16 @@ def draw_chart(draw, y: int, panel: dict) -> None:
         gy = py(value)
         draw.line((left, gy, right, gy), fill=LINE, width=1)
         # 價格刻度在右側；和關鍵價位框太近的那格刻度數字不畫，避免文字重疊
-        if all(abs(gy - ty) > LEVEL_TAG_H for ty in tag_label_ys):
+        if all(abs(gy - ty) > _tag_height(tagged_levels) for ty in tag_label_ys):
             tick = price_text(value)
             tick_size = 23 if len(tick) <= 8 else 20       # 指數的長數字維持 20 級，不超出卡片
             text_at(draw, (right + 14, gy - tick_size // 2), tick, tick_size, MUTED)
+    for item in tagged_levels:
+        if item.get('lead'):
+            # 11-04 移植：費波型態頁右側框的費波價位在 K 線上畫同色細虛線（畫在 K 棒底下，不遮 K 棒；不另寫字）
+            ly = py(item['price'])
+            for sx in range(int(left), int(right), 14):
+                draw.line((sx, ly, min(sx + 7, right), ly), fill=item['color'], width=1)
     if not panel.get('compact'):
         draw_marks(draw, panel, px, py, step, price_top, price_bottom)
     for i, bar in enumerate(bars):
@@ -1761,7 +1806,9 @@ def _level_rows(card: dict) -> list[tuple[str, str, float, float | None]]:
 
     rows = []
     # 覆盤卡會帶 level_limits（多列幾道支撐），讓成本與各均線距現價多少都看得到
-    max_res, max_sup = (1, 1) if compact else (card.get('level_limits') or (LEVEL_MAX_RESISTANCES, LEVEL_MAX_SUPPORTS))
+    # 11-04 移植：費波型態頁的比例標籤短（0.382），上下各最多 3 個；排不下時價位條會從最遠的開始省略
+    max_res, max_sup = (1, 1) if compact else (card.get('level_limits') or ((3, 3) if card.get('fib_page')
+                                                                            else (LEVEL_MAX_RESISTANCES, LEVEL_MAX_SUPPORTS)))
     for lv in _pick(card.get('resistances_above_close') or [], max_res):
         rows.append(('壓力', lv.get('label', ''), lv.get('price'), lv.get('distance_from_close_pct')))
     for lv in _pick(card.get('supports_below_close') or [], max_sup):
@@ -4587,6 +4634,10 @@ def render_answer(question: str, answer: str, panels: list[dict] | None = None,
     if debug_panel is not None:
         from kline_debug import render
         return render(debug_panel)
+    fib_panel = next((p.get("fib_debug") for p in panels if p.get("fib_debug")), None)
+    if fib_panel is not None:   # 11-04 移植（只給 /ace 管理員）：費波驗證圖
+        from fib_debug import render as fib_render
+        return fib_render(fib_panel)
     # 族群排行／成分股：整張用卡片呈現，不再另外排文字區塊（文字版只留給 Log）。
     sector_panels = [p for p in panels if _is_sector_panel(p)]
     article_panels = [p for p in panels if _is_article_panel(p)]

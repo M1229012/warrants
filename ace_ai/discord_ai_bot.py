@@ -2714,6 +2714,7 @@ def _compact_tool_data(name: str, data: Dict[str, Any], has_scorecard: bool) -> 
             out["margin"] = {"events": data["margin"]["events"][-3:]}
         return out
     if name == "get_technical_analysis":
+        data.pop("fib_reference", None)   # 11-04 移植：費波另放 payload.fib_reference，只在 /ace 管理員問型態時送
         data["bollinger"] = {k: v for k, v in (data.get("bollinger") or {}).items() if k in _BOLLINGER_KEEP}
         import kline_patterns
         data_full_patterns = kline_patterns.ai_pattern_facts(
@@ -3020,6 +3021,118 @@ def question_focus(question: str) -> List[str]:
     return labels
 
 
+# ---------- 11-04 移植（測試版 10-29～11-04；先給 /ace 管理員）：費波參考目標、費波型態頁 ----------
+FIB_UP, FIB_LATER, FIB_DOWN = "上方參考目標", "突破後條件目標", "還在下跌｜下方參考"
+
+
+def _fib_prices(x: Dict[str, Any]) -> List[float]:
+    if "價位" in x:
+        return [float(x["價位"])]
+    return [float(v) for v in str(x.get("價位區") or "").split("～") if v.strip()]
+
+
+def fib_for_ai(results: Sequence[tools.ToolResult], plans: Dict[str, Any], skip: Set[str] = frozenset(),
+               limit: int = 2) -> Tuple[Dict[str, Any], Dict[str, str]]:
+    """問型態時交給 AI 的費波參考，和既有規則對齊：
+    - 支撐壓力同一檔只有一份（10-21 定案，價格框／watch_plan／AI 同一套）→ 費波只補 watch_plan 沒有的「目標」：
+      平常給上方參考目標（含突破後條件目標）；只有還在下跌（低點未確認）才給下方參考。
+    - 離 watch_plan 任一價位 TEST_ATR 倍 ATR 內的費波價位視為同一區，不另外再講。
+    - 每類最多 limit 個（兩檔比較每檔 1 個），條件目標最多 1 個。
+    回傳（{code: 給 AI 的內容}, {code: 沒給的原因}）。"""
+    import fib_levels
+    out, why_not = {}, {}
+    for r in results:
+        if not (r.ok and r.name == "get_technical_analysis" and isinstance(r.data, dict)):
+            continue
+        code = str(r.data.get("stock_code") or "")
+        ref = r.data.get("fib_reference") or {}
+        if code in skip:
+            why_not[code] = "不是問這檔的型態"
+            continue
+        if not ref or ref.get("狀態"):
+            why_not[code] = ref.get("狀態") or "沒有費波資料"
+            continue
+        plan = plans.get(code) or {}
+        taken = [_plan_num(x.get("價位")) for key in ("下方支撐_由近到遠", "上方壓力_由近到遠", "上方均線_扣抵條件", "下方均線_回測觀察")
+                 for x in plan.get(key) or []]
+        gap = fib_levels.TEST_ATR * float(ref.get("ATR") or 0)
+        fresh = lambda x: not any(t is not None and abs(t - p) <= gap for p in _fib_prices(x) for t in taken)
+        item = {}
+        if ref.get("模式") == "falling":
+            downs = [x for x in ref.get("下方候選支撐") or [] if fresh(x)][:limit]
+            if downs:
+                item[FIB_DOWN] = downs
+        else:
+            ups = [x for x in ref.get("目前壓力") or [] if fresh(x)][:limit]
+            later = [x for x in ref.get("突破後條件目標") or [] if fresh(x)][:1]
+            if ups:
+                item[FIB_UP] = ups
+            if later:
+                item[FIB_LATER] = later
+        if not item:
+            why_not[code] = "費波價位都和觀察重點的價位重疊"
+            continue
+        out[code] = {"說明": ref.get("說明", ""), **item, **({"可信度": ref["可信度"]} if ref.get("可信度") else {})}
+    return out, why_not
+
+
+def _fib_price(value: Any) -> str:
+    """千元以上寫整數加千分位，千元以下照原數字（與 watch_plan 價位寫法一致）。"""
+    try:
+        p = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    return f"{p:,.0f}" if p >= 1000 else f"{p:g}"
+
+
+def fib_sentence(ref: Dict[str, Any], name: str = "") -> str:
+    """AI 沒寫費波句時由程式補的一句；只用 fib_reference 的價位，不另外計算。"""
+    def val(x):
+        if "價位" in x:
+            return _fib_price(x["價位"])
+        low, _, high = str(x.get("價位區") or "").partition("～")
+        return f"{_fib_price(low)}～{_fib_price(high)}"
+
+    ups, later, downs = (ref.get(k) or [] for k in (FIB_UP, FIB_LATER, FIB_DOWN))
+    parts = []
+    if ups:
+        parts.append("上方參考目標約 " + "、".join(val(x) for x in ups))
+    if later:
+        parts.append("若突破，條件目標約 " + "、".join(val(x) for x in later))
+    if downs:
+        parts.append("若續跌，下方參考約 " + "、".join(val(x) for x in downs))
+    if not parts:
+        return ""
+    notes = []
+    if any(x.get("註記") for x in ups + later + downs):
+        notes.append("依目前高低點試算，之後可能調整")
+    if ref.get("可信度"):
+        notes.append("目前沒有明確波段，只是區間量測")
+    return (f"{name}費波參考：" + "；".join(parts) + ("（" + "，".join(notes) + "）" if notes else "")
+            + "，僅供參考，不代表一定會到。")
+
+
+FINAL_FIB_RULES = ("【費波參考目標（優先於規則 3「不給目標價」，也不受「關鍵價位固定用 watch_plan」限制）】"
+    "fib_reference（JSON）是程式算好的費波南西參考價，已經和 watch_plan 的價位去重；支撐壓力仍照 watch_plan 寫，費波只補目標：\n"
+    "- 有 fib_reference 的股票，why 最後一句寫一句以「費波參考」開頭的句子，只用 fib_reference 裡的價位，最多 3 個數字，"
+    "價位寫法照 watch_plan 規則（千元以上寫整數加千分位，千元以下照原數字）。\n"
+    f"- 「{FIB_UP}」寫「費波參考目標約 X」；「{FIB_LATER}」一定寫成條件（例「若突破，條件目標約 Y」），不可說成已啟動的目標；"
+    f"「{FIB_DOWN}」寫「若續跌，費波下方參考約 Z」。\n"
+    "- 價位有「註記」要說依目前高低點試算、之後可能調整；有「可信度」要說只是區間量測。\n"
+    "- 不寫比例計算過程、錨點日期或 A、B、C 代號；用「參考」「可能」，不說一定會到、會漲到，不給買賣指令。\n"
+    "- 使用者問目標價、滿足點時，就用這一句回答，不要說不提供目標價。沒有 fib_reference 的股票完全不提費波。")
+
+FINAL_FIB_PAGE_RULES = ("【費波型態頁（優先於規則 3「不給目標價」）】使用者問的是費波南西。圖上右側價格框與價位條是費波價位，"
+    "watch_plan 的支撐、壓力也已經是同一份費波價位；完整清單在 get_fib_levels（說明＝這段波段是上漲後拉回、創高延伸還是下跌後反彈）：\n"
+    "- answer 一句直接回答：目前價格落在哪兩個費波價位之間、最關鍵的一個費波價位（守住或站上代表什麼）。\n"
+    "- why 依 get_fib_levels.說明 講這段波段的狀態，再講下方最近的費波支撐與上方最近的費波壓力。圖上價位條是比例在前、價格在後"
+    "（get_fib_levels 的「圖上標示」，watch_plan 的名稱也是它），文字照這個寫法：比例接價位，第一次提到時補一個字說明性質"
+    "（例「0.618 回撤 2,333」「1.618 延伸 2,847」，性質看「名稱」）；前波高點、前低、整理區照名稱寫。價位照 watch_plan 規則寫。有「條件」的價位一定寫成條件（例「若站上前波高點，延伸目標約 X」）；有「次要」的 0.786 要說是 0.618 守不住時的下一個參考；"
+    "有「註記」要說依目前高低點試算、之後可能調整；有「可信度」要說只是區間量測。\n"
+    "- 均線、量能最多一句帶過；不寫比例計算過程、錨點日期或 A、B、C 代號；用「參考」「可能」，不說一定會到，不給買賣指令。\n"
+    "- get_fib_levels 有「狀態」（沒有可用的費波波段）時，直接說目前沒有明確的費波波段、圖上是一般關鍵價位，再照 watch_plan 回答。")
+
+
 FINAL_FOCUS_RULES = ("【先回答重點】payload.question_focus 是使用者這題真正問的重點。回答第一段必須直接回答這些重點，"
                      "再補其他技術面：量能＝今日（盤中用累計量與預估量）對 MV5／MV20 的量比，明講「有／沒有放量」；"
                      "三大法人籌碼＝用 get_institutional_flow 說外資／投信／自營商最新一日、近5日、近20日買賣超張數與連買／連賣天數，"
@@ -3186,6 +3299,10 @@ def build_final_prompt(payload: Dict[str, Any]) -> str:
             # 10-11：使用者問的不是型態，三角只帶一句，篇幅留給本題
             sections.append("本題不是問型態：有正式或候選三角時只用一句帶過（例如「目前在三角收斂內」或「先前已跌破三角」），"
                             "不展開上下緣價位、碰線次數與事件日期；沒有三角就不提。篇幅以使用者所問的內容為主。")
+    if payload.get("fib_reference"):     # 11-04 移植：只有 /ace 管理員的 payload 會帶
+        sections.append(FINAL_FIB_RULES)
+    if payload.get("fib_page"):
+        sections.append(FINAL_FIB_PAGE_RULES)
     if "get_recent_news" in names:
         sections.append(FINAL_NEWS_RULES)
     if "get_sheet_stock_chips" in names:
@@ -3246,6 +3363,9 @@ def build_final_prompt(payload: Dict[str, Any]) -> str:
     payload_json = json.dumps(payload.get("tool_results") or {}, ensure_ascii=False, separators=(",", ":"), default=tools.json_safe)
     # 11-03（測試版 10-29 移植，不含費波）：規則裡寫的 payload.watch_plan 以前沒有放進 prompt（只送 tool_results），AI 其實看不到
     plan_part = ("watch_plan（JSON）：\n" + json.dumps(payload["watch_plan"], ensure_ascii=False, separators=(",", ":"), default=tools.json_safe) + "\n\n") if payload.get("watch_plan") else ""
+    # 11-04 移植（只有 /ace 管理員的 payload 才會有 fib_reference）：費波參考目標也要放進 prompt，AI 才看得到
+    if payload.get("fib_reference"):
+        plan_part += "fib_reference（JSON）：\n" + json.dumps(payload["fib_reference"], ensure_ascii=False, separators=(",", ":"), default=tools.json_safe) + "\n\n"
     return "\n\n".join(sections) + f"\n\n使用者問題：{payload['question']}\n\n{plan_part}tool_results（JSON）：\n{payload_json}\n"
 
 
@@ -3455,6 +3575,12 @@ class FactSheet:
         for result in results:
             if result.ok and isinstance(result.data, dict):
                 self._add_result(result.name, result.data)
+        # 11-04 移植：費波參考價從 tool_results 拿掉、另放 payload.fib_reference，核對時也要認得這些價位
+        # （不加的話 AI 寫的費波句一律被當成「對不上的數字」刪掉）
+        for code, ref in (payload.get("fib_reference") or {}).items():
+            numbers = _variants_of(json.dumps(ref, ensure_ascii=False, default=str))
+            self.market.update(numbers)
+            self.stock_numbers.setdefault(str(code), set()).update(numbers)
 
     def _add_result(self, name: str, data: Dict[str, Any]) -> None:
         code = str(data.get("stock_code") or "")

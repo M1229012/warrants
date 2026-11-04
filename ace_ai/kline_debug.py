@@ -50,6 +50,12 @@ def parse_codes(question: str, limit: int = 10) -> list[str]:
 
 def load_panel(code: str) -> dict[str, Any]:
     """僅管理員路由呼叫；沿用既有行情與公司行動入口。"""
+    code, name, frame, events = load_closed(code)
+    return build_panel(frame, events, code, name, state_key=f"tri_state_{code}", state_write=False)
+
+
+def load_closed(code: str) -> tuple[str, str, pd.DataFrame, dict]:
+    """正式收盤日 K＋公司行動（型態驗證、費波驗證共用；11-04 移植費波時從 load_panel 拆出，行為不變）。盤中暫定 K 一律剔除。"""
     import warrant_ai_tools as tools
 
     code, name = tools._stock_identity(code)
@@ -65,8 +71,7 @@ def load_panel(code: str) -> dict[str, Any]:
         frame = frame[pd.to_datetime(frame.index).date < pending_day.date()]
     if frame.empty:
         raise ValueError("沒有可使用的正式收盤日 K")
-    events = tools.get_corporate_actions(code)
-    return build_panel(frame, events, code, name, state_key=f"tri_state_{code}", state_write=False)
+    return code, name, frame, tools.get_corporate_actions(code)
 
 
 def _state_summary(state_key: str, computed=None, read_only=False, loaded_rules=None) -> str:
