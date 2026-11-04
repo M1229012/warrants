@@ -15,8 +15,9 @@ WARRANT_DENIED = ("🔒 此功能尚未解鎖\n\n權證分點、事件勝率、�
 ADMIN_DENIED = "此功能只限伺服器管理員或 SUPERUSER 使用，請使用真正的 /ace 指令。"
 SPOT_DENIED = "現股分點籌碼｜此功能目前沒有使用權限。"
 SECTOR_DENIED = "族群分析目前調整中，暫不開放，完成後會再通知。"
-# 族群（族群排行／族群雷達）暫停開放給會員（管理員不受限）；Railway 設 DISCORD_AI_SECTOR_OPEN=1 即重新開放。
-SECTOR_OPEN = os.getenv("DISCORD_AI_SECTOR_OPEN", "0").strip() == "1"
+# 族群（族群排行／族群雷達）開關：11-04 使用者決定開放給 /ask（新族群名單、今日族群排行，和 /ace 一樣）；
+# Railway 設 DISCORD_AI_SECTOR_OPEN=0 可以再暫停（管理員不受限）。
+SECTOR_OPEN = os.getenv("DISCORD_AI_SECTOR_OPEN", "1").strip() == "1"
 
 
 def require_sector(access):

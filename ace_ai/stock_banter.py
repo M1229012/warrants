@@ -119,8 +119,8 @@ def user_response_prompt(prompt, purpose, schema=None):
         return prompt  # 分類、理由對照、OCR 不寫笑話。
     import ai_text_guard
     import warrant_ai_tools
-    # 11-02（測試版 11-03 移植）：AI 不可寫出資料欄位名稱；先給 /ace 管理員
-    guard = (ai_text_guard.PROMPT_RULE.strip(),) if warrant_ai_tools.ace_preview() else ()
+    # 11-02（測試版 11-03 移植）：AI 不可寫出資料欄位名稱；11-04 起 /ask 也一樣
+    guard = (ai_text_guard.PROMPT_RULE.strip(),) if warrant_ai_tools.card_style_preview() else ()
     for rules in (RESPONSE_LANGUAGE_RULES, NATURAL_ANALYSIS_RULES, ALL_TOPIC_RESPONSE_RULES) + guard:
         if rules not in prompt:
             prompt += '\n\n' + rules

@@ -1637,6 +1637,24 @@ def ace_preview() -> bool:
     return bool(_ACE_PREVIEW.get())
 
 
+# 11-04 使用者：撐大盤／拖累大盤（新版貢獻榜、盤面結構）開放給 /ask，內容和 /ace 一樣；
+# Railway 設 DISCORD_AI_MARKET_OPEN=0 可以收回只給 /ace 管理員。族群另由 discord_access.SECTOR_OPEN 控制。
+MARKET_OPEN = os.getenv("DISCORD_AI_MARKET_OPEN", "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def market_preview() -> bool:
+    return ace_preview() or MARKET_OPEN
+
+
+# 11-04 使用者（「對，這部分一樣」）：圖卡通用樣式（圖上不放「※」說明、AI 不可寫出欄位名稱、統計格負數深綠）也給 /ask；
+# Railway 設 DISCORD_AI_CARD_STYLE_OPEN=0 可以收回只給 /ace 管理員。
+CARD_STYLE_OPEN = os.getenv("DISCORD_AI_CARD_STYLE_OPEN", "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def card_style_preview() -> bool:
+    return ace_preview() or CARD_STYLE_OPEN
+
+
 def set_ace_preview(on: bool) -> None:
     """Discord 入口在確認身分後設定（同一個 asyncio Task 之後畫圖、補圖都看得到）；Task 結束就跟著消失。"""
     _ACE_PREVIEW.set(bool(on))
@@ -7018,7 +7036,7 @@ def get_index_contribution(top: int = 0, market: str = "") -> Dict[str, Any]:
     """加權與櫃買的指數貢獻點數：誰把指數拉上去、誰把它拖下來（權重 × 漲跌）。market 指定就只算那個市場。
     11-03：/ace 管理員預覽列前 10（測試版 11-02 定案）；/ask 維持前 5，等下放時再一起改。"""
     import index_contribution
-    preview = ace_preview()
+    preview = market_preview()     # 11-04：/ask 也用新版（前 10、股價欄、指數漲跌幅）
     out = index_contribution.report(top=max(3, int(top or (10 if preview else 5))), market=str(market or ""))
     for row in out.get("markets") or []:
         if preview:

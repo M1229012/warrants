@@ -276,10 +276,10 @@ def body_blocks(text: str) -> list[Block]:
 
 
 def _preview() -> bool:
-    """11-03：測試版移植的圖卡改動（圖上不放註解、AI 欄位防線、深綠字）先只給 /ace 管理員本人。"""
+    """11-03：測試版移植的圖卡改動（圖上不放註解、AI 欄位防線、深綠字）先只給 /ace 管理員本人；11-04 起 /ask 也一樣。"""
     try:
         import warrant_ai_tools as tools
-        return tools.ace_preview()
+        return tools.card_style_preview()
     except Exception:
         return False
 

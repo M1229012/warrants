@@ -1626,7 +1626,7 @@ class QueryRouter:
         if not parsed.branches and _BREADTH_RE.search(parsed.original) and not (parsed.stocks and "index" not in parsed.intents):
             # 盤面廣度：指數漲跌 vs 多數個股，不需要任何個股資料。
             plan = QueryPlan(route="rule_breadth", need_final_llm=True)
-            if tools.ace_preview():    # 11-03：/ace 管理員一題只算問到的市場（全部成分股才來得及）；/ask 照舊兩個都算
+            if tools.market_preview():    # 11-03：一題只算問到的市場（全部成分股才來得及）；11-04 /ask 也開放
                 plan.add("get_index_contribution", market=_contribution_market(parsed.original))
             else:
                 plan.add("get_index_contribution")
@@ -3363,7 +3363,7 @@ def build_final_prompt(payload: Dict[str, Any]) -> str:
     if "get_sheet_stock_chips" in names:
         sections.append(FINAL_CHIPS_RULES)
     if "get_market_breadth" in names:
-        sections.append(FINAL_BREADTH_RULES_PREVIEW if tools.ace_preview() else FINAL_BREADTH_RULES)
+        sections.append(FINAL_BREADTH_RULES_PREVIEW if tools.market_preview() else FINAL_BREADTH_RULES)   # 11-04 /ask 也開放
     if "get_futures_positions" in names:
         sections.append(FINAL_FUTURES_RULES)
     if "get_top_warrant_buy_stocks" in names:
@@ -4071,7 +4071,7 @@ def _breadth_panel(data: Dict[str, Any]) -> Dict[str, Any]:
                        "comparison_date": "", "rows": rows, "others": others,
                        "coverage_note": "", "liquidity_note": note,
                        # 11-02（測試版，正式版先給 /ace 管理員）：收盤後不能寫「盤中 13:33｜收盤前會變動」
-                       **({"stamp_text": "今日收盤"} if tools.ace_preview() and not live
+                       **({"stamp_text": "今日收盤"} if tools.market_preview() and not live
                           else {"live_time": str(data.get("time") or "")})}}
 
 
@@ -6135,6 +6135,8 @@ class AceQueryEngine:
                         "sector=" + str(sector.get("name") or sector.get("industry") or "") + ":" + str(sector.get("mode") or "")])
         if tools.ace_preview():
             key += "|測試版移植預覽v2"        # 11-03：/ace 管理員的新功能回答不沿用移植前的舊快取；11-04 v2：加費波
+        elif tools.market_preview() or access_policy.SECTOR_OPEN:
+            key += "|ask開放族群貢獻v1"       # 11-04：族群、撐大盤／拖累大盤開放給 /ask，不沿用舊版回答
         key = self._access_cache_key(key)
         hit, cached = self._cached_answer(key, partitioned=True)
         if hit:
@@ -7583,7 +7585,7 @@ class AceQueryEngine:
                   # 11-02（測試版 11-03 移植，先給 /ace 管理員）：撐大盤／拖累大盤的白話問法靠 AI 讀整句，不補關鍵字
                   + ("問哪些股票影響大盤、指數，是問股票排行，type 用 rank、targets 寫大盤，不是 pattern；"
                      "白話也算，只要是在問誰撐住、帶領、拉抬、領漲、拖累、拉低、壓著、扛著大盤，或大盤今天靠誰、被誰拖、誰害的、誰最有貢獻。\n"
-                     if tools.ace_preview() else "") +
+                     if tools.market_preview() else "") +
                   "問句有指定權證分點（券商分點名稱）時，依使用者要的內容改用分點類型，targets 放分點名稱（有股票也放股票）："
                   "branch_warrants＝這個分點買了哪些權證、權證明細／權證買賣明細／清單／代號、剩餘天數、槓桿、價內外、估算報酬；"
                   "branch_events＝這個分點的 A～E 事件、什麼時候進場或出場（不是要列權證）；branch_position＝這個分點部位還在嗎、持有或出清；"
@@ -7679,7 +7681,7 @@ class AceQueryEngine:
         # 11-02 Log（測試版 11-03 移植，先給 /ace 管理員）：「今天哪些股票撐大盤」AI 判斷是問大盤的排行，
         # 名冊卻把「撐大盤」當成查不到的族群，硬轉型態後整題出錯。大盤的排行走盤面結構（權值股、指數貢獻點數）；
         # 真的查不到的族群維持原本「查不到」的回覆。
-        if (tools.ace_preview() and "sector" not in drop and (not sector or sector.get("mode") == "unsupported")
+        if (tools.market_preview() and "sector" not in drop and (not sector or sector.get("mode") == "unsupported")
                 and any(n.get("type") == "rank" and _is_market_rank_target(t) for n in items for t in n.get("targets") or [])):
             parsed.sector = parsed.sector_context = None
             plan = QueryPlan(route="rule_breadth", need_final_llm=True)
@@ -8164,7 +8166,7 @@ class AceQueryEngine:
             except Exception as exc:   # 查不到事件就維持 70 根，不影響回答
                 self.log(f"完整點位略過：{type(exc).__name__}: {exc}")
         # 11-02（測試版，正式版先給 /ace 管理員）：盤面結構問的是哪些股票，貢獻榜和權值股才是答案；不放大盤 K 線
-        chart_codes = ([] if plan.route == "rule_breadth" and tools.ace_preview()
+        chart_codes = ([] if plan.route == "rule_breadth" and tools.market_preview()
                        else chart_codes_for_plan(plan, codes))
         self.log(f"K 線排程｜預期股票={','.join(chart_codes) or '無（依需求）'}")
         for c in chart_codes:
@@ -8325,8 +8327,8 @@ class AceQueryEngine:
                                                 for p in panels if p.get("stock_code") and p.get("bars")}
         contribution = next((r.data for r in results if r.name == "get_index_contribution" and r.ok), None)
         breadth = next((r.data for r in results if r.name == "get_market_breadth" and r.ok), None)
-        if tools.ace_preview():
-            panels.extend(_market_structure_panels(question, contribution, breadth))   # 11-03：測試版 11-02 版本，先給 /ace 管理員
+        if tools.market_preview():
+            panels.extend(_market_structure_panels(question, contribution, breadth))   # 11-03：測試版 11-02 版本；11-04 /ask 也開放
         else:
             markets = list((contribution or {}).get("markets") or [])
             # 問大盤就只給加權、問櫃買就只給櫃買；沒指定才兩個都給，不要拿另一個市場充數。
