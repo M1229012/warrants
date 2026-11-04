@@ -1287,7 +1287,7 @@ _TAG_COLORS = (('三角上緣', '#C76C00'), ('三角下緣', '#1478B5'), ('量�
 _TAG_SPARE = '#7A5AF8'
 # 11-04 移植（只給 /ace 管理員）：費波型態頁。右側框上行寫比例（0.618）、下行寫價格，K 線上畫同色虛線；
 # 和費波驗證圖同一套顏色（回撤／反彈藍、前波高點橘、延伸紫、整理區綠、下跌支撐紅）。只在費波頁（lead）套用。
-FIB_TAG_MAX = 4
+FIB_TAG_MAX = 5            # 11-04 費波型態頁：右側框上行寫比例（0.618）、下行寫價格，K 線上畫同色虛線；使用者「怎麼沒有標出 0.618」→ 4 個改 5 個
 FIB_TAG_H = 48
 _FIB_TAG_COLORS = (('回撤', '#1478B5'), ('反彈', '#1478B5'), ('前波高點', '#C76C00'), ('延伸', '#8044B8'),
                    ('整理區', '#2F855A'), ('前低', '#B4232C'), ('大段', '#B4232C'), ('等幅', '#B4232C'))
@@ -1393,6 +1393,7 @@ def _price_range(bars: list) -> tuple[float, float]:
 
 LEGEND_ROW_H = 56                  # 10-18 方案 1：價位條高度（和上方均線列同一種條狀樣式）
 LEGEND_ITEM_GAP = 34
+LEGEND_ITEM_GAP_COMPACT = 24     # 11-04：右側有標框的價位一條放不下時，縮字縮間距（不省略有標框的）
 LEGEND_BLOCK_W = 92                # 左側「支撐／壓力」實心標籤塊
 LEGEND_W = CONTENT - 64            # 和上方均線列同寬
 _LEGEND_KIND_INK = {'壓力': UP_TEXT, '支撐': DOWN_TEXT}
@@ -1400,6 +1401,12 @@ _LEGEND_KIND_TINT = {'壓力': '#FDF1F1', '支撐': '#EEF8F5'}
 
 
 def _legend_item_w(item: dict) -> float:
+    if item.get('compact'):   # 11-04：一條放不下時的小一號寫法（名稱 21／19、價格 24）
+        if item.get('lead'):
+            return ((22 if item['marked'] else 0) + font(21).getlength(item['name']) + 6
+                    + font(24, True).getlength(price_text(item['price'])))
+        return ((22 if item['marked'] else 0) + font(24, True).getlength(price_text(item['price'])) + 6
+                + font(19).getlength(item['name']))
     if item.get('lead'):      # 費波型態頁：比例（23 級）在前、價格在後
         return ((22 if item['marked'] else 0) + font(23).getlength(item['name']) + 8
                 + font(26, True).getlength(price_text(item['price'])))
@@ -1414,17 +1421,25 @@ def _legend_layout(panel: dict, width: float) -> tuple[list[tuple[float, str, ob
     回傳 ([(x, 種類, 內容)], 是否有內容)。"""
     tagged, rest = _chart_levels(panel)
     rest = sorted(rest, key=lambda it: abs(it['pct']) if it['pct'] is not None else 1e9)   # 由近到遠
-    while True:
-        placed, end = _legend_place(tagged, rest, width)
-        if end <= width or not rest:
+    # 11-04：只剩有標框的還是放不下（費波頁 5 個框）→ 縮字縮間距再排一次，不讓字超出價位條
+    for compact in (False, True):
+        tags = [dict(x, compact=True) for x in tagged] if compact else tagged
+        others = [dict(x, compact=True) for x in rest] if compact else rest
+        while True:
+            placed, end = _legend_place(tags, others, width)
+            if end <= width or not others:
+                break
+            others = others[:-1]
+        if end <= width or compact:
             return placed, bool(placed)
-        rest = rest[:-1]
+    return [], False
 
 
 def _legend_place(tagged: list[dict], rest: list[dict], width: float) -> tuple[list[tuple[float, str, object]], float]:
     """排一條：回傳 ([(x, 'block'|'item'|'sep', 內容)], 最右邊的 x（含右側留白）)。"""
     marked = {id(x) for x in tagged}
     placed: list[tuple[float, str, object]] = []
+    gap = LEGEND_ITEM_GAP_COMPACT if any(it.get('compact') for it in tagged + rest) else LEGEND_ITEM_GAP
     x = 0.0
     for kind in ('壓力', '支撐'):
         group = sorted((it for it in tagged + rest if it['kind'] == kind),
@@ -1435,11 +1450,11 @@ def _legend_place(tagged: list[dict], rest: list[dict], width: float) -> tuple[l
         x += LEGEND_BLOCK_W + 22
         for k, item in enumerate(group):
             if k:
-                placed.append((x - LEGEND_ITEM_GAP / 2, 'sep', kind))
+                placed.append((x - gap / 2, 'sep', kind))
             item = dict(item, marked=id(item) in marked)
             placed.append((x, 'item', item))
-            x += _legend_item_w(item) + LEGEND_ITEM_GAP
-    return placed, (x - LEGEND_ITEM_GAP + 22 if placed else 0.0)
+            x += _legend_item_w(item) + gap
+    return placed, (x - gap + 22 if placed else 0.0)
 
 
 def _level_legend_height(panel: dict) -> int:
@@ -1476,14 +1491,16 @@ def draw_level_legend(draw, x: float, y: float, width: float, panel: dict) -> No
                 draw.ellipse((cx, mid - 7, cx + 14, mid + 7), fill=value['color'])
                 cx += 22
             price = price_text(value['price'])
+            small = bool(value.get('compact'))      # 11-04：一條放不下時小一號（和 _legend_item_w 同一套尺寸）
+            name_size, price_size, pad = (21, 24, 6) if small else (23, 26, 8)
             if value.get('lead'):
-                draw.text((cx, mid), value['name'], font=font(23), fill=INK, anchor='lm')
-                cx += font(23).getlength(value['name']) + 8
-                draw.text((cx, mid), price, font=font(26, True), fill=INK, anchor='lm')
+                draw.text((cx, mid), value['name'], font=font(name_size), fill=INK, anchor='lm')
+                cx += font(name_size).getlength(value['name']) + pad
+                draw.text((cx, mid), price, font=font(price_size, True), fill=INK, anchor='lm')
                 continue
-            draw.text((cx, mid), price, font=font(26, True), fill=INK, anchor='lm')
-            cx += font(26, True).getlength(price) + 8
-            draw.text((cx, mid), value['name'], font=font(21), fill=INK, anchor='lm')
+            draw.text((cx, mid), price, font=font(price_size, True), fill=INK, anchor='lm')
+            cx += font(price_size, True).getlength(price) + pad
+            draw.text((cx, mid), value['name'], font=font(19 if small else 21), fill=INK, anchor='lm')
 
 
 def _tag_height(tagged: list[dict]) -> float:
