@@ -1076,6 +1076,9 @@ def contribution(market: str, live: bool, top: int = 5, *, deadline: Optional[fl
         "index_prev_close": round(float(prev_index), 2) if prev_index is not None else None,
         "index_now": round(float(now_index), 2) if now_index is not None else None,
         "index_points": index_points,
+        # 11-04（測試版移植，/ace 管理員）：指數漲跌點數旁邊要寫漲跌幅；/ask 由 get_index_contribution 拿掉
+        "index_change_pct": (round((float(now_index) / float(prev_index) - 1.0) * 100.0, 2)
+                             if now_index is not None and prev_index and float(prev_index) > 0 else None),
         "estimated_points": estimated_points,
         "residual_points": residual,
         "basis": basis,

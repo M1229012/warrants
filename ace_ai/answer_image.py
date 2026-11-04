@@ -3487,7 +3487,10 @@ def _contribution_card_v2(draw, y: float, data: dict, dry: bool) -> int:
         draw.text((tx, y + 44), now_text, font=font(30, True), fill=color, anchor='lm')
         tx += font(30, True).getlength(now_text) + 18
     if points is not None:
-        draw.text((tx, y + 44), f'{points:+.2f} 點', font=font(30, True), fill=color, anchor='lm')
+        # 11-04（測試版移植，/ace 管理員）：點數旁邊寫漲跌幅（+0.52%），同色
+        pct = _finite(data.get('index_change_pct'))
+        draw.text((tx, y + 44), f'{points:+.2f} 點' + (f'（{pct:+.2f}%）' if pct is not None else ''),
+                  font=font(30, True), fill=color, anchor='lm')
 
     note = str(data.get('basis') or '')
     coverage = _finite(data.get('market_cap_coverage_pct'))
@@ -3956,6 +3959,40 @@ def _branch_section(draw, x0: float, x1: float, y: float, section: dict, dry: bo
                 value, size = fit(item['value'], 38, tile_w - 36, True, 22)
                 text_at(draw, (tx + 20, y + 50), value, size, _tone_color(item['value'], item.get('tone', 'ink')), True)
         return tile_h + 22
+    if kind == 'oi_tiles':
+        # 11-04（測試版移植，/ace 管理員）台指期未平倉：名稱＋較前日、帶正負號的淨部位（紅多綠空）、多空單比例條、多單／空單口數
+        items = section.get('items') or []
+        if not items:
+            return 0
+        gap, tile_h = 12, 156
+        tile_w = (width - gap * (len(items) - 1)) / len(items)
+        if not dry:
+            for i, item in enumerate(items):
+                tx, ty = x0 + i * (tile_w + gap), y
+                left, right = tx + 18, tx + tile_w - 18
+                draw.rounded_rectangle((tx, ty, tx + tile_w, ty + tile_h), radius=12, fill=TILE_BG)
+                change = str(item.get('change') or '')
+                change_w = font(19, True).getlength(change) if change else 0
+                if change:
+                    draw.text((right, ty + 28), change, font=font(19, True), fill=_tone_color(change, 'signed'), anchor='rm')
+                    draw.text((right - change_w - 8, ty + 28), '較前日', font=font(17), fill=MUTED, anchor='rm')
+                name, size = fit(str(item.get('name', '')), 21, right - left - (change_w + 70 if change else 0), True, 16)
+                draw.text((left, ty + 28), name, font=font(size, True), fill=INK, anchor='lm')
+                value = str(item.get('value', ''))
+                value, size = fit(value, 34, right - left, True, 24)
+                draw.text((left, ty + 72), value, font=font(size, True), fill=_tone_color(value, 'signed'), anchor='lm')
+                long_oi, short_oi = float(item.get('long') or 0), float(item.get('short') or 0)
+                if long_oi + short_oi > 0:
+                    by = ty + 106
+                    draw.rounded_rectangle((left, by, right, by + 10), radius=5, fill=DOWN)
+                    split = left + (right - left) * long_oi / (long_oi + short_oi)
+                    if split > left + 1:
+                        draw.rounded_rectangle((left, by, max(split, left + 10), by + 10), radius=5, fill=UP)
+                        if split < right - 5:
+                            draw.rectangle((max(split - 5, left + 5), by, split, by + 10), fill=UP)
+                    draw.text((left, ty + 136), f'多 {long_oi:,.0f}', font=font(18), fill=MUTED, anchor='lm')
+                    draw.text((right, ty + 136), f'空 {short_oi:,.0f}', font=font(18), fill=MUTED, anchor='rm')
+        return tile_h + 14
     if kind == 'stats' and section.get('presentation') == 'inline':
         # Weekly article only: fit label/value pairs on a line; never stretch one value into a full-width tile.
         cursor, row, total = x0, 0, 0

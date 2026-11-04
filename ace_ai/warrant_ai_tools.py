@@ -7020,9 +7020,11 @@ def get_index_contribution(top: int = 0, market: str = "") -> Dict[str, Any]:
     import index_contribution
     preview = ace_preview()
     out = index_contribution.report(top=max(3, int(top or (10 if preview else 5))), market=str(market or ""))
-    if preview:
-        for row in out.get("markets") or []:
+    for row in out.get("markets") or []:
+        if preview:
             row["price_columns"] = True       # 圖卡用新版（股價、漲跌停底色），answer_image.contribution_card
+        else:
+            row.pop("index_change_pct", None)   # 11-04：指數漲跌幅先只給 /ace（圖卡、文字版、AI 都看不到）
     return out
 
 

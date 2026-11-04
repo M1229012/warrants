@@ -53,6 +53,7 @@ import numpy as np
 
 import sector_match
 import kline_debug
+import fib_debug        # 11-04 移植：費波驗證圖、費波型態頁（只給 /ace 管理員）
 import sector_radar
 import trade_review
 import review_language
@@ -400,6 +401,7 @@ class ParsedQuestion:
     unknown_terms: List[str] = field(default_factory=list)   # 沒有對到股票／分點的剩餘字（反問「找不到 X」用）
     branch_leftover: List[str] = field(default_factory=list) # 權證／籌碼題沒對到分點的剩餘字（交給 AI 讀整句判斷）
     warrant_list: bool = False                               # AI 判斷：要列出分點買了哪些權證
+    preset_plan: Optional["QueryPlan"] = None                # 11-04 移植：費波型態頁（/ace 管理員），標的與工具由入口決定
 
     def summary(self) -> Dict[str, Any]:
         return {
@@ -661,6 +663,7 @@ class QueryPlan:
     needs: Optional[Dict[str, Any]] = None
     uncertain: bool = False     # 規則只認出股票、看不出要問什麼：交給 AI 讀整句分類（10-06）
     brief_pattern: Set[str] = field(default_factory=set)   # 10-20：圖照出型態圖，但這些股票問的不是型態（AI 型態 1～2 句、不放評分卡）
+    fib_page: bool = False                   # 11-04 移植（/ace 管理員）：費波型態頁——價格框／價位條改標費波價位
 
     def add(self, name: str, **kwargs: Any) -> None:
         call = ToolCall(name, {k: v for k, v in kwargs.items() if v not in (None, "")})
@@ -734,6 +737,9 @@ ADMIN_HELP_GROUPS = (
                   "熱門股票今日／近7天", "大家都問什麼類型的問題", "統計診斷")),
     ("額度（/額度 指令）", ("贈送 AI 次數", "設定身分組每日 AI 次數", "清除身分組每日設定", "查詢某人／身分組額度")),
     ("型態驗證", ("型態驗證 2330（趨勢線、錨點、轉折確認日）", "型態驗證 2344 1608 2421（一次最多 10 檔，公開）", "圖片型態驗證（attachment 附股票清單截圖，最多 10 檔）")),
+    # 11-04 移植：費波（只給 /ace 管理員；/ask 維持原樣）
+    ("費波", ("2330 費波、大盤費波如何（費波型態頁，一次最多 2 檔）", "費波驗證 2330（大波段錨點、回撤／延伸價位、共振）",
+              "費波驗證 2344 1608（一次最多 10 檔，公開）", "費波驗證 台指期（近月日盤＋夜盤自己算；最右邊一根是奇摩即時，只顯示）")),
     ("本週精選", ("本週精選排名", "3006 幫我生成週精選文字", "這版確認，生成圖片")),
     ("草稿", ("直接說修改需求", "還原上一版", "目前草稿")),
     ("資料維護", ("系統狀態", "用量（含費用估算）", "錯誤紀錄", "更新市場底庫", "更新族群名冊", "匯出狀態／匯入狀態")),
@@ -1086,6 +1092,8 @@ def futures_extra(data: Dict[str, Any], focus: str) -> str:
 
 def futures_card(data: Dict[str, Any], question: str = "", retail: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """台指期三大法人淨未平倉：各法人一格（淨多／淨空口數＋較前一日變化）；副圖在 K 線下方。"""
+    if tools.ace_preview():
+        return _futures_card_v2(data, question, retail)
     items = []
     for x in data.get("investors") or []:
         change = x.get("change_vs_prev")
@@ -1104,6 +1112,31 @@ def futures_card(data: Dict[str, Any], question: str = "", retail: Optional[Dict
             items.append({"label": f"{c['name']}散戶多空比{change}",
                           "value": f"{c['ratio_pct']:+.2f}%（多 {c['retail_long']:,}／空 {c['retail_short']:,}）"})
         sections[-1:-1] = [{"type": "stats", "items": items}]
+        sections[-1]["text"] += "散戶＝全市場未平倉扣掉三大法人（當天結算到期的契約不計）。"
+    return {"branch": "台指期三大法人未平倉", "tags": [futures_focus(question)], "label": "期貨籌碼", "sections": sections}
+
+
+def _futures_card_v2(data: Dict[str, Any], question: str = "", retail: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """11-04（測試版移植，/ace 管理員）：淨部位寫成帶正負號（淨多 +、淨空 −，紅多綠空），每格加多空單比例條（oi_tiles）；
+    /ask 維持 futures_card 舊版，下放時再一起換。"""
+    items = []
+    for x in data.get("investors") or []:
+        change = x.get("change_vs_prev")
+        # 多單／空單寫在比例條下方（問「空單多少」看得到空方未平倉口數，不只淨額）
+        items.append({"name": x["investor"], "value": f"{int(x['net_oi']):+,} 口" if x["net_oi"] else "0 口",
+                      "long": x.get("long_oi"), "short": x.get("short_oi"),
+                      "change": "" if change is None else f"{int(change):+,} 口"})
+    sections = [{"type": "badge", "text": f"資料日期 {data.get('data_date', '-')}｜台指期（{data.get('futures_id', 'TX')}）三大法人未平倉"},
+                {"type": "oi_tiles", "items": items},
+                {"type": "note", "text": "※ 未平倉含現貨避險部位，不能單獨當作多空訊號；K 線下方紅柱＝淨多增加（空單減少）、綠柱＝淨空增加，金線＝淨未平倉。"}]
+    if retail:
+        items = []
+        for c in retail.get("contracts") or []:
+            prev = c.get("ratio_prev_pct")
+            items.append({"name": f"{c['name']}散戶多空比", "value": f"{c['ratio_pct']:+.2f}%",
+                          "long": c["retail_long"], "short": c["retail_short"],
+                          "change": f"{c['ratio_pct'] - prev:+.2f}" if prev is not None else ""})
+        sections[-1:-1] = [{"type": "oi_tiles", "items": items}]
         sections[-1]["text"] += "散戶＝全市場未平倉扣掉三大法人（當天結算到期的契約不計）。"
     return {"branch": "台指期三大法人未平倉", "tags": [futures_focus(question)], "label": "期貨籌碼", "sections": sections}
 
@@ -3738,6 +3771,8 @@ class FactSheet:
             if value.is_integer() and abs(value) <= 10 and not _PERCENT_AFTER_RE.match(text, match.end()):
                 continue
             forms = {cleaned, cleaned.lstrip("-")}
+            if tools.ace_preview():      # 11-04（測試版移植，/ace 管理員）：AI 寫「39442.0」＝39442（費波句常這樣寫），不算對不上
+                forms |= {re.sub(r"\.0+$", "", f) for f in forms}
             unit = text[match.end():match.end() + 3].lstrip()[:1]   # 10-16：「3.4 萬張」中間有空白也要換算
             if unit in ("萬", "億"):            # 10-16：「1870 萬張」＝18,709,109 張；換算後在 0.5% 內就算對得上
                 base = 1e4 if unit == "萬" else 1e8
@@ -4027,6 +4062,8 @@ def format_index_contribution(data: Dict[str, Any]) -> str:
         head = f"{market.get('index_name', '')}"
         if points is not None:
             head += f" {points:+.2f} 點"
+            if market.get("index_change_pct") is not None:       # 11-04（/ace 管理員；/ask 資料裡沒有）：點數旁邊寫漲跌幅
+                head += f"（{market['index_change_pct']:+.2f}%）"
         coverage = market.get("market_cap_coverage_pct")
         if coverage is not None and (str(market.get("basis") or "").startswith("盤中") or coverage < 99.9):
             head += f"｜市值涵蓋 {coverage:.1f}%"
@@ -5085,6 +5122,15 @@ def drop_number_dumps(text: str, limit: int = 4, total: int = 7) -> str:
     return "".join(kept).strip()
 
 
+_BIG_DECIMAL_RE = re.compile(r"(?<![\d,.])(\d{4,6})\.(\d+)(?![\d.])(?!\s*[%％萬億倍])")
+
+
+def tidy_big_prices(text: str) -> str:
+    """11-04（測試版移植，/ace 管理員）：千元以上的價位寫整數加千分位（watch_plan 規則）；AI 常寫成「43857.0 點」「45665.22」，
+    核對後由程式改寫。百分比、萬／億、倍數不動。"""
+    return _BIG_DECIMAL_RE.sub(lambda m: f"{round(float(m.group())):,}", str(text or ""))
+
+
 def drop_warrant_listing(text: str, results) -> str:
     """10-15：分點權證明細表已逐檔列出權證；解讀文字中提到權證代號／名稱或逐檔條列的句子直接拿掉（不重呼叫 Gemini）。"""
     keys = set()
@@ -5418,7 +5464,7 @@ REQUIRED_MODULE_API = {
     "corporate_action_sources": ("twse_events",),
     "discord_access": ("_CHIP_WORD_RE", "require_sector"),
     "warrant_ai_tools": ("get_market_institutional", "prefetch_sheet_tables", "_reserve_fugle_slot", "check_sheet_version", "err_text",
-                         "chart_marks_for_stock", "stock_live_quotes", "ace_preview", "set_ace_preview"),
+                         "chart_marks_for_stock", "stock_live_quotes", "ace_preview", "set_ace_preview", "_fib_reference"),
     "answer_image": ("wrap_cell", "observed_mark_layout", "CHIP_LAYOUT_VERSION", "public_ma_condition", "group_rank_card", "follow_card"),
     "chip_event_backtest": ("event_marks", "branch_card", "VERSION"),
     "moneydj_spot_cost": ("costs", "period_avg"),
@@ -5438,6 +5484,11 @@ REQUIRED_MODULE_API = {
     "ai_text_guard": ("clean_card", "PROMPT_RULE"),
     "index_contribution": ("report", "OfficialClosePending"),
     "market_scan": ("value_liquid_codes", "EXCLUDED_NAMES"),
+    # 11-04 測試版移植（費波，只給 /ace 管理員）：新檔案 fib_debug、fib_levels、taifex_futures 要一起上傳
+    "fib_debug": ("is_request", "mentions_fib", "page_codes", "page_levels", "load_panel", "ai_reference", "render"),
+    "fib_levels": ("compute", "ai_reference", "TEST_ATR"),
+    "taifex_futures": ("CODE", "daily_frame", "live_bar"),
+    "kline_debug": ("load_closed",),
 }
 
 
@@ -5855,6 +5906,9 @@ class AceQueryEngine:
                 speed_text = str(exc)
             return AnswerResult(speed_text, 'admin_spot_speed', 0, time.perf_counter()-started,
                                 as_text=True, cacheable=False)
+        # 11-04 移植：費波驗證排在型態驗證前（「費波型態驗證」不能被型態驗證吃掉）；只有 /ace 管理員能用
+        if fib_debug.is_request(question):
+            return self._answer_level_debug(question, started, is_admin=is_admin, admin_mode=admin_mode)
         if kline_debug.is_request(question):
             return self._answer_kline_debug(question, started, is_admin=is_admin, admin_mode=admin_mode, image=image)
         if admin_mode:
@@ -6008,6 +6062,14 @@ class AceQueryEngine:
                                               warrant_branch=bool(parsed.branches or parsed.branch_candidates),
                                               # 只有真的追問（沿用上一題的股票／分點）才沿用上一題的籌碼類型
                                               remembered=getattr(remembered, "chip_context", "") if remembered and note else "")
+        if tools.ace_preview():
+            # 11-04 移植（先給 /ace 管理員）：沒說「驗證」的費波問句改出費波型態頁
+            try:
+                page = self._fib_page_codes(question)
+            except ValueError as exc:
+                return AnswerResult(text=str(exc), route="clarify", gemini_calls=0, elapsed=time.perf_counter() - started, as_text=True)
+            if page:
+                self._apply_fib_page(parsed, page)
         if (_OVERNIGHT_ASK_RE.search(question) and parsed.chip not in ("spot", "combined") and parsed.stocks
                 and (access is None or access.entitlement.spot)):
             parsed.chip = "spot"   # 10-15：問隔日沖＝型態頁＋今日現股籌碼重點（顯示不變），AI 解讀再回答有沒有隔日沖可能
@@ -6050,7 +6112,7 @@ class AceQueryEngine:
                         "chip=" + parsed.chip,
                         "sector=" + str(sector.get("name") or sector.get("industry") or "") + ":" + str(sector.get("mode") or "")])
         if tools.ace_preview():
-            key += "|測試版移植預覽v1"        # 11-03：/ace 管理員的新功能回答不沿用移植前的舊快取
+            key += "|測試版移植預覽v2"        # 11-03：/ace 管理員的新功能回答不沿用移植前的舊快取；11-04 v2：加費波
         key = self._access_cache_key(key)
         hit, cached = self._cached_answer(key, partitioned=True)
         if hit:
@@ -6812,6 +6874,86 @@ class AceQueryEngine:
         return AnswerResult(text=result["text"], route=route, gemini_calls=0,
                             elapsed=time.perf_counter()-started, cacheable=False, panels=panels,
                             as_text=not panels, image_title=result.get("title") or "族群雷達")
+
+    def _ask_json(self, prompt: str, schema: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """讀題用的 AI（回 JSON）；失敗回 None，由呼叫端改用規則或請使用者講清楚。（11-04 移植，費波標的用）"""
+        result = self.gateway.generate(prompt, purpose="intent", schema=schema, temperature=0.0)
+        if not result.ok:
+            return None
+        try:
+            out = json.loads(result.text)
+        except (ValueError, TypeError):
+            return None
+        self.log(f"🧭 AI 讀題｜{json.dumps(out, ensure_ascii=False)[:200]}")
+        return out if isinstance(out, dict) else None
+
+    def _fib_page_codes(self, question: str) -> List[str]:
+        """11-04 移植（先給 /ace 管理員）：沒說「驗證」的費波問句（「2330 費波」「大盤費波如何」）→ 費波型態頁的標的；
+        不是費波問句或看不出標的回空清單。「費波驗證」照舊是管理員驗證圖（_answer_impl 先攔）。
+        台指期費波型態頁要先有台指期型態頁（正式版還沒有），先請管理員用「費波驗證 台指期」。一次超過 2 檔丟 ValueError。"""
+        import taifex_futures
+        if not fib_debug.mentions_fib(question) or fib_debug.is_request(question):
+            return []
+        codes = fib_debug.page_codes(question, self._ask_json)
+        if taifex_futures.CODE in codes:
+            raise ValueError("正式版還沒有台指期型態頁，台指期的費波請用：費波驗證 台指期")
+        return codes
+
+    def _apply_fib_page(self, parsed: ParsedQuestion, codes: List[str]) -> None:
+        """費波型態頁：標的與工具固定，之後和型態頁同一條路（K 線、價格框、AI 解讀、事實核對、快取、排隊）。"""
+        stocks = []
+        for code in codes:
+            try:
+                stocks.append(tools._stock_identity(code))
+            except Exception:
+                stocks.append((code, ""))
+        plan = QueryPlan(route="rule_pattern", need_final_llm=True, fib_page=True)
+        for code, _ in stocks:
+            plan.add("get_stock_overview", stock_code=code)
+            plan.add("get_technical_analysis", stock_code=code)
+            plan.add("get_volume_profile", stock_code=code)
+            if code not in tools.INDEX_CODES:
+                plan.add("get_institutional_flow", stock_code=code, days=70)
+        parsed.stocks, parsed.branches, parsed.stock_candidates, parsed.branch_candidates = stocks, [], [], []
+        parsed.sector = parsed.sector_context = None
+        parsed.chip = ""
+        for attr in ("spot_branch",):
+            if hasattr(parsed, attr):
+                setattr(parsed, attr, "")
+        if hasattr(parsed, "spot_combo"):
+            parsed.spot_combo = False
+        parsed.intents = {"technical"}
+        parsed.preset_plan = plan
+        self.log(f"🧭 費波型態頁｜{','.join(c for c, _ in stocks)}")
+
+    def _answer_level_debug(self, question: str, started: float, *, is_admin: bool, admin_mode: bool) -> AnswerResult:
+        """11-04 移植：管理員費波驗證圖，權限與可見性比照型態驗證；價位全部來自程式同次計算，不用 AI。
+        標的規則看不出來時（夜盤、期貨等白話），讓 AI 讀整句；價位計算仍然不用 AI。"""
+        label, route = "費波驗證", "admin_fib"
+        access = self._access()
+        if not (is_admin and admin_mode and access is not None and access.admin_mode and not access.simulation):
+            return AnswerResult(text=f"{label}僅限管理員透過 /ace 使用。", route=route + "_denied",
+                                gemini_calls=0, elapsed=time.perf_counter()-started, as_text=True)
+        try:
+            codes = fib_debug.parse_codes(question, ask_ai=self._ask_json)
+        except Exception as exc:
+            return AnswerResult(text=f"{label}未完成：" + tools.err_text(exc), route=route + "_error",
+                                gemini_calls=0, elapsed=time.perf_counter()-started, cacheable=False, as_text=True)
+        results = []
+        for code in codes:
+            try:
+                __import__("request_runtime").check_budget(IMAGE_RESERVE_SECONDS)
+                panel = fib_debug.load_panel(code)
+                results.append(AnswerResult(text=f"管理員{label}：沿用程式計算的價位；未使用 AI。",
+                                            route=route + "_debug", gemini_calls=0, elapsed=time.perf_counter()-started,
+                                            panels=[panel], cacheable=False, image_title=f"{code}｜{label}"))
+            except Exception as exc:
+                self.log(f"{label}未完成｜{code}｜{tools.err_text(exc)}")
+                results.append(AnswerResult(text=f"{code} {label}未完成：" + tools.err_text(exc), route=route + "_error",
+                                            gemini_calls=0, elapsed=time.perf_counter()-started, cacheable=False, as_text=True))
+        first = results[0]
+        first.followups = list(first.followups) + results[1:]
+        return first
 
     def _answer_kline_debug(self, question: str, started: float, *, is_admin: bool, admin_mode: bool, image=None) -> AnswerResult:
         access = self._access()
@@ -7859,12 +8001,16 @@ class AceQueryEngine:
                 return AnswerResult(text="目前無法解析問題所需的基本資料，請稍後再試。", route="error", gemini_calls=0, elapsed=time.perf_counter() - started)
         parsed.access = self._access()
         self.log(f"解析結果：{json.dumps(parsed.summary(), ensure_ascii=False)}")
-        split = self._split_by_clause(question, parsed, started)
+        page_plan = getattr(parsed, "preset_plan", None)     # 11-04 移植：費波型態頁（/ace 管理員），不拆題、不走規則路由與需求表
+        split = None if page_plan is not None else self._split_by_clause(question, parsed, started)
         if split is not None:
             return split
         stocks_only = [c for c, _ in parsed.stocks if c not in tools.INDEX_CODES]
         market_inst = market_institutional_wanted(parsed)
-        if market_inst and not (parsed.stocks and pattern_asked(parsed)):
+        if page_plan is not None:
+            import copy
+            plan = copy.deepcopy(page_plan)
+        elif market_inst and not (parsed.stocks and pattern_asked(parsed)):
             # 「外資今天買超多少」「今天三大法人買賣超」：全市場（上市）三大法人；只問數字不呼叫 AI
             plan = QueryPlan(route="rule_market_institutional",
                              need_final_llm=bool(_INSTITUTIONAL_ANALYSIS_RE.search(question) or "analysis" in parsed.intents))
@@ -7891,7 +8037,9 @@ class AceQueryEngine:
                 plan.add("get_market_institutional", market=market_of(parsed))
                 if "futures" not in parsed.intents:
                     plan.tool_calls = [c for c in plan.tool_calls if c.name != "get_futures_positions"]
-        if needs_semantic(parsed) and plan.route != "clarify":
+        if page_plan is not None:
+            pass
+        elif needs_semantic(parsed) and plan.route != "clarify":
             needs = self._parse_needs(question, parsed, stats)
             if needs is None:
                 return AnswerResult(text="需求與排除条件暫時無法確認，請分開描述各檔要查的項目。", route="clarify",
@@ -8116,7 +8264,9 @@ class AceQueryEngine:
             for panel in [p for p in panels if p.get("stock_code")]:   # 只有 K 線面板有評分卡（籌碼重點不是）
                 # 10-20：比較圖、問的不是型態（新聞、法人、還有機會嗎…）的型態頁不放評分卡；價位照樣標在 K 線上
                 # 10-20：大盤／櫃買也不放評分卡（使用者要求）
-                no_score = compare_page or panel["stock_code"] in plan.brief_pattern or panel["stock_code"] in tools.INDEX_CODES
+                # 11-04 移植：費波型態頁不放評分卡（評分卡的價位會蓋掉費波價格框）
+                no_score = (compare_page or panel["stock_code"] in plan.brief_pattern or panel["stock_code"] in tools.INDEX_CODES
+                            or plan.fib_page)
                 card = None if no_score else self._pattern_scorecard(panel["stock_code"], results, parsed.cost_price)
                 with_chips = any(r.name == "get_sheet_stock_chips" and r.ok for r in results)
                 if card and (getattr(parsed, "spot_combo", False) or with_chips or market_flow):
@@ -8141,6 +8291,9 @@ class AceQueryEngine:
                         panels.append({"branch_card": margin, "hide_text": True})
         self._attach_warrant_insights(results)
         self._attach_chart_levels(panels, results, parsed.cost_price)
+        if plan.fib_page:      # 11-04 移植（/ace 管理員）：費波型態頁的價格框與價位條改標費波價位
+            for panel in [p for p in panels if p.get("stock_code") and p.get("bars") and not p.get("compact")]:
+                self._use_fib_levels(panel, panel["stock_code"], results)
         if getattr(self, "_request_local", None) is not None:
             # 10-21：圖上那份價位（評分卡或價位卡）交給 watch_plan，價格框、觀察重點、AI 同一份
             self._request_local.chart_levels = {str(p["stock_code"]): (p.get("scorecard") or p.get("key_levels") or {})
@@ -8556,6 +8709,23 @@ class AceQueryEngine:
                 self.log(f"權證分點觀察｜{data['stock_code']}｜" + "、".join(b["branch"] for b in data["branches"])
                          + f"｜{time.perf_counter() - started:.2f}s")
 
+    def _use_fib_levels(self, panel: Dict[str, Any], code: str, results: List[tools.ToolResult]) -> None:
+        """11-04 移植：費波型態頁——價格框與價位條改標費波價位（和費波驗證圖同一份計算）；觀察重點（watch_plan）
+        用圖上那份價位，所以 AI 的支撐壓力也跟著是費波。費波價位另外交給 AI（get_fib_levels），事實核對才對得上。
+        算不出來就保留一般關鍵價位。"""
+        try:
+            card, data = fib_debug.page_levels(code, float(panel["bars"][-1]["Close"]))
+        except Exception as exc:
+            self.log(f"費波型態頁｜{code} 費波價位略過，保留一般關鍵價位｜{tools.err_text(exc)}")
+            return
+        results.append(tools.ToolResult("get_fib_levels", True, data))
+        if not (card["supports_below_close"] or card["resistances_above_close"]):
+            self.log(f"費波型態頁｜{code} {data.get('狀態') or '沒有費波價位'}｜保留一般關鍵價位")
+            return
+        panel.pop("scorecard", None)
+        panel["key_levels"] = dict(card, ma_deduction=(panel.get("key_levels") or {}).get("ma_deduction") or {})
+        self.log(f"費波型態頁｜{code}｜壓力 {len(card['resistances_above_close'])}｜支撐 {len(card['supports_below_close'])}")
+
     def _attach_chart_levels(self, panels: List[Dict[str, Any]], results: Sequence[tools.ToolResult],
                              cost_price: Optional[float]) -> None:
         """10-20：非型態題（「中鋼還有機會嗎」「光寶科壓力大概多少」）沒有型態評分卡 → 關鍵價位仍標在 K 線上
@@ -8807,6 +8977,17 @@ class AceQueryEngine:
         if plans:
             payload["watch_plan"] = plans
             self.log("觀察重點｜" + "｜".join(f"{c} {v['方向']}" + ("（止穩觀察）" if v.get("止穩觀察") else "") for c, v in plans.items()))
+        if plan.fib_page:
+            payload["fib_page"] = True       # 11-04 移植：費波型態頁（觀察重點的支撐壓力已是費波價位，不再另附 fib_reference）
+        elif tools.ace_preview() and payload["pattern_focus"] and not payload.get("brief_quote"):
+            # 11-04 移植（先給 /ace 管理員）：問型態才附費波參考目標；在 watch_plan 之後算，和觀察重點的價位去重
+            fibs, why_not = fib_for_ai(results, plans, skip=set(payload.get("brief_pattern") or []),
+                                       limit=1 if payload.get("compare_page") else 2)
+            if fibs:
+                payload["fib_reference"] = fibs
+            self.log("費波參考價｜" + ("｜".join(
+                f"{c} " + ("、".join(f"{k} {len(v)}" for k, v in fibs[c].items() if isinstance(v, list)) if c in fibs else why_not[c])
+                for c in sorted(set(fibs) | set(why_not))) or "本題沒有技術面"))
         if plan.route == "rule_spot_chip":
             # 10-21：現股籌碼頁以籌碼為主，技術面只留結論欄位；支撐壓力看 watch_plan（大量區原始資料不送）
             slim_spot_payload(payload)
@@ -8860,8 +9041,10 @@ class AceQueryEngine:
             # 10-20：止穩觀察（持續下跌）時 KD／MACD 沒有意義，AI 還寫就由程式刪；平常照留
             drop_mode = any(isinstance(v, dict) and v.get("止穩觀察") for v in (payload.get("watch_plan") or {}).values())
             osc = drop_oscillator_noise if drop_mode else (lambda t: t)
+            # 11-04（測試版移植，/ace 管理員）：「43857.0 點」「45665.22」改成千分位整數；/ask 照舊
+            tidy = tidy_big_prices if tools.ace_preview() else (lambda t: t)
             for key in ("answer", "why", "summary"):
-                card[key] = drop_directives(card.get(key, ""))
+                card[key] = tidy(drop_directives(card.get(key, "")))
                 card[key] = drop_warrant_listing(card[key], results)
                 card[key] = drop_source_mentions(card[key])
                 card[key] = osc(card[key])
@@ -8871,10 +9054,20 @@ class AceQueryEngine:
             card["answer"], spill = split_answer_head(drop_filler_head(card.get("answer", "")))
             if spill:
                 card["why"] = (spill + card.get("why", "")).strip()
-            card["scenarios"] = [dict(x, text=osc(drop_source_mentions(drop_directives(x["text"]))),
+            card["scenarios"] = [dict(x, text=osc(drop_source_mentions(tidy(drop_directives(x["text"])))),
                                       title=drop_source_mentions(drop_directives(fix_scenario_title(x.get("title", "")))))
                                  for x in card.get("scenarios") or []]
             card["scenarios"] = [x for x in card["scenarios"] if x["text"]]
+            fibs = payload.get("fib_reference") or {}
+            if fibs and "費波" not in ai_card_text(card):
+                # 11-04 移植：flash-lite 常不照規則寫費波句 → 程式依同一份 fib_reference 補一句（數字都來自工具資料）
+                names = {str(r.data.get("stock_code")): str(r.data.get("stock_name") or "") for r in results
+                         if r.ok and isinstance(r.data, dict) and r.data.get("stock_code")}
+                lines = [fib_sentence(ref, names.get(code, "") if len(fibs) > 1 else "") for code, ref in list(fibs.items())[:2]]
+                lines = [x for x in lines if x]
+                if lines:
+                    card["why"] = (card.get("why", "").rstrip() + "".join(lines)).strip()
+                    self.log("費波句｜AI 沒寫，程式補上：" + "".join(lines)[:120])
             if not card['answer'] and card.get('why'):
                 # 10-16：標題句因來源字樣等被清掉：拿「為什麼」第一句當標題，不讓整張解讀消失
                 head = re.split(r"(?<=[。！？])", card["why"], maxsplit=1)[0]
@@ -9060,7 +9253,7 @@ def schedule_late_ai_image(engine, original, target, make_files, no_mentions):
 
 PUBLIC_ANSWER_ROUTES = frozenset(("planner", "answer_cache"))
 # 11-02（測試版 11-03 移植）：/ace 問族群雷達（哪些族群正在轉強）和 /ask 一樣公開
-PUBLIC_ADMIN_ROUTES = frozenset(("admin_kline_debug", "admin_radar"))
+PUBLIC_ADMIN_ROUTES = frozenset(("admin_kline_debug", "admin_fib_debug", "admin_radar"))   # 11-04 移植：費波驗證圖比照型態驗證公開
 # /ace 管理指令字眼：含內部狀態、路徑、快取、筆數、log 的回覆一開始就 ephemeral defer。
 _ADMIN_PRIVATE_RE = re.compile(r"錯誤|ERROR|狀態|用量|使用量|USAGE|底庫|名冊|維護|DEBUG|LOG|日誌|快取|CACHE|草稿|說明|HELP|指令", re.IGNORECASE)
 
@@ -9082,7 +9275,8 @@ def is_public_answer(result) -> bool:
 
 def followup_ephemeral(result, *, ephemeral=False) -> bool:
     """型態驗證逐張決定可見性；其他後續回覆保留原設定。"""
-    if result.route in PUBLIC_ADMIN_ROUTES or result.route in ("admin_kline_error", "admin_kline_denied"):
+    if result.route in PUBLIC_ADMIN_ROUTES or result.route in ("admin_kline_error", "admin_kline_denied",
+                                                               "admin_fib_error", "admin_fib_denied"):
         return bool(ephemeral or not is_public_answer(result))
     return bool(ephemeral)
 
