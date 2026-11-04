@@ -5006,10 +5006,16 @@ _MARGIN_RE = re.compile(r"融資|融券|券資比")
 _MARGIN_SCHEMA = {"type": "object", "properties": {"kind": {"type": "string", "enum": [
     "market_twse", "market_tpex", "market_both", "stock", "other"]}}, "required": ["kind"]}
 _MARGIN_MARKET_FALLBACK_RE = re.compile(r"大盤|加權|櫃買|上市|上櫃|台股|整體|全市場|市場|OTC", re.I)
-FINAL_MARGIN_RULES = ("【大盤／櫃買融資（11-04）】get_market_margin 是交易所公布的市場融資融券合計（收盤後晚上才公布，盤中沒有今天的），"
-    "融資金額用億元、融資融券張數用張：講最新融資餘額、較前一日與近 5 個交易日增減（margin_change_5d_yi 是 null 就不提）。"
-    "融資增加＝用借錢買股的部位變多，常拿來看散戶追價或籌碼是否變亂；融資減少＝去槓桿或斷頭賣壓。不可說融資增加就會漲或會跌，也不給買賣建議。"
-    "data_date 不是今天時要說是哪一天的資料。使用者問的是融資時重點放在融資、指數走勢最多一句；問大盤型態時融資最多一句帶過。")
+FINAL_MARGIN_RULES = ("【大盤／櫃買融資（11-05）】get_market_margin 是交易所公布的市場融資融券合計（收盤後晚上才公布，盤中沒有今天的），"
+    "融資金額用億元、融資融券張數用張。圖上只有 K 線下方的融資副圖（柱＝每日增減、線＝融資餘額）和維持率，"
+    "原本表格上的數字要由你在解讀裡說清楚（不逐日念 rows）：\n"
+    "- answer 一句：最新融資餘額與較前一日增減。\n"
+    "- why 依序：近 5 個交易日增減（margin_change_5d_yi 是 null 就不提）與 rows 看得出的近期趨勢（連續增加或減少、和約一個月前比）；"
+    "融資張數變化（margin_lots_change；和金額方向相反時可說可能是低價股融資增加、高價股減少）；融券張數與變化；"
+    "融資維持率 maintenance_pct（一定寫「估算」，算法看 maintenance_note）：維持率越低代表融資戶帳面虧損越大，個股低於約 130% 會被追繳，"
+    "大盤維持率常見說法是 150～160% 以下偏低、要留意斷頭賣壓，170% 以上相對安全；沒有 maintenance_pct 就不提。\n"
+    "- 融資增加＝用借錢買股的部位變多，常拿來看散戶追價或籌碼是否變亂；融資減少＝去槓桿或斷頭賣壓。不可說融資增加就會漲或會跌，也不給買賣建議。"
+    "data_date 不是今天時要說是哪一天的資料。問大盤型態時融資最多一句帶過。")
 
 
 def market_margin_card(items: Sequence[Dict[str, Any]], question: str = "") -> Dict[str, Any]:
@@ -5039,7 +5045,8 @@ def format_market_margin(data: Dict[str, Any]) -> str:
     return (f"【{'櫃買（上櫃）' if data.get('market') == 'tpex' else '大盤（上市）'}融資融券】資料日期 {data.get('data_date', '-')}\n"
             f"・融資餘額 {float(data.get('margin_balance_yi') or 0):,.2f} 億元｜較前一日 {_signed_yi(data.get('margin_change_yi'))} 億"
             + (f"｜近 5 日 {_signed_yi(five)} 億" if five is not None else "")
-            + f"\n・融資 {float(data.get('margin_lots') or 0):,.0f} 張｜融券 {float(data.get('short_lots') or 0):,.0f} 張")
+            + f"\n・融資 {float(data.get('margin_lots') or 0):,.0f} 張｜融券 {float(data.get('short_lots') or 0):,.0f} 張"
+            + (f"｜融資維持率 {float(data['maintenance_pct']):.1f}%（估算）" if data.get("maintenance_pct") else ""))
 
 
 def market_of(parsed: "ParsedQuestion") -> str:
@@ -8383,8 +8390,14 @@ class AceQueryEngine:
                 panels.append({"branch_card": market_institutional_card(market_flow, question, with_chart=has_chart),
                                "hide_text": plan.route == "rule_market_institutional"})
         margins = [r.data for r in results if r.ok and r.name == "get_market_margin"]
-        if margins and plan.route == "rule_market_margin":     # 11-04：大盤／櫃買融資卡（型態頁只給 AI，不另放卡）
-            panels.append({"branch_card": market_margin_card(margins, question), "hide_text": True})
+        if margins and plan.route == "rule_market_margin":     # 11-04：大盤／櫃買融資頁（型態頁只給 AI，不另放圖）
+            # 11-05 使用者：改用 K 線下方副圖（柱＝每日增減、線＝融資餘額、標題列寫維持率），表格數字改由 AI 說明；沒有 K 線才用卡片
+            chart = next((p for p in panels if p.get("stock_code") in ("TAIEX", "TPEX") and p.get("bars")), None)
+            if chart is not None:
+                chart["margin"] = [{"name": "櫃買（上櫃）" if m.get("market") == "tpex" else "大盤（上市）", "rows": m.get("rows") or [],
+                                    "maintenance_pct": m.get("maintenance_pct")} for m in margins]
+            else:
+                panels.append({"branch_card": market_margin_card(margins, question), "hide_text": True})
         futures_data = next((r.data for r in results if r.ok and r.name == "get_futures_positions"), None)
         retail_data = next((r.data for r in results if r.ok and r.name == "get_retail_futures"), None)
         if futures_data and plan.route == "rule_futures":
@@ -9239,7 +9252,7 @@ class AceQueryEngine:
                 card[key] = drop_source_mentions(card[key])
                 card[key] = osc(card[key])
                 if key in ("why", "summary"):
-                    card[key] = drop_number_dumps(card[key], total=6 if payload.get("compare_page") else 10 if txf_page else 7)   # 10-20：念數據的句子拿掉
+                    card[key] = drop_number_dumps(card[key], total=6 if payload.get("compare_page") else 10 if txf_page or plan.route == "rule_market_margin" else 7)   # 10-20：念數據的句子拿掉
             # 10-20：結論太長時圖卡會把後半句切成標題下一行小字 → 後半段移到「為什麼」開頭
             card["answer"], spill = split_answer_head(drop_filler_head(card.get("answer", "")))
             if spill:
@@ -10105,7 +10118,16 @@ def _tpex_institutional_loop(stop: threading.Event) -> None:
         except Exception as exc:
             print(f"⚠️ 上櫃三大法人補資料略過｜{type(exc).__name__}: {exc}", flush=True)
             full = False
+        try:
+            # 11-05：大盤／櫃買融資（上櫃融資一次一天＋兩個市場的融資維持率）同一個迴圈慢慢補；補完就每 30 分鐘看一次
+            if tools.sync_market_margin(max_requests=12, log=lambda m: print(f"💳 {m}", flush=True)):
+                fetched, full = fetched or 1, False
+        except Exception as exc:
+            print(f"⚠️ 大盤／櫃買融資補資料略過｜{type(exc).__name__}: {exc}", flush=True)
         tools.TPEX_INST_KICK.clear()
+        if tools.MARGIN_KICK.is_set():
+            tools.MARGIN_KICK.clear()
+            fetched = fetched or 1                        # 會員查到缺融資：一分鐘後再補
         if tools.TPEX_INST_KICK.wait(60 if (fetched or not full) else 1800) and stop.is_set():
             break
         if stop.is_set():
