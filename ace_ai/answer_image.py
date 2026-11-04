@@ -1881,7 +1881,9 @@ def _level_rows(card: dict) -> list[tuple[str, str, float, float | None]]:
     rows = []
     # 覆盤卡會帶 level_limits（多列幾道支撐），讓成本與各均線距現價多少都看得到
     # 11-03：費波型態頁的比例標籤短（0.382），上下各最多 3 個；排不下時價位條會從最遠的開始省略
-    max_res, max_sup = (1, 1) if compact else (card.get('level_limits') or ((3, 3) if card.get('fib_page')
+    # 11-04：使用者指定往上／往下時（fib_focus），那一邊最多 4 個，反方向 page_levels 已只留最近 1 個
+    fib_limits = (4, 4) if card.get('fib_focus') else (3, 3)
+    max_res, max_sup = (1, 1) if compact else (card.get('level_limits') or (fib_limits if card.get('fib_page')
                                                                             else (LEVEL_MAX_RESISTANCES, LEVEL_MAX_SUPPORTS)))
     for lv in _pick(card.get('resistances_above_close') or [], max_res):
         rows.append(('壓力', lv.get('label', ''), lv.get('price'), lv.get('distance_from_close_pct')))

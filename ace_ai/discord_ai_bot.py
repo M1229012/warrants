@@ -670,6 +670,7 @@ class QueryPlan:
     brief_quote: bool = False                # 10-16：只問數字＋簡短 AI 看法
     brief_pattern: Set[str] = field(default_factory=set)   # 10-20：圖照出完整型態圖，但這些股票問的不是型態（AI 型態 1～2 句）
     fib_page: bool = False                   # 11-03（測試版）：費波型態頁——價格框／價位條改標費波價位
+    fib_focus: str = "both"                  # 11-04（測試版）：費波頁使用者想看的方向 up／down／both（AI 讀整句）
 
     def add(self, name: str, **kwargs: Any) -> None:
         call = ToolCall(name, {k: v for k, v in kwargs.items() if v not in (None, "")})
@@ -3003,6 +3004,7 @@ def watch_plan(payload: Dict[str, Any], chart_levels: Optional[Dict[str, Dict[st
 
 
 FIB_UP, FIB_LATER, FIB_DOWN = "上方參考目標", "突破後條件目標", "還在下跌｜下方參考"
+FIB_OTHER = "另一方向（使用者問到才用）"     # 11-04：還在下跌時放上方、平常放下方
 
 
 def _fib_prices(x: Dict[str, Any]) -> List[float]:
@@ -3052,7 +3054,15 @@ def fib_for_ai(results: Sequence[tools.ToolResult], plans: Dict[str, Any], skip:
         if not item:
             why_not[code] = "費波價位都和觀察重點的價位重疊"
             continue
-        out[code] = {"說明": ref.get("說明", ""), **item, **({"可信度": ref["可信度"]} if ref.get("可信度") else {})}
+        # 11-04 使用者：還在下跌卻問目標價、上漲中卻問哪裡止跌 → 另一個方向也給 AI，由寫解讀的 AI 讀整句決定要不要用
+        # （不多叫一次 AI）；程式補句 fib_sentence 只用預設方向
+        if ref.get("模式") == "falling":
+            other = {FIB_UP: [x for x in ref.get("目前壓力") or [] if fresh(x)][:limit]}
+        else:
+            other = {FIB_DOWN: [x for x in ref.get("下方候選支撐") or [] if fresh(x)][:limit]}
+        other = {k: v for k, v in other.items() if v}
+        out[code] = {"說明": ref.get("說明", ""), **item, **({FIB_OTHER: other} if other else {}),
+                     **({"可信度": ref["可信度"]} if ref.get("可信度") else {})}
     return out, why_not
 
 
@@ -3100,17 +3110,25 @@ FINAL_FIB_RULES = ("【費波參考目標（測試版；優先於規則 3「不�
     f"「{FIB_DOWN}」寫「若續跌，費波下方參考約 Z」。\n"
     "- 價位有「註記」要說依目前高低點試算、之後可能調整；有「可信度」要說只是區間量測。\n"
     "- 不寫比例計算過程、錨點日期或 A、B、C 代號；用「參考」「可能」，不說一定會到、會漲到，不給買賣指令。\n"
-    "- 使用者問目標價、滿足點時，就用這一句回答，不要說不提供目標價。沒有 fib_reference 的股票完全不提費波。")
+    "- 使用者問目標價、滿足點時，就用這一句回答，不要說不提供目標價。沒有 fib_reference 的股票完全不提費波。\n"
+    f"- 「{FIB_OTHER}」（11-04）：讀使用者整句，意思是想看另一個方向才用這組（例：還在下跌卻問目標價、能漲到哪、反彈到哪；"
+    "上漲中卻問會跌到哪、哪裡止跌、回檔到哪），這時費波句改寫那個方向（上方寫「費波參考目標約 X」、下方寫「若回檔，費波下方參考約 Z」）；"
+    "上下都問就各寫一句。沒問到就完全不用這組。")
 
 FINAL_FIB_PAGE_RULES = ("【費波型態頁（測試版；優先於規則 3「不給目標價」）】使用者問的是費波南西。圖上右側價格框與價位條是費波價位，"
     "watch_plan 的支撐、壓力也已經是同一份費波價位；完整清單在 get_fib_levels（說明＝這段波段是上漲後拉回、創高延伸還是下跌後反彈）：\n"
     "- answer 一句直接回答：目前價格落在哪兩個費波價位之間、最關鍵的一個費波價位（守住或站上代表什麼）。\n"
     "- why 依 get_fib_levels.說明 講這段波段的狀態，再講下方最近的費波支撐與上方最近的費波壓力。圖上價位條是比例在前、價格在後"
     "（get_fib_levels 的「圖上標示」，watch_plan 的名稱也是它），文字照這個寫法：比例接價位，第一次提到時補一個字說明性質"
-    "（例「0.618 回撤 2,333」「1.618 延伸 2,847」，性質看「名稱」）；前波高點、前低、整理區照名稱寫。價位照 watch_plan 規則寫。有「條件」的價位一定寫成條件（例「若站上前波高點，延伸目標約 X」）；有「次要」的 0.786 要說是 0.618 守不住時的下一個參考；"
+    "（例「0.618 回撤 2,333」「1.618 延伸 2,847」，性質看「名稱」）；前波高點、前低、整理區照名稱寫。「大段0.786」是更早一段大波段的回撤，不是這一段的 0.786，要寫「大波段 0.786」。"
+    "有「同區還有」的價位最多補半句（例「前低 322.74，也接近大波段 0.786」），不另外當成一個價位。價位照 watch_plan 規則寫。有「條件」的價位一定寫成條件（例「若站上前波高點，延伸目標約 X」）；有「次要」的 0.786 要說是 0.618 守不住時的下一個參考；"
     "有「註記」要說依目前高低點試算、之後可能調整；有「可信度」要說只是區間量測。\n"
     "- 均線、量能最多一句帶過；不寫比例計算過程、錨點日期或 A、B、C 代號；用「參考」「可能」，不說一定會到，不給買賣指令。\n"
-    "- get_fib_levels 有「狀態」（沒有可用的費波波段）時，直接說目前沒有明確的費波波段、圖上是一般關鍵價位，再照 watch_plan 回答。")
+    "- get_fib_levels 有「狀態」（沒有可用的費波波段）時，直接說目前沒有明確的費波波段、圖上是一般關鍵價位，再照 watch_plan 回答。\n"
+    "- get_fib_levels 有「使用者想看」時（11-04）：往上＝answer 直接回答往上依序看哪幾個費波價位（由近到遠最多 3 個，"
+    "有「條件」的寫成站上哪裡之後才看），why 講每一關的意義，下方只用一句提最近的支撐當風險；"
+    "往下＝answer 直接回答往下依序可能在哪裡止跌（由近到遠最多 3 個），why 講每一關守住或跌破代表什麼、要看到什麼才算止穩，"
+    "上方只用一句提最近的壓力。scenarios 也照這個方向寫。沒有「使用者想看」就照上面上下都講。")
 
 FINAL_TXF_RULES = ("【台指期型態頁（測試版）】TXF＝台指期近月連續日 K：每根＝前一晚夜盤＋當天日盤（開盤用夜盤開盤、收盤用日盤收盤），"
     "換月不還原價差；成交量單位是口，不是張；稱呼一律用「台指期」，不寫 TXF。\n"
@@ -7291,8 +7309,12 @@ class AceQueryEngine:
         parsed.sector = parsed.sector_context = None
         parsed.chip, parsed.spot_branch, parsed.spot_combo = "", "", False
         parsed.intents = {"technical"} | ({"futures"} if futures else set())
+        if fib:
+            # 11-04 使用者：想看目標價（往上）還是哪裡止跌（往下），任何白話都要懂 → AI 讀整句；沒特別說就上下都標
+            plan.fib_focus = fib_debug.fib_direction(parsed.original, self._ask_json)
         parsed.preset_plan = plan
-        self.log(f"🧭 {'費波型態頁' if fib else '台指期型態頁'}｜{','.join(c for c, _ in stocks)}")
+        self.log(f"🧭 {'費波型態頁' if fib else '台指期型態頁'}｜{','.join(c for c, _ in stocks)}"
+                 + (f"｜方向 {plan.fib_focus}" if fib else ""))
 
     def _answer_level_debug(self, question: str, started: float, *, module, label: str, route: str,
                             is_admin: bool, admin_mode: bool, codes: Optional[List[str]] = None) -> AnswerResult:
@@ -8686,7 +8708,7 @@ class AceQueryEngine:
                         self.log(f"{code} 三角疊線未通過｜{view.get('notice')}｜{json.dumps(view.get('diagnostic') or {}, ensure_ascii=False, default=str)}")
                 panel["key_levels"] = member_pattern.levels_card(panel, technical, tools.key_price_levels, tools.NEAR_ZONE_RATIO)
                 if plan.fib_page:
-                    self._use_fib_levels(panel, code, results)
+                    self._use_fib_levels(panel, code, results, getattr(plan, "fib_focus", "both"))
                 if parsed.cost_price is not None:
                     panel["key_levels"]["cost_price"] = parsed.cost_price
                 panel["disable_compare"] = not member_pattern.comparing(plan)
@@ -9140,12 +9162,12 @@ class AceQueryEngine:
                 self.log(f"權證分點觀察｜{data['stock_code']}｜" + "、".join(b["branch"] for b in data["branches"])
                          + f"｜{time.perf_counter() - started:.2f}s")
 
-    def _use_fib_levels(self, panel: Dict[str, Any], code: str, results: List[tools.ToolResult]) -> None:
+    def _use_fib_levels(self, panel: Dict[str, Any], code: str, results: List[tools.ToolResult], focus: str = "both") -> None:
         """11-03 使用者：費波型態頁——價格框與價位條改標費波價位（和費波驗證圖同一份計算）；觀察重點（watch_plan）
         用圖上那份價位，所以 AI 的支撐壓力也跟著是費波。費波價位另外交給 AI（get_fib_levels），事實核對才對得上。
-        算不出來就保留一般關鍵價位。"""
+        算不出來就保留一般關鍵價位。11-04：focus＝使用者想看的方向（往上多標壓力／目標，往下多標支撐）。"""
         try:
-            card, data = fib_debug.page_levels(code, float(panel["bars"][-1]["Close"]))
+            card, data = fib_debug.page_levels(code, float(panel["bars"][-1]["Close"]), focus)
         except Exception as exc:
             self.log(f"費波型態頁｜{code} 費波價位略過，保留一般關鍵價位｜{tools.err_text(exc)}")
             return
@@ -9420,6 +9442,8 @@ class AceQueryEngine:
             self.log("觀察重點｜" + "｜".join(f"{c} {v['方向']}" + ("（止穩觀察）" if v.get("止穩觀察") else "") for c, v in plans.items()))
         if plan.fib_page:
             payload["fib_page"] = True       # 11-03：費波型態頁（觀察重點的支撐壓力已是費波價位，不再另附 fib_reference）
+            if getattr(plan, "fib_focus", "both") in fib_debug.FOCUS_TEXT:
+                payload["fib_focus"] = plan.fib_focus      # 11-04：使用者想看往上或往下
         elif payload["pattern_focus"] and not payload.get("brief_quote"):
             # 10-29（測試版）：問型態才附費波參考目標；在 watch_plan 之後算，和觀察重點的價位去重（同一檔只有一份支撐壓力）
             fibs, why_not = fib_for_ai(results, plans, skip=set(payload.get("brief_pattern") or []),
