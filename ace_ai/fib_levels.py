@@ -348,6 +348,7 @@ def _compute(frame: pd.DataFrame, events: Optional[Dict[str, Any]], lookback: in
     found = bool(chosen and not fallback and not (chosen is primary and note))
 
     selected, levels, areas, summary = None, [], [], []
+    falling = False
     mode, mode_text = "none", f"最近 {lookback} 根價格沒有波動，不給費波價位"
     if chosen:
         leg, used, (a, b, cpt, merged, broken) = chosen
@@ -559,6 +560,9 @@ def _compute(frame: pd.DataFrame, events: Optional[Dict[str, Any]], lookback: in
                 c=_pivot(selected["c"], dates) if selected["c"] else None, amp=float(selected["amp"]),
                 amp_atr=float(selected["amp_atr"])),
             "mode": mode, "levels": levels,
+            # 11-04：還在下跌時那段低點未確認的下跌（高點 a → 目前低點 b）；費波型態頁看反彈用，價位計算不變
+            "falling_leg": ({"a": _pivot(provisional["a"], dates), "b": _pivot(provisional["b"], dates)}
+                            if falling else None),
             "areas": [{"low": z["low"], "high": z["high"], "above": z["above"], "ai": z["ai"], "tentative": z["tentative"],
                        "conditional": z["conditional"], "labels": [x["label"] for x in z["members"]]} for z in areas],
             "summary": summary, "flags": flags,
