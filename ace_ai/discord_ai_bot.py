@@ -4302,6 +4302,8 @@ def format_index_contribution(data: Dict[str, Any]) -> str:
         head = f"{market.get('index_name', '')}"
         if points is not None:
             head += f" {points:+.2f} 點"
+            if market.get("index_change_pct") is not None:       # 11-04：點數旁邊寫漲跌幅
+                head += f"（{market['index_change_pct']:+.2f}%）"
         coverage = market.get("market_cap_coverage_pct")
         if coverage is not None and (str(market.get("basis") or "").startswith("盤中") or coverage < 99.9):
             head += f"｜市值涵蓋 {coverage:.1f}%"

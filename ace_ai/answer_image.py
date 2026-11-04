@@ -3471,7 +3471,10 @@ def contribution_card(draw, y: float, data: dict, dry: bool) -> int:
         draw.text((tx, y + 44), now_text, font=font(30, True), fill=color, anchor='lm')
         tx += font(30, True).getlength(now_text) + 18
     if points is not None:
-        draw.text((tx, y + 44), f'{points:+.2f} 點', font=font(30, True), fill=color, anchor='lm')
+        # 11-04 使用者：點數旁邊寫漲跌幅（+0.52%），同色
+        pct = _finite(data.get('index_change_pct'))
+        draw.text((tx, y + 44), f'{points:+.2f} 點' + (f'（{pct:+.2f}%）' if pct is not None else ''),
+                  font=font(30, True), fill=color, anchor='lm')
 
     note = str(data.get('basis') or '')
     coverage = _finite(data.get('market_cap_coverage_pct'))
