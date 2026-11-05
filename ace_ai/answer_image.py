@@ -727,12 +727,14 @@ def draw_market_margin(draw, top: float, left: float, right: float, px, step: fl
     draw.rectangle((lx, top + 12, lx + 8, top + 28), fill=UP)
     draw.rectangle((lx + 8, top + 12, lx + 16, top + 28), fill=DOWN)
     last_change = next((c for c in reversed(changes) if c is not None), None)
-    text = '每日增減' + (f' 最新 {last_change:+,.2f}億' if last_change is not None else '')
+    unit = margin.get('unit', '億')          # 11-05：個股融資單位是張
+    money = (lambda v, sign='': f'{v:{sign},.2f}億') if unit == '億' else (lambda v, sign='': f'{v:{sign},.0f}張')
+    text = '每日增減' + (f' 最新 {money(last_change, "+")}' if last_change is not None else '')
     draw.text((lx + 22, top + 20), text, font=font(19), fill=INK, anchor='lm')
     lx += 22 + font(19).getlength(text) + 22
     if known:
         draw.line((lx, top + 20, lx + 22, top + 20), fill=ACCENT, width=3)
-        text = f'融資餘額 {known[-1]:,.2f}億'
+        text = f'融資餘額 {money(known[-1])}'
         draw.text((lx + 30, top + 20), text, font=font(19, True), fill=INK, anchor='lm')
         lx += 30 + font(19, True).getlength(text) + 22
     pct = margin.get('maintenance_pct')
@@ -1355,7 +1357,7 @@ _TAG_COLORS = (('三角上緣', '#C76C00'), ('三角下緣', '#1478B5'), ('量�
 _TAG_SPARE = '#7A5AF8'
 # 11-04 移植（只給 /ace 管理員）：費波型態頁。右側框上行寫比例（0.618）、下行寫價格，K 線上畫同色虛線；
 # 和費波驗證圖同一套顏色（回撤／反彈藍、前波高點橘、延伸紫、整理區綠、下跌支撐紅）。只在費波頁（lead）套用。
-FIB_TAG_MAX = 5            # 11-04 費波型態頁：右側框上行寫比例（0.618）、下行寫價格，K 線上畫同色虛線；使用者「怎麼沒有標出 0.618」→ 4 個改 5 個
+FIB_TAG_MAX = 8            # 11-04 費波型態頁：右側框上行寫比例（0.618）、下行寫價格，K 線上畫同色虛線；11-05 使用者「關鍵價位全部列上去」→ 最多 8 個（價格框欄放得下的量），K 線範圍外的寫在價位條
 FIB_TAG_H = 48
 _FIB_TAG_COLORS = (('回撤', '#1478B5'), ('反彈', '#1478B5'), ('前波高點', '#C76C00'), ('延伸', '#8044B8'),
                    ('整理區', '#2F855A'), ('前低', '#B4232C'), ('大段', '#B4232C'), ('等幅', '#B4232C'))
@@ -1485,8 +1487,8 @@ def _legend_item_w(item: dict) -> float:
 def _legend_layout(panel: dict, width: float) -> tuple[list[tuple[float, str, object]], bool]:
     """關鍵價位條（10-18 方案 1）：淺色底整條，左邊實心「支撐」（綠）／「壓力」（紅）標籤塊，
     後面接價位（價格粗體大字＋名稱），價位之間細直線隔開；右側有標框的價位加同色圓點。
-    一律只排一條：放不下時從離收盤最遠的參考價位開始省略（右側有標框的兩個一定保留），不換行、不截字。
-    回傳 ([(x, 種類, 內容)], 是否有內容)。"""
+    一般頁只排一條：放不下時從離收盤最遠的參考價位開始省略（右側有標框的兩個一定保留），不換行、不截字。
+    （費波頁全部列、可換行，見 _legend_lines。）回傳 ([(x, 種類, 內容)], 是否有內容)。"""
     tagged, rest = _chart_levels(panel)
     rest = sorted(rest, key=lambda it: abs(it['pct']) if it['pct'] is not None else 1e9)   # 由近到遠
     # 11-04：只剩有標框的還是放不下（費波頁 5 個框）→ 縮字縮間距再排一次，不讓字超出價位條
@@ -1501,6 +1503,52 @@ def _legend_layout(panel: dict, width: float) -> tuple[list[tuple[float, str, ob
         if end <= width or compact:
             return placed, bool(placed)
     return [], False
+
+
+def _legend_lines(panel: dict, width: float) -> list[list[tuple[float, str, object]]]:
+    """價位條每一行的內容。11-05 使用者（費波頁「關鍵價位全部列上去」）：費波頁那一邊的價位一個都不省略——
+    一行放得下就一行，放不下先縮字縮間距，還是放不下就換行（續行和第一行的標籤塊後面對齊）。其他頁照 _legend_layout 只排一條。"""
+    tagged, rest = _chart_levels(panel)
+    if tagged + rest and all(it.get('lead') for it in tagged + rest):
+        rest = sorted(rest, key=lambda it: abs(it['pct']) if it['pct'] is not None else 1e9)
+        for compact in (False, True):
+            tags = [dict(x, compact=True) for x in tagged] if compact else tagged
+            others = [dict(x, compact=True) for x in rest] if compact else rest
+            placed, end = _legend_place(tags, others, width)
+            if end <= width:
+                return [placed]
+        return _legend_wrap(tags, others, width)
+    placed, has = _legend_layout(panel, width)
+    return [placed] if has else []
+
+
+def _legend_wrap(tagged: list[dict], rest: list[dict], width: float) -> list[list[tuple[float, str, object]]]:
+    marked = {id(x) for x in tagged}
+    lines: list[list[tuple[float, str, object]]] = []
+    line: list[tuple[float, str, object]] = []
+    indent = LEGEND_BLOCK_W + 22
+    for kind in ('壓力', '支撐'):
+        group = sorted((it for it in tagged + rest if it['kind'] == kind), key=lambda it: it['price'], reverse=(kind == '支撐'))
+        if not group:
+            continue
+        if line:                                           # 每一組另起一行
+            lines.append(line)
+            line = []
+        line.append((0.0, 'block', kind))
+        x = indent
+        for k, item in enumerate(group):
+            item = dict(item, marked=id(item) in marked)
+            w = _legend_item_w(item)
+            if k and x + w + 22 > width:
+                lines.append(line)
+                line, x = [], indent
+            elif k:
+                line.append((x - LEGEND_ITEM_GAP_COMPACT / 2, 'sep', kind))
+            line.append((x, 'item', item))
+            x += w + LEGEND_ITEM_GAP_COMPACT
+    if line:
+        lines.append(line)
+    return lines
 
 
 def _legend_place(tagged: list[dict], rest: list[dict], width: float) -> tuple[list[tuple[float, str, object]], float]:
@@ -1526,49 +1574,60 @@ def _legend_place(tagged: list[dict], rest: list[dict], width: float) -> tuple[l
 
 
 def _level_legend_height(panel: dict) -> int:
-    _, has = _legend_layout(panel, LEGEND_W)
-    return LEGEND_ROW_H + 18 if has else 0
+    lines = _legend_lines(panel, LEGEND_W)
+    return LEGEND_ROW_H * len(lines) + 18 if lines else 0
 
 
 def draw_level_legend(draw, x: float, y: float, width: float, panel: dict) -> None:
-    placed, has = _legend_layout(panel, LEGEND_W)
-    if not has:
+    lines = _legend_lines(panel, LEGEND_W)
+    if not lines:
         return
     h, top = LEGEND_ROW_H, y
-    mid = top + h / 2
-    blocks = [(dx, kind) for dx, k, kind in placed if k == 'block']
-    # 底色：第一組的淡色鋪滿整條（圓角），第二組從它的標籤塊開始改成自己的淡色
-    draw.rounded_rectangle((x, top, x + LEGEND_W, top + h), radius=12, fill=_LEGEND_KIND_TINT[blocks[0][1]])
-    for dx, kind in blocks[1:]:
-        draw.rounded_rectangle((x + dx, top, x + LEGEND_W, top + h), radius=12, fill=_LEGEND_KIND_TINT[kind])
-        draw.rectangle((x + dx, top, x + dx + 12, top + h), fill=_LEGEND_KIND_TINT[kind])
-    for dx, k, value in placed:
-        if k == 'block':
-            ink = _LEGEND_KIND_INK[value]
-            if dx == 0:
-                draw.rounded_rectangle((x, top, x + LEGEND_BLOCK_W, top + h), radius=12, fill=ink)
-                draw.rectangle((x + LEGEND_BLOCK_W - 12, top, x + LEGEND_BLOCK_W, top + h), fill=ink)
-            else:
-                draw.rectangle((x + dx, top, x + dx + LEGEND_BLOCK_W, top + h), fill=ink)
-            draw.text((x + dx + LEGEND_BLOCK_W / 2, mid), value, font=font(23, True), fill='white', anchor='mm')
-        elif k == 'sep':
-            draw.line((x + dx, top + 16, x + dx, top + h - 16), fill='#D0D5DD', width=2)
-        elif k == 'item':
-            cx = x + dx
-            if value['marked']:
-                draw.ellipse((cx, mid - 7, cx + 14, mid + 7), fill=value['color'])
-                cx += 22
-            price = price_text(value['price'])
-            small = bool(value.get('compact'))      # 11-04：一條放不下時小一號（和 _legend_item_w 同一套尺寸）
-            name_size, price_size, pad = (21, 24, 6) if small else (23, 26, 8)
-            if value.get('lead'):
-                draw.text((cx, mid), value['name'], font=font(name_size), fill=INK, anchor='lm')
-                cx += font(name_size).getlength(value['name']) + pad
+    # 每個標籤塊（壓力／支撐）管到哪一行：從它出現的那行到下一個標籤塊之前（費波頁換行時標籤塊整個拉高）
+    spans = []
+    for row, line in enumerate(lines):
+        for dx, k, value in line:
+            if k == 'block':
+                spans.append([row, row, value, dx])
+        if spans and not any(k == 'block' for _, k, _ in line):
+            spans[-1][1] = row
+    total = top + h * len(lines)
+    # 底色：第一組的淡色鋪滿整條（圓角），後面的組從它的標籤塊開始改成自己的淡色
+    draw.rounded_rectangle((x, top, x + LEGEND_W, total), radius=12, fill=_LEGEND_KIND_TINT[spans[0][2]])
+    for r0, r1, kind, dx in spans[1:]:
+        y0, y1 = top + r0 * h, top + (r1 + 1) * h
+        draw.rounded_rectangle((x + dx, y0, x + LEGEND_W, y1), radius=12, fill=_LEGEND_KIND_TINT[kind])
+        draw.rectangle((x + dx, y0, x + dx + 12, y1), fill=_LEGEND_KIND_TINT[kind])
+    for r0, r1, kind, dx in spans:
+        y0, y1 = top + r0 * h, top + (r1 + 1) * h
+        ink = _LEGEND_KIND_INK[kind]
+        if dx == 0:
+            draw.rounded_rectangle((x, y0, x + LEGEND_BLOCK_W, y1), radius=12, fill=ink)
+            draw.rectangle((x + LEGEND_BLOCK_W - 12, y0, x + LEGEND_BLOCK_W, y1), fill=ink)
+        else:
+            draw.rectangle((x + dx, y0, x + dx + LEGEND_BLOCK_W, y1), fill=ink)
+        draw.text((x + dx + LEGEND_BLOCK_W / 2, (y0 + y1) / 2), kind, font=font(23, True), fill='white', anchor='mm')
+    for row, line in enumerate(lines):
+        mid = top + row * h + h / 2
+        for dx, k, value in line:
+            if k == 'sep':
+                draw.line((x + dx, mid - h / 2 + 16, x + dx, mid + h / 2 - 16), fill='#D0D5DD', width=2)
+            elif k == 'item':
+                cx = x + dx
+                if value['marked']:
+                    draw.ellipse((cx, mid - 7, cx + 14, mid + 7), fill=value['color'])
+                    cx += 22
+                price = price_text(value['price'])
+                small = bool(value.get('compact'))      # 11-04：一條放不下時小一號（和 _legend_item_w 同一套尺寸）
+                name_size, price_size, pad = (21, 24, 6) if small else (23, 26, 8)
+                if value.get('lead'):
+                    draw.text((cx, mid), value['name'], font=font(name_size), fill=INK, anchor='lm')
+                    cx += font(name_size).getlength(value['name']) + pad
+                    draw.text((cx, mid), price, font=font(price_size, True), fill=INK, anchor='lm')
+                    continue
                 draw.text((cx, mid), price, font=font(price_size, True), fill=INK, anchor='lm')
-                continue
-            draw.text((cx, mid), price, font=font(price_size, True), fill=INK, anchor='lm')
-            cx += font(price_size, True).getlength(price) + pad
-            draw.text((cx, mid), value['name'], font=font(19 if small else 21), fill=INK, anchor='lm')
+                cx += font(price_size, True).getlength(price) + pad
+                draw.text((cx, mid), value['name'], font=font(19 if small else 21), fill=INK, anchor='lm')
 
 
 def _tag_height(tagged: list[dict]) -> float:
@@ -1897,7 +1956,7 @@ def _level_rows(card: dict) -> list[tuple[str, str, float, float | None]]:
     # 覆盤卡會帶 level_limits（多列幾道支撐），讓成本與各均線距現價多少都看得到
     # 11-04 移植：費波型態頁的比例標籤短（0.382），上下各最多 3 個；排不下時價位條會從最遠的開始省略
     # 11-04 移植：使用者指定往上／往下時（fib_focus），那一邊最多 4 個，反方向 page_levels 已只留最近 1 個
-    fib_limits = (4, 4) if card.get('fib_focus') else (3, 3)
+    fib_limits = (99, 99)     # 11-05 使用者：費波頁那一邊的價位全部列（page_levels 已只留一邊）
     max_res, max_sup = (1, 1) if compact else (card.get('level_limits') or (fib_limits if card.get('fib_page')
                                                                             else (LEVEL_MAX_RESISTANCES, LEVEL_MAX_SUPPORTS)))
     for lv in _pick(card.get('resistances_above_close') or [], max_res):

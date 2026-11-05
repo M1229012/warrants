@@ -881,6 +881,7 @@ _TOOL_FAILURE_MESSAGES = {
     "get_institutional_flow": "目前三大法人資料取得失敗",
     "get_market_institutional": "目前全市場三大法人資料取得失敗",
     "get_market_margin": "目前大盤／櫃買融資資料取得失敗",
+    "get_stock_margin": "目前個股融資資料取得失敗",
     "get_retail_futures": "目前散戶多空比資料取得失敗",
     "get_index_contribution": "指數貢獻點數：所有成分股依權重 × 漲跌排序的拉升榜與拖累榜（非漲幅排名）",
     "get_market_breadth": "盤面廣度資料取得失敗",
@@ -7599,6 +7600,87 @@ def get_market_margin(market: str = "twse", days: int = MARGIN_CHART_DAYS) -> Di
     }
 
 
+# 11-05 使用者：個股融資（所有人可問）＋融資維持率（估算）。FinMind TaiwanStockMarginPurchaseShortSale（免費，只有張數、沒有金額）；
+# 個股維持率沒有公開資料 → 用每天的融資增減 × 當天收盤價推算融資平均成本（融資減少時照平均成本等比例扣掉），
+# 維持率 ≈ 收盤價 ÷（融資平均成本 × 融資成數）× 100；融資成數上市 6 成、上櫃 5 成（一般規定，個股可能被調降）。
+STOCK_MARGIN_FINANCING = {"twse": 0.6, "tpex": 0.5}
+STOCK_MAINT_NOTE = ("個股融資維持率是估算：用近 {days} 個交易日每天的融資增減 × 當天收盤價推算融資平均成本，"
+                    "維持率 ≈ 收盤價 ÷（融資平均成本 × 融資成數 {ratio:.0%}）；起算日之前的融資部位當成起算日收盤價買進，實際成本不同會有誤差")
+
+
+def get_stock_margin(stock_code: str, days: int = MARGIN_CHART_DAYS) -> Dict[str, Any]:
+    """個股融資融券（張）：近 days 天的融資餘額、每日增減、融券餘額，最新一天的較前一日、近 5 個交易日、券資比，以及融資維持率（估算）。"""
+    code, name = _stock_identity(stock_code)
+    if code in INDEX_CODES or code in FUTURES_CODES:
+        raise ToolDataError("指數和台指期沒有個股融資，請改問大盤或櫃買融資")
+    kf = core()
+    end = taipei_now()
+    started = time.perf_counter()
+    try:
+        raw = kf._finmind_get_data("TaiwanStockMarginPurchaseShortSale", data_id=code,
+                                   start_date=(end - timedelta(days=200)).strftime("%Y-%m-%d"),
+                                   end_date=end.strftime("%Y-%m-%d"), allow_empty=False)
+        record_api_event("FinMindData", status=200, latency=time.perf_counter() - started)
+    except Exception as exc:
+        record_api_event("FinMindData", status=500, latency=time.perf_counter() - started)
+        raise ToolDataError(f"{name or code} 融資資料暫時無法取得") from exc
+    daily: Dict[str, Dict[str, float]] = {}
+    for row in (raw.to_dict("records") if raw is not None else []):
+        day = str(row.get("date") or "")[:10]
+        if day:
+            daily[day] = {"margin": _margin_num(row.get("MarginPurchaseTodayBalance")),
+                          "margin_prev": _margin_num(row.get("MarginPurchaseYesterdayBalance")),
+                          "short": _margin_num(row.get("ShortSaleTodayBalance")),
+                          "short_prev": _margin_num(row.get("ShortSaleYesterdayBalance"))}
+    if not daily:
+        raise ToolDataError(f"{name or code} 沒有融資資料（可能不能融資）")
+    try:
+        frame = closed_frame(_load_price_bundle(code))
+        closes = {f"{pd.Timestamp(ts):%Y-%m-%d}": float(value) for ts, value in frame["Close"].items() if value == value}
+    except Exception:
+        closes = {}
+    try:
+        market = local_market_cache.stock_markets([code]).get(code) or "twse"
+    except Exception:
+        market = "twse"
+    ratio = STOCK_MARGIN_FINANCING.get(market, 0.6)
+    # 融資平均成本：第一天的餘額當成當天收盤買進；之後增加照當天收盤加進去、減少照平均成本等比例扣掉
+    maint: Dict[str, float] = {}
+    cost_total, held, basis_days = None, 0.0, 0
+    for day in sorted(daily):
+        close, balance = closes.get(day), daily[day]["margin"]
+        if close is None:
+            continue
+        if cost_total is None:
+            cost_total, held = balance * close, balance
+        else:
+            if balance > held:
+                cost_total += (balance - held) * close
+            elif held > 0:
+                cost_total *= balance / held
+            held = balance
+        basis_days += 1
+        if held > 0 and cost_total > 0:
+            maint[day] = round(close / (cost_total / held * ratio) * 100, 2)
+    dates = sorted(daily)[-days:]
+    rows = [{"date": d.replace("-", "/"), "margin_lots": daily[d]["margin"], "change_lots": daily[d]["margin"] - daily[d]["margin_prev"],
+             "short_lots": daily[d]["short"], **({"maintenance_pct": maint[d]} if d in maint else {})} for d in dates]
+    last = daily[dates[-1]]
+    five = rows[-1]["margin_lots"] - rows[-6]["margin_lots"] if len(rows) >= 6 else None
+    latest_maint = next(((r["date"], r["maintenance_pct"]) for r in reversed(rows) if r.get("maintenance_pct")), None)
+    return {
+        "stock_code": code, "stock_name": name, "market": market, "data_date": rows[-1]["date"], "unit": "張",
+        "margin_lots": last["margin"], "margin_lots_change": last["margin"] - last["margin_prev"], "margin_change_5d_lots": five,
+        "short_lots": last["short"], "short_lots_change": last["short"] - last["short_prev"],
+        "short_margin_ratio_pct": round(last["short"] / last["margin"] * 100, 2) if last["margin"] else None,
+        "maintenance_pct": latest_maint[1] if latest_maint and basis_days >= 20 else None,
+        "maintenance_date": latest_maint[0] if latest_maint and basis_days >= 20 else "",
+        "maintenance_note": STOCK_MAINT_NOTE.format(days=basis_days, ratio=ratio) if basis_days >= 20 else "股價資料不足 20 天，不估算維持率",
+        "rows": rows,
+        "definition_note": "交易所公布的個股融資融券餘額（張），收盤後晚上才公布、盤中沒有今天的；融資增加代表用借錢買這檔的部位變多，不等於會漲",
+    }
+
+
 TOOL_REGISTRY: Dict[str, Callable[..., Dict[str, Any]]] = {
     "get_chart_panel": get_chart_panel,
     "get_sheet_stock_chips": get_sheet_stock_chips,
@@ -7612,6 +7694,7 @@ TOOL_REGISTRY: Dict[str, Callable[..., Dict[str, Any]]] = {
     "get_institutional_flow": get_institutional_flow,
     "get_market_institutional": get_market_institutional,
     "get_market_margin": get_market_margin,
+    "get_stock_margin": get_stock_margin,
     "get_retail_futures": get_retail_futures,
     "get_market_breadth": get_market_breadth,
     "get_index_contribution": get_index_contribution,
@@ -7633,6 +7716,7 @@ TOOL_REGISTRY: Dict[str, Callable[..., Dict[str, Any]]] = {
 _CANCELLABLE_TOOLS = {"get_warrant_branch", "get_high_winrate_branches_buying"}
 
 TOOL_DESCRIPTIONS: Dict[str, str] = {
+    "get_stock_margin": "個股融資融券（張）：近 90 天融資餘額與每日增減、融券、券資比、融資維持率估算，收盤後晚上公布（參數 stock_code）",
     "get_market_margin": "大盤（上市）或櫃買（上櫃）融資融券餘額：融資金額億元、融資／融券張數、較前一日與近 5 日變化，收盤後晚上公布（參數 market=twse／tpex）",
     "get_top_warrant_buy_stocks": "權證共識淨買超排行：讀「快取_TOP15共識淨買超」最新統計日期的名次（參數 limit）",
     "get_cost_position_context": "持股成本相對現價、均線、大量區、布林的位置與上下關鍵價位（參數 stock_code, cost_price）",
