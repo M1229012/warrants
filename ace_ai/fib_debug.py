@@ -177,14 +177,92 @@ def live_bar(code: str, last_closed: str) -> dict[str, Any] | None:
             "time": str(info.get("time") or "")[:5], "is_live": bool(info.get("is_live"))}
 
 
+BIG_WAVE_MIN_MULT = 2.0                       # 大波段幅度至少是小波段的幾倍才算（不然是同一段）
+BIG_WAVE_RATIOS = (0.382, 0.5, 0.618, 0.786)
+
+
+def _big_wave(data: dict) -> dict | None:
+    """11-05 使用者（「跌破 0.786 才看更大範圍會不會太慢」）：往下看支撐時，最近一段上漲（小波段）之外，一開始就一起看大一級的波段——
+    這一年資料裡、小波段起點之前的最低點 → 同一個高點。幅度至少是小波段的 BIG_WAVE_MIN_MULT 倍才算；選用的不是上漲段就不看。"""
+    sel = data.get("selected") or {}
+    bars = data.get("bars") or []
+    if sel.get("dir", 0) <= 0 or not bars:
+        return None
+    a, b = sel["a"], sel["b"]
+    before = bars[:int(a["idx"])]
+    if not before:
+        return None
+    k = min(range(len(before)), key=lambda i: float(before[i]["Low"]))
+    low, high = float(before[k]["Low"]), float(b["price"])
+    amp = high - low
+    if low >= float(a["price"]) or amp < BIG_WAVE_MIN_MULT * (high - float(a["price"])):
+        return None
+    return {"low": low, "low_date": str(before[k]["date"]), "high": high, "high_date": str(b["date"]), "amp": amp,
+            "small_low": float(a["price"]), "small_date": str(a["date"])}
+
+
+def _big_wave_levels(data: dict, close: float) -> tuple[list[dict], dict | None]:
+    wave = _big_wave(data)
+    if not wave:
+        return [], None
+    span = f"（大波段 {wave['low_date']}～{wave['high_date'][5:]}）"
+    return [{"label": f"大波段回撤 {r:g}{span}", "tag": f"大段{r:g}", "kind": "retrace", "ratio": r,
+             "price": wave["high"] - wave["amp"] * r, "ai": True}
+            for r in BIG_WAVE_RATIOS if wave["high"] - wave["amp"] * r < close], wave
+
+
+def _wave_text(wave: dict) -> str:
+    return (f"大波段 {wave['low_date']} 低點 {wave['low']:.2f} → {wave['high_date']} 高點 {wave['high']:.2f}（這一年的主升段）；"
+            f"名稱有「大段」的是這段的回撤（跌深時的支撐），其餘是最近一段上漲 {wave['small_date'][5:]}～{wave['high_date'][5:]} 的回撤（短線拉回）")
+
+
+BIG_WAVE_SWITCH = 0.618                       # 跌破小波段這個回撤比例＝小波段的上漲結構被破壞，改看大波段
+
+
+def _use_big_wave(wave: dict | None, close: float) -> bool:
+    """11-05 使用者（「小範圍大範圍都列出來很奇怪，應該有判斷看哪一個」）：現價還在小波段 0.618 之上＝拉回不到 61.8%，
+    最近這段上漲還算完整 → 看小波段；跌破 0.618＝這段上漲的結構被破壞，價格在修正更大的波段 → 改看大波段。"""
+    if not wave:
+        return False
+    switch = wave["high"] - (wave["high"] - wave["small_low"]) * BIG_WAVE_SWITCH
+    return close < switch
+
+
+def _wave_choice_text(wave: dict, big: bool) -> str:
+    switch = wave["high"] - (wave["high"] - wave["small_low"]) * BIG_WAVE_SWITCH
+    small = f"最近一段上漲 {wave['small_date'][5:]}～{wave['high_date'][5:]}"
+    if big:
+        return (f"看大波段：現價已跌破{small}的 0.618（{switch:.2f}），這段上漲的結構被破壞，改看{_wave_text(wave).split('；')[0]}；"
+                "名稱有「大段」的是大波段的回撤，前低是小波段的起點")
+    return f"看小波段：現價還在{small}的 0.618（{switch:.2f}）之上，這段上漲的結構還在，先看這段的回撤"
+
+
+def _with_big_wave(ref: dict, res: dict) -> dict:
+    """型態頁的費波參考：下方候選支撐也加上大波段回撤（收盤之下），和費波頁同一套。"""
+    if ref.get("狀態"):
+        return ref
+    close = float(res.get("close") or 0)
+    big, wave = _big_wave_levels(res, close)
+    if not big or not _use_big_wave(wave, close):       # 11-05：還在小波段 0.618 之上 → 照原本的小波段支撐
+        return ref
+    # 跌破小波段 0.618 → 下方支撐改看大波段（保留前低，小波段的回撤與等幅拿掉）
+    downs = [x for x in ref.get("下方候選支撐") or [] if "前波低點" in str(x.get("依據")) and "大波段" not in str(x.get("依據"))]
+    downs += [{"依據": lv["label"], "價位": round(lv["price"], 2)} for lv in big]
+    top = lambda x: float(x["價位"]) if "價位" in x else float(str(x.get("價位區") or "0").split("～")[-1] or 0)
+    return dict(ref, **{"下方候選支撐": sorted(downs, key=top, reverse=True), "看的範圍": _wave_choice_text(wave, True)})
+
+
 def ai_reference(code: str) -> dict[str, Any]:
-    """10-29（測試版）：問型態時給 AI 的費波參考價；與費波驗證圖同一份資料（正式收盤 K＋一年日K）與計算。"""
+    """10-29（測試版）：問型態時給 AI 的費波參考價；與費波驗證圖同一份資料（正式收盤 K＋一年日K）與計算。
+    11-05：下方候選支撐加上大一級波段的回撤（_with_big_wave）。"""
     import taifex_futures
     if code == taifex_futures.CODE:     # 11-03：台指期型態頁也給費波參考（近月連續日 K，正式收盤）
-        return fib_levels.ai_reference(fib_levels.compute(taifex_futures.daily_frame(), None))
-    code, _, frame, events = kline_debug.load_closed(code)
-    frame, _ = extend_history(code, frame, events)
-    return fib_levels.ai_reference(fib_levels.compute(frame, events))
+        res = fib_levels.compute(taifex_futures.daily_frame(), None)
+    else:
+        code, _, frame, events = kline_debug.load_closed(code)
+        frame, _ = extend_history(code, frame, events)
+        res = fib_levels.compute(frame, events)
+    return _with_big_wave(fib_levels.ai_reference(res), res)
 
 
 PAGE_LIMIT = 2      # 費波型態頁和型態頁一樣，一次最多 2 檔（兩檔＝比較圖）
@@ -274,10 +352,10 @@ def page_levels(code: str, close: float, focus: str = "both") -> tuple[dict, dic
                 {"stock_code": code, "狀態": "沒有可用的費波波段，價位照一般型態頁"})
     gap = 0.15 * float(data["atr"] or 0)
     side = focus if focus in FOCUS_TEXT else default_side(data)
-    picked, same, drop, low_text, note = _side_levels(data, close, side, gap)
+    picked, same, drop, low_text, note, wave = _side_levels(data, close, side, gap)
     if not picked:                         # 這一邊算不出價位（極少見）：改看另一邊，不讓整頁沒有費波
         side = "down" if side == "up" else "up"
-        picked, same, drop, low_text, note = _side_levels(data, close, side, gap)
+        picked, same, drop, low_text, note, wave = _side_levels(data, close, side, gap)
     rows = [{"label": _chart_name(lv), "price": round(lv["price"], 2), "source": "fib",
              "distance_from_close_pct": (lv["price"] / close - 1) * 100 if close else None} for lv in picked]
     card = {"levels_only": True, "hide_score": True, "show_tracked_branches": False, "close": close, "stock_code": code,
@@ -300,6 +378,8 @@ def page_levels(code: str, close: float, focus: str = "both") -> tuple[dict, dic
     if drop:
         ai["反彈量測"] = (f"{drop['a']['date'][5:]} 高點 {drop['a']['price']:.2f} → {low_text}"
                       f"；「反彈」價位用這段下跌量（{note}）")
+    if wave:
+        ai["看的範圍"] = _wave_choice_text(wave, not wave.get("small_only"))
     return card, ai
 
 
@@ -310,7 +390,7 @@ def default_side(data: dict) -> str:
 
 
 def _side_levels(data: dict, close: float, side: str, gap: float):
-    """只取一邊的費波價位，相距 gap 內併成一個（_page_rank 選代表）。回傳 (picked, 同區名稱, 反彈量測段, 低點文字, 註記)。
+    """只取一邊的費波價位，相距 gap 內併成一個（_page_rank 選代表）。回傳 (picked, 同區名稱, 反彈量測段, 低點文字, 註記, 大波段)。
     還在下跌卻看往上：用這段下跌（高點→目前低點；盤中破低用盤中低點）量反彈，不用上漲段的回撤。"""
     levels, drop, low_text, note = list(data["levels"]), None, "", ""
     if side == "up":
@@ -326,6 +406,15 @@ def _side_levels(data: dict, close: float, side: str, gap: float):
             levels = [{"label": f"反彈 {r:g}", "kind": "retrace", "ratio": r, "price": lo + (hi - lo) * r, "ai": True,
                        "tentative": True, "note": note} for r in fib_levels.RETRACE] + [
                       {"label": "前波高點 B", "kind": "prior", "ratio": 1.0, "price": hi, "ai": True}]
+    wave = None
+    if side == "down":
+        big, wave = _big_wave_levels(data, close)
+        # 11-05 使用者：小波段／大波段只看一個（_use_big_wave 判斷）；原本用相鄰轉折算的「大段」一律拿掉，避免同名卻是不同段
+        levels = [lv for lv in levels if not str(lv.get("tag") or "").startswith("大段")]
+        if big and _use_big_wave(wave, close):
+            levels = [lv for lv in levels if lv.get("tag") == "前低"] + big     # 跌破小波段 0.618：大波段回撤＋前低
+        else:
+            wave = dict(wave, small_only=True) if wave else None
     levels = [lv for lv in levels if (lv["price"] > close) == (side == "up")]
     groups = []
     for lv in sorted(levels, key=lambda x: (x["price"], not x["ai"])):
@@ -339,7 +428,7 @@ def _side_levels(data: dict, close: float, side: str, gap: float):
         best = min(group, key=lambda x: (_page_rank(x), group.index(x)))
         picked.append(best)
         same[id(best)] = [_page_name(x) for x in group if x is not best]
-    return picked, same, drop, low_text, note
+    return picked, same, drop, low_text, note, wave
 
 
 
