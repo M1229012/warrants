@@ -1682,7 +1682,11 @@ def draw_level_tags(draw, tagged: list[dict], py, right: float, price_top: float
 def _date_ticks(bars: list, step: float) -> list[int]:
     """每 5 根（間距太窄時 10、15…）標一個日期，從最後一根往回數，確保最新一天一定有日期。"""
     interval = 5 * max(1, math.ceil(math.ceil(64 / max(step, 1e-6)) / 5))
-    return sorted(range(len(bars) - 1, -1, -interval))
+    ticks = sorted(range(len(bars) - 1, -1, -interval))
+    # 11-05：K 棒很密時（費波頁往前補到一年），最後一個日期靠右邊會往左推約 26px，和前一個疊在一起 → 拿掉前一個
+    if len(ticks) > 1 and (ticks[-1] - ticks[-2]) * step - max(0.0, 26 - step / 2) < 60:
+        ticks.pop(-2)
+    return ticks
 
 
 def draw_chart(draw, y: int, panel: dict) -> None:

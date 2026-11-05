@@ -2727,6 +2727,8 @@ def _compact_tool_data(name: str, data: Dict[str, Any], has_scorecard: bool) -> 
         return None  # 成本位置、支撐壓力、量區型態都已整理在評分卡
     # 權證分點只在會員明確問權證時才和評分卡一起出現（「權證籌碼和型態」），要送給 AI，否則 AI 無法回答權證那一半
     data = dict(data)
+    if name in ("get_market_margin", "get_stock_margin") and isinstance(data.get("rows"), list):
+        data["rows"] = data["rows"][-20:]      # 11-05：逐日只給 AI 最近 20 天（90 天整包 1.3 萬字太浪費）；副圖照畫 90 天
     if name == "get_spot_event_backtest":
         # 10-16：只送表格上那幾家分點的摘要；逐日紀錄、波段事件與統計不送（原本一題 7～13 萬字）
         spot = data.get("spot") or {}
@@ -6212,8 +6214,11 @@ class AceQueryEngine:
             # 11-04（測試版 11-03 移植，所有人）：「台指期現在如何」「夜盤怎麼看」→ 台指期型態頁；任何白話都可以，
             # 由 AI 讀整句判斷（問法人未平倉照舊走未平倉卡）
             import taifex_futures
-            if taifex_futures.wants_trend(question, self._ask_json):
+            kind = taifex_futures.question_kind(question, self._ask_json)
+            if kind == "trend":
                 self._apply_txf_page(parsed)
+            elif kind == "positions" and not [c for c, _ in parsed.stocks if c not in tools.INDEX_CODES]:
+                self._apply_futures_page(parsed)        # 11-05：大盤外資空單頁（加權 K 線＋未平倉副圖）
         if (_OVERNIGHT_ASK_RE.search(question) and parsed.chip not in ("spot", "combined") and parsed.stocks
                 and (access is None or access.entitlement.spot)):
             parsed.chip = "spot"   # 10-15：問隔日沖＝型態頁＋今日現股籌碼重點（顯示不變），AI 解讀再回答有沒有隔日沖可能
@@ -7076,6 +7081,19 @@ class AceQueryEngine:
             cache.clear()
         cache[q] = kind
         return kind
+
+    def _apply_futures_page(self, parsed: ParsedQuestion) -> None:
+        """11-05 使用者：問大盤外資空單／期貨未平倉（任何白話，AI 讀整句）→ 加權 K 線＋外資淨未平倉副圖＋散戶多空比，
+        不放卡片、數字由 AI 說；不走需求表（Log：需求表把它判成型態頁，副圖變成三大法人買賣超）。"""
+        plan = QueryPlan(route="rule_futures", need_final_llm=True)
+        plan.add("get_futures_positions")
+        plan.add("get_retail_futures")
+        parsed.stocks, parsed.branches, parsed.stock_candidates, parsed.branch_candidates = [("TAIEX", tools.INDEX_CODES["TAIEX"])], [], [], []
+        parsed.sector = parsed.sector_context = None
+        parsed.chip = ""
+        parsed.intents = {"futures"}
+        parsed.preset_plan = plan
+        self.log("🧭 大盤外資空單頁｜TAIEX")
 
     def _apply_txf_page(self, parsed: ParsedQuestion) -> None:
         """11-04（測試版 11-03 移植，/ask、/ace 都開放）：台指期／夜盤型態頁——標的與工具固定（台指期不在股票名冊，規則路由認不得），
@@ -8984,6 +9002,16 @@ class AceQueryEngine:
         panel.pop("scorecard", None)
         panel["key_levels"] = dict(card, ma_deduction=(panel.get("key_levels") or {}).get("ma_deduction") or {})
         self.log(f"費波型態頁｜{code}｜壓力 {len(card['resistances_above_close'])}｜支撐 {len(card['supports_below_close'])}")
+        if card.get("fib_wave_start"):
+            # 11-05 使用者：看大波段時 K 線往前補到大波段起點；拉長後三角線位置對不上，費波頁不畫三角線
+            try:
+                added = fib_debug.extend_chart(panel, code, card["fib_wave_start"])
+                if added:
+                    panel.pop("member_triangle", None)
+                    panel.pop("volume_profile", None)      # 價量分布只算最近 70 根，鋪在一年的圖上會誤導
+                    self.log(f"費波型態頁｜{code}｜看大波段，K 線往前補 {added} 根（{card['fib_wave_start']} 起）")
+            except Exception as exc:
+                self.log(f"費波型態頁｜{code}｜K 線往前補略過｜{tools.err_text(exc)}")
 
     def _attach_chart_levels(self, panels: List[Dict[str, Any]], results: Sequence[tools.ToolResult],
                              cost_price: Optional[float]) -> None:
