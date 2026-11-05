@@ -37,27 +37,33 @@ def is_futures(text: str) -> bool:
 
 
 # 只用來決定「要不要請 AI 讀整句」：句子有提到期貨、夜盤才多花一次 AI；是不是問台指期走勢由 AI 判斷
-_MENTION_RE = re.compile(r"台指|期指|期貨|夜盤|日盤|大台|小台|微台|(?<![A-Za-z])TXF?(?![A-Za-z])", re.IGNORECASE)
+# 11-05 Log：「外資空單如何」沒提期貨也是在問台指期未平倉 → 空單、多單、未平倉也請 AI 讀整句
+_MENTION_RE = re.compile(r"台指|期指|期貨|夜盤|日盤|大台|小台|微台|空單|多單|未平倉|(?<![A-Za-z])TXF?(?![A-Za-z])", re.IGNORECASE)
 _KIND_SCHEMA = {"type": "object", "properties": {"kind": {"type": "string", "enum": ["trend", "positions", "other"]}},
                 "required": ["kind"]}
 
 
-def wants_trend(question: str, ask_ai) -> bool:
+def question_kind(question: str, ask_ai) -> str:
     """11-03 使用者：「現在夜盤如何」「台指期如何」要出台指期型態頁＋AI 解讀，任何白話都可以 → 讓 AI 讀整句，不補關鍵字。
-    trend＝問台指期本身（日盤、夜盤）走勢；positions＝法人／散戶未平倉口數（照舊出未平倉卡）；other＝其他（照舊）。
-    ask_ai(prompt, schema) 回 dict 或 None；讀題失敗就照舊。"""
+    回 trend＝問台指期本身（日盤、夜盤）走勢；positions＝法人／散戶期貨未平倉、外資空單（11-05：加權 K 線＋未平倉副圖）；
+    other＝其他；沒提期貨相關字、沒有 AI 或讀題失敗回空字串（照舊）。ask_ai(prompt, schema) 回 dict 或 None。"""
     q = str(question or "")
     if ask_ai is None or not _MENTION_RE.search(q):
-        return False
-    prompt = ("你是台股問句解析器，只輸出 JSON，不要回答問題。使用者的問題提到期貨或夜盤，讀完整句判斷他要看什麼：\n"
+        return ""
+    prompt = ("你是台股問句解析器，只輸出 JSON，不要回答問題。使用者的問題提到期貨、夜盤或空單多單，讀完整句判斷他要看什麼：\n"
               "trend＝台指期本身的走勢、型態、現在怎樣、支撐壓力、會不會漲跌（日盤、夜盤、大台、小台都算）；\n"
-              "positions＝三大法人、外資、散戶的期貨未平倉、多單空單口數、多空比；\n"
-              "other＝其他（個股期貨、選擇權、加權指數現貨、美股夜盤、和台指期無關的問題）。\n問題：" + q)
+              "positions＝三大法人、外資、散戶的期貨未平倉、多單空單口數、多空比（「外資空單」「外資多單」沒講個股就是台指期未平倉）；\n"
+              "other＝其他（個股的融券或個股期貨、選擇權、加權指數現貨、美股夜盤、和台指期無關的問題）。\n問題：" + q)
     try:
         out = ask_ai(prompt, _KIND_SCHEMA) or {}
     except Exception:
-        return False
-    return str(out.get("kind") or "") == "trend"
+        return ""
+    kind = str(out.get("kind") or "")
+    return kind if kind in ("trend", "positions", "other") else ""
+
+
+def wants_trend(question: str, ask_ai) -> bool:
+    return question_kind(question, ask_ai) == "trend"
 
 
 def _fetch_rows() -> pd.DataFrame:

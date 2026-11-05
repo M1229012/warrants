@@ -360,6 +360,7 @@ def page_levels(code: str, close: float, focus: str = "both") -> tuple[dict, dic
              "distance_from_close_pct": (lv["price"] / close - 1) * 100 if close else None} for lv in picked]
     card = {"levels_only": True, "hide_score": True, "show_tracked_branches": False, "close": close, "stock_code": code,
             "fib_page": True, "fib_focus": side,
+            **({"fib_wave_start": wave["low_date"]} if wave and not wave.get("small_only") else {}),   # 11-05：K 線要補到這天
             "resistances_above_close": sorted([r for r in rows if r["price"] > close], key=lambda r: r["price"]),
             "supports_below_close": sorted([r for r in rows if r["price"] <= close], key=lambda r: -r["price"])}
     ai = {"stock_code": code, "stock_name": data.get("stock_name", ""),
@@ -381,6 +382,42 @@ def page_levels(code: str, close: float, focus: str = "both") -> tuple[dict, dic
     if wave:
         ai["看的範圍"] = _wave_choice_text(wave, not wave.get("small_only"))
     return card, ai
+
+
+EXTEND_PAD = 5          # 大波段起點前多留幾根，起點不貼著圖的左邊
+
+
+def extend_chart(panel: dict, code: str, start: str) -> int:
+    """11-05 使用者（「出現大範圍費波時，顯示的時間週期要符合費波，讓起點終點完整出現在圖上」）：
+    看大波段時，用費波同一份一年日 K（load_panel）補在現有 K 線前面，從大波段起點前 EXTEND_PAD 根開始；
+    現有的 K 棒（含盤中那根）照舊，補的那段均線、布林用整段一年日 K 重算，前後接得上。回傳補了幾根（不用補回 0）。"""
+    import warrant_ai_tools as tools
+    bars = panel.get("bars") or []
+    if not bars or not start:
+        return 0
+    first = str(bars[0]["date"]).replace("/", "-")
+    if start >= first:
+        return 0
+    year = load_panel(code)["fib_debug"]["bars"]
+    frame = pd.DataFrame(year, index=pd.to_datetime([b["date"] for b in year]))[["Open", "High", "Low", "Close", "Volume"]]
+    # 指數一年日 K 有幾段成交量是 0（資料缺口）：當成沒有資料，柱與均量線留空，不要畫成掉到 0
+    frame["Volume"] = frame["Volume"].where(frame["Volume"] > 0)
+    frame = tools.core().calculate_indicators(frame)
+    dates = [f"{ts:%Y-%m-%d}" for ts in frame.index]
+    k = next((i for i, d in enumerate(dates) if d >= start), None)
+    if k is None:
+        return 0
+    columns = ("Open", "High", "Low", "Close", "Volume", "MV5", "MV20", "MA5", "MA10", "MA20", "MA60", "BB_UPPER", "BB_MID", "BB_LOWER")
+    extra = []
+    for i in range(max(0, k - EXTEND_PAD), len(dates)):
+        if dates[i] >= first:
+            break
+        row = frame.iloc[i]
+        extra.append({"date": dates[i].replace("-", "/"),
+                      **{c: (float(row[c]) if c in frame.columns and pd.notna(row[c]) else None) for c in columns}})
+    if extra:
+        panel["bars"] = extra + bars
+    return len(extra)
 
 
 def default_side(data: dict) -> str:
