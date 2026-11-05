@@ -9387,16 +9387,6 @@ class AceQueryEngine:
             return
         panel["key_levels"] = dict(card, ma_deduction=(panel.get("key_levels") or {}).get("ma_deduction") or {})
         self.log(f"費波型態頁｜{code}｜壓力 {len(card['resistances_above_close'])}｜支撐 {len(card['supports_below_close'])}")
-        if card.get("fib_wave_start"):
-            # 11-05 使用者：看大波段時 K 線往前補到大波段起點；拉長後三角線位置對不上，費波頁不畫三角線
-            try:
-                added = fib_debug.extend_chart(panel, code, card["fib_wave_start"])
-                if added:
-                    panel.pop("member_triangle", None)
-                    panel.pop("volume_profile", None)      # 價量分布只算最近 70 根，鋪在一年的圖上會誤導
-                    self.log(f"費波型態頁｜{code}｜看大波段，K 線往前補 {added} 根（{card['fib_wave_start']} 起）")
-            except Exception as exc:
-                self.log(f"費波型態頁｜{code}｜K 線往前補略過｜{tools.err_text(exc)}")
 
     def _attach_chart_levels(self, panels: List[Dict[str, Any]], results: Sequence[tools.ToolResult],
                              cost_price: Optional[float]) -> None:
