@@ -197,7 +197,7 @@ def _big_wave(data: dict) -> dict | None:
     amp = high - low
     if low >= float(a["price"]) or amp < BIG_WAVE_MIN_MULT * (high - float(a["price"])):
         return None
-    return {"low": low, "low_date": str(before[k]["date"]), "high": high, "high_date": str(b["date"]), "amp": amp,
+    return {"low": low, "low_idx": k, "low_date": str(before[k]["date"]), "high": high, "high_date": str(b["date"]), "amp": amp,
             "small_low": float(a["price"]), "small_date": str(a["date"])}
 
 
@@ -360,7 +360,6 @@ def page_levels(code: str, close: float, focus: str = "both") -> tuple[dict, dic
              "distance_from_close_pct": (lv["price"] / close - 1) * 100 if close else None} for lv in picked]
     card = {"levels_only": True, "hide_score": True, "show_tracked_branches": False, "close": close, "stock_code": code,
             "fib_page": True, "fib_focus": side,
-            **({"fib_wave_start": wave["low_date"]} if wave and not wave.get("small_only") else {}),   # 11-05：K 線要補到這天
             "resistances_above_close": sorted([r for r in rows if r["price"] > close], key=lambda r: r["price"]),
             "supports_below_close": sorted([r for r in rows if r["price"] <= close], key=lambda r: -r["price"])}
     ai = {"stock_code": code, "stock_name": data.get("stock_name", ""),
@@ -384,40 +383,63 @@ def page_levels(code: str, close: float, focus: str = "both") -> tuple[dict, dic
     return card, ai
 
 
-EXTEND_PAD = 5          # 大波段起點前多留幾根，起點不貼著圖的左邊
+VERIFY_PAD = 5          # 費波驗證圖：大波段起點前多留幾根，起點不貼著圖的左邊
+BIG_COLOR = "#7C3AED"   # 大波段 A／B 與連線
 
 
-def extend_chart(panel: dict, code: str, start: str) -> int:
-    """11-05 使用者（「出現大範圍費波時，顯示的時間週期要符合費波，讓起點終點完整出現在圖上」）：
-    看大波段時，用費波同一份一年日 K（load_panel）補在現有 K 線前面，從大波段起點前 EXTEND_PAD 根開始；
-    現有的 K 棒（含盤中那根）照舊，補的那段均線、布林用整段一年日 K 重算，前後接得上。回傳補了幾根（不用補回 0）。"""
-    import warrant_ai_tools as tools
-    bars = panel.get("bars") or []
-    if not bars or not start:
-        return 0
-    first = str(bars[0]["date"]).replace("/", "-")
-    if start >= first:
-        return 0
-    year = load_panel(code)["fib_debug"]["bars"]
-    frame = pd.DataFrame(year, index=pd.to_datetime([b["date"] for b in year]))[["Open", "High", "Low", "Close", "Volume"]]
-    # 指數一年日 K 有幾段成交量是 0（資料缺口）：當成沒有資料，柱與均量線留空，不要畫成掉到 0
-    frame["Volume"] = frame["Volume"].where(frame["Volume"] > 0)
-    frame = tools.core().calculate_indicators(frame)
-    dates = [f"{ts:%Y-%m-%d}" for ts in frame.index]
-    k = next((i for i, d in enumerate(dates) if d >= start), None)
-    if k is None:
-        return 0
-    columns = ("Open", "High", "Low", "Close", "Volume", "MV5", "MV20", "MA5", "MA10", "MA20", "MA60", "BB_UPPER", "BB_MID", "BB_LOWER")
-    extra = []
-    for i in range(max(0, k - EXTEND_PAD), len(dates)):
-        if dates[i] >= first:
-            break
-        row = frame.iloc[i]
-        extra.append({"date": dates[i].replace("-", "/"),
-                      **{c: (float(row[c]) if c in frame.columns and pd.notna(row[c]) else None) for c in columns}})
-    if extra:
-        panel["bars"] = extra + bars
-    return len(extra)
+def _full_ratios(data: dict) -> dict:
+    """11-05 使用者：費波驗證圖 0.382／0.5／0.618／0.786 都要畫。演算法只算到 0.618（0.786 要盤中跌深才標），
+    選用波段缺的比例補成虛線、不交給 AI、名稱寫「只畫線」；已經有的（含次要 0.786）不重複。回傳新的 dict。"""
+    sel = data.get("selected")
+    if not sel or not sel.get("a") or not sel.get("b"):
+        return data
+    have = {round(float(lv.get("ratio") or 0), 3) for lv in data.get("levels") or []
+            if lv.get("kind") == "retrace" and not str(lv.get("tag") or "").startswith("大段")}
+    up = sel.get("dir", 0) > 0
+    end, amp = float(sel["b"]["price"]), abs(float(sel["b"]["price"]) - float(sel["a"]["price"]))
+    close, name = float(data.get("close") or 0), "回撤" if up else "反彈"
+    add = []
+    for r in BIG_WAVE_RATIOS:
+        if round(r, 3) in have:
+            continue
+        price = end - amp * r if up else end + amp * r
+        add.append({"label": f"{name} {r:g}（只畫線）", "tag": f"{name}{r:g}", "kind": "retrace", "ratio": r, "price": price,
+                    "ai": False, "above": price > close, "confluence": [], "tight": []})
+    return dict(data, levels=list(data.get("levels") or []) + add) if add else data
+
+
+def verify_view(data: dict) -> dict:
+    """11-05 使用者（「費波驗證的時候 K 線圖要顯示完整，A、B 點要畫出來；一般問費波照常 70 根」）：
+    只給費波驗證圖（render）用，回傳新的 dict，不改原資料。和費波頁同一套判斷：照趨勢往下看、現價（盤中用即時價）
+    跌破小波段 0.618 才看大波段——這時圖從大波段起點前 VERIFY_PAD 根開始顯示、畫出大A→大B，價位線加上大波段回撤；
+    交給 AI 的下方價位和 _with_big_wave 一樣改成大波段回撤＋前波低點（小波段收盤之下的回撤改成不交給 AI），
+    舊的相鄰轉折「大段」拿掉，避免同名卻是不同段。
+    11-05 使用者（「只要是費波驗證，0.382、0.5、0.618、0.786 全部顯示在 K 線圖」）：選用波段缺的比例補成虛線（_full_ratios）；
+    大波段四個比例不論在收盤上下都畫，收盤之上的不交給 AI。"""
+    data = _full_ratios(data)
+    if default_side(data) != "down":
+        return data
+    live = data.get("live_bar") or {}
+    close = float(live.get("Close") or data.get("close") or 0)
+    big, wave = _big_wave_levels(data, close)
+    if not big or not _use_big_wave(wave, close):
+        return data
+    a_idx, b_idx = wave["low_idx"], int(data["selected"]["b"]["idx"])
+    keep = lambda lv: lv["price"] >= close or ("前波低點" in lv["label"] and "大波段" not in lv["label"])
+    levels = [lv if keep(lv) else dict(lv, ai=False) for lv in data.get("levels") or []
+              if not str(lv.get("tag") or "").startswith("大段")]
+    span = f"（大波段 {wave['low_date']}～{wave['high_date'][5:]}）"
+    for r in BIG_WAVE_RATIOS:
+        price = wave["high"] - wave["amp"] * r
+        levels.append({"label": f"大波段回撤 {r:g}{span}", "tag": f"大段{r:g}", "kind": "retrace", "ratio": r, "price": price,
+                       "ai": price < close, "above": price >= close, "confluence": [], "tight": [], "from_idx": a_idx})
+    areas = [area if area.get("low", 0) >= close else dict(area, ai=False) for area in data.get("areas") or []]
+    return dict(data, levels=levels, areas=areas, display_start=min(int(data["display_start"]), max(0, a_idx - VERIFY_PAD)),
+                big_wave={"a": {"idx": a_idx, "price": wave["low"], "type": "L"},
+                          "b": {"idx": b_idx, "price": wave["high"], "type": "H"}},
+                summary=[f"{_wave_choice_text(wave, True)}；圖從大波段起點顯示，紫色大A→大B 是這段，"
+                         "名稱有「大段」的是它的回撤（交給 AI），小波段收盤之下的回撤改成不交給 AI"]
+                        + list(data.get("summary") or []))
 
 
 def default_side(data: dict) -> str:
@@ -528,6 +550,7 @@ def render(data: dict) -> Image.Image:
     """Pillow 繪圖，沿用既有字型；畫在高畫布上，最後依實際內容裁切。"""
     from answer_image import font, wrap
 
+    data = verify_view(data)         # 11-05：看大波段時從大波段起點顯示、畫出大A／大B
     bars = data["bars"]
     start, end = data["display_start"], data["last"]
     visible = bars[start:end + 1]
@@ -617,6 +640,8 @@ def render(data: dict) -> Image.Image:
     for lv in levels:
         yy, color = py(lv["price"]), KIND_COLOR[lv["kind"]]
         x1 = left if lv["kind"] == "support" else x0   # 下跌支撐來自更早的結構，整條畫滿才看得到
+        if "from_idx" in lv:                           # 11-05：大波段回撤從大A畫起
+            x1 = px(max(start, lv["from_idx"]))
         if lv["ai"] and lv.get("conditional"):   # 突破後才成立：長短線
             xx = x1
             while xx < right:
@@ -653,16 +678,29 @@ def render(data: dict) -> Image.Image:
                 x1 = left
             if x1 >= left:
                 draw.line((x1, y1, x2, y2), fill="#8A94A6", width=2)
-        for key, p in points:
+        marks = [(p, key.upper(), "#C2410C") for key, p in points]
+        wave = data.get("big_wave")      # 11-05：看大波段時畫出大A→大B（和小波段同一個高點時標「B＝大B」）
+        if wave:
+            ba, bb = wave["a"], wave["b"]
+            if start <= ba["idx"] and bb["idx"] <= end:
+                draw.line((px(ba["idx"]), py(ba["price"]), px(bb["idx"]), py(bb["price"])), fill=BIG_COLOR, width=2)
+            marks.append((ba, "大A", BIG_COLOR))
+            same = [k for k, (p, _, _) in enumerate(marks) if p is not ba and p["idx"] == bb["idx"]]
+            if same:
+                p, label, _ = marks[same[0]]
+                marks[same[0]] = (p, f"{label}＝大B", BIG_COLOR)
+            else:
+                marks.append((bb, "大B", BIG_COLOR))
+        for p, label, mark in marks:
             if not start <= p["idx"] <= end:
                 continue
             xx, yy = px(p["idx"]), py(p["price"])
-            draw.ellipse((xx - 10, yy - 10, xx + 10, yy + 10), outline="#C2410C", width=4)
-            label = key.upper()
+            draw.ellipse((xx - 10, yy - 10, xx + 10, yy + 10), outline=mark, width=4)
             ly = yy - 42 if p["type"] == "H" else yy + 14
-            cx = min(max(xx, left + 16), right - 16)   # 10-28：最後幾根的錨點字框不能伸進右側價位標籤
-            draw.rectangle((cx - 14, ly, cx + 14, ly + 28), fill="#FFFFFF", outline="#C2410C")
-            text(cx - tw(label, 21, True) / 2, ly + 1, label, 21, "#C2410C", True)
+            half = max(14, tw(label, 21, True) / 2 + 8)
+            cx = min(max(xx, left + half + 2), right - half - 2)   # 10-28：最後幾根的錨點字框不能伸進右側價位標籤
+            draw.rectangle((cx - half, ly, cx + half, ly + 28), fill="#FFFFFF", outline=mark)
+            text(cx - tw(label, 21, True) / 2, ly + 1, label, 21, mark, True)
 
     tags = [{"y": py(lv["price"]), "text": f"{lv.get('tag') or lv['label'].replace('前波高點', '前高').replace(' ', '')}｜{lv['price']:.2f}"
                                            + (" 現價附近" if lv.get("watch") else " 條件" if lv["ai"] and lv.get("conditional")
@@ -678,7 +716,10 @@ def render(data: dict) -> Image.Image:
     for tag in tags:
         if abs(tag["ly"] - tag["y"]) > 2:
             draw.line((right + 4, tag["y"], right + 14, tag["ly"]), fill=tag["color"], width=1)
-        text(right + 16, tag["ly"] - 12, tag["text"], 19, tag["color"], tag["bold"])   # 與最後一根的錨點圓圈留空隙
+        size = 19                                      # 11-05：加權數字長，標籤超出圖右緣就縮字（不截字）
+        while size > 14 and right + 16 + tw(tag["text"], size, tag["bold"]) > width - 6:
+            size -= 1
+        text(right + 16, tag["ly"] - 12, tag["text"], size, tag["color"], tag["bold"])   # 與最後一根的錨點圓圈留空隙
 
     tick_gap = max(1, math.ceil(len(visible) / 9))
     for i in range(start, end + 1, tick_gap):
