@@ -70,6 +70,8 @@ def read_request(question: str, ask_ai: Optional[Callable[[str, dict], Optional[
               "group（kind=branch 才看）：selected_five＝指定「精選五分點／五大分點／精選分點」這一組；named＝點名特定分點；"
               "all＝其他（我關注的、追蹤分點、主力，沒有特別指定）。\n"
               "branches：group=named 時句子裡點名的券商分點名稱，照原文寫；其他情況留空陣列。\n"
+              "kind=branch 時如果還指定某檔股票（例：永豐金內湖的雙鴻權證今天有沒有加碼或賣出、元大南屯手上的 2454 權證今天有動嗎），"
+              "stock 寫那檔股票的代號或名稱，照原文寫；沒指定留空字串。\n"
               "問題：" + q)
     try:
         out = ask_ai(prompt, _SCHEMA) or {}
@@ -82,8 +84,9 @@ def read_request(question: str, ask_ai: Optional[Callable[[str, dict], Optional[
         return {"kind": "stock", "group": "all", "branches": [], "unknown": [], "stock": str(out.get("stock") or "").strip()}
     if kind != "branch":
         return None
+    stock = str(out.get("stock") or "").strip()      # 11-06 使用者：「永豐金內湖的雙鴻」＝分點＋股票
     if out.get("group") == "selected_five":          # 11-06 使用者：「另外可以問精選五分點的權證」
-        return {"kind": "branch", "group": "selected_five", "branches": [], "unknown": []}
+        return {"kind": "branch", "group": "selected_five", "branches": [], "unknown": [], "stock": stock}
     kf = tools.core()
     picks: List[str] = []
     unknown: List[str] = []
@@ -97,7 +100,8 @@ def read_request(question: str, ask_ai: Optional[Callable[[str, dict], Optional[
         else:
             unknown.append(name)
     picks = list(dict.fromkeys(picks))
-    return {"kind": "branch", "group": "named" if picks or unknown else "all", "branches": picks, "unknown": unknown}
+    return {"kind": "branch", "group": "named" if picks or unknown else "all", "branches": picks, "unknown": unknown,
+            "stock": stock}
 
 
 def watched_branches() -> List[str]:
@@ -120,9 +124,11 @@ def _branch_holdings(branch: str) -> List[Dict[str, Any]]:
     return out
 
 
-def holdings(branches: List[str], log: Callable[[str], None] = print) -> Dict[str, Dict[str, Any]]:
-    """{權證代號: {名稱、標的、holders=[(分點, 張數)]、lots＝合計張數、cost＝合計成本}}。"""
-    key = (tools.taipei_now().strftime("%Y-%m-%d"), tuple(sorted(branches)))
+def holdings(branches: List[str], log: Callable[[str], None] = print,
+             min_cost: Optional[float] = None) -> Dict[str, Dict[str, Any]]:
+    """{權證代號: {名稱、標的、holders=[(分點, 張數)]、lots＝合計張數、cost＝合計成本}}；min_cost 預設 MIN_HOLD_COST。"""
+    min_cost = MIN_HOLD_COST if min_cost is None else min_cost
+    key = (tools.taipei_now().strftime("%Y-%m-%d"), tuple(sorted(branches)), min_cost)
     with _HOLD_LOCK:
         hit = _HOLD.get(key)
         if hit and time.monotonic() - hit[0] <= HOLD_CACHE_SECONDS:
@@ -140,7 +146,7 @@ def holdings(branches: List[str], log: Callable[[str], None] = print) -> Dict[st
             item["lots"] += row["lots"]
             item["cost"] += row["cost"]
             item["name"] = item["name"] or row["name"]
-    merged = {code: item for code, item in merged.items() if item["cost"] >= MIN_HOLD_COST}   # 零頭不算有單
+    merged = {code: item for code, item in merged.items() if item["cost"] >= min_cost}   # 零頭不算有單
     for item in merged.values():
         item["holders"].sort(key=lambda h: -h[1])
     with _HOLD_LOCK:
@@ -204,8 +210,15 @@ def surge_text(quote: Dict[str, Any]) -> str:
     return "爆量" if lots > 0 and (prev <= 0 or lots >= SURGE_MULT * prev) else ""
 
 
-def build(branches: List[str], focus: str = "", log: Callable[[str], None] = print) -> Dict[str, Any]:
-    hold = holdings(branches, log)
+FOCUS_MIN_COST = 100_000         # 指定股票時（永豐金內湖的雙鴻）門檻放低：小一點的部位也要看到有沒有動作
+
+
+def build(branches: List[str], focus: str = "", log: Callable[[str], None] = print,
+          stock: str = "", stock_name: str = "") -> Dict[str, Any]:
+    """stock＝只看這檔股票的權證（11-06 使用者：「單獨問分點的權證今日有沒有動作，例如永豐金內湖的雙鴻」）。"""
+    hold = holdings(branches, log, min(MIN_HOLD_COST, FOCUS_MIN_COST) if stock else None)
+    if stock:
+        hold = {code: item for code, item in hold.items() if str(item.get("stock") or "") == stock}
     symbols = {symbol(code, item.get("market", "")): code for code, item in hold.items()}
     items = yahoo_quotes.raw_items(symbols, QUOTE_DEADLINE) if symbols else {}
     now = tools.taipei_now()
@@ -220,7 +233,13 @@ def build(branches: List[str], focus: str = "", log: Callable[[str], None] = pri
     traded = [r for r in rows if r["quote"] and r["quote"]["traded"]]
     traded.sort(key=lambda r: (-r["quote"]["value"], -r["quote"]["lots"]))   # 11-06 使用者：金額、張數高的優先
     return {"branches": branches, "focus": focus, "time": now.strftime("%H:%M"), "date": today,
+            "stock": stock, "stock_name": stock_name,
             "holding_count": len(hold), "quoted": len(items), "rows": rows, "traded": traded}
+
+
+def net_lots(quote: Dict[str, Any]) -> float:
+    """估計買賣超（張）＝外盤－內盤（只算分得出內外盤的成交）。"""
+    return float(quote.get("outside") or 0) - float(quote.get("inside") or 0)
 
 
 def _holder_text(holders: List[Tuple[str, float]]) -> str:
@@ -234,30 +253,46 @@ def card(res: Dict[str, Any]) -> Dict[str, Any]:
     buys = sum(1 for x in leans if x is not None and x >= LEAN_BUY)
     sells = sum(1 for x in leans if x is not None and x <= 1 - LEAN_BUY)
     total = sum(r["quote"]["value"] for r in traded)
-    title = f"{res['focus']}｜權證盤中量能" if res["focus"] else "關注分點權證｜盤中量能"
+    stock_label = f"{res.get('stock_name') or res.get('stock')}" if res.get("stock") else ""
+    if stock_label:
+        title = f"{res['focus'] or '關注分點'}｜{stock_label} 權證今日動向"
+    else:
+        title = f"{res['focus']}｜權證盤中量能" if res["focus"] else "關注分點權證｜盤中量能"
     sections: List[Dict[str, Any]] = [{"type": "tiles", "items": [
         {"label": "今天有成交", "value": f"{len(traded)} / {res['holding_count']} 檔"},
         {"label": "成交金額合計", "value": tools._plain_money(total) if total else "0"},
         {"label": "偏買／偏賣", "value": f"{buys} / {sells} 檔"}]}]
-    if traded:
+    single = len(res["branches"]) == 1                 # 只看一家分點：「持有分點」欄不用列
+    # 指定股票：沒成交的持有權證也列（「今天沒成交」也是答案）；不指定：只列有成交的
+    listed = traded + ([r for r in res["rows"] if r not in traded] if stock_label else [])
+    if listed:
         rows = []
-        for r in traded[:TABLE_MAX]:
-            q = r["quote"]
-            change = "-" if q["change_pct"] is None else f"{q['change_pct']:+.1f}%"
-            rows.append([f"{r['name'] or q['name'] or r['warrant']} {r['warrant']}", _holder_text(r["holders"]),
-                         f"{r['lots']:,.0f}張", f"{q['lots']:,.0f}張 {tools._plain_money(q['value'])}",
-                         f"{r['share']:.0%}", change, lean(q)[0]])
-        sections += [{"type": "heading", "text": "有成交的權證（成交金額、張數大的在前）"},
-                     {"type": "table", "columns": ["權證", "持有分點", "分點持有", "今日成交", "占持有", "漲跌", "內外盤"],
-                      "rows": rows, "widths": [3.0, 1.9, 1.3, 2.2, 1.1, 1.1, 1.5], "signed": ("漲跌",), "accent": (),
-                      "row_badges": [surge_text(r["quote"]) for r in traded[:TABLE_MAX]]}]
-        if len(traded) > TABLE_MAX:
-            sections.append({"type": "note", "text": f"另有 {len(traded) - TABLE_MAX} 檔量較小，未列出", "keep": True})
+        for r in listed[:TABLE_MAX]:
+            q = r["quote"] if r["quote"] and r["quote"]["traded"] else None
+            name = f"{r['name'] or (r['quote'] or {}).get('name') or r['warrant']} {r['warrant']}"
+            if q:
+                change = "-" if q["change_pct"] is None else f"{q['change_pct']:+.1f}%"
+                net = net_lots(q)
+                cells = [f"{q['lots']:,.0f}張 {tools._plain_money(q['value'])}", f"{r['share']:.0%}", change,
+                         f"{net:+,.0f}張" if q["inside"] + q["outside"] else "-"]
+            else:
+                cells = ["今天沒成交", "-", "-", "-"]
+            rows.append([name] + ([] if single else [_holder_text(r["holders"])]) + [f"{r['lots']:,.0f}張"] + cells)
+        columns = ["權證"] + ([] if single else ["持有分點"]) + ["分點持有", "今日成交", "占持有", "漲跌", "估計買賣超"]
+        widths = [3.0] + ([] if single else [1.9]) + [1.3, 2.2, 1.1, 1.1, 1.5]
+        heading = (f"{stock_label} 持有中的權證（有成交的在前）" if stock_label else "有成交的權證（成交金額、張數大的在前）")
+        sections += [{"type": "heading", "text": heading},
+                     {"type": "table", "columns": columns, "rows": rows, "widths": widths,
+                      "signed": ("漲跌", "估計買賣超"), "accent": (),
+                      "row_badges": [surge_text(r["quote"]) if r["quote"] and r["quote"]["traded"] else "" for r in listed[:TABLE_MAX]]}]
+        if len(listed) > TABLE_MAX:
+            sections.append({"type": "note", "text": f"另有 {len(listed) - TABLE_MAX} 檔量較小，未列出", "keep": True})
     else:
         sections.append({"type": "paragraph", "text": f"關注分點持有的 {res['holding_count']} 檔權證，今天到 {res['time']} 都還沒有成交。"})
     sections.append({"type": "note", "keep": True,
-                     "text": "今日成交＝全市場成交；占持有＝今日成交張數÷關注分點持有張數；爆量＝盤中量已達昨天全天 2 倍；內外盤＝可分辨的成交裡打在委賣（偏買）或委買（偏賣）的比例，"
-                             "權證多和發行商造市成交，只能參考。盤中看不到分點，是不是這些分點在買賣要等收盤分點資料確認。"})
+                     "text": "今日成交＝全市場成交；占持有＝今日成交張數÷分點持有張數；爆量＝盤中量已達昨天全天 2 倍；"
+                             "估計買賣超＝外盤張數－內盤張數（權證多和發行商造市成交，外盤多大致是有人買進、內盤多大致是有人賣出）。"
+                             "盤中看不到分點，是不是這個分點在加碼或賣出，要等收盤分點資料確認。"})
     return {"branch": title, "label": f"盤中 {res['time']}", "sections": sections, "clean_display": False,
             "footer_text": "股市艾斯  /  權證盤中量能為奇摩即時報價，收盤前會變動"}
 

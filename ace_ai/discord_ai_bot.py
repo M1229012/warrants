@@ -751,7 +751,7 @@ ADMIN_HELP_GROUPS = (
                           "費波驗證 台指期（近月日盤＋夜盤自己算；最右邊一根是奇摩即時，只顯示）")),
     ("CDP 驗證（測試版）", ("CDP驗證 2330（逐日五價、觸及與收回統計）", "CDP驗證 2344 1608（一次最多 10 檔，公開）")),
     ("分點權證盤中（測試版，白話可）", ("關注分點的權證今天有量嗎", "追蹤分點有單的權證誰在爆量", "精選五分點的權證今天有量嗎",
-                                    "元大南屯的權證今天有在賣嗎")),
+                                    "元大南屯的權證今天有在賣嗎", "永豐金內湖的雙鴻權證今天有沒有加碼或賣出")),
     ("權證盤中排行（測試版，白話可）", ("今天哪些權證爆量", "權證成交金額前十", "盤中最熱的權證")),
     ("個股權證盤中買賣超（測試版，白話可）", ("金山電的權證今天買賣超", "2454權證盤中是買超還賣超")),
     ("本週精選", ("本週精選排名", "3006 幫我生成週精選文字", "這版確認，生成圖片")),
@@ -7574,11 +7574,20 @@ class AceQueryEngine:
         if not branches:
             return AnswerResult(text=f"目前讀不到{focus or '關注分點'}清單，請稍後再試。",
                                 route="admin_branch_warrant_live_error", gemini_calls=1, elapsed=elapsed(), as_text=True)
+        stock_code = stock_name = ""
+        if request.get("stock"):            # 11-06 使用者：「永豐金內湖的雙鴻」＝分點＋股票，看他之前買的權證今天有沒有動作
+            import warrant_live_stock as wls
+            stock_code, stock_name = wls.resolve(request["stock"])
+            if not stock_code:
+                return AnswerResult(text=f"看不出是哪一檔股票（{request['stock']}），請寫股票代號或名稱。",
+                                    route="admin_branch_warrant_live_clarify", gemini_calls=1, elapsed=elapsed(), as_text=True)
+            scope += f"｜{stock_name or stock_code}"
         self.log(f"🧭 分點權證盤中｜{scope}｜{'、'.join(branches)}")
-        result = bwl.build(branches, focus=focus, log=self.log)
+        result = bwl.build(branches, focus=focus, log=self.log, stock=stock_code, stock_name=stock_name)
         if not result["holding_count"]:
-            return AnswerResult(text="這些分點目前沒有持有中的權證（或權證分點歷史庫還沒同步），沒有可以看的盤中量。",
-                                route="admin_branch_warrant_live_empty", gemini_calls=1, elapsed=elapsed(), as_text=True)
+            empty = (f"{focus or '關注分點'}目前沒有持有中的 {stock_name or stock_code} 權證（剩餘成本 10 萬以上），沒有可以看的盤中動作。"
+                     if stock_code else "這些分點目前沒有持有中的權證（或權證分點歷史庫還沒同步），沒有可以看的盤中量。")
+            return AnswerResult(text=empty, route="admin_branch_warrant_live_empty", gemini_calls=1, elapsed=elapsed(), as_text=True)
         text = bwl.log_text(result)
         self.log(text)
         return AnswerResult(text=text, route="admin_branch_warrant_live", gemini_calls=1, elapsed=elapsed(),
