@@ -1093,8 +1093,9 @@ def futures_extra(data: Dict[str, Any], focus: str) -> str:
 
 
 def futures_card(data: Dict[str, Any], question: str = "", retail: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """台指期三大法人淨未平倉：各法人一格（淨多／淨空口數＋較前一日變化）；副圖在 K 線下方。"""
-    if tools.ace_preview():
+    """台指期三大法人淨未平倉：各法人一格（淨多／淨空口數＋較前一日變化）；副圖在 K 線下方。
+    11-06 使用者：/ask 也和測試版一樣用新版（淨部位帶正負號、多空比例條）。"""
+    if True:
         return _futures_card_v2(data, question, retail)
     items = []
     for x in data.get("investors") or []:
@@ -8483,7 +8484,10 @@ class AceQueryEngine:
                                     "maintenance_pct": stock_margin.get("maintenance_pct")}]
         futures_data = next((r.data for r in results if r.ok and r.name == "get_futures_positions"), None)
         retail_data = next((r.data for r in results if r.ok and r.name == "get_retail_futures"), None)
-        if futures_data and plan.route == "rule_futures" and not any(p.get("futures") for p in panels):   # 11-05：沒有副圖才用卡片
+        # 11-05：沒有副圖才用卡片。11-06 修正：副圖在下面的迴圈才掛上，這裡原本看 p["futures"] 永遠是空的 → 卡片每次都出；
+        # 改成看有沒有加權／台指期 K 線（有 K 線就一定會掛未平倉副圖）
+        if futures_data and plan.route == "rule_futures" and not any(
+                p.get("stock_code") in ("TAIEX", "TXF") and p.get("bars") for p in panels):
             panels.append({"branch_card": futures_card(futures_data, question, retail_data), "hide_text": True})
         if plan.route == "rule_institutional":
             flow = next((r.data for r in results if r.ok and r.name == "get_institutional_flow"), None)
