@@ -43,6 +43,7 @@ _RANK_WORDS = r"(?:排行|排名|top|前\s*\d+|前[十五三]|最|爆|量|熱)"
 _RANK_RE = re.compile(rf"(?:權證|牛熊證|窩輪).*{_RANK_WORDS}|{_RANK_WORDS}.*(?:權證|牛熊證|窩輪)", re.IGNORECASE)
 _SCHEMA = {"type": "object",
            "properties": {"kind": {"type": "string", "enum": ["branch", "rank", "other"]},
+                          "group": {"type": "string", "enum": ["all", "selected_five", "named"]},
                           "branches": {"type": "array", "items": {"type": "string"}}},
            "required": ["kind", "branches"]}
 
@@ -60,7 +61,9 @@ def read_request(question: str, ask_ai: Optional[Callable[[str, dict], Optional[
               "（例：關注分點的權證今天有量嗎、追蹤分點有單的權證誰在爆量、元大南屯的權證今天有在賣嗎）。\n"
               "kind=rank：全市場的權證今天盤中成交排行，不限分點（例：今天哪些權證爆量、權證成交金額前十、盤中最熱的權證、權證量大排行）。\n"
               "kind=other：其他（分點過去的買賣紀錄、勝率、持有部位明細、某檔股票的籌碼或型態、權證怎麼選、收盤後的歷史排行等）。\n"
-              "branches：kind=branch 時句子裡點名的券商分點名稱，照原文寫；沒點名（例如「我關注的分點」「追蹤分點」）或不是 branch 留空陣列。\n"
+              "group（kind=branch 才看）：selected_five＝指定「精選五分點／五大分點／精選分點」這一組；named＝點名特定分點；"
+              "all＝其他（我關注的、追蹤分點、主力，沒有特別指定）。\n"
+              "branches：group=named 時句子裡點名的券商分點名稱，照原文寫；其他情況留空陣列。\n"
               "問題：" + q)
     try:
         out = ask_ai(prompt, _SCHEMA) or {}
@@ -68,9 +71,11 @@ def read_request(question: str, ask_ai: Optional[Callable[[str, dict], Optional[
         return None
     kind = out.get("kind")
     if kind == "rank":
-        return {"kind": "rank", "branches": [], "unknown": []}
+        return {"kind": "rank", "group": "all", "branches": [], "unknown": []}
     if kind != "branch":
         return None
+    if out.get("group") == "selected_five":          # 11-06 使用者：「另外可以問精選五分點的權證」
+        return {"kind": "branch", "group": "selected_five", "branches": [], "unknown": []}
     kf = tools.core()
     picks: List[str] = []
     unknown: List[str] = []
@@ -83,7 +88,8 @@ def read_request(question: str, ask_ai: Optional[Callable[[str, dict], Optional[
             picks.append(canon)
         else:
             unknown.append(name)
-    return {"kind": "branch", "branches": list(dict.fromkeys(picks)), "unknown": unknown}
+    picks = list(dict.fromkeys(picks))
+    return {"kind": "branch", "group": "named" if picks or unknown else "all", "branches": picks, "unknown": unknown}
 
 
 def watched_branches() -> List[str]:

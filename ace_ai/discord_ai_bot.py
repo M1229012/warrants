@@ -750,7 +750,8 @@ ADMIN_HELP_GROUPS = (
     ("費波驗證（測試版）", ("費波驗證 2330（大波段錨點、回撤／延伸價位、共振）", "費波驗證 2344 1608（一次最多 10 檔，公開）",
                           "費波驗證 台指期（近月日盤＋夜盤自己算；最右邊一根是奇摩即時，只顯示）")),
     ("CDP 驗證（測試版）", ("CDP驗證 2330（逐日五價、觸及與收回統計）", "CDP驗證 2344 1608（一次最多 10 檔，公開）")),
-    ("分點權證盤中（測試版，白話可）", ("關注分點的權證今天有量嗎", "追蹤分點有單的權證誰在爆量", "元大南屯的權證今天有在賣嗎")),
+    ("分點權證盤中（測試版，白話可）", ("關注分點的權證今天有量嗎", "追蹤分點有單的權證誰在爆量", "精選五分點的權證今天有量嗎",
+                                    "元大南屯的權證今天有在賣嗎")),
     ("權證盤中排行（測試版，白話可）", ("今天哪些權證爆量", "權證成交金額前十", "盤中最熱的權證")),
     ("本週精選", ("本週精選排名", "3006 幫我生成週精選文字", "這版確認，生成圖片")),
     ("草稿", ("直接說修改需求", "還原上一版", "目前草稿")),
@@ -7539,12 +7540,22 @@ class AceQueryEngine:
         if request["unknown"] and not request["branches"]:
             return AnswerResult(text=f"找不到分點「{'、'.join(request['unknown'])}」，請確認名稱。",
                                 route="admin_branch_warrant_live_clarify", gemini_calls=1, elapsed=elapsed(), as_text=True)
-        branches = request["branches"] or bwl.watched_branches()
+        if request.get("group") == "selected_five":       # 11-06 使用者：「另外可以問精選五分點的權證」
+            try:
+                branches = tools.selected_five_branches()
+            except Exception as exc:
+                self.log(f"分點權證盤中｜精選五分點清單讀取失敗｜{tools.err_text(exc)}")
+                branches = []
+            focus, scope = "精選五分點", f"精選五分點 {len(branches)} 家"
+        else:
+            branches = request["branches"] or bwl.watched_branches()
+            focus = "、".join(request["branches"])
+            scope = f"指定 {focus}" if request["branches"] else f"關注分點 {len(branches)} 家"
         if not branches:
-            return AnswerResult(text="目前讀不到關注分點清單（高勝率分點、精選五分點），請稍後再試。",
+            return AnswerResult(text=f"目前讀不到{focus or '關注分點'}清單，請稍後再試。",
                                 route="admin_branch_warrant_live_error", gemini_calls=1, elapsed=elapsed(), as_text=True)
-        self.log(f"🧭 分點權證盤中｜{'指定 ' + '、'.join(branches) if request['branches'] else f'關注分點 {len(branches)} 家'}")
-        result = bwl.build(branches, focus="、".join(request["branches"]), log=self.log)
+        self.log(f"🧭 分點權證盤中｜{scope}｜{'、'.join(branches)}")
+        result = bwl.build(branches, focus=focus, log=self.log)
         if not result["holding_count"]:
             return AnswerResult(text="這些分點目前沒有持有中的權證（或權證分點歷史庫還沒同步），沒有可以看的盤中量。",
                                 route="admin_branch_warrant_live_empty", gemini_calls=1, elapsed=elapsed(), as_text=True)
@@ -10025,7 +10036,9 @@ def schedule_late_ai_image(engine, original, target, make_files, no_mentions):
 
 PUBLIC_ANSWER_ROUTES = frozenset(("planner", "answer_cache"))
 # 11-02：/ace 問族群雷達（哪些族群正在轉強）和 /ask 一樣公開
-PUBLIC_ADMIN_ROUTES = frozenset(("admin_kline_debug", "admin_fib_debug", "admin_cdp_debug", "admin_radar"))
+PUBLIC_ADMIN_ROUTES = frozenset(("admin_kline_debug", "admin_fib_debug", "admin_cdp_debug", "admin_radar",
+                                 # 11-06 使用者（測試版）：分點權證盤中量能、權證盤中成交 TOP10 不要只有自己看得到
+                                 "admin_branch_warrant_live", "admin_warrant_live_rank"))
 # /ace 管理指令字眼：含內部狀態、路徑、快取、筆數、log 的回覆一開始就 ephemeral defer。
 # 11-02：「記憶體」只比對管理指令本身；「記憶體族群誰最強」是族群問題，要公開。
 _ADMIN_PRIVATE_RE = re.compile(r"錯誤|ERROR|狀態|用量|使用量|USAGE|底庫|名冊|維護|DEBUG|LOG|日誌|快取|CACHE|草稿|說明|HELP|指令|記憶體明細|^\s*記憶體\s*$", re.IGNORECASE)
