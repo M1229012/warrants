@@ -750,6 +750,8 @@ ADMIN_HELP_GROUPS = (
     ("費波驗證（測試版）", ("費波驗證 2330（大波段錨點、回撤／延伸價位、共振）", "費波驗證 2344 1608（一次最多 10 檔，公開）",
                           "費波驗證 台指期（近月日盤＋夜盤自己算；最右邊一根是奇摩即時，只顯示）")),
     ("CDP 驗證（測試版）", ("CDP驗證 2330（逐日五價、觸及與收回統計）", "CDP驗證 2344 1608（一次最多 10 檔，公開）")),
+    ("分點權證盤中（測試版，白話可）", ("關注分點的權證今天有量嗎", "追蹤分點有單的權證誰在爆量", "元大南屯的權證今天有在賣嗎")),
+    ("權證盤中排行（測試版，白話可）", ("今天哪些權證爆量", "權證成交金額前十", "盤中最熱的權證")),
     ("本週精選", ("本週精選排名", "3006 幫我生成週精選文字", "這版確認，生成圖片")),
     ("草稿", ("直接說修改需求", "還原上一版", "目前草稿")),
     ("資料維護", ("系統狀態", "記憶體明細（常駐記憶體花在哪）", "用量（含費用估算）", "錯誤紀錄", "更新市場底庫", "更新族群名冊", "匯出狀態／匯入狀態")),
@@ -6323,6 +6325,11 @@ class AceQueryEngine:
                                                 is_admin=is_admin, admin_mode=admin_mode)
         if kline_debug.is_request(question) and (admin_mode or kline_debug._COMMAND.search(question) or re.search(r"驗證|核對|錨點|轉折確認", question)):
             return self._answer_kline_debug(question, started, is_admin=is_admin, admin_mode=admin_mode, image=image)
+        if admin_mode and is_admin and image is None:
+            # 11-06 使用者（測試版）：關注分點有部位的權證，今天盤中有沒有量、偏買偏賣（白話問，AI 讀題）
+            live_reply = self._answer_branch_warrant_live(question, started)
+            if live_reply is not None:
+                return live_reply
         if admin_mode:
             self.log(f"使用者問題（/ace）：{question[:120]}")   # 管理員路線（草稿、精選、維護）也留下原文，方便查路由
         if any(word in compact for word in MEMORY_RESET_WORDS):
@@ -7501,6 +7508,52 @@ class AceQueryEngine:
         parsed.preset_plan = plan
         self.log(f"🧭 {'費波型態頁' if fib else '台指期型態頁'}｜{','.join(c for c, _ in stocks)}"
                  + (f"｜方向 {plan.fib_focus}" if fib else ""))
+
+    def _answer_branch_warrant_live(self, question: str, started: float) -> Optional[AnswerResult]:
+        """11-06 使用者（測試版，/testace 管理員）：「關注分點有單的權證今天有沒有量、量多大、買單還賣單」。
+        任何白話都可以：branch_warrant_live.read_request 先看有沒有提到分點／追蹤／關注或已知分點名，再由 AI 讀整句；
+        不是這類問題回 None（照一般流程）。關注分點清單屬追蹤規則（機密），只給管理員、模擬會員時不出。"""
+        import branch_warrant_live as bwl
+        access = self._access()
+        if access is None or not access.admin_mode or access.simulation:
+            return None
+        try:
+            known = tools.get_known_branches()
+        except Exception:
+            known = tools.get_cached_known_branches()
+        request = bwl.read_request(question, self._ask_json, known)
+        if request is None:
+            return None
+        elapsed = lambda: time.perf_counter() - started
+        if request["kind"] == "rank":
+            # 11-06 使用者：「關注分點跟爆量 TOP10 是分開的」→ 全市場權證盤中成交 TOP10 另一張
+            import warrant_live_rank as wlr
+            self.log("🧭 權證盤中成交 TOP10")
+            ranked = wlr.build(log=self.log)
+            text = wlr.log_text(ranked)
+            self.log(text)
+            return AnswerResult(text=text, route="admin_warrant_live_rank", gemini_calls=1, elapsed=elapsed(),
+                                panels=[{"branch_card": wlr.card(ranked), "hide_text": True,
+                                         "footer_text": "股市艾斯  /  權證成交為奇摩即時報價，收盤前會變動"}],
+                                cacheable=False, image_title="權證盤中成交 TOP10")
+        if request["unknown"] and not request["branches"]:
+            return AnswerResult(text=f"找不到分點「{'、'.join(request['unknown'])}」，請確認名稱。",
+                                route="admin_branch_warrant_live_clarify", gemini_calls=1, elapsed=elapsed(), as_text=True)
+        branches = request["branches"] or bwl.watched_branches()
+        if not branches:
+            return AnswerResult(text="目前讀不到關注分點清單（高勝率分點、精選五分點），請稍後再試。",
+                                route="admin_branch_warrant_live_error", gemini_calls=1, elapsed=elapsed(), as_text=True)
+        self.log(f"🧭 分點權證盤中｜{'指定 ' + '、'.join(branches) if request['branches'] else f'關注分點 {len(branches)} 家'}")
+        result = bwl.build(branches, focus="、".join(request["branches"]), log=self.log)
+        if not result["holding_count"]:
+            return AnswerResult(text="這些分點目前沒有持有中的權證（或權證分點歷史庫還沒同步），沒有可以看的盤中量。",
+                                route="admin_branch_warrant_live_empty", gemini_calls=1, elapsed=elapsed(), as_text=True)
+        text = bwl.log_text(result)
+        self.log(text)
+        return AnswerResult(text=text, route="admin_branch_warrant_live", gemini_calls=1, elapsed=elapsed(),
+                            panels=[{"branch_card": bwl.card(result), "hide_text": True,
+                                     "footer_text": "股市艾斯  /  權證盤中量能為奇摩即時報價，收盤前會變動"}],
+                            cacheable=False, image_title="分點權證盤中量能")
 
     def _answer_level_debug(self, question: str, started: float, *, module, label: str, route: str,
                             is_admin: bool, admin_mode: bool, codes: Optional[List[str]] = None) -> AnswerResult:

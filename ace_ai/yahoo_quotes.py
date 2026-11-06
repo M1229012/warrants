@@ -226,3 +226,55 @@ def fetch(codes: List[str], deadline_seconds: Optional[float] = None,
     print(f"📡 Yahoo 成員報價｜requested={len(codes)}｜returned={len(out)}｜市場別不明={len(codes) - len(symbols)}"
           f"｜http_calls={calls}｜失敗 {errors} 批｜{time.perf_counter() - began:.1f}s{age_text}", flush=True)
     return out
+
+
+def raw_items(symbols: Dict[str, str], deadline_seconds: float = DEFAULT_DEADLINE) -> Dict[str, Dict[str, Any]]:
+    """11-06（測試版）：權證盤中量能用——symbols＝{奇摩代號（065712.TW）: 代號}，回 {代號: 奇摩原始報價}。
+    不解析、不進族群報價快取；和 fetch 共用同一把鎖、請求間隔與被擋冷卻（不並行打奇摩）。
+    11-06 實測權證欄位：volume（股）、previousVolume（昨量，股）、turnoverM（百萬元）、inMarket／outMarket（內／外盤張數，
+    只含能分辨的成交）、orderbook（五檔）、relatedSymbol（標的）、regularMarketTime（最後成交時間）。"""
+    out: Dict[str, Dict[str, Any]] = {}
+    if not symbols or not enabled():
+        return out
+    began = time.perf_counter()
+    deadline = began + deadline_seconds
+    if not _LOCK.acquire(timeout=max(0.0, min(deadline_seconds, deadline - time.perf_counter()))):
+        print(f"⚠️ Yahoo 權證報價｜等前一批抓完超過時限，這次先不抓｜{len(symbols)} 檔", flush=True)
+        return out
+    errors = calls = 0
+    try:
+        names = list(symbols)
+        for start in range(0, len(names), BATCH):
+            left = deadline - time.perf_counter()
+            if left <= 0.3 or not enabled():
+                break
+            gap = _LAST_CALL[0] + GAP_SECONDS - time.monotonic()
+            if gap >= left:
+                break
+            if gap > 0:
+                time.sleep(gap)
+            calls += 1
+            _LAST_CALL[0] = time.monotonic()
+            batch = names[start:start + BATCH]
+            try:
+                resp = requests.get(URL + urllib.parse.quote(",".join(batch)), headers=HEADERS,
+                                    timeout=min(TIMEOUT_SECONDS, max(0.01, deadline - time.perf_counter())))
+                if resp.status_code in (403, 429):
+                    _cool_down(f"HTTP {resp.status_code}")
+                    break
+                resp.raise_for_status()
+                for item in resp.json() or []:
+                    code = symbols.get(str(item.get("symbol") or ""))
+                    if code:
+                        out[code] = item
+            except Exception as exc:
+                errors += 1
+                print(f"⚠️ Yahoo 權證報價批次失敗｜{len(batch)} 檔｜{tools.err_text(exc)}", flush=True)
+                if errors >= MAX_ERRORS:
+                    _cool_down(f"連續 {errors} 批失敗")
+                    break
+    finally:
+        _LOCK.release()
+    print(f"📡 Yahoo 權證報價｜requested={len(symbols)}｜returned={len(out)}｜http_calls={calls}｜失敗 {errors} 批"
+          f"｜{time.perf_counter() - began:.1f}s", flush=True)
+    return out
