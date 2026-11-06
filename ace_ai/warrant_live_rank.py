@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import os
+import re
 import threading
 import time
 from datetime import datetime, timedelta
@@ -27,6 +28,10 @@ TWSE_TYPES = ("0999", "0999P", "0999C", "0999B", "0999X")   # 認購、認售、
 TWSE_URL = "https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX?date={date}&type={type}&response=json"
 TPEX_URL = "https://www.tpex.org.tw/www/zh-tw/afterTrading/otc?date={date}&type=WW&response=json"
 TWSE_GAP = 1.0                   # 證交所連打會被擋
+# 11-06 使用者：「另外列排除 ETF、台積電、正二等權證的一般股票權證 TOP10」。
+# 一般股票權證＝標的是 4 碼、不是 00 開頭（ETF／正2／反1）的個股，且不在排除名單；指數權證（臺股指）奇摩沒有標的 → 不算。
+GENERAL_EXCLUDE = {c.strip() for c in os.getenv("DISCORD_AI_WARRANT_RANK_EXCLUDE", "2330").split(",") if c.strip()}
+_STOCK_CODE = re.compile(r"[1-9]\d{3}")
 
 _LOCK = threading.Lock()
 _POOL: Dict[str, Dict[str, Any]] = {}          # {今天日期: 候選池}
@@ -100,19 +105,27 @@ def previous_pool(now: datetime, log: Callable[[str], None] = print) -> Dict[str
             break
         if twse is None:
             continue
-        try:
-            tpex = _tpex_day(day)
-        except Exception as exc:              # 櫃買抓不到：只用上市，照出排行（Log 記下）
-            log(f"權證排行｜櫃買 {day:%m/%d} 權證行情略過｜{tools.err_text(exc)}")
-            tpex = []
+        tpex, tpex_ok = [], False
+        for attempt in range(2):              # 11-06 實測櫃買偶爾連線中斷（ChunkedEncodingError）：重試一次
+            try:
+                tpex, tpex_ok = _tpex_day(day), True
+                break
+            except Exception as exc:
+                log(f"權證排行｜櫃買 {day:%m/%d} 權證行情失敗（第 {attempt + 1} 次）｜{tools.err_text(exc)}")
         rows = sorted(twse + tpex, key=lambda r: -r["prev_value"])[:POOL_SIZE]
-        pool = {"date": day.strftime("%Y-%m-%d"), "rows": rows, "twse": len(twse), "tpex": len(tpex)}
+        pool = {"date": day.strftime("%Y-%m-%d"), "rows": rows, "twse": len(twse), "tpex": len(tpex), "tpex_ok": tpex_ok}
         break
-    if pool["rows"]:
+    if pool["rows"] and pool.get("tpex_ok"):  # 櫃買沒抓到：這次只用上市照出，但不快取，下次問再重抓
         with _LOCK:
             _POOL.clear()
             _POOL[key] = pool
     return pool
+
+
+def is_general(quote: Dict[str, Any]) -> bool:
+    """一般股票權證：標的是個股（4 碼、非 00 開頭）且不在排除名單（預設台積電）。"""
+    code = str(quote.get("underlying") or "")
+    return bool(_STOCK_CODE.fullmatch(code)) and code not in GENERAL_EXCLUDE
 
 
 def build(log: Callable[[str], None] = print) -> Dict[str, Any]:
@@ -131,9 +144,9 @@ def build(log: Callable[[str], None] = print) -> Dict[str, Any]:
         if quote["traded"]:
             traded.append(dict(quote, code=code))
     traded.sort(key=lambda q: (-q["value"], -q["lots"]))          # 金額、張數高的優先
-    res = {"time": now.strftime("%H:%M"), "after_close": (now.hour, now.minute) >= (13, 35),
+    res = {"time": now.strftime("%H:%M"), "after_close": (now.hour, now.minute) >= (13, 35), "tpex_ok": pool.get("tpex_ok", True),
            "pool_date": pool["date"], "pool": len(rows), "quoted": len(items), "traded": len(traded),
-           "rows": traded[:TOP], "all": traded}
+           "rows": traded[:TOP], "all": traded, "general": [q for q in traded if is_general(q)][:TOP]}
     if rows and items:
         _RANK.update(at=time.monotonic(), date=today, res=res)
     return res
@@ -144,6 +157,17 @@ def _times(quote: Dict[str, Any]) -> str:
     return f"{quote['lots'] / prev:.1f}倍" if prev > 0 else "昨無量"
 
 
+def _table(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    table = []
+    for i, q in enumerate(rows, 1):
+        change = "-" if q["change_pct"] is None else f"{q['change_pct']:+.1f}%"
+        table.append([f"{i}. {q['name'] or q['code']} {q['code']}", f"{q['lots']:,.0f}張 {tools._plain_money(q['value'])}",
+                      _times(q), change, bwl.lean(q)[0]])
+    return {"type": "table", "columns": ["權證", "今日成交", "比昨天", "漲跌", "內外盤"], "rows": table,
+            "widths": [3.4, 2.6, 1.3, 1.2, 1.6], "signed": ("漲跌",), "accent": (),
+            "row_badges": [bwl.surge_text(q) for q in rows]}
+
+
 def card(res: Dict[str, Any]) -> Dict[str, Any]:
     rows = res["rows"]
     total = sum(q["value"] for q in rows)
@@ -152,20 +176,18 @@ def card(res: Dict[str, Any]) -> Dict[str, Any]:
         {"label": "今天有成交", "value": f"{res['traded']:,} 檔"},
         {"label": f"TOP{TOP} 成交金額", "value": tools._plain_money(total) if total else "0"}]}]
     if rows:
-        table = []
-        for i, q in enumerate(rows, 1):
-            change = "-" if q["change_pct"] is None else f"{q['change_pct']:+.1f}%"
-            table.append([f"{i}. {q['name'] or q['code']} {q['code']}", f"{q['lots']:,.0f}張 {tools._plain_money(q['value'])}",
-                          _times(q), change, bwl.lean(q)[0]])
-        sections += [{"type": "heading", "text": "成交金額、張數大的在前"},
-                     {"type": "table", "columns": ["權證", "今日成交", "比昨天", "漲跌", "內外盤"], "rows": table,
-                      "widths": [3.4, 2.6, 1.3, 1.2, 1.6], "signed": ("漲跌",), "accent": (),
-                      "row_badges": [bwl.surge_text(q) for q in rows]}]
+        excluded = "、".join({"2330": "台積電"}.get(c, c) for c in sorted(GENERAL_EXCLUDE))
+        sections += [{"type": "heading", "text": "全部權證（成交金額、張數大的在前）"}, _table(rows)]
+        general = res.get("general") or []
+        sections.append({"type": "heading", "text": f"一般股票權證 TOP{TOP}（排除指數、ETF{'、' + excluded if excluded else ''}）"})
+        sections.append(_table(general) if general else {"type": "paragraph", "text": "今天還沒有一般股票權證成交。"})
     elif not res["pool"]:
         sections.append({"type": "paragraph", "text": "抓不到前一個交易日的權證行情，暫時排不出來，請稍後再試。"})
     else:
         sections.append({"type": "paragraph", "text": f"候選的 {res['pool']:,} 檔權證，今天到 {res['time']} 都還沒有成交。"})
     pool_day = res["pool_date"][5:].replace("-", "/") if res["pool_date"] else "前一個交易日"
+    if res["pool"] and not res.get("tpex_ok", True):
+        sections.append({"type": "note", "keep": True, "text": "這次櫃買權證行情沒抓到，名單只含上市權證；再問一次會重抓。"})
     sections.append({"type": "note", "keep": True,
                      "text": f"候選＝{pool_day} 成交金額前 {res['pool']:,} 檔權證，昨天沒什麼量、今天才突然放量的可能不在名單內；"
                              "比昨天＝今日張數÷昨天全天張數；爆量＝已達昨天 2 倍；內外盤只能參考（權證多和發行商造市成交）。"})
@@ -177,7 +199,10 @@ def card(res: Dict[str, Any]) -> Dict[str, Any]:
 def log_text(res: Dict[str, Any]) -> str:
     lines = [f"權證成交排行｜{res['time']}｜候選 {res['pool']} 檔（{res['pool_date']} 成交金額前段）"
              f"｜有報價 {res['quoted']} 檔｜今天有成交 {res['traded']} 檔"]
-    for i, q in enumerate(res["all"][:30], 1):
-        lines.append(f"{i}. {q['name']}（{q['code']}）｜{q['lots']:,.0f}張 {tools._plain_money(q['value'])}"
-                     f"｜昨 {q['prev_lots']:,.0f}張｜內 {q['inside']:,.0f}／外 {q['outside']:,.0f}｜{bwl.lean(q)[0]}｜{q['time']}")
+    for title, rows in (("全部權證", res["all"][:30]), ("一般股票權證", res.get("general") or [])):
+        lines.append(f"【{title}】")
+        for i, q in enumerate(rows, 1):
+            lines.append(f"{i}. {q['name']}（{q['code']}，標的 {q.get('underlying') or '指數'}）｜{q['lots']:,.0f}張 "
+                         f"{tools._plain_money(q['value'])}｜昨 {q['prev_lots']:,.0f}張｜內 {q['inside']:,.0f}／外 {q['outside']:,.0f}"
+                         f"｜{bwl.lean(q)[0]}｜{q['time']}")
     return "\n".join(lines)

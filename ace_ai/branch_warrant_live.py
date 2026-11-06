@@ -169,7 +169,9 @@ def parse(item: Dict[str, Any], today: str) -> Dict[str, Any]:
     if today_trade and value <= 0:
         value = lots * 1000 * (raw(item.get("avgPrice")) or price)
     inside, outside = (raw(item.get("inMarket")), raw(item.get("outMarket"))) if today_trade else (0.0, 0.0)
+    related = str(item.get("relatedSymbol") or "")       # 標的：2330.TW、00632R.TW；指數權證（臺股指）是空的
     return {"name": str(item.get("symbolName") or ""), "traded": today_trade and lots > 0, "lots": lots,
+            "underlying": related.split(".")[0], "underlying_name": str(item.get("relatedSymbolName") or ""),
             "prev_lots": raw(item.get("previousVolume")) / 1000, "value": value, "price": price, "prev": prev,
             "change_pct": (price / prev - 1) * 100 if price > 0 and prev > 0 else None,
             "inside": inside, "outside": outside, "time": moment.strftime("%H:%M") if today_trade else ""}
