@@ -128,6 +128,27 @@ def is_general(quote: Dict[str, Any]) -> bool:
     return bool(_STOCK_CODE.fullmatch(code)) and code not in GENERAL_EXCLUDE
 
 
+def by_stock(quotes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """11-06 使用者（「一隻股票的權證容易霸榜」）：一般股票權證改依標的股票彙整——同一檔股票的權證成交張數、金額、
+    內外盤、昨量加總，依金額、再依張數排。"""
+    groups: Dict[str, Dict[str, Any]] = {}
+    for q in quotes:
+        code = str(q.get("underlying") or "")
+        g = groups.setdefault(code, {"underlying": code, "underlying_name": q.get("underlying_name") or "", "count": 0,
+                                     "lots": 0.0, "prev_lots": 0.0, "value": 0.0, "inside": 0.0, "outside": 0.0, "top": q,
+                                     "call_net": 0.0, "calls": 0})
+        g["count"] += 1
+        for key in ("lots", "prev_lots", "value", "inside", "outside"):
+            g[key] += float(q.get(key) or 0)
+        # 認購、認售混在一起算內外盤會互相抵銷（買認售是看空）→ 表上只放認購的估計買賣超（外盤－內盤）
+        if not any(mark in str(q.get("name") or "") for mark in ("售", "熊")):
+            g["calls"] += 1
+            g["call_net"] += float(q.get("outside") or 0) - float(q.get("inside") or 0)
+        if q["value"] > g["top"]["value"]:
+            g["top"] = q
+    return sorted(groups.values(), key=lambda g: (-g["value"], -g["lots"]))
+
+
 def build(log: Callable[[str], None] = print) -> Dict[str, Any]:
     now = tools.taipei_now()
     today = now.strftime("%Y-%m-%d")
@@ -146,7 +167,7 @@ def build(log: Callable[[str], None] = print) -> Dict[str, Any]:
     traded.sort(key=lambda q: (-q["value"], -q["lots"]))          # 金額、張數高的優先
     res = {"time": now.strftime("%H:%M"), "after_close": (now.hour, now.minute) >= (13, 35), "tpex_ok": pool.get("tpex_ok", True),
            "pool_date": pool["date"], "pool": len(rows), "quoted": len(items), "traded": len(traded),
-           "rows": traded[:TOP], "all": traded, "general": [q for q in traded if is_general(q)][:TOP]}
+           "rows": traded[:TOP], "all": traded, "general": by_stock([q for q in traded if is_general(q)])[:TOP]}
     if rows and items:
         _RANK.update(at=time.monotonic(), date=today, res=res)
     return res
@@ -168,6 +189,17 @@ def _table(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
             "row_badges": [bwl.surge_text(q) for q in rows]}
 
 
+def _stock_table(groups: List[Dict[str, Any]]) -> Dict[str, Any]:
+    table = []
+    for i, g in enumerate(groups, 1):
+        net = f"{g['call_net']:+,.0f}張" if g["calls"] else "-"
+        table.append([f"{i}. {g['underlying_name'] or g['underlying']} {g['underlying']}",
+                      f"{g['lots']:,.0f}張 {tools._plain_money(g['value'])}", f"{g['count']}檔", _times(g), net])
+    return {"type": "table", "columns": ["標的股", "權證成交", "檔數", "比昨天", "認購買賣超"], "rows": table,
+            "widths": [2.9, 2.7, 1.0, 1.2, 1.8], "accent": (), "signed": ("認購買賣超",),
+            "row_badges": [bwl.surge_text(g) for g in groups]}
+
+
 def card(res: Dict[str, Any]) -> Dict[str, Any]:
     rows = res["rows"]
     total = sum(q["value"] for q in rows)
@@ -179,8 +211,8 @@ def card(res: Dict[str, Any]) -> Dict[str, Any]:
         excluded = "、".join({"2330": "台積電"}.get(c, c) for c in sorted(GENERAL_EXCLUDE))
         sections += [{"type": "heading", "text": "全部權證（成交金額、張數大的在前）"}, _table(rows)]
         general = res.get("general") or []
-        sections.append({"type": "heading", "text": f"一般股票權證 TOP{TOP}（排除指數、ETF{'、' + excluded if excluded else ''}）"})
-        sections.append(_table(general) if general else {"type": "paragraph", "text": "今天還沒有一般股票權證成交。"})
+        sections.append({"type": "heading", "text": f"一般股票權證 TOP{TOP}（依標的股票；排除指數、ETF{'、' + excluded if excluded else ''}）"})
+        sections.append(_stock_table(general) if general else {"type": "paragraph", "text": "今天還沒有一般股票權證成交。"})
     elif not res["pool"]:
         sections.append({"type": "paragraph", "text": "抓不到前一個交易日的權證行情，暫時排不出來，請稍後再試。"})
     else:
@@ -190,7 +222,8 @@ def card(res: Dict[str, Any]) -> Dict[str, Any]:
         sections.append({"type": "note", "keep": True, "text": "這次櫃買權證行情沒抓到，名單只含上市權證；再問一次會重抓。"})
     sections.append({"type": "note", "keep": True,
                      "text": f"候選＝{pool_day} 成交金額前 {res['pool']:,} 檔權證，昨天沒什麼量、今天才突然放量的可能不在名單內；"
-                             "比昨天＝今日張數÷昨天全天張數；爆量＝已達昨天 2 倍；內外盤只能參考（權證多和發行商造市成交）。"})
+                             "比昨天＝今日張數÷昨天全天張數；爆量＝已達昨天 2 倍；內外盤只能參考（權證多和發行商造市成交）；"
+                             "認購買賣超＝這檔股票認購權證的外盤張數－內盤張數（只算候選名單裡的權證）。"})
     return {"branch": f"權證{'今日' if res['after_close'] else '盤中'}成交 TOP{TOP}",
             "label": f"{'今日' if res['after_close'] else '盤中'} {res['time']}", "sections": sections,
             "clean_display": False, "footer_text": "股市艾斯  /  權證成交為奇摩即時報價，收盤前會變動"}
@@ -199,10 +232,14 @@ def card(res: Dict[str, Any]) -> Dict[str, Any]:
 def log_text(res: Dict[str, Any]) -> str:
     lines = [f"權證成交排行｜{res['time']}｜候選 {res['pool']} 檔（{res['pool_date']} 成交金額前段）"
              f"｜有報價 {res['quoted']} 檔｜今天有成交 {res['traded']} 檔"]
-    for title, rows in (("全部權證", res["all"][:30]), ("一般股票權證", res.get("general") or [])):
-        lines.append(f"【{title}】")
-        for i, q in enumerate(rows, 1):
-            lines.append(f"{i}. {q['name']}（{q['code']}，標的 {q.get('underlying') or '指數'}）｜{q['lots']:,.0f}張 "
-                         f"{tools._plain_money(q['value'])}｜昨 {q['prev_lots']:,.0f}張｜內 {q['inside']:,.0f}／外 {q['outside']:,.0f}"
-                         f"｜{bwl.lean(q)[0]}｜{q['time']}")
+    lines.append("【全部權證】")
+    for i, q in enumerate(res["all"][:30], 1):
+        lines.append(f"{i}. {q['name']}（{q['code']}，標的 {q.get('underlying') or '指數'}）｜{q['lots']:,.0f}張 "
+                     f"{tools._plain_money(q['value'])}｜昨 {q['prev_lots']:,.0f}張｜內 {q['inside']:,.0f}／外 {q['outside']:,.0f}"
+                     f"｜{bwl.lean(q)[0]}｜{q['time']}")
+    lines.append("【一般股票權證（依標的）】")
+    for i, g in enumerate(res.get("general") or [], 1):
+        lines.append(f"{i}. {g['underlying_name']}（{g['underlying']}）｜{g['count']} 檔｜{g['lots']:,.0f}張 "
+                     f"{tools._plain_money(g['value'])}｜昨 {g['prev_lots']:,.0f}張｜內 {g['inside']:,.0f}／外 {g['outside']:,.0f}"
+                     f"｜認購估計買賣超 {g['call_net']:+,.0f}張｜最大 {g['top']['name']}")
     return "\n".join(lines)

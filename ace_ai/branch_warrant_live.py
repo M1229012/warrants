@@ -41,8 +41,11 @@ _HOLD_LOCK = threading.Lock()
 _MENTION_RE = re.compile(r"分點|追蹤|關注|主力|券商|大戶")
 _RANK_WORDS = r"(?:排行|排名|top|前\s*\d+|前[十五三]|最|爆|量|熱)"
 _RANK_RE = re.compile(rf"(?:權證|牛熊證|窩輪).*{_RANK_WORDS}|{_RANK_WORDS}.*(?:權證|牛熊證|窩輪)", re.IGNORECASE)
+_TODAY_WORDS = r"(?:今天|今日|盤中|現在|目前|買超|賣超|買賣超|內外盤|外盤|內盤)"
+_TODAY_RE = re.compile(rf"(?:權證|牛熊證|窩輪).*{_TODAY_WORDS}|{_TODAY_WORDS}.*(?:權證|牛熊證|窩輪)")
 _SCHEMA = {"type": "object",
-           "properties": {"kind": {"type": "string", "enum": ["branch", "rank", "other"]},
+           "properties": {"kind": {"type": "string", "enum": ["branch", "rank", "stock", "other"]},
+                          "stock": {"type": "string"},
                           "group": {"type": "string", "enum": ["all", "selected_five", "named"]},
                           "branches": {"type": "array", "items": {"type": "string"}}},
            "required": ["kind", "branches"]}
@@ -54,13 +57,16 @@ def read_request(question: str, ask_ai: Optional[Callable[[str, dict], Optional[
     branches: [正式分點名], unknown: [認不出的名稱]}；branches 空＝全部關注分點。不是這兩種或讀題失敗回 None（照一般流程）。"""
     q = str(question or "")
     named = any(len(alias) >= 2 and alias in q for alias in known)
-    if ask_ai is None or not (_MENTION_RE.search(q) or named or _RANK_RE.search(q)):
+    if ask_ai is None or not (_MENTION_RE.search(q) or named or _RANK_RE.search(q) or _TODAY_RE.search(q)):
         return None
     prompt = ("你是台股問句解析器，只輸出 JSON，不要回答問題。判斷使用者要看哪一種「今天盤中的權證成交量」：\n"
               "kind=branch：分點（關注分點、追蹤分點、主力、某家券商分點）手上持有的權證，今天盤中有沒有量、在買或賣、有沒有爆量／出貨"
               "（例：關注分點的權證今天有量嗎、追蹤分點有單的權證誰在爆量、元大南屯的權證今天有在賣嗎）。\n"
               "kind=rank：全市場的權證今天盤中成交排行，不限分點（例：今天哪些權證爆量、權證成交金額前十、盤中最熱的權證、權證量大排行）。\n"
-              "kind=other：其他（分點過去的買賣紀錄、勝率、持有部位明細、某檔股票的籌碼或型態、權證怎麼選、收盤後的歷史排行等）。\n"
+              "kind=stock：某一檔股票的權證今天盤中的成交、買賣超、內外盤，不問分點（例：金山電的權證今天買賣超、2454 權證盤中有人在買嗎、"
+              "台積電權證今天是買超還賣超）；stock＝那檔股票的代號或名稱，照原文寫。\n"
+              "kind=other：其他（分點過去的買賣紀錄、勝率、持有部位明細、某檔股票的權證分點籌碼（哪些分點買）、型態、權證怎麼選、"
+              "收盤後的歷史排行等）。\n"
               "group（kind=branch 才看）：selected_five＝指定「精選五分點／五大分點／精選分點」這一組；named＝點名特定分點；"
               "all＝其他（我關注的、追蹤分點、主力，沒有特別指定）。\n"
               "branches：group=named 時句子裡點名的券商分點名稱，照原文寫；其他情況留空陣列。\n"
@@ -72,6 +78,8 @@ def read_request(question: str, ask_ai: Optional[Callable[[str, dict], Optional[
     kind = out.get("kind")
     if kind == "rank":
         return {"kind": "rank", "group": "all", "branches": [], "unknown": []}
+    if kind == "stock":                              # 11-06 使用者：某檔股票的權證今天買賣超
+        return {"kind": "stock", "group": "all", "branches": [], "unknown": [], "stock": str(out.get("stock") or "").strip()}
     if kind != "branch":
         return None
     if out.get("group") == "selected_five":          # 11-06 使用者：「另外可以問精選五分點的權證」

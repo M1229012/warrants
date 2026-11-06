@@ -753,6 +753,7 @@ ADMIN_HELP_GROUPS = (
     ("分點權證盤中（測試版，白話可）", ("關注分點的權證今天有量嗎", "追蹤分點有單的權證誰在爆量", "精選五分點的權證今天有量嗎",
                                     "元大南屯的權證今天有在賣嗎")),
     ("權證盤中排行（測試版，白話可）", ("今天哪些權證爆量", "權證成交金額前十", "盤中最熱的權證")),
+    ("個股權證盤中買賣超（測試版，白話可）", ("金山電的權證今天買賣超", "2454權證盤中是買超還賣超")),
     ("本週精選", ("本週精選排名", "3006 幫我生成週精選文字", "這版確認，生成圖片")),
     ("草稿", ("直接說修改需求", "還原上一版", "目前草稿")),
     ("資料維護", ("系統狀態", "記憶體明細（常駐記憶體花在哪）", "用量（含費用估算）", "錯誤紀錄", "更新市場底庫", "更新族群名冊", "匯出狀態／匯入狀態")),
@@ -7526,6 +7527,25 @@ class AceQueryEngine:
         if request is None:
             return None
         elapsed = lambda: time.perf_counter() - started
+        if request["kind"] == "stock":
+            # 11-06 使用者：「多一種問法，顯示今日這檔股票權證買賣超的權證」
+            import warrant_live_stock as wls
+            code, name = wls.resolve(request.get("stock", ""))
+            if not code:
+                return AnswerResult(text=f"看不出是哪一檔股票（{request.get('stock') or '沒寫股票'}），請寫股票代號或名稱。",
+                                    route="admin_warrant_stock_live_clarify", gemini_calls=1, elapsed=elapsed(), as_text=True)
+            missing = wls.ensure_store()
+            if missing:
+                return AnswerResult(text=missing, route="admin_warrant_stock_live_error", gemini_calls=1, elapsed=elapsed(),
+                                    as_text=True)
+            self.log(f"🧭 個股權證盤中買賣超｜{name}（{code}）")
+            stock_res = wls.build(code, name, log=self.log)
+            text = wls.log_text(stock_res)
+            self.log(text)
+            return AnswerResult(text=text, route="admin_warrant_stock_live", gemini_calls=1, elapsed=elapsed(),
+                                panels=[{"branch_card": wls.card(stock_res), "hide_text": True,
+                                         "footer_text": "股市艾斯  /  權證成交為奇摩即時報價，收盤前會變動"}],
+                                cacheable=False, image_title=f"{name or code} 權證今日買賣超")
         if request["kind"] == "rank":
             # 11-06 使用者：「關注分點跟爆量 TOP10 是分開的」→ 全市場權證盤中成交 TOP10 另一張
             import warrant_live_rank as wlr
@@ -10038,7 +10058,7 @@ PUBLIC_ANSWER_ROUTES = frozenset(("planner", "answer_cache"))
 # 11-02：/ace 問族群雷達（哪些族群正在轉強）和 /ask 一樣公開
 PUBLIC_ADMIN_ROUTES = frozenset(("admin_kline_debug", "admin_fib_debug", "admin_cdp_debug", "admin_radar",
                                  # 11-06 使用者（測試版）：分點權證盤中量能、權證盤中成交 TOP10 不要只有自己看得到
-                                 "admin_branch_warrant_live", "admin_warrant_live_rank"))
+                                 "admin_branch_warrant_live", "admin_warrant_live_rank", "admin_warrant_stock_live"))
 # /ace 管理指令字眼：含內部狀態、路徑、快取、筆數、log 的回覆一開始就 ephemeral defer。
 # 11-02：「記憶體」只比對管理指令本身；「記憶體族群誰最強」是族群問題，要公開。
 _ADMIN_PRIVATE_RE = re.compile(r"錯誤|ERROR|狀態|用量|使用量|USAGE|底庫|名冊|維護|DEBUG|LOG|日誌|快取|CACHE|草稿|說明|HELP|指令|記憶體明細|^\s*記憶體\s*$", re.IGNORECASE)
