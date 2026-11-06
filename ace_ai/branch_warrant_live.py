@@ -211,6 +211,19 @@ def surge_text(quote: Dict[str, Any]) -> str:
 
 
 FOCUS_MIN_COST = 100_000         # 指定股票時（永豐金內湖的雙鴻）門檻放低：小一點的部位也要看到有沒有動作
+# 11-06 使用者（「推估他買的量占這支權證發行量幾 %，初步判斷是不是他賣的」）：三個條件都成立標「疑似賣出」（待收盤確認）
+SUSPECT_ISSUE_SHARE = float(os.getenv("DISCORD_AI_BRANCH_LIVE_SUSPECT_ISSUE", "0.2") or 0.2)   # 分點持有 ≥ 發行量 20%
+SUSPECT_INSIDE_SHARE = float(os.getenv("DISCORD_AI_BRANCH_LIVE_SUSPECT_INSIDE", "0.3") or 0.3)  # 今日內盤 ≥ 分點持有 30%
+
+
+def suspect_sell(row: Dict[str, Any]) -> bool:
+    """疑似分點賣出：分點是主要持有人（持有 ≥ 發行量 SUSPECT_ISSUE_SHARE）、今天內盤張數 ≥ 分點持有 SUSPECT_INSIDE_SHARE、
+    估計買賣超為負。只是線索，是不是他賣要等收盤分點資料。"""
+    q = row.get("quote") or {}
+    if not q.get("traded") or not row.get("lots") or row.get("issue_share") is None:
+        return False
+    return (row["issue_share"] >= SUSPECT_ISSUE_SHARE and float(q.get("inside") or 0) >= SUSPECT_INSIDE_SHARE * row["lots"]
+            and net_lots(q) < 0)
 
 
 def build(branches: List[str], focus: str = "", log: Callable[[str], None] = print,
@@ -223,12 +236,20 @@ def build(branches: List[str], focus: str = "", log: Callable[[str], None] = pri
     items = yahoo_quotes.raw_items(symbols, QUOTE_DEADLINE) if symbols else {}
     now = tools.taipei_now()
     today = now.strftime("%Y-%m-%d")
+    try:
+        import warrant_issue
+        issue = warrant_issue.issued(list(hold), log) if hold else {}
+    except Exception as exc:                 # 發行量讀不到：照常出圖，只是不算占發行、不標疑似
+        log(f"分點權證盤中｜發行量略過｜{tools.err_text(exc)}")
+        issue = {}
     rows = []
     for code, item in hold.items():
         quote = parse(items[code], today) if code in items else None
-        row = dict(item, quote=quote, share=0.0)
+        row = dict(item, quote=quote, share=0.0, issue=issue.get(code),
+                   issue_share=(item["lots"] / issue[code]) if issue.get(code) else None)
         if quote and quote["traded"] and item["lots"] > 0:
             row["share"] = quote["lots"] / item["lots"]
+        row["suspect"] = suspect_sell(row)
         rows.append(row)
     traded = [r for r in rows if r["quote"] and r["quote"]["traded"]]
     traded.sort(key=lambda r: (-r["quote"]["value"], -r["quote"]["lots"]))   # 11-06 使用者：金額、張數高的優先
@@ -242,6 +263,14 @@ def net_lots(quote: Dict[str, Any]) -> float:
     return float(quote.get("outside") or 0) - float(quote.get("inside") or 0)
 
 
+def _badge(row: Dict[str, Any]) -> str:
+    """一列只放一個標籤：疑似賣出優先，其次爆量。"""
+    if row.get("suspect"):
+        return "疑似賣出"
+    q = row.get("quote") or {}
+    return surge_text(q) if q.get("traded") else ""
+
+
 def _holder_text(holders: List[Tuple[str, float]]) -> str:
     return holders[0][0] if len(holders) == 1 else f"{holders[0][0]} 等{len(holders)}家"
 
@@ -249,19 +278,18 @@ def _holder_text(holders: List[Tuple[str, float]]) -> str:
 def card(res: Dict[str, Any]) -> Dict[str, Any]:
     """branch_card 格式（answer_image.branch_card）：摘要三格＋有成交的權證表＋一行聲明。"""
     traded = res["traded"]
-    leans = [lean(r["quote"])[1] for r in traded]
-    buys = sum(1 for x in leans if x is not None and x >= LEAN_BUY)
-    sells = sum(1 for x in leans if x is not None and x <= 1 - LEAN_BUY)
     total = sum(r["quote"]["value"] for r in traded)
     stock_label = f"{res.get('stock_name') or res.get('stock')}" if res.get("stock") else ""
     if stock_label:
         title = f"{res['focus'] or '關注分點'}｜{stock_label} 權證今日動向"
     else:
         title = f"{res['focus']}｜權證盤中量能" if res["focus"] else "關注分點權證｜盤中量能"
+    suspects = sum(1 for r in traded if r.get("suspect"))
     sections: List[Dict[str, Any]] = [{"type": "tiles", "items": [
         {"label": "今天有成交", "value": f"{len(traded)} / {res['holding_count']} 檔"},
         {"label": "成交金額合計", "value": tools._plain_money(total) if total else "0"},
-        {"label": "偏買／偏賣", "value": f"{buys} / {sells} 檔"}]}]
+        # 11-06：第三格改成「疑似分點賣出」檔數（偏買／偏賣檔數寫 Log）
+        {"label": "疑似分點賣出", "value": f"{suspects} 檔", "tone": "down" if suspects else "ink"}]}]
     single = len(res["branches"]) == 1                 # 只看一家分點：「持有分點」欄不用列
     # 指定股票：沒成交的持有權證也列（「今天沒成交」也是答案）；不指定：只列有成交的
     listed = traded + ([r for r in res["rows"] if r not in traded] if stock_label else [])
@@ -277,33 +305,42 @@ def card(res: Dict[str, Any]) -> Dict[str, Any]:
                          f"{net:+,.0f}張" if q["inside"] + q["outside"] else "-"]
             else:
                 cells = ["今天沒成交", "-", "-", "-"]
-            rows.append([name] + ([] if single else [_holder_text(r["holders"])]) + [f"{r['lots']:,.0f}張"] + cells)
-        columns = ["權證"] + ([] if single else ["持有分點"]) + ["分點持有", "今日成交", "占持有", "漲跌", "估計買賣超"]
-        widths = [3.0] + ([] if single else [1.9]) + [1.3, 2.2, 1.1, 1.1, 1.5]
+            held = f"{r['lots']:,.0f}張" + (f" {r['issue_share']:.0%}" if r.get("issue_share") is not None else "")
+            rows.append([name] + ([] if single else [_holder_text(r["holders"])]) + [held] + cells)
+        columns = ["權證"] + ([] if single else ["持有分點"]) + ["分點持有（占發行）", "今日成交", "占持有", "漲跌", "估計買賣超"]
+        widths = [2.9] + ([] if single else [1.8]) + [1.8, 2.1, 1.0, 1.1, 1.4]
         heading = (f"{stock_label} 持有中的權證（有成交的在前）" if stock_label else "有成交的權證（成交金額、張數大的在前）")
         sections += [{"type": "heading", "text": heading},
                      {"type": "table", "columns": columns, "rows": rows, "widths": widths,
                       "signed": ("漲跌", "估計買賣超"), "accent": (),
-                      "row_badges": [surge_text(r["quote"]) if r["quote"] and r["quote"]["traded"] else "" for r in listed[:TABLE_MAX]]}]
+                      "row_badges": [_badge(r) for r in listed[:TABLE_MAX]]}]
         if len(listed) > TABLE_MAX:
             sections.append({"type": "note", "text": f"另有 {len(listed) - TABLE_MAX} 檔量較小，未列出", "keep": True})
     else:
         sections.append({"type": "paragraph", "text": f"關注分點持有的 {res['holding_count']} 檔權證，今天到 {res['time']} 都還沒有成交。"})
     sections.append({"type": "note", "keep": True,
-                     "text": "今日成交＝全市場成交；占持有＝今日成交張數÷分點持有張數；爆量＝盤中量已達昨天全天 2 倍；"
-                             "估計買賣超＝外盤張數－內盤張數（權證多和發行商造市成交，外盤多大致是有人買進、內盤多大致是有人賣出）。"
-                             "盤中看不到分點，是不是這個分點在加碼或賣出，要等收盤分點資料確認。"})
+                     "text": "占發行＝分點持有÷權證發行量（發行量含發行商沒賣出的部分，實際占投資人手上的比例更高）；"
+                             "今日成交＝全市場成交；占持有＝今日成交張數÷分點持有張數；爆量＝盤中量已達昨天全天 2 倍；"
+                             "估計買賣超＝外盤張數－內盤張數（權證多和發行商造市成交，外盤多大致是有人買進、內盤多大致是有人賣出）；"
+                             f"疑似賣出＝分點持有占發行 {SUSPECT_ISSUE_SHARE:.0%} 以上、今天內盤達分點持有 {SUSPECT_INSIDE_SHARE:.0%}、"
+                             "估計買賣超為負。盤中看不到分點，是不是這個分點在加碼或賣出，要等收盤分點資料確認。"})
     return {"branch": title, "label": f"盤中 {res['time']}", "sections": sections, "clean_display": False,
             "footer_text": "股市艾斯  /  權證盤中量能為奇摩即時報價，收盤前會變動"}
 
 
 def log_text(res: Dict[str, Any]) -> str:
+    leans = [lean(r["quote"])[1] for r in res["traded"]]
+    buys = sum(1 for x in leans if x is not None and x >= LEAN_BUY)
+    sells = sum(1 for x in leans if x is not None and x <= 1 - LEAN_BUY)
     lines = [f"分點權證盤中｜{res['time']}｜分點 {len(res['branches'])} 家｜持有權證 {res['holding_count']} 檔"
-             f"｜有報價 {res['quoted']} 檔｜今天有成交 {len(res['traded'])} 檔"]
+             f"｜有報價 {res['quoted']} 檔｜今天有成交 {len(res['traded'])} 檔｜偏買 {buys}／偏賣 {sells}"
+             f"｜疑似賣出 {sum(1 for r in res['traded'] if r.get('suspect'))} 檔"]
     for r in res["traded"]:
         q = r["quote"]
         holders = "、".join(f"{b} {lots:,.0f}張" for b, lots in r["holders"])
-        lines.append(f"- {r['name'] or q['name']}（{r['warrant']}）｜{holders}｜今日 {q['lots']:,.0f}張"
+        issue = (f"｜發行 {r['issue']:,.0f}張、占 {r['issue_share']:.0%}" if r.get("issue_share") is not None else "｜發行量不明")
+        lines.append(f"- {r['name'] or q['name']}（{r['warrant']}）｜{holders}{issue}｜今日 {q['lots']:,.0f}張"
                      f"（昨 {q['prev_lots']:,.0f}張）{tools._plain_money(q['value'])}｜占持有 {r['share']:.0%}"
-                     f"｜內 {q['inside']:,.0f}／外 {q['outside']:,.0f}｜{lean(q)[0]}｜最後成交 {q['time']}")
+                     f"｜內 {q['inside']:,.0f}／外 {q['outside']:,.0f}｜{lean(q)[0]}｜最後成交 {q['time']}"
+                     + ("｜疑似賣出" if r.get("suspect") else ""))
     return "\n".join(lines)
