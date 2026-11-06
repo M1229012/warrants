@@ -546,8 +546,9 @@ def _spread(items: list[dict], gap: float, low: float, high: float) -> None:
             nxt = item["ly"]
 
 
-def render(data: dict) -> Image.Image:
-    """Pillow 繪圖，沿用既有字型；畫在高畫布上，最後依實際內容裁切。"""
+def _render_detail(data: dict) -> Image.Image:
+    """舊的詳細驗證圖（延伸、整理區、共振表）；11-06 起只在沒有選用波段時當 render 的備援。
+    Pillow 繪圖，沿用既有字型；畫在高畫布上，最後依實際內容裁切。"""
     from answer_image import font, wrap
 
     data = verify_view(data)         # 11-05：看大波段時從大波段起點顯示、畫出大A／大B
@@ -805,3 +806,251 @@ def render(data: dict) -> Image.Image:
     y += 20
     text(margin, y, "僅管理員驗證｜忠實呈現目前演算法，找不到合格波段時不補畫｜費波為技術參考，不代表預測能力或買賣建議", 20, muted)
     return image.crop((0, 0, width, int(y + 50)))
+
+
+# ---- 11-06 費波驗證圖：一般費波工具畫法 ----
+V_UP, V_DOWN = "#DB4949", "#23997E"
+V_INK, V_MUTED, V_GRID = "#1D2B44", "#64748B", "#E7EBF1"
+V_LINE, V_EDGE, V_BAND = "#2F6FB0", "#94A3B8", "#EEF4FB"
+VERIFY_BOX = (118, 150, 1190, 760)      # 驗證圖 K 線區：左、上、右、下
+
+
+def _vfmt(p: float) -> str:
+    return f"{p:,.0f}" if abs(p) >= 10000 else f"{p:,.2f}"
+
+
+def _verify_wave(data: dict):
+    """回 {a, b, up, amp, why}；和費波頁同一套：往下看、跌破小波段 0.618 才量大波段。"""
+    sel = data.get("selected")
+    if not sel or not sel.get("a") or not sel.get("b"):
+        return None
+    live = data.get("live_bar") or {}
+    price = float(live.get("Close") or data["close"])
+    a, b = dict(sel["a"]), dict(sel["b"])
+    atr = float(data.get("atr") or 0) or 1.0
+    big = _big_wave(data) if default_side(data) == "down" else None
+    up = float(b["price"]) > float(a["price"])
+    if big and _use_big_wave(big, price):
+        switch = big["high"] - (big["high"] - big["small_low"]) * BIG_WAVE_SWITCH
+        why = (f"最近一段上漲（{sel['a']['date'][5:]}～{sel['b']['date'][5:]}）的 0.618 在 {_vfmt(switch)}，"
+               f"現價已跌破，這段上漲結構被破壞，改量一年來的主升段")
+        a = {"idx": big["low_idx"], "price": big["low"], "date": big["low_date"]}
+    elif sel.get("fallback"):
+        why = "沒有夠大的波段，用回看區間的最高、最低點量（僅供參考）"
+    elif up:
+        amp = float(b["price"]) - float(a["price"])
+        why = f"最近一段夠大的上漲（約 {amp / atr:.1f} 倍 ATR）"
+        if big:
+            switch = big["high"] - (big["high"] - big["small_low"]) * BIG_WAVE_SWITCH
+            why += f"；現價還在這段的 0.618（{_vfmt(switch)}）之上，上漲結構還在，先量這段"
+    else:
+        amp = float(a["price"]) - float(b["price"])
+        why = f"最近一段夠大的下跌（約 {amp / atr:.1f} 倍 ATR）"
+        if sel.get("provisional"):
+            why += "；低點還沒確認，之後再破低，B 和各價位會跟著往下移"
+    amp = abs(float(b["price"]) - float(a["price"]))
+    return {"a": a, "b": b, "up": up, "amp": amp, "why": why, "price": price}
+
+
+def _verify_levels(wave: dict) -> list:
+    b, amp, up = float(wave["b"]["price"]), wave["amp"], wave["up"]
+    out = [{"r": 0.0, "price": b, "edge": True}]
+    out += [{"r": r, "price": b - amp * r if up else b + amp * r, "edge": False} for r in BIG_WAVE_RATIOS]
+    out.append({"r": 1.0, "price": float(wave["a"]["price"]), "edge": True})
+    return out
+
+
+def _short_flag(flag: str) -> str:
+    flag = str(flag)
+    if flag.startswith("一年日K未接上"):
+        return "一年日 K 沒抓到，只用近半年資料，比較大的波段可能量不到"
+    return flag
+
+
+def render(data: dict) -> Image.Image:
+    """11-06 使用者（看了費波教學：「這樣誰看得懂，照大師高手的做法畫」）：一張圖只量一段波段——
+    上漲段從低點 A 拉到高點 B、下跌段從高點 A 拉到低點 B（和費波頁同一套選段，跌破小波段 0.618 量大波段），
+    0（B）／0.382／0.5／0.618／0.786／1（A）水平線從 A 往右畫，右側標比例＋價位；A、B 標價格日期並連虛線。
+    圖下白話寫量哪一段、為什麼、現在位置，表格列四個比例（離現價、支撐或壓力、AI 有沒有拿到）。
+    沒有選用波段時改畫舊的詳細驗證圖（_render_detail）。"""
+    from answer_image import font, wrap
+
+    wave = _verify_wave(data)
+    if not wave:
+        return _render_detail(data)
+    bars, end = data["bars"], data["last"]
+    a, b, up, amp, price = wave["a"], wave["b"], wave["up"], wave["amp"], wave["price"]
+    start = min(int(data["display_start"]), max(0, int(a["idx"]) - 5))
+    visible = bars[start:end + 1]
+    live = data.get("live_bar")
+    lvls = _verify_levels(wave)
+
+    width, margin = 1500, 56
+    image = Image.new("RGB", (width, 4000), "#FFFFFF")
+    draw = ImageDraw.Draw(image)
+
+    def text(x, y, value, size=23, color=V_INK, bold=False):
+        draw.text((x, y), str(value), font=font(size, bold), fill=color)
+
+    def tw(value, size=23, bold=False):
+        return draw.textlength(str(value), font=font(size, bold))
+
+    name = f"{data['stock_code']} {data.get('stock_name', '')}".strip()
+    text(margin, 28, f"{name}｜費波驗證", 38, bold=True)
+    text(margin, 86, f"日 K｜正式收盤至 {bars[end]['date']}", 22, V_MUTED)
+
+    left, top, right, bottom = VERIFY_BOX
+    step = (right - left) / max(1, len(visible) + (1 if live else 0))
+    px = lambda i: left + (i - start + 0.5) * step
+    prices = [x[k] for x in visible + ([live] if live else []) for k in ("Low", "High")] + [lv["price"] for lv in lvls]
+    low, high = min(prices), max(prices)
+    pad = (high - low) * 0.05
+    low, high = low - pad, high + pad
+    py = lambda p: bottom - (p - low) / (high - low) * (bottom - top)
+
+    for j in range(6):                                   # 格線＋左側價格
+        value = low + (high - low) * j / 5
+        yy = py(value)
+        draw.line((left, yy, right, yy), fill=V_GRID)
+        text(left - 12 - tw(_vfmt(value), 18), yy - 12, _vfmt(value), 18, V_MUTED)
+
+    xa = px(int(a["idx"]))
+    by = {lv["r"]: py(lv["price"]) for lv in lvls}
+    draw.rectangle((xa, by[0.5], right, by[0.618]) if by[0.5] < by[0.618] else (xa, by[0.618], right, by[0.5]), fill=V_BAND)
+    for lv in lvls:                                      # 費波水平線：從 A 往右畫
+        yy = py(lv["price"])
+        if lv["edge"]:
+            xx = xa
+            while xx < right:
+                draw.line((xx, yy, min(xx + 10, right), yy), fill=V_EDGE, width=2)
+                xx += 16
+        else:
+            draw.line((xa, yy, right, yy), fill=V_LINE, width=2)
+
+    half = max(1.5, min(7, step * 0.30))
+    for i in range(start, end + 1):                      # K 棒
+        x = bars[i]
+        color = V_UP if x["Close"] >= x["Open"] else V_DOWN
+        xx = px(i)
+        draw.line((xx, py(x["High"]), xx, py(x["Low"])), fill=color, width=2)
+        y1, y2 = sorted((py(x["Open"]), py(x["Close"])))
+        draw.rectangle((xx - half, y1, xx + half, max(y1 + 2, y2)), fill=color)
+    if live:
+        color = V_UP if live["Close"] >= live["Open"] else V_DOWN
+        xx = px(end + 1)
+        draw.line((xx, py(live["High"]), xx, py(live["Low"])), fill=color, width=2)
+        y1, y2 = sorted((py(live["Open"]), py(live["Close"])))
+        draw.rectangle((xx - half, y1, xx + half, max(y1 + 2, y2)), fill=color)
+
+    ax, ay, bx, by_ = xa, py(float(a["price"])), px(int(b["idx"])), py(float(b["price"]))
+    n = max(1, int(math.hypot(bx - ax, by_ - ay) // 14))
+    for k in range(n):                                   # A→B 虛線
+        t0, t1 = k / n, (k + 0.55) / n
+        draw.line((ax + (bx - ax) * t0, ay + (by_ - ay) * t0, ax + (bx - ax) * t1, ay + (by_ - ay) * t1), fill=V_MUTED, width=2)
+    for key, p, xx, yy in (("A", a, ax, ay), ("B", b, bx, by_)):
+        high_point = (key == "A") != up                  # 上漲段 A 是低點、B 是高點
+        draw.ellipse((xx - 9, yy - 9, xx + 9, yy + 9), outline=V_INK, width=3, fill="#FFFFFF")
+        label = f"{key}  {_vfmt(float(p['price']))}  {str(p['date'])[5:].replace('-', '/')}"
+        w = tw(label, 20, True) + 20
+        cx = min(max(xx, left + w / 2 + 2), right - w / 2 - 2)
+        ly = yy - 46 if high_point else yy + 16
+        ly = min(max(ly, top - 30), bottom - 30)
+        draw.rounded_rectangle((cx - w / 2, ly, cx + w / 2, ly + 30), radius=6, fill="#FFFFFF", outline=V_INK, width=2)
+        text(cx - w / 2 + 10, ly + 2, label, 20, V_INK, True)
+
+    tags = []
+    for lv in lvls:
+        name_ = ("0（B）" if lv["r"] == 0 else "1（A）") if lv["edge"] else f"{lv['r']:g}"
+        tags.append({"y": py(lv["price"]), "text": f"{name_}  {_vfmt(lv['price'])}", "color": V_EDGE if lv["edge"] else V_LINE,
+                     "bold": not lv["edge"]})
+    now_label = ("盤中 " if live and live.get("is_live") else "現價 ") + _vfmt(price)
+    tags.append({"y": py(price), "text": now_label, "color": V_INK, "bold": True, "now": True})
+    _spread(tags, 28, top - 8, bottom + 8)
+    for tag in tags:
+        if tag.get("now"):
+            draw.line((right - 14, tag["y"], right, tag["y"]), fill=V_INK, width=3)
+        if abs(tag["ly"] - tag["y"]) > 2:
+            draw.line((right + 3, tag["y"], right + 12, tag["ly"]), fill=tag["color"], width=1)
+        size = 21
+        while size > 15 and right + 16 + tw(tag["text"], size, tag["bold"]) > width - 8:
+            size -= 1
+        text(right + 16, tag["ly"] - 13, tag["text"], size, tag["color"], tag["bold"])
+
+    count = len(visible)                                 # 日期：約 8 個，不互疊
+    gap = max(1, math.ceil(count / 8))
+    last_x = -999
+    for i in range(start, end + 1, gap):
+        xx = px(i) - 28
+        if xx - last_x >= 70:
+            text(xx, bottom + 14, bars[i]["date"][5:].replace("-", "/"), 19, V_MUTED)
+            last_x = xx
+
+    vt, vb = bottom + 60, bottom + 150                   # 成交量（指數資料缺口是 0，不畫）
+    text(margin, vt - 6, "成交量", 19, V_MUTED)
+    vols = [max(0.0, float(x.get("Volume") or 0)) for x in visible]
+    top_vol = max(vols + [1.0])
+    for i, v in zip(range(start, end + 1), vols):
+        if v > 0:
+            x = bars[i]
+            hh = v / top_vol * (vb - vt - 20)
+            draw.rectangle((px(i) - step * 0.3, vb - hh, px(i) + step * 0.3, vb), fill=V_UP if x["Close"] >= x["Open"] else V_DOWN)
+    draw.line((margin, vb + 18, width - margin, vb + 18), fill=V_GRID, width=2)
+
+    y = vb + 40                                          # 白話說明
+    move = "上漲" if up else "下跌"
+    lines = [
+        ("量哪一段", f"A {str(a['date']).replace('-', '/')} {'低點' if up else '高點'} {_vfmt(float(a['price']))} → "
+                    f"B {str(b['date']).replace('-', '/')} {'高點' if up else '低點'} {_vfmt(float(b['price']))}，{move} {_vfmt(amp)}"),
+        ("為什麼", wave["why"]),
+    ]
+    pct = ((float(b["price"]) - price) if up else (price - float(b["price"]))) / amp * 100 if amp else 0
+    ratio_now = pct / 100
+    below = [r for r in (0.0,) + BIG_WAVE_RATIOS + (1.0,) if r <= ratio_now]
+    above = [r for r in (0.0,) + BIG_WAVE_RATIOS + (1.0,) if r > ratio_now]
+    where = (f"在 {below[-1]:g} 和 {above[0]:g} 之間" if below and above else "已超過整段" if not above else "")
+    lines.append(("現在", f"{now_label}，{'從 B 拉回' if up else '從 B 反彈'} {pct:.1f}%，{where}"))
+    if live:
+        lines.append(("盤中", f"最右邊一根是 {str(live['date'])[5:].replace('-', '/')} {_live_state(live)} 的價格，只顯示、不加入計算；"
+                              f"A、B 和各價位都用 {bars[end]['date'][5:].replace('-', '/')} 正式收盤計算"))
+    for head, body in lines:
+        text(margin, y, head, 23, V_MUTED, True)
+        rows = wrap(body, 23, width - margin * 2 - 120)
+        for k, line in enumerate(rows):
+            text(margin + 120, y + k * 34, line, 23, V_INK)
+        y += len(rows) * 34 + 8
+
+    ai_prices = [lv["price"] for lv in verify_view(data).get("levels") or [] if lv.get("ai")]
+    y += 16
+    cols = [(margin + 14, "比例"), (margin + 190, "價位"), (margin + 420, "離現價"), (margin + 610, "看法")]
+    draw.rectangle((margin, y, width - margin, y + 42), fill="#EEF2F7")
+    for cx, head in cols:
+        text(cx, y + 7, head, 21, V_INK, True)
+    y += 50
+    atr = float(data.get("atr") or 0)
+    for lv in [x for x in lvls if not x["edge"]]:
+        p = lv["price"]
+        dist = (p / price - 1) * 100 if price else 0
+        if atr and abs(p - price) <= 0.25 * atr:
+            view = "現價附近，看這裡守不守得住"
+        elif up:
+            view = "已跌破，反彈先看這裡（壓力）" if p > price else "下方支撐"
+        else:
+            view = "上方壓力" if p > price else "已站上，拉回先看這裡（支撐）"
+        if any(abs(p - q) <= max(0.01, abs(p) * 1e-6) for q in ai_prices):
+            view += "｜AI 有拿到"
+        text(cols[0][0], y, f"{lv['r']:g}", 22, V_INK, True)
+        text(cols[1][0], y, _vfmt(p), 22, V_INK)
+        text(cols[2][0], y, f"{dist:+.1f}%", 22, V_UP if dist > 0 else V_DOWN)
+        text(cols[3][0], y, view, 22, V_INK)
+        y += 38
+        draw.line((margin, y - 6, width - margin, y - 6), fill=V_GRID)
+
+    flags = [_short_flag(f) for f in data.get("flags") or [] if "公司行動資料未核實" not in str(f)]
+    y += 14
+    for flag in flags:
+        for line in wrap("資料：" + flag, 20, width - margin * 2):
+            text(margin, y, line, 20, "#9A5B13")
+            y += 30
+    y += 10
+    text(margin, y, "僅管理員驗證｜A→B 是程式選的波段，0.382～0.786 是這段的回撤比例｜費波為技術參考，不構成投資建議", 19, V_MUTED)
+    return image.crop((0, 0, width, int(y + 46)))
