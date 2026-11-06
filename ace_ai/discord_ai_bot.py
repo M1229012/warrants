@@ -3299,12 +3299,13 @@ FINAL_WARRANT_HABIT_RULES = ("【分點挑權證的習慣】get_branch_warrant_d
                              "why 3～4 句，依上面 1～4 挑有意義的寫；scenarios 給空陣列；summary 一句說接下來要留意什麼（例如標的離價內還差多少、剩餘天期）。")
 
 
-FINAL_FUTURES_PAGE_RULES = ("【大盤外資空單頁（11-05 使用者）】圖上是加權指數 K 線，下方副圖＝外資台指期淨未平倉（柱＝每日增減、線＝淨部位）與小台／微台散戶多空比，"
-    "沒有數字卡；卡片上的數字改由你在解讀裡說（優先於【台指期未平倉】只講前一日變化的限制）：\n"
-    "- answer 一句：外資目前淨空（或淨多）幾口、較前一日增減（用 get_futures_positions.foreign_summary）。\n"
-    "- why：外資多單、空單口數（investors 裡外資的 long_oi、short_oi）與較前一日；近 5 個交易日、有「連續」就說連續幾天、和近期淨空最多的水位比；"
-    "投信、自營商的淨部位各半句；散戶多空比一句（get_retail_futures）。最後說未平倉含現貨避險部位、不能單獨當多空訊號。\n"
-    "- 不可說外資看空所以會跌，也不推論明天漲跌、不給買賣建議。")
+FINAL_FUTURES_PAGE_RULES = ("【大盤外資空單頁（11-06 使用者）】圖上是加權指數 K 線，下方副圖＝外資台指期淨未平倉（柱＝每日增減、線＝淨部位）"
+    "與小台／微台散戶多空比；再下面有一張「台指期三大法人未平倉」數字卡（三大法人淨部位、多單／空單口數、較前日，小台／微台散戶多空比）。"
+    "卡片上已有的數字不要逐項重念，解讀講趨勢與意義（優先於【台指期未平倉】只陳述口數的寫法）：\n"
+    "- answer 一句：外資淨空（或淨多）的方向與這幾天的變化（例：淨空連續 3 天擴大、接近近期最高水位），最多帶一個關鍵數字。\n"
+    "- why：近 5 個交易日外資部位怎麼走（連續增減幾天、和近期最高水位比）；投信、自營商和外資方向是否相反；散戶多空比偏多或偏空、"
+    "往哪個方向變；最後說未平倉含現貨避險部位、不能單獨當多空訊號。\n"
+    "- 不可逐一列出各法人淨部位、多單空單口數、散戶多空比數字（卡片上都有）；不可說外資看空所以會跌，也不推論明天漲跌、不給買賣建議。")
 
 
 FINAL_FUTURES_RULES = ("【台指期未平倉】只陳述口數與前一日變化，並說明未平倉含現貨避險部位、不能單獨當多空訊號；不可用它推論明天漲跌，也不可給買賣建議。"
@@ -8930,10 +8931,8 @@ class AceQueryEngine:
                                     "maintenance_pct": stock_margin.get("maintenance_pct")}]
         futures_data = next((r.data for r in results if r.ok and r.name == "get_futures_positions"), None)
         retail_data = next((r.data for r in results if r.ok and r.name == "get_retail_futures"), None)
-        # 11-05：沒有副圖才用卡片。11-06 修正：副圖在下面的迴圈才掛上，這裡原本看 p["futures"] 永遠是空的 → 卡片每次都出；
-        # 改成看有沒有加權／台指期 K 線（有 K 線就一定會掛未平倉副圖）
-        if futures_data and plan.route == "rule_futures" and not any(
-                p.get("stock_code") in ("TAIEX", "TXF") and p.get("bars") for p in panels):
+        # 11-06 使用者：副圖看趨勢、卡片看今天的數字（多單／空單口數、較前日、散戶多空比）→ 兩個都放；AI 解讀不念卡片上的數字
+        if futures_data and plan.route == "rule_futures":
             panels.append({"branch_card": futures_card(futures_data, question, retail_data), "hide_text": True})
         if plan.route == "rule_institutional":
             flow = next((r.data for r in results if r.ok and r.name == "get_institutional_flow"), None)
