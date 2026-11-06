@@ -42,10 +42,12 @@ def resolve(text: str) -> Tuple[str, str]:
     return "", ""
 
 
-def warrants_of(code: str, today: str) -> List[Dict[str, str]]:
+def warrants_of(code: str, today: str, name: str = "") -> List[Dict[str, str]]:
+    """11-06 實測：基本資料裡上市權證的標的代號是空的（51,146 筆全空），只有標的名稱 → 代號或名稱對上都算。"""
     import warrant_store
-    rows = warrant_store._query("SELECT warrant, name, market, type FROM warrant_meta WHERE stock=? "
-                                "AND (last_trade='' OR last_trade IS NULL OR last_trade>=?)", (code, today))
+    rows = warrant_store._query("SELECT warrant, name, market, type FROM warrant_meta "
+                                "WHERE (stock=? OR (? <> '' AND stock_name=?)) "
+                                "AND (last_trade='' OR last_trade IS NULL OR last_trade>=?)", (code, name, name, today))
     return [{"code": r[0], "name": r[1] or "", "market": r[2] or "", "type": r[3] or ""} for r in rows]
 
 
@@ -58,7 +60,7 @@ def side_of(kind: str, name: str) -> str:
 def build(code: str, name: str, log: Callable[[str], None] = print) -> Dict[str, Any]:
     now = tools.taipei_now()
     today = now.strftime("%Y-%m-%d")
-    listed = warrants_of(code, today)
+    listed = warrants_of(code, today, name)
     symbols = {bwl.symbol(w["code"], w["market"]): w["code"] for w in listed}
     items = yahoo_quotes.raw_items(symbols, QUOTE_DEADLINE) if symbols else {}
     meta = {w["code"]: w for w in listed}
@@ -103,7 +105,7 @@ def card(res: Dict[str, Any]) -> Dict[str, Any]:
         sections += [{"type": "heading", "text": "今天有成交的權證（成交金額、張數大的在前）"},
                      {"type": "table", "columns": ["權證", "今日成交", "外盤", "內盤", "估計買賣超", "漲跌"], "rows": table,
                       "widths": [3.2, 2.4, 1.1, 1.1, 1.5, 1.1], "signed": ("估計買賣超", "漲跌"), "accent": (),
-                      "row_badges": [bwl.surge_text(r) for r in rows[:TABLE_MAX]]}]
+                      "row_badges": [bwl.quote_badge(r) for r in rows[:TABLE_MAX]]}]
         if len(rows) > TABLE_MAX:
             sections.append({"type": "note", "keep": True, "text": f"另有 {len(rows) - TABLE_MAX} 檔金額較小，未列出"})
     elif not res["listed"]:
@@ -112,7 +114,8 @@ def card(res: Dict[str, Any]) -> Dict[str, Any]:
         sections.append({"type": "paragraph", "text": f"這檔股票的 {res['listed']} 檔權證，今天到 {res['time']} 都還沒有成交。"})
     sections.append({"type": "note", "keep": True,
                      "text": "估計買賣超＝外盤張數－內盤張數（只算分得出內外盤的成交）；權證多和發行商造市成交，外盤多大致是投資人買進、"
-                             "內盤多大致是投資人賣出；認售買超是看空。盤中看不到分點，是誰在買賣要等收盤分點資料。"})
+                             "內盤多大致是投資人賣出；認售買超是看空；疑似對轉＝大量分不出內外盤的成交（多半是券商之間對轉），"
+                             "不算進買賣超、爆量。盤中看不到分點，是誰在買賣要等收盤分點資料。"})
     when = "今日" if res["after_close"] else "盤中"
     return {"branch": f"{res['name'] or res['code']}（{res['code']}）｜權證{when}買賣超", "label": f"{when} {res['time']}",
             "sections": sections, "clean_display": False, "footer_text": "股市艾斯  /  權證成交為奇摩即時報價，收盤前會變動"}

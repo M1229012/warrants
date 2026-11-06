@@ -136,10 +136,12 @@ def by_stock(quotes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         code = str(q.get("underlying") or "")
         g = groups.setdefault(code, {"underlying": code, "underlying_name": q.get("underlying_name") or "", "count": 0,
                                      "lots": 0.0, "prev_lots": 0.0, "value": 0.0, "inside": 0.0, "outside": 0.0, "top": q,
+                                     "real_lots": 0.0, "cross": 0.0,
                                      "call_net": 0.0, "calls": 0})
         g["count"] += 1
-        for key in ("lots", "prev_lots", "value", "inside", "outside"):
+        for key in ("lots", "prev_lots", "value", "inside", "outside", "cross"):
             g[key] += float(q.get(key) or 0)
+        g["real_lots"] += float(q.get("real_lots", q.get("lots")) or 0)
         # 認購、認售混在一起算內外盤會互相抵銷（買認售是看空）→ 表上只放認購的估計買賣超（外盤－內盤）
         if not any(mark in str(q.get("name") or "") for mark in ("售", "熊")):
             g["calls"] += 1
@@ -174,8 +176,8 @@ def build(log: Callable[[str], None] = print) -> Dict[str, Any]:
 
 
 def _times(quote: Dict[str, Any]) -> str:
-    prev = float(quote.get("prev_lots") or 0)
-    return f"{quote['lots'] / prev:.1f}倍" if prev > 0 else "昨無量"
+    prev = float(quote.get("prev_lots") or 0)      # 11-06：疑似對轉的量不算進比昨天
+    return f"{float(quote.get('real_lots', quote['lots'])) / prev:.1f}倍" if prev > 0 else "昨無量"
 
 
 def _table(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -186,7 +188,7 @@ def _table(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
                       _times(q), change, bwl.lean(q)[0]])
     return {"type": "table", "columns": ["權證", "今日成交", "比昨天", "漲跌", "內外盤"], "rows": table,
             "widths": [3.4, 2.6, 1.3, 1.2, 1.6], "signed": ("漲跌",), "accent": (),
-            "row_badges": [bwl.surge_text(q) for q in rows]}
+            "row_badges": [bwl.quote_badge(q) for q in rows]}
 
 
 def _stock_table(groups: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -197,7 +199,7 @@ def _stock_table(groups: List[Dict[str, Any]]) -> Dict[str, Any]:
                       f"{g['lots']:,.0f}張 {tools._plain_money(g['value'])}", f"{g['count']}檔", _times(g), net])
     return {"type": "table", "columns": ["標的股", "權證成交", "檔數", "比昨天", "認購買賣超"], "rows": table,
             "widths": [2.9, 2.7, 1.0, 1.2, 1.8], "accent": (), "signed": ("認購買賣超",),
-            "row_badges": [bwl.surge_text(g) for g in groups]}
+            "row_badges": [bwl.surge_text(g) for g in groups]}      # 彙整列只標爆量（已扣掉疑似對轉的量）
 
 
 def card(res: Dict[str, Any]) -> Dict[str, Any]:
@@ -223,7 +225,8 @@ def card(res: Dict[str, Any]) -> Dict[str, Any]:
     sections.append({"type": "note", "keep": True,
                      "text": f"候選＝{pool_day} 成交金額前 {res['pool']:,} 檔權證，昨天沒什麼量、今天才突然放量的可能不在名單內；"
                              "比昨天＝今日張數÷昨天全天張數；爆量＝已達昨天 2 倍；內外盤只能參考（權證多和發行商造市成交）；"
-                             "認購買賣超＝這檔股票認購權證的外盤張數－內盤張數（只算候選名單裡的權證）。"})
+                             "認購買賣超＝這檔股票認購權證的外盤張數－內盤張數（只算候選名單裡的權證）；"
+                             "疑似對轉＝大量分不出內外盤的成交（多半是券商之間對轉），不算進比昨天、爆量。"})
     return {"branch": f"權證{'今日' if res['after_close'] else '盤中'}成交 TOP{TOP}",
             "label": f"{'今日' if res['after_close'] else '盤中'} {res['time']}", "sections": sections,
             "clean_display": False, "footer_text": "股市艾斯  /  權證成交為奇摩即時報價，收盤前會變動"}

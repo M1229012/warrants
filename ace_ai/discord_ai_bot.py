@@ -8930,7 +8930,10 @@ class AceQueryEngine:
                                     "maintenance_pct": stock_margin.get("maintenance_pct")}]
         futures_data = next((r.data for r in results if r.ok and r.name == "get_futures_positions"), None)
         retail_data = next((r.data for r in results if r.ok and r.name == "get_retail_futures"), None)
-        if futures_data and plan.route == "rule_futures" and not any(p.get("futures") for p in panels):   # 11-05：沒有副圖才用卡片
+        # 11-05：沒有副圖才用卡片。11-06 修正：副圖在下面的迴圈才掛上，這裡原本看 p["futures"] 永遠是空的 → 卡片每次都出；
+        # 改成看有沒有加權／台指期 K 線（有 K 線就一定會掛未平倉副圖）
+        if futures_data and plan.route == "rule_futures" and not any(
+                p.get("stock_code") in ("TAIEX", "TXF") and p.get("bars") for p in panels):
             panels.append({"branch_card": futures_card(futures_data, question, retail_data), "hide_text": True})
         if plan.route == "rule_institutional":
             flow = next((r.data for r in results if r.ok and r.name == "get_institutional_flow"), None)

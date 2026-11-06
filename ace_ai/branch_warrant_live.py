@@ -30,6 +30,12 @@ TABLE_MAX = 20                   # 圖上最多列幾檔（其餘寫 Log）
 LEAN_BUY = 0.6                   # 外盤比 ≥ 60%＝偏買；≤ 40%＝偏賣
 MIN_SIDE_LOTS = 10               # 能分辨內外盤的成交太少（< 10 張）不判斷
 SURGE_MULT = 2.0                 # 盤中量已經 ≥ 昨天全天 2 倍（或昨天沒成交）＝爆量（圖上標出）
+# 11-06 使用者（「券商之間大量對轉應該直接過濾」）：盤中看不到成交雙方，只能看奇摩分不出內外盤的量——
+# 對轉多半成交在買賣價中間（不是打造市商的委買／委賣），奇摩就分不出內外盤。11-06 實測大部分權證這部分是 0，
+# 台達電中信62購01 有 2,635 張（40%）。分不出的量 ≥ CROSS_MIN_LOTS 張且占當日 ≥ CROSS_SHARE → 標「疑似對轉」，
+# 這部分不算進占持有、爆量、疑似賣出（估計買賣超本來就只算分得出內外盤的）。
+CROSS_MIN_LOTS = float(os.getenv("DISCORD_AI_WARRANT_CROSS_MIN_LOTS", "300") or 300)
+CROSS_SHARE = float(os.getenv("DISCORD_AI_WARRANT_CROSS_SHARE", "0.3") or 0.3)
 # 「有單」門檻：剩餘部位成本（關注分點合計）。11-06 實測五個分點 FIFO 剩餘 > 0 的有 5,641 檔，多是 1～5 張的零頭
 # （小額買賣的殘量），≥ 50 萬剩 474 檔、≥ 100 萬剩 284 檔 → 預設 50 萬（部分減碼後的部位也看得到）
 MIN_HOLD_COST = float(os.getenv("DISCORD_AI_BRANCH_LIVE_MIN_COST", "500000") or 500000)
@@ -183,12 +189,15 @@ def parse(item: Dict[str, Any], today: str) -> Dict[str, Any]:
     if today_trade and value <= 0:
         value = lots * 1000 * (raw(item.get("avgPrice")) or price)
     inside, outside = (raw(item.get("inMarket")), raw(item.get("outMarket"))) if today_trade else (0.0, 0.0)
+    unknown = max(0.0, lots - inside - outside)
+    cross = unknown if unknown >= CROSS_MIN_LOTS and lots > 0 and unknown >= CROSS_SHARE * lots else 0.0
     related = str(item.get("relatedSymbol") or "")       # 標的：2330.TW、00632R.TW；指數權證（臺股指）是空的
     return {"name": str(item.get("symbolName") or ""), "traded": today_trade and lots > 0, "lots": lots,
             "underlying": related.split(".")[0], "underlying_name": str(item.get("relatedSymbolName") or ""),
             "prev_lots": raw(item.get("previousVolume")) / 1000, "value": value, "price": price, "prev": prev,
             "change_pct": (price / prev - 1) * 100 if price > 0 and prev > 0 else None,
-            "inside": inside, "outside": outside, "time": moment.strftime("%H:%M") if today_trade else ""}
+            "inside": inside, "outside": outside, "time": moment.strftime("%H:%M") if today_trade else "",
+            "cross": cross, "real_lots": lots - cross}
 
 
 def lean(quote: Dict[str, Any]) -> Tuple[str, Optional[float]]:
@@ -205,9 +214,14 @@ def lean(quote: Dict[str, Any]) -> Tuple[str, Optional[float]]:
 
 
 def surge_text(quote: Dict[str, Any]) -> str:
-    """盤中量已經 ≥ 昨天全天 SURGE_MULT 倍（或昨天沒成交）→「爆量」。"""
-    lots, prev = float(quote.get("lots") or 0), float(quote.get("prev_lots") or 0)
+    """盤中量已經 ≥ 昨天全天 SURGE_MULT 倍（或昨天沒成交）→「爆量」。疑似對轉的量不算。"""
+    lots, prev = float(quote.get("real_lots", quote.get("lots")) or 0), float(quote.get("prev_lots") or 0)
     return "爆量" if lots > 0 and (prev <= 0 or lots >= SURGE_MULT * prev) else ""
+
+
+def quote_badge(quote: Dict[str, Any]) -> str:
+    """個股／排行表的標籤：疑似對轉優先，其次爆量。"""
+    return "疑似對轉" if float(quote.get("cross") or 0) > 0 else surge_text(quote)
 
 
 FOCUS_MIN_COST = 100_000         # 指定股票時（永豐金內湖的雙鴻）門檻放低：小一點的部位也要看到有沒有動作
@@ -248,7 +262,7 @@ def build(branches: List[str], focus: str = "", log: Callable[[str], None] = pri
         row = dict(item, quote=quote, share=0.0, issue=issue.get(code),
                    issue_share=(item["lots"] / issue[code]) if issue.get(code) else None)
         if quote and quote["traded"] and item["lots"] > 0:
-            row["share"] = quote["lots"] / item["lots"]
+            row["share"] = quote["real_lots"] / item["lots"]          # 疑似對轉的量不算進占持有
         row["suspect"] = suspect_sell(row)
         rows.append(row)
     traded = [r for r in rows if r["quote"] and r["quote"]["traded"]]
@@ -264,11 +278,11 @@ def net_lots(quote: Dict[str, Any]) -> float:
 
 
 def _badge(row: Dict[str, Any]) -> str:
-    """一列只放一個標籤：疑似賣出優先，其次爆量。"""
+    """一列只放一個標籤：疑似賣出優先，其次疑似對轉、爆量。"""
     if row.get("suspect"):
         return "疑似賣出"
     q = row.get("quote") or {}
-    return surge_text(q) if q.get("traded") else ""
+    return quote_badge(q) if q.get("traded") else ""
 
 
 def _holder_text(holders: List[Tuple[str, float]]) -> str:
@@ -323,7 +337,9 @@ def card(res: Dict[str, Any]) -> Dict[str, Any]:
                              "今日成交＝全市場成交；占持有＝今日成交張數÷分點持有張數；爆量＝盤中量已達昨天全天 2 倍；"
                              "估計買賣超＝外盤張數－內盤張數（權證多和發行商造市成交，外盤多大致是有人買進、內盤多大致是有人賣出）；"
                              f"疑似賣出＝分點持有占發行 {SUSPECT_ISSUE_SHARE:.0%} 以上、今天內盤達分點持有 {SUSPECT_INSIDE_SHARE:.0%}、"
-                             "估計買賣超為負。盤中看不到分點，是不是這個分點在加碼或賣出，要等收盤分點資料確認。"})
+                             f"估計買賣超為負；疑似對轉＝分不出內外盤的成交達 {CROSS_MIN_LOTS:,.0f} 張且占當日 {CROSS_SHARE:.0%} 以上"
+                             "（多半是券商之間對轉），不算進占持有、爆量、疑似賣出。"
+                             "盤中看不到分點，是不是這個分點在加碼或賣出，要等收盤分點資料確認。"})
     return {"branch": title, "label": f"盤中 {res['time']}", "sections": sections, "clean_display": False,
             "footer_text": "股市艾斯  /  權證盤中量能為奇摩即時報價，收盤前會變動"}
 
@@ -342,5 +358,6 @@ def log_text(res: Dict[str, Any]) -> str:
         lines.append(f"- {r['name'] or q['name']}（{r['warrant']}）｜{holders}{issue}｜今日 {q['lots']:,.0f}張"
                      f"（昨 {q['prev_lots']:,.0f}張）{tools._plain_money(q['value'])}｜占持有 {r['share']:.0%}"
                      f"｜內 {q['inside']:,.0f}／外 {q['outside']:,.0f}｜{lean(q)[0]}｜最後成交 {q['time']}"
+                     + (f"｜疑似對轉 {q['cross']:,.0f}張" if q.get("cross") else "")
                      + ("｜疑似賣出" if r.get("suspect") else ""))
     return "\n".join(lines)
