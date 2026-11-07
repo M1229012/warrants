@@ -7313,18 +7313,17 @@ def _market_inst_summary(daily: Dict[str, Dict[str, float]], days: int, scope: s
 # 上櫃：櫃買中心每日融資融券餘額表的合計列（一次一天，存本地 kv「tpex_margin:日期」；背景 sync_market_margin 慢慢補滿 90 天）。
 # 11-05 使用者：加融資維持率——FinMind 的大盤維持率要付費（免費帳號回「Your level is free」），改自己算：
 # Σ(各股融資餘額張數 × 1000 × 當日收盤價) ÷ 融資金額（證交所 MI_MARGN 全部＋MI_INDEX 收盤；櫃買中心融資餘額表＋上櫃收盤行情），
-# 一天算一次存 kv「margin_maint:市場:日期」。兩邊都是收盤後晚上才公布，盤中沒有今天的。
+# 一天算一次存 kv「margin_ex:市場:日期」（11-07 起扣除 ETF，見 _margin_ex）。兩邊都是收盤後晚上才公布，盤中沒有今天的。
 TPEX_MARGIN_URL = "https://www.tpex.org.tw/www/zh-tw/margin/balance?date={date}&response=json"
 TWSE_MARGIN_ALL_URL = "https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN?date={date}&selectType=ALL&response=json"
 TWSE_CLOSE_ALL_URL = "https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX?date={date}&type=ALLBUT0999&response=json"
 TPEX_CLOSE_URL = "https://www.tpex.org.tw/www/zh-tw/afterTrading/otc?date={date}&type=EW&response=json"
 MARGIN_CHART_DAYS = 90             # 和 K 線副圖同一段（K 線約 70 根）
 TPEX_MARGIN_QUERY_FETCH = 6        # 查詢時最多當場補幾天上櫃融資（含休市日），其餘交給背景
-MAINT_QUERY_FETCH = 1              # 查詢時最多當場算幾天維持率（一天要抓兩份全市場資料）
+MAINT_QUERY_FETCH = 2              # 查詢時最多當場算幾天扣除 ETF 的資料（一天要抓兩份全市場明細）；最新兩天才有線
 MAINT_HISTORY_DAYS = 70            # 背景補維持率的天數（K 線那一段）
 MARGIN_PUBLISH_HOUR = 21           # 晚上才公布：這之前不抓今天
-MAINT_NOTE = ("融資維持率是自己算的估算值：各股融資餘額張數 × 當日收盤價 ÷ 融資金額；"
-              "FinMind 的大盤維持率要付費，財經網站的算法可能略有不同（例如當天沒成交的股票不計）")
+MAINT_NOTE = ("融資維持率是自己算的估算值，已扣除 ETF（代號 0 開頭：一般／槓桿反向／債券 ETF、ETN、REITs，和 CMoney、玩股網一樣）：個股融資餘額張數 × 當日收盤價 ÷（融資金額 − ETF 估算融資金額）；ETF 融資金額＝ETF 融資張數 × 收盤價 × 融資成數（交易所不公布逐檔融資金額），各網站算法可能略有不同")
 
 
 def _margin_num(value: Any) -> float:
@@ -7422,30 +7421,84 @@ def _twse_margin_daily(days: int) -> Dict[str, Dict[str, float]]:
     return {d: v for d, v in daily.items() if v.get("margin_yi")}
 
 
-def _maintenance_ratio(lots: Dict[str, float], closes: Dict[str, float], money_yuan: float) -> Optional[float]:
-    """Σ(融資餘額張數 × 1000 × 收盤價) ÷ 融資金額 × 100；沒有收盤價的（當天沒成交）不計。"""
-    if money_yuan <= 0:
-        return None
-    value = sum(n * 1000 * closes[code] for code, n in lots.items() if n > 0 and code in closes)
-    return round(value / money_yuan * 100, 2) if value > 0 else None
+# 11-07 使用者（「CMoney、玩股網的融資維持率都扣除 ETF，請確保扣除完整、不要漏掉」）：大盤／櫃買融資一律扣除 ETF。
+# 扣除範圍＝代號 0 開頭的全部（一般 ETF、槓桿／反向 ETF、債券 ETF、主動式 ETF、ETN、REITs 受益證券）；股票、TDR 都不是 0 開頭。
+# - 張數：交易所逐檔公布融資／融券今日、前日餘額 → 精確扣除。
+# - 金額：交易所只公布市場合計的融資金額，不公布逐檔 → ETF 借的錢用「ETF 融資張數 × 1000 × 收盤價 × 融資成數」估算後扣掉（標估算）。
+#   每日增減＝官方融資金額增減 − ETF（今日張數 − 前日張數）× 收盤價 × 融資成數，一天的資料就算得出來。
+# - 維持率：個股融資市值 ÷（融資金額 − ETF 估算融資金額）。
+# - 收盤價：當天沒成交的用最後揭示買賣價（中價），還是沒有的記在 missing（11-06 實測上市 230 檔、上櫃 74 檔有融資的 ETF 全部有價）。
+# 一天算一次存 kv「margin_ex:市場:日期」（舊的 margin_maint 是含 ETF 的，不再用）。
+MARGIN_EX_FINANCING = {"twse": float(os.getenv("DISCORD_AI_MARGIN_ETF_FINANCING_TWSE", "0.6") or 0.6),
+                       "tpex": float(os.getenv("DISCORD_AI_MARGIN_ETF_FINANCING_TPEX", "0.5") or 0.5)}
+MARGIN_EX_HISTORY_MIN = 60          # 扣除 ETF 的逐日資料少於這麼多天：叫醒背景補
 
 
-def _official_closes(payload: Dict[str, Any], code_names: Tuple[str, ...], close_names: Tuple[str, ...]) -> Dict[str, float]:
+def is_fund_code(code: Any) -> bool:
+    """代號 0 開頭＝ETF／槓桿反向 ETF／債券 ETF／ETN／REITs（不是一般股票），融資統計要扣除。"""
+    return str(code or "").strip()[:1] == "0"
+
+
+def _official_prices(payload: Dict[str, Any], code_names: Tuple[str, ...], close_names: Tuple[str, ...],
+                     bid_names: Tuple[str, ...] = (), ask_names: Tuple[str, ...] = ()) -> Dict[str, float]:
+    """{代號: 價格}：收盤價；當天沒成交的用最後揭示買賣價（兩個都有取中價，只有一個用那一個）。"""
     out: Dict[str, float] = {}
     for table in payload.get("tables") or []:
         fields = [str(f).strip() for f in table.get("fields") or []]
-        ci = next((fields.index(n) for n in close_names if n in fields), None)
-        ki = next((fields.index(n) for n in code_names if n in fields), None)
+        pick = lambda names: next((fields.index(n) for n in names if n in fields), None)
+        ki, ci, bi, ai = pick(code_names), pick(close_names), pick(bid_names), pick(ask_names)
         if ci is None or ki is None:
             continue
         for row in table.get("data") or []:
             value = _margin_num(row[ci]) if len(row) > ci else 0.0
+            if value <= 0:
+                bid = _margin_num(row[bi]) if bi is not None and len(row) > bi else 0.0
+                ask = _margin_num(row[ai]) if ai is not None and len(row) > ai else 0.0
+                value = (bid + ask) / 2 if bid > 0 and ask > 0 else (bid or ask)
             if value > 0:
                 out[str(row[ki]).strip()] = value
     return out
 
 
-def _twse_maintenance(day: datetime) -> Optional[float]:
+def _margin_ex(rows: List[Dict[str, float]], prices: Dict[str, float], money_yuan: float, money_prev_yuan: float,
+               market: str) -> Optional[Dict[str, Any]]:
+    """rows＝逐檔 {code, lots, lots_prev, short, short_prev}；回扣除 ETF 後的一天（金額億元、張數、維持率％）。"""
+    if money_yuan <= 0:
+        return None
+    ratio = MARGIN_EX_FINANCING.get(market, 0.6)
+    fund = {"count": 0, "lots": 0.0, "lots_prev": 0.0, "short": 0.0, "short_prev": 0.0, "value": 0.0, "delta_value": 0.0}
+    stock = {"lots": 0.0, "lots_prev": 0.0, "short": 0.0, "short_prev": 0.0, "value": 0.0}
+    missing: List[str] = []
+    for r in rows:
+        code = r["code"]
+        side = fund if is_fund_code(code) else stock
+        for key in ("lots", "lots_prev", "short", "short_prev"):
+            side[key] += r.get(key, 0.0)
+        price = prices.get(code)
+        if is_fund_code(code):
+            if r.get("lots", 0) > 0 or r.get("lots_prev", 0) > 0:
+                fund["count"] += 1
+                if price:
+                    fund["value"] += r.get("lots", 0.0) * 1000 * price
+                    fund["delta_value"] += (r.get("lots", 0.0) - r.get("lots_prev", 0.0)) * 1000 * price
+                else:
+                    missing.append(code)
+        elif price and r.get("lots", 0) > 0:
+            stock["value"] += r["lots"] * 1000 * price
+    fund_money = fund["value"] * ratio
+    stock_money = money_yuan - fund_money
+    if stock_money <= 0 or stock["value"] <= 0:
+        return None
+    change = (money_yuan - money_prev_yuan - fund["delta_value"] * ratio) if money_prev_yuan > 0 else None
+    return {"money_yi": round(stock_money / 1e8, 2), "change_yi": round(change / 1e8, 2) if change is not None else None,
+            "lots": stock["lots"], "lots_change": stock["lots"] - stock["lots_prev"],
+            "short": stock["short"], "short_change": stock["short"] - stock["short_prev"],
+            "maint": round(stock["value"] / stock_money * 100, 2),
+            "official_money_yi": round(money_yuan / 1e8, 2), "etf_money_yi": round(fund_money / 1e8, 2),
+            "etf_lots": fund["lots"], "etf_count": fund["count"], "missing": missing[:20], "missing_count": len(missing)}
+
+
+def _twse_margin_ex(day: datetime) -> Optional[Dict[str, Any]]:
     date = day.strftime("%Y%m%d")
     margin = _official_json(TWSE_MARGIN_ALL_URL.format(date=date), "TWSE")
     tables = margin.get("tables") or []
@@ -7454,29 +7507,37 @@ def _twse_maintenance(day: datetime) -> Optional[float]:
     money_row = next((r for r in tables[0].get("data") or [] if "融資金額" in str(r[0])), None)
     if not money_row:
         return None
-    lots = {str(r[0]).strip(): _margin_num(r[6]) for r in tables[1].get("data") or [] if len(r) > 6}
+    # 證交所融資融券彙總：代號、名稱、融資 買進／賣出／現金償還／前日餘額／今日餘額／限額、融券 買進／賣出／現券償還／前日餘額／今日餘額…
+    rows = [{"code": str(r[0]).strip(), "lots": _margin_num(r[6]), "lots_prev": _margin_num(r[5]),
+             "short": _margin_num(r[12]), "short_prev": _margin_num(r[11])}
+            for r in tables[1].get("data") or [] if len(r) > 12]
     time.sleep(1.0)                                   # 證交所連打會被擋
-    closes = _official_closes(_official_json(TWSE_CLOSE_ALL_URL.format(date=date), "TWSE"), ("證券代號",), ("收盤價",))
-    return _maintenance_ratio(lots, closes, _margin_num(money_row[5]) * 1000)
+    prices = _official_prices(_official_json(TWSE_CLOSE_ALL_URL.format(date=date), "TWSE"), ("證券代號",), ("收盤價",),
+                              ("最後揭示買價",), ("最後揭示賣價",))
+    return _margin_ex(rows, prices, _margin_num(money_row[5]) * 1000, _margin_num(money_row[4]) * 1000, "twse")
 
 
-def _tpex_maintenance(day: datetime) -> Optional[float]:
+def _tpex_margin_ex(day: datetime) -> Optional[Dict[str, Any]]:
     date = day.strftime("%Y/%m/%d")
     table = ((_official_json(TPEX_MARGIN_URL.format(date=date), "TPEx").get("tables") or [{}])[0] or {})
     money_row = next((r for r in table.get("summary") or [] if len(r) > 6 and "融資金" in str(r[1])), None)
     if not money_row:
         return None
-    lots = {str(r[0]).strip(): _margin_num(r[6]) for r in table.get("data") or [] if len(r) > 6}
-    closes = _official_closes(_official_json(TPEX_CLOSE_URL.format(date=date), "TPEx"), ("代號",), ("收盤",))
-    return _maintenance_ratio(lots, closes, _margin_num(money_row[6]) * 1000)
+    # 櫃買融資融券餘額表：代號、名稱、前資餘額、資買、資賣、現償、資餘額、…、前券餘額、券賣、券買、券償、券餘額…
+    rows = [{"code": str(r[0]).strip(), "lots": _margin_num(r[6]), "lots_prev": _margin_num(r[2]),
+             "short": _margin_num(r[14]), "short_prev": _margin_num(r[10])}
+            for r in table.get("data") or [] if len(r) > 14]
+    prices = _official_prices(_official_json(TPEX_CLOSE_URL.format(date=date), "TPEx"), ("代號",), ("收盤",),
+                              ("最後買價",), ("最後賣價",))
+    return _margin_ex(rows, prices, _margin_num(money_row[6]) * 1000, _margin_num(money_row[2]) * 1000, "tpex")
 
 
-def _margin_maintenance(market: str, dates: List[str], budget: int) -> Dict[str, float]:
-    """{日期: 維持率%}：先讀 kv，新的日期優先，最多當場算 budget 天（失敗就不再試，交給背景）。"""
-    out: Dict[str, float] = {}
-    compute = _tpex_maintenance if market == "tpex" else _twse_maintenance
+def _margin_ex_daily(market: str, dates: List[str], budget: int) -> Dict[str, Dict[str, Any]]:
+    """{日期: 扣除 ETF 的一天}：先讀 kv，新的日期優先，最多當場算 budget 天（失敗就不再試，交給背景）。"""
+    out: Dict[str, Dict[str, Any]] = {}
+    compute = _tpex_margin_ex if market == "tpex" else _twse_margin_ex
     for key in sorted(dates, reverse=True):
-        value = local_market_cache.get_state(f"margin_maint:{market}:{key}")
+        value = local_market_cache.get_state(f"margin_ex:{market}:{key}")
         if value is None and budget > 0:
             budget -= 1
             try:
@@ -7484,9 +7545,9 @@ def _margin_maintenance(market: str, dates: List[str], budget: int) -> Dict[str,
             except Exception:
                 value, budget = None, 0
             if value is not None:
-                local_market_cache.set_state(f"margin_maint:{market}:{key}", value)
+                local_market_cache.set_state(f"margin_ex:{market}:{key}", value)
         if value:
-            out[key] = float(value)
+            out[key] = value
     return out
 
 
@@ -7494,7 +7555,8 @@ MARGIN_KICK = threading.Event()           # 會員查到缺資料時叫醒背景
 
 
 def sync_market_margin(max_requests: int = 12, log: Optional[Callable[[str], None]] = None) -> int:
-    """背景補大盤／櫃買融資：上櫃融資（一次一天，補滿 90 天）＋兩個市場的維持率（每天兩份全市場資料，補 70 天）。回傳這輪打了幾次。"""
+    """背景補大盤／櫃買融資：上櫃融資合計（一次一天，補滿 90 天）＋兩個市場扣除 ETF 的逐日資料（每天兩份全市場資料，補 70 天）。
+    回傳這輪打了幾次。"""
     calls = errors = 0
     for day in _tpex_candidate_days(MARGIN_CHART_DAYS):
         if calls >= max_requests or errors >= 3:
@@ -7515,17 +7577,17 @@ def sync_market_margin(max_requests: int = 12, log: Optional[Callable[[str], Non
             break
         if _publish_skip(day) or not local_market_cache.get_state(f"tpex_margin:{key}"):
             continue                                       # 休市或上櫃融資還沒補到（用它判斷交易日）
-        for market, compute in (("twse", _twse_maintenance), ("tpex", _tpex_maintenance)):
-            if calls >= max_requests or local_market_cache.get_state(f"margin_maint:{market}:{key}") is not None:
+        for market, compute in (("twse", _twse_margin_ex), ("tpex", _tpex_margin_ex)):
+            if calls >= max_requests or local_market_cache.get_state(f"margin_ex:{market}:{key}") is not None:
                 continue
             calls += 2
             try:
                 value = compute(day)
-                local_market_cache.set_state(f"margin_maint:{market}:{key}", value if value is not None else 0)
+                local_market_cache.set_state(f"margin_ex:{market}:{key}", value if value is not None else {})
             except Exception as exc:
                 errors += 1
                 if log:
-                    log(f"融資維持率計算失敗｜{market}｜{key}｜{type(exc).__name__}: {exc}")
+                    log(f"扣除 ETF 融資計算失敗｜{market}｜{key}｜{type(exc).__name__}: {exc}")
             time.sleep(1.5)
     if calls and log:
         log(f"大盤／櫃買融資｜本輪打 {calls} 次｜失敗 {errors}")
@@ -7533,39 +7595,61 @@ def sync_market_margin(max_requests: int = 12, log: Optional[Callable[[str], Non
 
 
 def get_market_margin(market: str = "twse", days: int = MARGIN_CHART_DAYS) -> Dict[str, Any]:
-    """大盤（上市）或櫃買（上櫃）融資融券：近 days 天的融資金額（億元）、每日增減、融資／融券張數、融資維持率（估算）；
-    最新一天另外整理較前一日、近 5 個交易日變化。"""
+    """大盤（上市）或櫃買（上櫃）融資融券，11-07 起一律扣除 ETF（is_fund_code）：近 days 天的個股融資金額（億元，估算）、
+    每日增減、融資／融券張數、融資維持率（估算）；另附交易所公布含 ETF 的總額（official_*）方便對照。
+    扣除 ETF 的逐日資料要逐天抓全市場明細：查詢時當場算最新 MAINT_QUERY_FETCH 天，其餘背景補；沒算到的日子副圖留空，不混用含 ETF 的數字。"""
     tpex = str(market).lower() == "tpex"
     daily = _tpex_margin_daily(days) if tpex else _twse_margin_daily(days)
     if not daily:
         raise ToolDataError(f"{'櫃買' if tpex else '大盤'}融資資料暫時無法取得")
     dates = sorted(daily)[-days:]
-    maint = _margin_maintenance("tpex" if tpex else "twse", dates, MAINT_QUERY_FETCH)
-    if tpex and len(dates) < min(days, 60):
-        MARGIN_KICK.set()                                  # 上櫃歷史還沒補滿：叫醒背景
-        TPEX_INST_KICK.set()
+    ex = _margin_ex_daily("tpex" if tpex else "twse", dates, MAINT_QUERY_FETCH)
+    if (tpex and len(dates) < min(days, 60)) or len([d for d in dates if d in ex]) < min(len(dates), MARGIN_EX_HISTORY_MIN):
+        MARGIN_KICK.set()                                  # 歷史還沒補滿：叫醒背景
+        if tpex:
+            TPEX_INST_KICK.set()
     change = lambda now, prev: round(now - prev, 2) if now is not None and prev else None
-    rows = [{"date": d.replace("-", "/"), "margin_yi": daily[d].get("margin_yi"),
-             "change_yi": change(daily[d].get("margin_yi"), daily[d].get("margin_prev_yi")),
-             "margin_lots": daily[d].get("margin_lots"), "short_lots": daily[d].get("short_lots"),
-             **({"maintenance_pct": maint[d]} if maint.get(d) else {})} for d in dates]
-    last = daily[dates[-1]]
-    five = round(rows[-1]["margin_yi"] - rows[-6]["margin_yi"], 2) if len(rows) >= 6 else None
-    latest_maint = next(((r["date"], r["maintenance_pct"]) for r in reversed(rows) if r.get("maintenance_pct")), None)
-    return {
-        "market": "tpex" if tpex else "twse", "scope": "上櫃" if tpex else "上市（集中市場）", "index_name": "櫃買指數" if tpex else "加權指數",
-        "unit": "億元", "data_date": rows[-1]["date"],
-        "margin_balance_yi": last.get("margin_yi"), "margin_change_yi": change(last.get("margin_yi"), last.get("margin_prev_yi")),
-        "margin_change_5d_yi": five, "margin_lots": last.get("margin_lots"),
-        "margin_lots_change": change(last.get("margin_lots"), last.get("margin_lots_prev")),
-        "short_lots": last.get("short_lots"), "short_lots_change": change(last.get("short_lots"), last.get("short_lots_prev")),
-        "maintenance_pct": latest_maint[1] if latest_maint else None,
-        "maintenance_date": latest_maint[0] if latest_maint else "",
-        "maintenance_note": MAINT_NOTE,
-        "rows": rows,
-        "definition_note": f"交易所公布的{'上櫃' if tpex else '上市'}融資融券餘額（市場合計），收盤後晚上才公布、盤中沒有今天的；"
-                           "融資增加代表用借錢買股的部位變多，不等於一定看多或會漲",
-    }
+    rows = []
+    for d in dates:
+        e = ex.get(d)
+        rows.append({"date": d.replace("-", "/"),
+                     "margin_yi": e["money_yi"] if e else None, "change_yi": e.get("change_yi") if e else None,
+                     "margin_lots": e["lots"] if e else None, "short_lots": e["short"] if e else None,
+                     "official_margin_yi": daily[d].get("margin_yi"),
+                     **({"maintenance_pct": e["maint"]} if e and e.get("maint") else {})})
+    last_day = next((d for d in reversed(dates) if d in ex), None)
+    last_official = daily[dates[-1]]
+    base = {"market": "tpex" if tpex else "twse", "scope": "上櫃" if tpex else "上市（集中市場）",
+            "index_name": "櫃買指數" if tpex else "加權指數", "unit": "億元", "rows": rows,
+            "official_margin_yi": last_official.get("margin_yi"),
+            "official_margin_change_yi": change(last_official.get("margin_yi"), last_official.get("margin_prev_yi")),
+            "official_margin_lots": last_official.get("margin_lots"),
+            "maintenance_note": MAINT_NOTE,
+            "definition_note": f"交易所公布的{'上櫃' if tpex else '上市'}融資融券，扣除 ETF（代號 0 開頭：一般／槓桿反向／債券 ETF、ETN、REITs）"
+                               "後的個股部分；金額是估算（交易所不公布逐檔融資金額），收盤後晚上才公布、盤中沒有今天的；"
+                               "融資增加代表用借錢買股的部位變多，不等於一定看多或會漲"}
+    if last_day is None:                               # 扣除 ETF 的資料一天都沒算到：照實說是含 ETF 的官方總額
+        return dict(base, etf_excluded=False, data_date=dates[-1].replace("-", "/"),
+                    margin_balance_yi=last_official.get("margin_yi"),
+                    margin_change_yi=base["official_margin_change_yi"], margin_change_5d_yi=None,
+                    margin_lots=last_official.get("margin_lots"),
+                    margin_lots_change=change(last_official.get("margin_lots"), last_official.get("margin_lots_prev")),
+                    short_lots=last_official.get("short_lots"),
+                    short_lots_change=change(last_official.get("short_lots"), last_official.get("short_lots_prev")),
+                    maintenance_pct=None, maintenance_date="")
+    e = ex[last_day]
+    idx = dates.index(last_day)
+    back = dates[idx - 5] if idx >= 5 else None
+    five = round(e["money_yi"] - ex[back]["money_yi"], 2) if back and back in ex else None
+    return dict(base, etf_excluded=True, data_date=last_day.replace("-", "/"),
+                margin_balance_yi=e["money_yi"], margin_change_yi=e.get("change_yi"), margin_change_5d_yi=five,
+                margin_lots=e["lots"], margin_lots_change=e["lots_change"],
+                short_lots=e["short"], short_lots_change=e["short_change"],
+                maintenance_pct=e.get("maint"), maintenance_date=last_day.replace("-", "/"),
+                etf_margin_yi=e.get("etf_money_yi"), etf_lots=e.get("etf_lots"), etf_count=e.get("etf_count"),
+                etf_missing_price=e.get("missing_count", 0),
+                official_margin_yi=e.get("official_money_yi") or base["official_margin_yi"],
+                ex_history_days=len([d for d in dates if d in ex]))
 
 
 # 11-05 使用者：個股融資（所有人可問）＋融資維持率（估算）。FinMind TaiwanStockMarginPurchaseShortSale（免費，只有張數、沒有金額）；
