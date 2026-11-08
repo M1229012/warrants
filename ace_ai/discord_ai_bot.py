@@ -8928,7 +8928,10 @@ class AceQueryEngine:
                 # 11-07 使用者：融資扣除 ETF（和 CMoney、玩股網一樣）→ 副圖標題寫明；沒扣到（etf_excluded=False）就照實寫含 ETF
                 # 11-07 使用者：先改回不扣 ETF → 標題照原本（扣除 ETF 開關打開時才寫「扣除ETF」）
                 chart["margin"] = [{"name": ("櫃買" if m.get("market") == "tpex" else "大盤")
-                                    + ("（扣除ETF）" if m.get("etf_excluded") else ("（上櫃）" if m.get("market") == "tpex" else "（上市）")),
+                                    + ("（扣除ETF）" if m.get("etf_excluded")
+                                       # 11-08：扣除 ETF 的成本還在累計時標題直接寫明（不靠 AI 說）
+                                       else "（含ETF，扣除ETF計算中）" if m.get("cost_status")
+                                       else ("（上櫃）" if m.get("market") == "tpex" else "（上市）")),
                                     "rows": m.get("rows") or [], "maintenance_pct": m.get("maintenance_pct")} for m in margins]
             else:
                 panels.append({"branch_card": market_margin_card(margins, question), "hide_text": True})

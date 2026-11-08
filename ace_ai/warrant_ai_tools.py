@@ -7570,7 +7570,11 @@ def kick_margin_ex_backfill(market: str, dates: List[str], log: Callable[[str], 
     missing = [d for d in sorted(dates)[-MAINT_HISTORY_DAYS:]
                if local_market_cache.get_state(f"margin_ex3:{market}:{d}") is None
                and not _publish_skip(datetime.strptime(d, "%Y-%m-%d"))]
-    if not missing:
+    # 11-08 使用者（櫃買副圖只有十幾天）：上櫃官方融資合計一次只能抓一天，查詢時只補 6 天、其餘靠背景；
+    # 測試版背景關閉就永遠補不滿 → 這條執行緒先把近 90 天的上櫃官方合計補齊，再補逐日明細
+    official = [day for day in _tpex_candidate_days(MARGIN_CHART_DAYS) if not _publish_skip(day)
+                and local_market_cache.get_state(f"tpex_margin:{day.strftime('%Y-%m-%d')}") is None] if market == "tpex" else []
+    if not missing and not official:
         return False
     with _EX_FILL_LOCK:
         if market in _EX_FILL_RUNNING:
@@ -7579,8 +7583,23 @@ def kick_margin_ex_backfill(market: str, dates: List[str], log: Callable[[str], 
     compute = _tpex_margin_ex if market == "tpex" else _twse_margin_ex
 
     def run() -> None:
-        done = errors = 0
+        nonlocal missing
+        done = errors = filled = 0
         try:
+            for day in official:                               # 新的日期先補；休市會記空的，不再重抓
+                try:
+                    _tpex_margin_fetch(day)
+                    filled += 1
+                except Exception as exc:
+                    errors += 1
+                    log(f"上櫃融資補歷史失敗｜{day:%Y-%m-%d}｜{type(exc).__name__}: {exc}")
+                    if errors >= 3:
+                        return
+                time.sleep(0.5)
+            if official:
+                days = sorted(_tpex_margin_daily(MARGIN_CHART_DAYS, budget=0))
+                missing = [d for d in days[-MAINT_HISTORY_DAYS:] if local_market_cache.get_state(f"margin_ex3:{market}:{d}") is None]
+                log(f"上櫃融資補歷史｜官方合計補 {filled} 天｜現有 {len(days)} 個交易日")
             for key in sorted(missing, reverse=True):          # 新的日期先補
                 if local_market_cache.get_state(f"margin_ex3:{market}:{key}") is not None:
                     continue
