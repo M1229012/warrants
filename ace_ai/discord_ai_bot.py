@@ -5291,18 +5291,20 @@ _MARGIN_RE = re.compile(r"融資|融券|券資比")
 _MARGIN_SCHEMA = {"type": "object", "properties": {"kind": {"type": "string", "enum": [
     "market_twse", "market_tpex", "market_both", "stock", "other"]}}, "required": ["kind"]}
 _MARGIN_MARKET_FALLBACK_RE = re.compile(r"大盤|加權|櫃買|上市|上櫃|台股|整體|全市場|市場|OTC", re.I)
-FINAL_MARGIN_RULES = ("【大盤／櫃買融資（11-05；11-07 起扣除 ETF）】get_market_margin 是交易所公布的市場融資融券（收盤後晚上才公布，盤中沒有今天的），"
+FINAL_MARGIN_RULES = ("【大盤／櫃買融資（11-05；扣除 ETF 看 etf_excluded）】get_market_margin 是交易所公布的市場融資融券（收盤後晚上才公布，盤中沒有今天的），"
     "etf_excluded=true 時融資餘額、增減、張數、融券、維持率都已扣除 ETF（代號 0 開頭：一般／槓桿反向／債券 ETF、ETN、REITs，"
     "和 CMoney、玩股網的算法一樣），金額是估算；official_margin_yi 是交易所公布含 ETF 的總額、etf_margin_yi 是扣掉的 ETF 估算融資金額。"
-    "etf_excluded=false 代表這次沒算到扣除 ETF 的資料，要說是含 ETF 的官方總額。"
+    "etf_excluded=false 時所有數字都是交易所公布的官方總額（含 ETF），維持率也含 ETF：照一般說法寫融資餘額，"
+    "不要提「扣除 ETF」，也不要說官方含 ETF 總額對照（下面跟扣除 ETF 有關的句子都略過）。"
     "融資金額用億元、融資融券張數用張。圖上只有 K 線下方的融資副圖（柱＝每日增減、線＝扣除 ETF 的融資餘額）和維持率，"
     "原本表格上的數字要由你在解讀裡說清楚（不逐日念 rows）：\n"
-    "- answer 一句：最新扣除 ETF 的融資餘額（說「扣除 ETF」）與較前一日增減。\n"
+    "- answer 一句：最新融資餘額（etf_excluded=true 時說「扣除 ETF」）與較前一日增減。\n"
     "- why 依序：近 5 個交易日增減（margin_change_5d_yi 是 null 就不提）與 rows 看得出的近期趨勢（連續增加或減少、和約一個月前比；"
-    "rows 裡 margin_yi 是 null 的日子是扣除 ETF 的資料還沒補到，不要拿 official_margin_yi 硬比）；"
+    "rows 裡 margin_yi 是 null 的日子是扣除 ETF 的資料還沒補到，不要拿 official_margin_yi 硬比；ex_backfilling=true 時加一句「扣除 ETF 的歷史正在補，幾分鐘後再問副圖就完整」；"
+    "有 cost_status 時照它說一句（扣除 ETF 的成本還在累計，這次是官方含 ETF 數字），不要把含 ETF 的數字說成扣除 ETF）；"
     "官方含 ETF 總額一句對照（official_margin_yi，其中 ETF 約 etf_margin_yi 億）；"
     "融資張數變化（margin_lots_change；和金額方向相反時可說可能是低價股融資增加、高價股減少）；融券張數與變化；"
-    "融資維持率 maintenance_pct（一定寫「估算、扣除 ETF」，算法看 maintenance_note）：維持率越低代表融資戶帳面虧損越大，個股低於約 130% 會被追繳，"
+    "融資維持率 maintenance_pct（一定寫「估算」，etf_excluded=true 時加「扣除 ETF」，算法看 maintenance_note）：維持率越低代表融資戶帳面虧損越大，個股低於約 130% 會被追繳，"
     "大盤維持率常見說法是 150～160% 以下偏低、要留意斷頭賣壓，170% 以上相對安全；沒有 maintenance_pct 就不提。\n"
     "- 融資增加＝用借錢買股的部位變多，常拿來看散戶追價或籌碼是否變亂；融資減少＝去槓桿或斷頭賣壓。不可說融資增加就會漲或會跌，也不給買賣建議。"
     "data_date 不是今天時要說是哪一天的資料。問大盤型態時融資最多一句帶過。")
@@ -5351,8 +5353,8 @@ def format_stock_margin(data: Dict[str, Any]) -> str:
 def format_market_margin(data: Dict[str, Any]) -> str:
     """大盤／櫃買融資融券（AI 失敗或純文字時用）。"""
     five = data.get("margin_change_5d_yi")
-    scope = "扣除 ETF" if data.get("etf_excluded") else "含 ETF"
-    return (f"【{'櫃買（上櫃）' if data.get('market') == 'tpex' else '大盤（上市）'}融資融券（{scope}）】資料日期 {data.get('data_date', '-')}\n"
+    scope = "（扣除 ETF）" if data.get("etf_excluded") else ""
+    return (f"【{'櫃買（上櫃）' if data.get('market') == 'tpex' else '大盤（上市）'}融資融券{scope}】資料日期 {data.get('data_date', '-')}\n"
             f"・融資餘額 {float(data.get('margin_balance_yi') or 0):,.2f} 億元｜較前一日 {_signed_yi(data.get('margin_change_yi'))} 億"
             + (f"｜近 5 日 {_signed_yi(five)} 億" if five is not None else "")
             + (f"｜官方含 ETF {float(data['official_margin_yi']):,.2f} 億" if data.get("etf_excluded") and data.get("official_margin_yi") else "")
@@ -8924,8 +8926,9 @@ class AceQueryEngine:
             chart = next((p for p in panels if p.get("stock_code") in ("TAIEX", "TPEX") and p.get("bars")), None)
             if chart is not None:
                 # 11-07 使用者：融資扣除 ETF（和 CMoney、玩股網一樣）→ 副圖標題寫明；沒扣到（etf_excluded=False）就照實寫含 ETF
+                # 11-07 使用者：先改回不扣 ETF → 標題照原本（扣除 ETF 開關打開時才寫「扣除ETF」）
                 chart["margin"] = [{"name": ("櫃買" if m.get("market") == "tpex" else "大盤")
-                                    + ("（扣除ETF）" if m.get("etf_excluded") else "（含ETF）"),
+                                    + ("（扣除ETF）" if m.get("etf_excluded") else ("（上櫃）" if m.get("market") == "tpex" else "（上市）")),
                                     "rows": m.get("rows") or [], "maintenance_pct": m.get("maintenance_pct")} for m in margins]
             else:
                 panels.append({"branch_card": market_margin_card(margins, question), "hide_text": True})
@@ -9129,7 +9132,10 @@ class AceQueryEngine:
             elapsed=elapsed,
             cacheable=llm_ok and all(r.ok for r in combined)
                       and all(any(p.get("stock_code") == code and p.get("bars") for p in panels)
-                              for code in chart_codes),
+                              for code in chart_codes)
+                      # 11-07 Log：扣除 ETF 的融資歷史還在補時不快取，否則幾分鐘後再問還是只有兩天的圖
+                      and not any(r.ok and r.name == "get_market_margin" and (r.data or {}).get("ex_backfilling")
+                                  for r in combined),
             errors=[f"{r.name}：{r.error or r.user_message}" for r in combined if not r.ok]
                    + ([self._compose_error()] if plan.need_final_llm and not llm_ok else []),
             panels=panels,

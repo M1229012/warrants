@@ -7313,7 +7313,7 @@ def _market_inst_summary(daily: Dict[str, Dict[str, float]], days: int, scope: s
 # 上櫃：櫃買中心每日融資融券餘額表的合計列（一次一天，存本地 kv「tpex_margin:日期」；背景 sync_market_margin 慢慢補滿 90 天）。
 # 11-05 使用者：加融資維持率——FinMind 的大盤維持率要付費（免費帳號回「Your level is free」），改自己算：
 # Σ(各股融資餘額張數 × 1000 × 當日收盤價) ÷ 融資金額（證交所 MI_MARGN 全部＋MI_INDEX 收盤；櫃買中心融資餘額表＋上櫃收盤行情），
-# 一天算一次存 kv「margin_ex:市場:日期」（11-07 起扣除 ETF，見 _margin_ex）。兩邊都是收盤後晚上才公布，盤中沒有今天的。
+# 一天算一次存 kv「margin_ex3:市場:日期」（11-07 起扣除 ETF，見 _margin_ex）。兩邊都是收盤後晚上才公布，盤中沒有今天的。
 TPEX_MARGIN_URL = "https://www.tpex.org.tw/www/zh-tw/margin/balance?date={date}&response=json"
 TWSE_MARGIN_ALL_URL = "https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN?date={date}&selectType=ALL&response=json"
 TWSE_CLOSE_ALL_URL = "https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX?date={date}&type=ALLBUT0999&response=json"
@@ -7323,7 +7323,7 @@ TPEX_MARGIN_QUERY_FETCH = 6        # 查詢時最多當場補幾天上櫃融資�
 MAINT_QUERY_FETCH = 2              # 查詢時最多當場算幾天扣除 ETF 的資料（一天要抓兩份全市場明細）；最新兩天才有線
 MAINT_HISTORY_DAYS = 70            # 背景補維持率的天數（K 線那一段）
 MARGIN_PUBLISH_HOUR = 21           # 晚上才公布：這之前不抓今天
-MAINT_NOTE = ("融資維持率是自己算的估算值，已扣除 ETF（代號 0 開頭：一般／槓桿反向／債券 ETF、ETN、REITs，和 CMoney、玩股網一樣）：個股融資餘額張數 × 當日收盤價 ÷（融資金額 − ETF 估算融資金額）；ETF 融資金額＝ETF 融資張數 × 收盤價 × 融資成數（交易所不公布逐檔融資金額），各網站算法可能略有不同")
+MAINT_NOTE = ("融資維持率是自己算的估算值，用財經M平方公開的算法：不含 ETF（代號 0 開頭：一般／槓桿反向／債券 ETF、ETN、REITs）""的融資股票市值（融資張數 × 當日收盤價）÷ 交易所公布的融資金額總額；""和證交所的「整戶擔保維持率」（融資融券合併、上市上櫃合計，數字通常高很多）不是同一個指標")
 
 
 def _margin_num(value: Any) -> float:
@@ -7426,12 +7426,18 @@ def _twse_margin_daily(days: int) -> Dict[str, Dict[str, float]]:
 # - 張數：交易所逐檔公布融資／融券今日、前日餘額 → 精確扣除。
 # - 金額：交易所只公布市場合計的融資金額，不公布逐檔 → ETF 借的錢用「ETF 融資張數 × 1000 × 收盤價 × 融資成數」估算後扣掉（標估算）。
 #   每日增減＝官方融資金額增減 − ETF（今日張數 − 前日張數）× 收盤價 × 融資成數，一天的資料就算得出來。
-# - 維持率：個股融資市值 ÷（融資金額 − ETF 估算融資金額）。
+# - 維持率（11-07 改）：不含 ETF 的融資股票市值 ÷ 大盤融資金額總額（財經M平方公開的算式；玩股網扣除 ETF 的數字也是這個口徑）。
+#   ETF 只從分子扣，分母不扣——ETF 借的錢沒有逐檔資料，各網站都不從分母估算扣除。
 # - 收盤價：當天沒成交的用最後揭示買賣價（中價），還是沒有的記在 missing（11-06 實測上市 230 檔、上櫃 74 檔有融資的 ETF 全部有價）。
-# 一天算一次存 kv「margin_ex:市場:日期」（舊的 margin_maint 是含 ETF 的，不再用）。
+# 一天算一次存 kv「margin_ex3:市場:日期」（舊的 margin_maint、margin_ex 是舊算法，不再用）。
 MARGIN_EX_FINANCING = {"twse": float(os.getenv("DISCORD_AI_MARGIN_ETF_FINANCING_TWSE", "0.6") or 0.6),
                        "tpex": float(os.getenv("DISCORD_AI_MARGIN_ETF_FINANCING_TPEX", "0.5") or 0.5)}
 MARGIN_EX_HISTORY_MIN = 60          # 扣除 ETF 的逐日資料少於這麼多天：叫醒背景補
+# 11-07 使用者：先改回不扣除 ETF（官方總額、含 ETF 維持率），扣除 ETF 的算法確認好再開
+MARGIN_EXCLUDE_ETF = os.getenv("DISCORD_AI_MARGIN_EXCLUDE_ETF", "0").strip().lower() in ("1", "true", "yes", "on")
+MAINT_NOTE_ALL = ("融資維持率是自己算的估算值：各股融資餘額張數 × 當日收盤價 ÷ 交易所公布的融資金額（含 ETF；"
+                  "11/05 和愛玩股公布的上市 155.73%、上市櫃整體 154.11% 一致）；"
+                  "和扣除 ETF 的算法、證交所「整戶擔保維持率」（融資融券合併、上市上櫃合計）不是同一個數字")
 
 
 def is_fund_code(code: Any) -> bool:
@@ -7493,7 +7499,9 @@ def _margin_ex(rows: List[Dict[str, float]], prices: Dict[str, float], money_yua
     return {"money_yi": round(stock_money / 1e8, 2), "change_yi": round(change / 1e8, 2) if change is not None else None,
             "lots": stock["lots"], "lots_change": stock["lots"] - stock["lots_prev"],
             "short": stock["short"], "short_change": stock["short"] - stock["short_prev"],
-            "maint": round(stock["value"] / stock_money * 100, 2),
+            # 11-07：維持率用公認算法（財經M平方）：不含 ETF 的融資股票市值 ÷ 大盤融資金額總額（分母不扣 ETF）
+            "maint": round(stock["value"] / money_yuan * 100, 2),
+            "maint_all": round((stock["value"] + fund["value"]) / money_yuan * 100, 2),   # 11-07：含 ETF（預設顯示這個）
             "official_money_yi": round(money_yuan / 1e8, 2), "etf_money_yi": round(fund_money / 1e8, 2),
             "etf_lots": fund["lots"], "etf_count": fund["count"], "missing": missing[:20], "missing_count": len(missing)}
 
@@ -7537,7 +7545,7 @@ def _margin_ex_daily(market: str, dates: List[str], budget: int) -> Dict[str, Di
     out: Dict[str, Dict[str, Any]] = {}
     compute = _tpex_margin_ex if market == "tpex" else _twse_margin_ex
     for key in sorted(dates, reverse=True):
-        value = local_market_cache.get_state(f"margin_ex:{market}:{key}")
+        value = local_market_cache.get_state(f"margin_ex3:{market}:{key}")
         if value is None and budget > 0:
             budget -= 1
             try:
@@ -7545,10 +7553,174 @@ def _margin_ex_daily(market: str, dates: List[str], budget: int) -> Dict[str, Di
             except Exception:
                 value, budget = None, 0
             if value is not None:
-                local_market_cache.set_state(f"margin_ex:{market}:{key}", value)
+                local_market_cache.set_state(f"margin_ex3:{market}:{key}", value)
         if value:
             out[key] = value
     return out
+
+
+_EX_FILL_LOCK = threading.Lock()
+_EX_FILL_RUNNING: set = set()
+
+
+def kick_margin_ex_backfill(market: str, dates: List[str], log: Callable[[str], None] = print) -> bool:
+    """11-07 使用者（副圖只有最近兩天）：扣除 ETF 的逐日資料缺的話，開一條執行緒把近 MAINT_HISTORY_DAYS 個交易日補完
+    （不靠背景排程；測試版背景關閉也會補）。同一個市場同時只跑一條；回傳這次有沒有開始補。"""
+    market = "tpex" if market == "tpex" else "twse"
+    missing = [d for d in sorted(dates)[-MAINT_HISTORY_DAYS:]
+               if local_market_cache.get_state(f"margin_ex3:{market}:{d}") is None
+               and not _publish_skip(datetime.strptime(d, "%Y-%m-%d"))]
+    if not missing:
+        return False
+    with _EX_FILL_LOCK:
+        if market in _EX_FILL_RUNNING:
+            return False
+        _EX_FILL_RUNNING.add(market)
+    compute = _tpex_margin_ex if market == "tpex" else _twse_margin_ex
+
+    def run() -> None:
+        done = errors = 0
+        try:
+            for key in sorted(missing, reverse=True):          # 新的日期先補
+                if local_market_cache.get_state(f"margin_ex3:{market}:{key}") is not None:
+                    continue
+                try:
+                    value = compute(datetime.strptime(key, "%Y-%m-%d"))
+                    local_market_cache.set_state(f"margin_ex3:{market}:{key}", value if value is not None else {})
+                    done += 1
+                except Exception as exc:
+                    errors += 1
+                    log(f"扣除 ETF 融資補歷史失敗｜{market}｜{key}｜{type(exc).__name__}: {exc}")
+                    if errors >= 3:
+                        break
+                time.sleep(1.5)                                # 證交所／櫃買連打會被擋
+        finally:
+            with _EX_FILL_LOCK:
+                _EX_FILL_RUNNING.discard(market)
+            log(f"扣除 ETF 融資補歷史｜{market}｜補 {done} 天｜失敗 {errors}｜原本缺 {len(missing)} 天")
+
+    threading.Thread(target=run, daemon=True, name=f"margin-ex-{market}").start()
+    return True
+
+
+# 11-08 使用者（「自己算成本」）：大盤融資維持率改用逐檔成本引擎（margin_cost.py）。
+# 11-08 驗證：只用證交所官方資料從 2025/10/01 重播，上市扣除 ETF 11/02～11/06 和玩股網每天都差 0.08 個百分點
+# （11/06：129.76% vs 129.68%）；扣除 ETF 融資餘額＝官方總額 − 引擎 ETF 本金，和玩股網表差約 1 億（4,979.47 vs 4,978.65）。
+# 重播滿 100～120 個交易日才收斂（從 34 天前開始會高 2.6 點）→ 第一次從 MARGIN_COST_START_DAYS 天前開始補，未滿 WARM_DAYS 不顯示。
+# 上櫃：同一套規則還沒對上（玩股網上櫃個股維持率會在股價下跌時跳升，原因未明）→ 預設只有上市用成本引擎，上櫃照官方含 ETF。
+MARGIN_COST_MARKETS = {m.strip() for m in os.getenv("DISCORD_AI_MARGIN_COST_MARKETS", "twse").split(",") if m.strip()}
+MARGIN_COST_START_DAYS = 400              # 第一次重播從幾個日曆天前開始（約 270 個交易日；副圖 90 天每一天都已收斂）
+MARGIN_COST_ROUND_DAYS = 4                # 背景排程每輪最多補幾個交易日（一天 2 份官方資料）
+_COST_LOCKS = {"twse": threading.Lock(), "tpex": threading.Lock()}
+
+
+_COST_LAST_CALL = [0.0]
+COST_REQUEST_GAP = 1.5                    # 每個官方請求至少間隔幾秒（11-08 驗證時 2.6 秒、0 次重試；證交所連打會被擋）
+
+
+def _throttled_json(url: str, source: str) -> Dict[str, Any]:
+    gap = _COST_LAST_CALL[0] + COST_REQUEST_GAP - time.monotonic()
+    if gap > 0:
+        time.sleep(gap)
+    _COST_LAST_CALL[0] = time.monotonic()
+    return _official_json(url, source)
+
+
+def _cost_day_iso(day: datetime) -> str:
+    return day.strftime("%Y-%m-%d")
+
+
+def sync_margin_cost(market: str, max_days: int = 10_000, log: Optional[Callable[[str], None]] = None) -> int:
+    """逐日重播成本引擎到最新已公布的交易日；回傳這次處理了幾個交易日。同一個市場同時只跑一個（拿不到鎖就回 0）。
+    狀態存 kv「margin_cost_state:市場」，每天結果存「margin_cost:市場:日期」（含 days＝已重播交易日數）。"""
+    import margin_cost
+    market = "tpex" if market == "tpex" else "twse"
+    lock = _COST_LOCKS[market]
+    if not lock.acquire(blocking=False):
+        return 0
+    done = 0
+    try:
+        state = local_market_cache.get_state(f"margin_cost_state:{market}") or {}
+        rows = state.get("rows") or {}
+        days = int(state.get("days") or 0)
+        now = taipei_now().replace(tzinfo=None)
+        day = (datetime.strptime(state["date"], "%Y-%m-%d") + timedelta(days=1)) if state.get("date") \
+            else (now - timedelta(days=MARGIN_COST_START_DAYS))
+        while day.date() <= now.date() and done < max_days:
+            if day.weekday() >= 5:
+                day += timedelta(days=1)
+                continue
+            if _publish_skip(day):
+                break                                     # 今天還沒公布
+            data = margin_cost.fetch_day(market, day, _throttled_json)
+            if data is None and day.date() >= (now - timedelta(days=1)).date():
+                break                                     # 最近一兩天沒資料：可能還沒公布，不當休市跳過
+            if data:
+                stats = margin_cost.step(rows, data)
+                days += 1
+                agg = margin_cost.aggregate(rows, market)
+                agg.update(days=days, rebased=stats["rebased"])
+                local_market_cache.set_state(f"margin_cost:{market}:{_cost_day_iso(day)}", agg)
+                done += 1
+            local_market_cache.set_state(f"margin_cost_state:{market}",
+                                         {"date": _cost_day_iso(day), "days": days, "rows": rows})
+            day += timedelta(days=1)
+    except Exception as exc:
+        if log:
+            log(f"融資成本引擎｜{market}｜中斷｜{type(exc).__name__}: {exc}")
+    finally:
+        lock.release()
+    if done and log:
+        log(f"融資成本引擎｜{market}｜補 {done} 個交易日")
+    return done
+
+
+def kick_margin_cost(market: str, log: Callable[[str], None] = print) -> bool:
+    """不等背景排程：開一條執行緒把成本引擎補到最新（同市場只跑一條）。回傳這次有沒有開始。"""
+    market = "tpex" if market == "tpex" else "twse"
+    if _COST_LOCKS[market].locked():
+        return False
+    threading.Thread(target=lambda: sync_margin_cost(market, log=log), daemon=True, name=f"margin-cost-{market}").start()
+    return True
+
+
+def _market_margin_cost(market: str, daily: Dict[str, Dict[str, float]], dates: List[str], base: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """成本引擎版的大盤融資（扣除 ETF）：最新交易日已收斂才回傳，否則回 None（呼叫端照官方含 ETF，並叫醒引擎）。"""
+    import margin_cost
+    cost = {d: local_market_cache.get_state(f"margin_cost:{market}:{d}") for d in dates}
+    warm = lambda d: bool(cost.get(d)) and int(cost[d].get("days") or 0) >= margin_cost.WARM_DAYS and cost[d].get("maint_ex")
+    if not warm(dates[-1]):
+        return None
+    change = lambda now, prev: round(now - prev, 2) if now is not None and prev is not None else None
+    rows, prev = [], None
+    for d in dates:
+        c = cost.get(d) if warm(d) else None
+        official = daily[d].get("margin_yi")
+        etf = round((c["principal_all_yi"] - c["principal_ex_yi"]), 2) if c else None
+        balance = round(official - etf, 2) if c and official else None
+        rows.append({"date": d.replace("-", "/"), "margin_yi": balance, "change_yi": change(balance, (prev or {}).get("margin_yi")),
+                     "margin_lots": c["lots_ex"] if c else None, "short_lots": c["short_ex"] if c else None,
+                     "official_margin_yi": official, **({"maintenance_pct": c["maint_ex"]} if c else {})})
+        prev = rows[-1]
+    last, before = rows[-1], (rows[-2] if len(rows) > 1 else {})
+    five = change(last["margin_yi"], rows[-6]["margin_yi"]) if len(rows) >= 6 else None
+    c = cost[dates[-1]]
+    return dict(base, etf_excluded=True, cost_model=True, rows=rows, data_date=last["date"],
+                margin_balance_yi=last["margin_yi"], margin_change_yi=last["change_yi"], margin_change_5d_yi=five,
+                margin_lots=last["margin_lots"], margin_lots_change=change(last["margin_lots"], before.get("margin_lots")),
+                short_lots=last["short_lots"], short_lots_change=change(last["short_lots"], before.get("short_lots")),
+                maintenance_pct=c["maint_ex"], maintenance_date=last["date"], maintenance_note=MAINT_NOTE_COST,
+                official_margin_yi=last["official_margin_yi"],
+                official_margin_change_yi=change(daily[dates[-1]].get("margin_yi"), daily[dates[-1]].get("margin_prev_yi")),
+                etf_margin_yi=round(c["principal_all_yi"] - c["principal_ex_yi"], 2), cost_days=int(c.get("days") or 0),
+                definition_note=f"交易所公布的{'上櫃' if market == 'tpex' else '上市'}融資融券，扣除 ETF（代號 0 開頭）；"
+                                "融資餘額＝官方總額 − ETF 估算本金，維持率＝個股融資市值 ÷ 個股估算本金（逐檔累計融資成本），"
+                                "收盤後晚上才公布、盤中沒有今天的；融資增加代表用借錢買股的部位變多，不等於一定看多或會漲")
+
+
+MAINT_NOTE_COST = ("融資維持率是估算值，扣除 ETF：個股融資市值（融資張數 × 收盤價）÷ 個股估算本金；"
+                   "估算本金＝逐檔每天用融資買進（成交均價）、賣出、現金償還累計的融資成本 × 融資成數 6 成（和玩股網同一算法，"
+                   "11/02～11/06 自算與玩股網差 0.08 個百分點）；和證交所「整戶擔保維持率」（融資融券合併、上市上櫃合計）不是同一個數字")
 
 
 MARGIN_KICK = threading.Event()           # 會員查到缺資料時叫醒背景補資料
@@ -7578,37 +7750,81 @@ def sync_market_margin(max_requests: int = 12, log: Optional[Callable[[str], Non
         if _publish_skip(day) or not local_market_cache.get_state(f"tpex_margin:{key}"):
             continue                                       # 休市或上櫃融資還沒補到（用它判斷交易日）
         for market, compute in (("twse", _twse_margin_ex), ("tpex", _tpex_margin_ex)):
-            if calls >= max_requests or local_market_cache.get_state(f"margin_ex:{market}:{key}") is not None:
+            if calls >= max_requests or local_market_cache.get_state(f"margin_ex3:{market}:{key}") is not None:
                 continue
             calls += 2
             try:
                 value = compute(day)
-                local_market_cache.set_state(f"margin_ex:{market}:{key}", value if value is not None else {})
+                local_market_cache.set_state(f"margin_ex3:{market}:{key}", value if value is not None else {})
             except Exception as exc:
                 errors += 1
                 if log:
                     log(f"扣除 ETF 融資計算失敗｜{market}｜{key}｜{type(exc).__name__}: {exc}")
             time.sleep(1.5)
+    for market in ("twse", "tpex"):                    # 11-08：成本引擎每輪補幾天（上櫃也先跑，等驗證）
+        if calls >= max_requests * 2:
+            break
+        calls += 2 * sync_margin_cost(market, max_days=MARGIN_COST_ROUND_DAYS, log=log)
     if calls and log:
         log(f"大盤／櫃買融資｜本輪打 {calls} 次｜失敗 {errors}")
     return calls
 
 
 def get_market_margin(market: str = "twse", days: int = MARGIN_CHART_DAYS) -> Dict[str, Any]:
-    """大盤（上市）或櫃買（上櫃）融資融券，11-07 起一律扣除 ETF（is_fund_code）：近 days 天的個股融資金額（億元，估算）、
-    每日增減、融資／融券張數、融資維持率（估算）；另附交易所公布含 ETF 的總額（official_*）方便對照。
-    扣除 ETF 的逐日資料要逐天抓全市場明細：查詢時當場算最新 MAINT_QUERY_FETCH 天，其餘背景補；沒算到的日子副圖留空，不混用含 ETF 的數字。"""
+    """大盤（上市）或櫃買（上櫃）融資融券：近 days 天的融資金額（億元）、每日增減、融資／融券張數、融資維持率（估算）；
+    最新一天另外整理較前一日、近 5 個交易日變化。
+    11-07 使用者（「先改回沒有扣除 ETF 的版本，確認好再改」）：預設用交易所公布的官方總額（含 ETF），維持率也含 ETF
+    （各股融資張數 × 收盤 ÷ 融資金額；11/05 和愛玩股公布的上市 155.73%、整體 154.11% 完全一致）。
+    扣除 ETF 的算法還在跟使用者確認，留在 MARGIN_EXCLUDE_ETF（環境變數 DISCORD_AI_MARGIN_EXCLUDE_ETF=1 才開）。
+    維持率要逐天抓全市場明細：查詢時當場算最新 MAINT_QUERY_FETCH 天，缺的歷史當場開執行緒補（kick_margin_ex_backfill）。"""
     tpex = str(market).lower() == "tpex"
     daily = _tpex_margin_daily(days) if tpex else _twse_margin_daily(days)
     if not daily:
         raise ToolDataError(f"{'櫃買' if tpex else '大盤'}融資資料暫時無法取得")
     dates = sorted(daily)[-days:]
+    mk = "tpex" if tpex else "twse"
+    base0 = {"market": mk, "scope": "上櫃" if tpex else "上市（集中市場）", "index_name": "櫃買指數" if tpex else "加權指數",
+             "unit": "億元", "maintenance_reference": {"大盤偏低（常見說法）": "150～160%", "大盤相對安全": "170%",
+                                                     "個股追繳": "130%", "個股留意斷頭": "140%"}}
+    if mk in MARGIN_COST_MARKETS and not MARGIN_EXCLUDE_ETF:
+        # 11-08：成本引擎（和玩股網同一算法）已收斂就用它；引擎落後最新交易日或還沒收斂就開執行緒補，這次先照官方含 ETF
+        state_date = (local_market_cache.get_state(f"margin_cost_state:{mk}") or {}).get("date") or ""
+        if state_date < dates[-1]:
+            kick_margin_cost(mk)
+        result = _market_margin_cost(mk, daily, dates, dict(base0, ex_backfilling=state_date < dates[-1]))
+        if result is not None:
+            return result
     ex = _margin_ex_daily("tpex" if tpex else "twse", dates, MAINT_QUERY_FETCH)
+    backfilling = False
     if (tpex and len(dates) < min(days, 60)) or len([d for d in dates if d in ex]) < min(len(dates), MARGIN_EX_HISTORY_MIN):
         MARGIN_KICK.set()                                  # 歷史還沒補滿：叫醒背景
         if tpex:
             TPEX_INST_KICK.set()
+        # 11-07：不等背景排程，當場開執行緒補逐日明細（維持率歷史；同市場同時只跑一條）
+        backfilling = kick_margin_ex_backfill("tpex" if tpex else "twse", dates) or ("tpex" if tpex else "twse") in _EX_FILL_RUNNING
     change = lambda now, prev: round(now - prev, 2) if now is not None and prev else None
+    # 11-07 Log：AI 規則提到的門檻放進資料（事實核對才不會把 150% 當成對不上的數字刪句）
+    cost_building = mk in MARGIN_COST_MARKETS and not MARGIN_EXCLUDE_ETF
+    base = dict(base0, ex_backfilling=backfilling or cost_building,
+                **({"cost_status": "扣除 ETF 的融資成本還在累計（要滿約 120 個交易日），這次先用官方含 ETF 數字"} if cost_building else {}))
+    if not MARGIN_EXCLUDE_ETF:
+        rows = [{"date": d.replace("-", "/"), "margin_yi": daily[d].get("margin_yi"),
+                 "change_yi": change(daily[d].get("margin_yi"), daily[d].get("margin_prev_yi")),
+                 "margin_lots": daily[d].get("margin_lots"), "short_lots": daily[d].get("short_lots"),
+                 **({"maintenance_pct": ex[d]["maint_all"]} if ex.get(d, {}).get("maint_all") else {})} for d in dates]
+        last = daily[dates[-1]]
+        five = round(rows[-1]["margin_yi"] - rows[-6]["margin_yi"], 2) if len(rows) >= 6 else None
+        latest_maint = next(((r["date"], r["maintenance_pct"]) for r in reversed(rows) if r.get("maintenance_pct")), None)
+        return dict(base, etf_excluded=False, rows=rows, data_date=rows[-1]["date"],
+                    margin_balance_yi=last.get("margin_yi"), margin_change_yi=change(last.get("margin_yi"), last.get("margin_prev_yi")),
+                    margin_change_5d_yi=five, margin_lots=last.get("margin_lots"),
+                    margin_lots_change=change(last.get("margin_lots"), last.get("margin_lots_prev")),
+                    short_lots=last.get("short_lots"), short_lots_change=change(last.get("short_lots"), last.get("short_lots_prev")),
+                    maintenance_pct=latest_maint[1] if latest_maint else None,
+                    maintenance_date=latest_maint[0] if latest_maint else "",
+                    maintenance_note=MAINT_NOTE_ALL,
+                    definition_note=f"交易所公布的{'上櫃' if tpex else '上市'}融資融券餘額（市場合計，含 ETF），收盤後晚上才公布、盤中沒有今天的；"
+                                    "融資增加代表用借錢買股的部位變多，不等於一定看多或會漲")
     rows = []
     for d in dates:
         e = ex.get(d)
@@ -7619,15 +7835,13 @@ def get_market_margin(market: str = "twse", days: int = MARGIN_CHART_DAYS) -> Di
                      **({"maintenance_pct": e["maint"]} if e and e.get("maint") else {})})
     last_day = next((d for d in reversed(dates) if d in ex), None)
     last_official = daily[dates[-1]]
-    base = {"market": "tpex" if tpex else "twse", "scope": "上櫃" if tpex else "上市（集中市場）",
-            "index_name": "櫃買指數" if tpex else "加權指數", "unit": "億元", "rows": rows,
-            "official_margin_yi": last_official.get("margin_yi"),
-            "official_margin_change_yi": change(last_official.get("margin_yi"), last_official.get("margin_prev_yi")),
-            "official_margin_lots": last_official.get("margin_lots"),
-            "maintenance_note": MAINT_NOTE,
-            "definition_note": f"交易所公布的{'上櫃' if tpex else '上市'}融資融券，扣除 ETF（代號 0 開頭：一般／槓桿反向／債券 ETF、ETN、REITs）"
-                               "後的個股部分；金額是估算（交易所不公布逐檔融資金額），收盤後晚上才公布、盤中沒有今天的；"
-                               "融資增加代表用借錢買股的部位變多，不等於一定看多或會漲"}
+    base = dict(base, rows=rows, maintenance_note=MAINT_NOTE,
+                official_margin_yi=last_official.get("margin_yi"),
+                official_margin_change_yi=change(last_official.get("margin_yi"), last_official.get("margin_prev_yi")),
+                official_margin_lots=last_official.get("margin_lots"),
+                definition_note=f"交易所公布的{'上櫃' if tpex else '上市'}融資融券，扣除 ETF（代號 0 開頭：一般／槓桿反向／債券 ETF、ETN、REITs）"
+                                "後的個股部分；金額是估算（交易所不公布逐檔融資金額），收盤後晚上才公布、盤中沒有今天的；"
+                                "融資增加代表用借錢買股的部位變多，不等於一定看多或會漲")
     if last_day is None:                               # 扣除 ETF 的資料一天都沒算到：照實說是含 ETF 的官方總額
         return dict(base, etf_excluded=False, data_date=dates[-1].replace("-", "/"),
                     margin_balance_yi=last_official.get("margin_yi"),

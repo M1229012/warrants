@@ -77,7 +77,8 @@ def fetch_day(market: str, day: datetime, get_json) -> Optional[Dict[str, Dict[s
         if not data:
             return None
         # 櫃買：代號、名稱、前資餘額、資買、資賣、現償、資餘額…
-        margin = {str(r[0]).strip(): (_num(r[2]), _num(r[3]), _num(r[4]), _num(r[5]), _num(r[6])) for r in data if len(r) > 6}
+        margin = {str(r[0]).strip(): (_num(r[2]), _num(r[3]), _num(r[4]), _num(r[5]), _num(r[6]), _num(r[14]) if len(r) > 14 else 0.0)
+                  for r in data if len(r) > 6}
         quotes = _quotes(get_json(TPEX_QUOTE.format(date=date), "TPEx"), "代號", "成交股數", "成交金額(元)", "收盤",
                          "最後買價", "最後賣價")
     else:
@@ -87,14 +88,14 @@ def fetch_day(market: str, day: datetime, get_json) -> Optional[Dict[str, Dict[s
         if payload.get("stat") != "OK" or len(tables) < 2:
             return None
         # 證交所：代號、名稱、融資 買進、賣出、現金償還、前日餘額、今日餘額…
-        margin = {str(r[0]).strip(): (_num(r[5]), _num(r[2]), _num(r[3]), _num(r[4]), _num(r[6]))
+        margin = {str(r[0]).strip(): (_num(r[5]), _num(r[2]), _num(r[3]), _num(r[4]), _num(r[6]), _num(r[12]) if len(r) > 12 else 0.0)
                   for r in tables[1].get("data") or [] if len(r) > 6}
         quotes = _quotes(get_json(TWSE_QUOTE.format(date=date), "TWSE"), "證券代號", "成交股數", "成交金額", "收盤價",
                          "最後揭示買價", "最後揭示賣價")
     out: Dict[str, Dict[str, float]] = {}
-    for code, (prev, buy, sell, repay, lots) in margin.items():
+    for code, (prev, buy, sell, repay, lots, short) in margin.items():
         q = quotes.get(code) or {}
-        out[code] = {"prev": prev, "buy": buy, "sell": sell, "repay": repay, "lots": lots,
+        out[code] = {"prev": prev, "buy": buy, "sell": sell, "repay": repay, "lots": lots, "short": short,
                      "close": q.get("close", 0.0), "vwap": q.get("vwap", 0.0)}
     return out
 
@@ -128,7 +129,7 @@ def step(state: Dict[str, list], rows: Dict[str, Dict[str, float]]) -> Dict[str,
             stats["adjusted"] += 1
         elif lots > 0 and expected <= 0:
             cost = lots * 1000 * (price or vwap)
-        state[code] = [lots, cost if lots > 0 else 0.0, price or s[2], s[3] + 1]
+        state[code] = [lots, cost if lots > 0 else 0.0, price or s[2], s[3] + 1, r.get("short", 0.0)]
     return stats
 
 
@@ -136,7 +137,13 @@ def aggregate(state: Dict[str, list], market: str) -> Dict[str, Any]:
     """Σ市值 ÷ Σ估算本金：全部（含 ETF、不含存託憑證）與扣除 ETF 兩種。"""
     f = FIN_RATIO.get(market, 0.6)
     acc = {"all": [0.0, 0.0, 0], "ex": [0.0, 0.0, 0]}
-    for code, (lots, cost, price, _) in state.items():
+    lots_sum = {"all": 0.0, "ex": 0.0}
+    short_sum = {"all": 0.0, "ex": 0.0}
+    for code, s in state.items():
+        lots, cost, price = s[0], s[1], s[2]
+        for key in ("all",) + (() if is_fund(code) else ("ex",)):     # 張數、融券：官方逐檔加總（含存託憑證）
+            lots_sum[key] += lots
+            short_sum[key] += s[4] if len(s) > 4 else 0.0
         if lots <= 0 or cost <= 0 or price <= 0 or is_tdr(code):
             continue
         value, principal = lots * 1000 * price, cost * f
@@ -144,7 +151,8 @@ def aggregate(state: Dict[str, list], market: str) -> Dict[str, Any]:
             acc[key][0] += value
             acc[key][1] += principal
             acc[key][2] += 1
-    out: Dict[str, Any] = {}
+    out: Dict[str, Any] = {"lots_all": lots_sum["all"], "lots_ex": lots_sum["ex"],
+                           "short_all": short_sum["all"], "short_ex": short_sum["ex"]}
     for key, (value, principal, count) in acc.items():
         out[f"maint_{key}"] = round(value / principal * 100, 2) if principal > 0 else None
         out[f"value_{key}_yi"] = round(value / 1e8, 2)
