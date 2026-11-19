@@ -5899,7 +5899,7 @@ REQUIRED_MODULE_API = {
     "corporate_action_sources": ("twse_events",),
     "discord_access": ("_CHIP_WORD_RE", "require_sector"),
     "warrant_ai_tools": ("get_market_institutional", "get_market_margin", "get_stock_margin", "prefetch_sheet_tables", "_reserve_fugle_slot", "check_sheet_version", "err_text",
-                         "chart_marks_for_stock"),
+                         "chart_marks_for_stock", "sweep_expired_caches"),
     "answer_image": ("wrap_cell", "observed_mark_layout", "CHIP_LAYOUT_VERSION", "public_ma_condition"),
     "chip_event_backtest": ("event_marks", "branch_card", "VERSION"),
     "weekly_pick": ("layout_card", "verify_layout"),
@@ -10772,6 +10772,41 @@ def _tpex_institutional_loop(stop: threading.Event) -> None:
             break
 
 
+MEMORY_RELEASE_SECONDS = tools._env_int("DISCORD_AI_MEM_RELEASE_SECONDS", 600)   # 0＝關閉
+
+
+def _memory_release_loop(stop: threading.Event) -> None:
+    """11-19 省 Railway 記憶體費：每 10 分鐘清掉已過期的快取，再把空出來的記憶體還給系統（malloc_trim）。
+
+    只清「已過期」的快取，查詢結果與命中率不變；獨立一條執行緒，不佔其他背景工作的時間。
+    非 Linux（本機 Windows）沒有 malloc_trim 就只清快取。任何錯誤都只略過這一輪。
+    """
+    try:
+        import mem_report
+    except Exception as exc:
+        print(f"⚠️ 記憶體整理未啟動｜{type(exc).__name__}: {exc}", flush=True)
+        return
+    try:
+        import ctypes
+        trim = ctypes.CDLL("libc.so.6").malloc_trim
+    except Exception:
+        trim = None
+    first = True
+    while not stop.wait(max(60, MEMORY_RELEASE_SECONDS)):
+        try:
+            before = mem_report.rss_bytes()
+            swept = tools.sweep_expired_caches()
+            if trim is not None:
+                trim(0)
+            after = mem_report.rss_bytes()
+            freed_mb = (before - after) / 1024 / 1024
+            if first or freed_mb >= 50:
+                print(f"🧹 記憶體整理：清掉過期快取 {swept} 筆｜RAM {before / 1024 / 1024:,.0f}MB → {after / 1024 / 1024:,.0f}MB", flush=True)
+            first = False
+        except Exception as exc:
+            print(f"⚠️ 記憶體整理略過｜{type(exc).__name__}: {exc}", flush=True)
+
+
 def _usage_monitor_loop(engine: "AceQueryEngine", stop: threading.Event) -> None:
     """Railway 背景監控：API 用量、記憶體、快取與延遲收盤重查。
 
@@ -11030,6 +11065,8 @@ def run_discord_bot(config: BotConfig) -> None:
         if not usage_monitor_started.is_set():
             usage_monitor_started.set()
             threading.Thread(target=_usage_monitor_loop, args=(engine, usage_stop), name="ace-usage-monitor", daemon=True).start()
+            if MEMORY_RELEASE_SECONDS > 0:
+                threading.Thread(target=_memory_release_loop, args=(usage_stop,), name="ace-mem-release", daemon=True).start()
             if MARKET_SYNC_ENABLE:
                 threading.Thread(target=_market_maintenance_loop, args=(usage_stop,), name="ace-market-base", daemon=True).start()
                 threading.Thread(target=_tpex_institutional_loop, args=(usage_stop,), name="ace-tpex-inst", daemon=True).start()

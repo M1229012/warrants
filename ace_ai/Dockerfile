@@ -7,7 +7,12 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONIOENCODING=utf-8 \
     MPLBACKEND=Agg \
-    MPLCONFIGDIR=/app/.cache/matplotlib
+    MPLCONFIGDIR=/app/.cache/matplotlib \
+    MALLOC_ARENA_MAX=2
+
+# 11-19 MALLOC_ARENA_MAX=2：Linux 預設每個執行緒各開一塊記憶體池、用完不還系統，Bot 執行緒多，
+# 常駐記憶體被撐大（Railway 依常駐記憶體計費）。限制成 2 塊只影響記憶體配置方式，不改任何功能或結果。
+# 要還原：刪掉上面的 MALLOC_ARENA_MAX=2（連同前一行行尾的反斜線）。
 
 RUN apt-get update && apt-get install -y --no-install-recommends fonts-noto-cjk fonts-noto-color-emoji \
     && rm -rf /var/lib/apt/lists/*

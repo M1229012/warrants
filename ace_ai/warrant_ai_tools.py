@@ -23,6 +23,7 @@ import re
 import sys
 import threading
 import time
+import weakref
 from collections import defaultdict, deque
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -638,6 +639,9 @@ def core():
 # 共用工具：TTL 快取、數值整理、日期
 # ============================================================
 
+_ALL_TTL_CACHES: "weakref.WeakSet" = weakref.WeakSet()   # 11-19 所有 TTLCache，給定時清過期資料用
+
+
 class TTLCache:
     """Discord AI 專用的記憶體 TTL 快取；所有 key 自動加上 discord_ai_ 前綴。
 
@@ -650,6 +654,8 @@ class TTLCache:
         self._owner: Dict[str, int] = {}      # key → 建立它的執行緒（背景只清自己的）
         self._lock = threading.Lock()
         self._key_locks: Dict[str, threading.Lock] = {}
+        self._idle_locks: Dict[str, threading.Lock] = {}   # 11-19 上一輪清理時已閒置的 key lock
+        _ALL_TTL_CACHES.add(self)
 
     def _full_key(self, key: str) -> str:
         return f"{self.namespace}_{'closed' if closed_quotes_only() else 'admin_live'}_{key}"
@@ -725,6 +731,27 @@ class TTLCache:
         for k in [k for k, lock in self._key_locks.items() if k not in self._data and not lock.locked()]:
             del self._key_locks[k]
 
+    def sweep_expired(self) -> int:
+        """11-19：清掉已過期的資料（原本只在超過上限或同 key 再被查時才清，過期的資料表會一直佔記憶體）。
+
+        只刪「已過期」的：這些 get() 本來就會當作沒命中、重新抓，所以命中率與結果都不變。
+        key lock 要連續兩輪清理都閒置（沒資料、沒人拿著）才刪，避免和剛拿到 lock 還沒鎖上的執行緒撞到。
+        資料表在鎖外才真正釋放，不讓查詢等這把鎖。回傳清掉幾筆。
+        """
+        now = time.time()
+        with self._lock:
+            doomed = [k for k, (exp, _) in self._data.items() if exp < now]
+            dropped = [self._data.pop(k) for k in doomed]
+            for k in doomed:
+                self._owner.pop(k, None)
+            idle = {k: lock for k, lock in self._key_locks.items() if k not in self._data and not lock.locked()}
+            for k, lock in idle.items():
+                if self._idle_locks.get(k) is lock:
+                    del self._key_locks[k]
+            self._idle_locks = {k: lock for k, lock in idle.items() if k in self._key_locks}
+        del dropped
+        return len(doomed)
+
     def get_or_compute(self, key: str, ttl_seconds: float, compute: Callable[[], Any]) -> Tuple[Any, bool]:
         """命中就回傳快取；否則執行 compute 並寫入。回傳 (值, 是否命中)。"""
         hit, value = self.get(key)
@@ -751,6 +778,17 @@ class TTLCache:
 
 
 CACHE = TTLCache("discord_ai")
+
+
+def sweep_expired_caches() -> int:
+    """11-19：清掉所有 TTLCache 已過期的資料；回傳總共清掉幾筆。單一快取出錯就跳過，不影響其他快取。"""
+    total = 0
+    for cache in list(_ALL_TTL_CACHES):
+        try:
+            total += cache.sweep_expired()
+        except Exception:
+            continue
+    return total
 
 _TOOL_CONTEXT = threading.local()
 
